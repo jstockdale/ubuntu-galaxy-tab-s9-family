@@ -593,5 +593,155 @@ fi
                       POSTINST.read_text())
 
 
+KIT = REPO / "tools/inplace/suspendkit"
+KIT_PREFIXES = ("/usr/libexec/", "/usr/lib/systemd/system/", "/etc/systemd/system/",
+                "/var/log/", "/var/backups/", "/run/", "/proc/", "/sys/", "/dev/")
+
+KIT_SYSTEMCTL = """#!/bin/sh
+R=$FAKE_ROOT
+echo "systemctl $*" >> "$R/systemctl.log"
+wants="$R/etc/systemd/system/ubuntu-gts9u-adsp-boot.service.wants"
+case "$1" in
+enable) mkdir -p "$wants"; ln -sf "$R/usr/lib/systemd/system/$2" "$wants/$2" ;;
+disable) rm -f "$wants/$2" ;;
+is-enabled) [ -L "$wants/$2" ] && echo enabled || { echo disabled; exit 1; } ;;
+start) [ -e "$R/start-fails" ] && exit 1
+	echo "ubuntu-gts9u-adsp-start-inhibit: the audio DSP is already up: nothing to hold" >> "$R/journal" ;;
+show) case "$*" in
+	*Result*) echo success ;;
+	*ActiveState*) echo inactive ;;
+	*Monotonic*) echo 0 ;;
+	esac ;;
+esac
+exit 0
+"""
+
+KIT_DPKG = """#!/bin/sh
+[ "$1" = -S ] || exit 2
+f="$FAKE_ROOT/owned/$(basename "$2")"
+[ -e "$f" ] || { echo "dpkg-query: no path found matching pattern $2" >&2; exit 1; }
+echo "ubuntu-gts9u-device: $2"
+"""
+
+
+class SuspendKitTest(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeRoot()
+        r = self.fake.root
+        for d in ("usr/libexec", "usr/lib/systemd/system", "etc/systemd/system",
+                  "var/backups", "owned", "kitbuild"):
+            (r / d).mkdir(parents=True, exist_ok=True)
+        self.fake.write("usr/lib/systemd/system/ubuntu-gts9u-adsp-boot.service", "[Unit]\n")
+        self.fake.write("journal", "")
+        self.fake.stub("bin/systemctl", KIT_SYSTEMCTL)
+        self.fake.stub("bin/dpkg", KIT_DPKG)
+        self.fake.stub("bin/fuser", "#!/bin/sh\nexit 1\n")
+        self.fake.stub("bin/systemd-analyze", "#!/bin/sh\nexit 0\n")
+        self.fake.stub("bin/journalctl", "#!/bin/sh\ncat \"$FAKE_ROOT/journal\"\n")
+        for tool in ("install", "sha256sum", "cmp", "stat", "mktemp", "find", "basename",
+                     "dirname", "git"):
+            target = r / "tools" / tool
+            if not target.exists():
+                os.symlink(shutil.which(tool), target)
+        self.kit = r / "kitbuild/suspendkit"
+        build = subprocess.run(["/bin/sh", str(KIT / "build-kit.sh"), str(self.kit)],
+                               text=True, capture_output=True, timeout=60)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        # Point every kit script at the fake root, then re-sum the kit.
+        pattern = re.compile("|".join(re.escape(p) for p in KIT_PREFIXES))
+        for script in self.kit.glob("*.sh"):
+            text = pattern.sub(lambda m: str(r) + m.group(0), script.read_text())
+            script.write_text(text)
+        sums = subprocess.run("find . -type f ! -name SHA256SUMS ! -name .suspendkit | "
+                              "sed 's#^./##' | LC_ALL=C sort | xargs sha256sum",
+                              shell=True, cwd=self.kit, text=True, capture_output=True)
+        (self.kit / "SHA256SUMS").write_text(sums.stdout)
+
+    def tearDown(self):
+        self.fake.cleanup()
+
+    def kit_run(self, name, *args):
+        return self.fake.run(self.kit / name, *args)
+
+    def test_build_lists_every_file(self):
+        names = sorted(l.split()[1] for l in (self.kit / "SHA256SUMS").read_text().splitlines())
+        self.assertEqual(names, ["README.md", "REVISION", "files/ubuntu-gts9u-adsp-start-inhibit",
+                                 "files/ubuntu-gts9u-adsp-start-inhibit.service",
+                                 "gts9u-suspend-cycles.sh", "install.sh", "rollback.sh",
+                                 "verify.sh", "x710-suspend-ladder.sh"])
+
+    def test_install_verify_rollback(self):
+        f = self.fake
+        result = self.kit_run("install.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        helper = f.root / "usr/libexec/ubuntu-gts9u-adsp-start-inhibit"
+        unit = f.root / "usr/lib/systemd/system/ubuntu-gts9u-adsp-start-inhibit.service"
+        self.assertEqual(helper.read_bytes(), INHIBIT.read_bytes())
+        self.assertEqual(unit.read_text(), INHIBIT_UNIT.read_text())
+        self.assertEqual(oct(helper.stat().st_mode & 0o777), "0o755")
+        self.assertTrue(f.exists("etc/systemd/system/ubuntu-gts9u-adsp-boot.service.wants/"
+                                 "ubuntu-gts9u-adsp-start-inhibit.service"))
+        log = f.read("var/log/gts9u-suspendkit-install.log")
+        self.assertIn("smoke test: ok", log)
+        self.assertIn("files that existed before: 0", log)
+        again = self.kit_run("install.sh")
+        self.assertEqual(again.returncode, 0, again.stdout)
+        self.assertIn("backups from", again.stdout)
+
+        verify = self.kit_run("verify.sh")
+        self.assertIn("ok     kit checksums", verify.stdout)
+        self.assertIn("ubuntu-gts9u-adsp-start-inhibit.service enabled", verify.stdout)
+        self.assertIn("installed during this boot", verify.stdout)
+
+        back = self.kit_run("rollback.sh")
+        self.assertEqual(back.returncode, 0, back.stdout + back.stderr)
+        self.assertFalse(helper.exists())
+        self.assertFalse(unit.exists())
+        self.assertFalse(f.exists("etc/systemd/system/ubuntu-gts9u-adsp-boot.service.wants/"
+                                  "ubuntu-gts9u-adsp-start-inhibit.service"))
+        self.assertFalse(f.exists("var/backups/ubuntu-gts9u-suspendkit"))
+        self.assertNotEqual(self.kit_run("rollback.sh").returncode, 0)
+
+    def test_failed_smoke_test_is_reported(self):
+        self.fake.write("start-fails", "")
+        result = self.kit_run("install.sh")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("smoke test: FAILED", result.stdout)
+
+    def test_packaged_identical_files_need_nothing(self):
+        f = self.fake
+        shutil.copy(INHIBIT, f.root / "usr/libexec/ubuntu-gts9u-adsp-start-inhibit")
+        shutil.copy(INHIBIT_UNIT, f.root / "usr/lib/systemd/system/ubuntu-gts9u-adsp-start-inhibit.service")
+        f.write("owned/ubuntu-gts9u-adsp-start-inhibit", "")
+        f.write("owned/ubuntu-gts9u-adsp-start-inhibit.service", "")
+        result = self.kit_run("install.sh")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("nothing to install", result.stdout)
+        self.assertFalse(f.exists("var/backups/ubuntu-gts9u-suspendkit"))
+
+    def test_packaged_different_file_is_not_overwritten(self):
+        f = self.fake
+        f.write("usr/libexec/ubuntu-gts9u-adsp-start-inhibit", "#!/bin/sh\n# newer\n")
+        f.write("owned/ubuntu-gts9u-adsp-start-inhibit", "")
+        result = self.kit_run("install.sh")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not overwriting", result.stdout)
+        self.assertEqual(f.read("usr/libexec/ubuntu-gts9u-adsp-start-inhibit"), "#!/bin/sh\n# newer\n")
+
+    def test_checksum_mismatch_stops(self):
+        with open(self.kit / "files/ubuntu-gts9u-adsp-start-inhibit", "a") as fh:
+            fh.write("# tampered\n")
+        result = self.kit_run("install.sh")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("kit checksum mismatch", result.stdout)
+        self.assertFalse(self.fake.exists("usr/libexec/ubuntu-gts9u-adsp-start-inhibit"))
+
+    def test_other_board_stops(self):
+        (self.fake.root / "proc/device-tree/compatible").write_bytes(GTS9UWIFI)
+        result = self.kit_run("install.sh")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not an SM-X710", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
