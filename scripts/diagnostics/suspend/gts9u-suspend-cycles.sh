@@ -77,6 +77,7 @@ ICC_GEM_NOC=/sys/devices/platform/soc@0/24100000.interconnect
 ICC_MC_VIRT=/sys/devices/platform/interconnect-1
 COLDBOOT=ubuntu-gts9u-panel-coldboot-recover.service
 ADSP_INHIBIT=ubuntu-gts9u-adsp-start-inhibit.service
+SENSORS_RESUME=ubuntu-gts9u-sensors-resume.service
 RTC_IRQ_NAME=pm8xxx_rtc_alarm
 PWRKEY_IRQ_NAME=pmic_pwrkey
 RESIN_IRQ_NAME=pmic_resin
@@ -216,7 +217,12 @@ s2idle_usage() {
 }
 
 intmax() {
-	grep -c 2147483647 "$ICC_SUMMARY" 2>/dev/null || echo n/a
+	# grep -c prints 0 and fails when nothing matches: no "|| echo" here.
+	if [ -r "$ICC_SUMMARY" ]; then
+		grep -c 2147483647 "$ICC_SUMMARY"
+	else
+		echo n/a
+	fi
 }
 
 icc_line() {
@@ -319,6 +325,26 @@ restore() {
 	[ -z "${times_was:-}" ] || printf '%s' "$times_was" > "$POWER/pm_print_times" 2>/dev/null || :
 }
 
+# A unit stop_conflicts stopped comes back through the sensors hook after
+# each resume.  If systemd-sleep refused before running its hooks, nothing
+# would start it again, so at the end of a run do what that hook does.
+restart_stopped() {
+	[ -s "$rundir/stopped-units" ] || return 0
+	for u in $(sort -u "$rundir/stopped-units"); do
+		[ "$(unit_state "$u")" = inactive ] || continue
+		case "$(unit_state "$SENSORS_RESUME")" in
+		active|activating) continue ;;
+		esac
+		if [ "$u" = hexagonrpcd-adsp-sensorspd.service ]; then
+			systemctl restart --no-block "$SENSORS_RESUME" >/dev/null 2>&1 || :
+			say "restarted $SENSORS_RESUME, which brings $u back (as the sensors sleep hook does)"
+		else
+			systemctl start --no-block "$u" >/dev/null 2>&1 || :
+			say "started $u again"
+		fi
+	done
+}
+
 # ------------------------------------------------------------ RTC check ---
 # Arm the alarm while awake: it must add exactly one pm8xxx_rtc_alarm
 # interrupt and clear wakealarm.  A run whose RTC cannot wake the tablet
@@ -417,6 +443,7 @@ cycle() {
 	echo "$marker" >> /dev/kmsg
 	stopped=
 	[ "$do_conflicts" = 1 ] && stopped=$(stop_conflicts)
+	[ -z "$stopped" ] || printf '%s\n' $stopped >> "$rundir/stopped-units"
 	rtc_disarm
 	if ! out=$(rtcwake -d "$RTC" -m no -s "$secs" 2>&1); then
 		not_started "rtcwake failed: $out"
@@ -626,6 +653,7 @@ on_exit() {
 			: > "$rundir/ABORTED"
 		fi
 		say 'restored: drop-in removed, RTC alarm cleared, mem_sleep and pm_debug_messages as before'
+		restart_stopped
 	fi
 }
 

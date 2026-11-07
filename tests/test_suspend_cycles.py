@@ -329,6 +329,15 @@ class SuspendCyclesTest(unittest.TestCase):
         self.assertTrue((self.latest() / "FAILED").exists())
         self.assertIn("RESULT: FAIL at cycle s2idle-2", (self.latest() / "run.log").read_text())
         self.assert_restored()
+        # No sleep hook brought the sensor PD back in this fake: the run does.
+        self.assertIn("systemctl restart --no-block ubuntu-gts9u-sensors-resume.service",
+                      self.fake.read("systemctl.log"))
+
+    def test_sensors_left_to_the_hook_when_it_ran(self):
+        self.fake.write("units/ubuntu-gts9u-sensors-resume.service", "activating\n")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--no-rtc-check")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("restart --no-block", self.fake.read("systemctl.log"))
 
     def test_wake_by_another_irq_fails(self):
         self.scenario(1, "wake=171\n")
@@ -454,6 +463,15 @@ class SuspendCyclesTest(unittest.TestCase):
         second =self.run_cycles("--s2idle", "1", "--deep", "0", "--release-icc", "--no-rtc-check")
         self.assertEqual(second.returncode, 0, second.stdout)
         self.assertIn("already synced", (self.latest() / "run.log").read_text())
+
+    def test_intmax_zero_is_one_number(self):
+        self.fake.write("sys/kernel/debug/interconnect/interconnect_summary", " node  tag  avg  peak\n a 0 0 0\n")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--release-icc", "--icc-watch", "0",
+                                 "--no-rtc-check")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        log = (self.latest() / "run.log").read_text()
+        self.assertIn("INT_MAX lines now 0 (target 0); watching", log)
+        self.assertNotIn("n/a", log.split("icc: released")[1].splitlines()[0])
 
     # ----------------------------------------------------------------- keys
     def test_key_power_passes_on_pwrkey(self):
