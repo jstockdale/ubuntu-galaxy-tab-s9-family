@@ -44,8 +44,17 @@ Files:
 
 Starting point: the tablet as it was left, on fix2-s2 (Stage 2), reachable as
 `jstockdale@10.42.0.2`.  Take every capture with the screen on and unlocked,
-at least 60 s after boot.  Stop at the first failing step and go to step 7.
+at least 60 s and preferably less than an hour after boot (the clk trace
+wraps after a few hours).  Stop at the first failing step and go to step 7.
 Each step takes about 10 minutes.
+
+Run these steps before installing anything from the other overnight kits
+(interconnect release, suspend inhibitor, Wi-Fi, boot-hygiene units): the
+control capture describes plain fix2-s2, and `flags-check.sh` expects the
+Stage 2 interconnect pattern (gem_noc and mc_virt unsynced).  If something
+was installed first, take a new `control` capture after it; a released
+interconnect then shows as `CHECK  interconnect state is not the Stage 2
+pattern` on every capture, control included.
 
 ### 0. Copy the sets and the kit (host, no sudo)
 
@@ -58,14 +67,16 @@ rsync -a "$S"/overnight/flags/kit/ jstockdale@10.42.0.2:flags-kit/
 ```
 
 Expected: no output.  `$S` is on tmpfs.  If the host has rebooted since, rebuild
-the sets first (about 10 s) and copy from there:
+the sets first (about 10 s) and copy from there.  Build outside `/tmp`: it is a
+quota-limited tmpfs shared with the session scratch files, and a full quota
+fails the build with "Disk quota exceeded".
 
 ```sh
 cd ~/projects/ubuntu-galaxy-tab-s9-ultra
-git worktree add --detach /tmp/flags-wt overnight/flags
-/tmp/flags-wt/tools/inplace/flags/build-variants.sh /tmp/flags-images
-diff /tmp/flags-images/IMAGES-flags.sha256 /tmp/flags-wt/tools/inplace/flags/IMAGES-flags.sha256   # no output
-# then: images from /tmp/flags-images/, kit from /tmp/flags-wt/tools/inplace/flags/
+git worktree add --detach ~/ubuntu-gts9u/build/flags-wt overnight/flags
+~/ubuntu-gts9u/build/flags-wt/tools/inplace/flags/build-variants.sh ~/ubuntu-gts9u/out/flags-images
+diff ~/ubuntu-gts9u/out/flags-images/IMAGES-flags.sha256 ~/ubuntu-gts9u/build/flags-wt/tools/inplace/flags/IMAGES-flags.sha256   # no output
+# then: images from ~/ubuntu-gts9u/out/flags-images/, kit from ~/ubuntu-gts9u/build/flags-wt/tools/inplace/flags/
 ```
 
 ### 1. Check the copies (tablet, no sudo)
