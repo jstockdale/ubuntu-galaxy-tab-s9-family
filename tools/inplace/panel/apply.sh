@@ -8,9 +8,10 @@
 # ~/display-exp/apply.sh uses).  Only vendor_boot is written; boot must hold
 # the fix2-s2 kernel, which carries every switch the variants use.  Checks
 # before anything is written: SM-X710, kit checksums, image checksum against
-# IMAGES.sha256, boot partition = fix2-s2.  The vendor_boot found on the first
-# run is kept in /var/backups/ubuntu-gts9u-panel-exp/ (rollback.sh falls back
-# to it).  Every write is read back from the disk.  Log:
+# IMAGES.sha256, boot partition = fix2-s2.  The vendor_boot found when no
+# panel variant is on the partition (the one to go back to) is kept in
+# /var/backups/ubuntu-gts9u-panel-exp/vendor_boot.first.img, which rollback.sh
+# restores.  Every write is read back from the disk.  Log:
 # /var/log/gts9u-panel-exp.log.
 set -eu
 
@@ -67,7 +68,22 @@ vb_now=$(part_sha vendor_boot)
 say "vendor_boot now: $vb_now"
 mkdir -p "$backup_dir"
 chmod 0750 "$backup_dir"
-if [ ! -f "$backup_dir/vendor_boot.first.img" ]; then
+# The backup is what rollback.sh restores: the vendor_boot from before the
+# experiments.  A panel variant on the partition means an experiment is under
+# way, so the backup stays.  Anything else (fix2-s2's, or a vendor_boot
+# another kit flashed since the last rollback) is the state to return to, so
+# it replaces an older backup instead of being lost at the next rollback.
+backup_sum=$(awk '$2 == "vendor_boot.first.img" { print $1 }' "$backup_dir/SHA256SUMS" 2>/dev/null || true)
+if grep -q "^$vb_now " "$kit/IMAGES.sha256"; then
+	[ -f "$backup_dir/vendor_boot.first.img" ] ||
+		say "note: vendor_boot holds a panel variant and there is no backup; rollback.sh will restore fix2-s2's vendor_boot from $images/fix2-s2"
+elif [ -f "$backup_dir/vendor_boot.first.img" ] && [ "$backup_sum" = "$vb_now" ]; then
+	say "backup $backup_dir/vendor_boot.first.img already holds this vendor_boot"
+else
+	if [ -f "$backup_dir/vendor_boot.first.img" ]; then
+		mv -f "$backup_dir/vendor_boot.first.img" "$backup_dir/vendor_boot.prev.img"
+		say "kept the older backup (${backup_sum:-unknown}) as $backup_dir/vendor_boot.prev.img"
+	fi
 	dd if=/dev/disk/by-partlabel/vendor_boot iflag=direct bs=4M count=24 status=none |
 		head -c "$boot_size" > "$backup_dir/vendor_boot.first.img"
 	[ "$(sha256sum "$backup_dir/vendor_boot.first.img" | cut -d' ' -f1)" = "$vb_now" ] ||

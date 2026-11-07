@@ -142,7 +142,9 @@ INTERESTING = [
     ("dead", re.compile(r"panel id 00 00 00: the DDIC did not answer")),
     ("invalid", re.compile(r"msm_dsi_host_cmd_rx:Invalid response cmd")),
     ("handoff", re.compile(r"bootloader hand-off: .*")),
-    ("cycle", re.compile(r"boot display cycle: .*")),
+    # The summary line of msm.boot_display_cycle; its warnings are errors.
+    ("cycle", re.compile(r"boot display cycle: MDSS GDSC .*")),
+    ("cycle-warn", re.compile(r"boot display cycle: .*")),
     ("suspend", re.compile(r"PM: suspend (entry|exit).*|PM: suspend debug: .*")),
     ("dphy", re.compile(r"D-PHY timings .*")),
     ("pll", re.compile(r"PLL turned on before configuring PHY|Turning OFF PHY while PLL is on")),
@@ -261,10 +263,27 @@ def main():
     suspended = any(kind == "suspend" and "entry" in text for _i, _t, kind, text in rows)
     handoff = [(i, text) for i, _t, kind, text in rows if kind == "handoff"]
     cycle = [(i, text) for i, _t, kind, text in rows if kind == "cycle"]
+    cycle_warnings = [text for _i, _t, kind, text in rows if kind == "cycle-warn"]
 
     def first_answer_after(index):
         return next((answer for i, answer in id_rows if i > index), None)
-    errors = [text for _i, _t, kind, text in rows if kind == "error"]
+
+    def cycle_answer(index):
+        """The id read by the power-on msm.boot_display_cycle itself made.
+
+        The cycle re-enables the display inside itself and prints its summary
+        line only afterwards, so that power-on is the last one before the
+        line; the one before it is the dead first enable that preceded the
+        cycle.  A later power-on (the display manager's modeset, a blank) is
+        not the cycle's result.  Without a power-on between the first one
+        and the line, the cycle ran before any enable: the first one after
+        it is then the result.
+        """
+        before = [answer for i, answer in id_rows if i < index]
+        if len(before) >= 2:
+            return before[-1]
+        return first_answer_after(index)
+    errors = [text for _i, _t, kind, text in rows if kind in ("error", "cycle-warn")]
     good_id = ("80", "00", "04")
     dead_id = ("00", "00", "00")
 
@@ -282,14 +301,29 @@ def main():
             out.append("E1 (GDSC cycle at probe): %s - %s" % ("PASS" if ok else "FAIL", text))
         if cycle:
             index, text = cycle[0]
-            ok = "power-cycled" in text and first_answer_after(index) == good_id
-            out.append("E2 (display-only boot cycle): %s - %s" % ("PASS" if ok else "FAIL", text))
+            answer = cycle_answer(index)
+            if id_rows[0][0] < index and first == good_id:
+                verdict = "NOT TESTED (the first power-on, before the cycle, already answered)"
+            else:
+                ok = ("power-cycled" in text and answer == good_id and not cycle_warnings)
+                verdict = "PASS" if ok else "FAIL"
+            out.append("E2 (display-only boot cycle): %s - %s; its power-on answered %s%s" % (
+                verdict, text, " ".join(answer) if answer else "-",
+                "; warnings: %s" % "; ".join(cycle_warnings) if cycle_warnings else ""))
+        elif cycle_warnings:
+            out.append("E2 (display-only boot cycle): FAIL - %s" % "; ".join(cycle_warnings))
+        if handoff and first == good_id:
+            out.append("(a first answer of 80 00 04 credits the switch only if panel-ref's"
+                       " first answer was 00 00 00)")
         if first == dead_id and good_id in ids and not handoff and not cycle:
             how = ("after a system suspend cycle (the boot-time pm_test cycle or a manual one)"
                    if suspended else "WITHOUT any system suspend (a blank/unblank: E3 PASS)")
             out.append("recovered %s" % how)
         elif first == dead_id and good_id not in ids:
             out.append("never recovered in this log")
+        elif first == good_id and not handoff and not cycle:
+            out.append("the FIRST power-on answered: the fault did not reproduce on this boot;"
+                       " it differs from a normal boot only by the switches above")
     if errors:
         out.append("display errors: %d (first: %s)" % (len(errors), errors[0]))
 

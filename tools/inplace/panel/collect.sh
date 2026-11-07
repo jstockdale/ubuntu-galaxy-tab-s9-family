@@ -67,10 +67,16 @@ done > "$out/genpd-mdss.txt" 2>&1
 # 31 PWR_ON, 1 HW_CTRL, 0 SW_COLLAPSE), b000 INT2 GDSCR, 8000/a000 their
 # BCRs, f000 DISP_CC_MISC_CMD (bit 0 masks the reset into DSI PHY0 during a
 # GDSC collapse, bits 5/7/9 DSI0 pixel/byte/PHY clock gating), which mainline
-# never writes.
+# never writes.  regmap reads take no runtime-PM reference: with the clock
+# controller runtime-suspended its MMCX vote may be gone and a read could
+# fault, so they are only made while it is active (it stayed active through
+# every blank on Stage 2).
 {
 	r=$(ls -d "$d"/regmap/*af00000.clock-controller* 2>/dev/null | head -n1)
-	if [ -z "$r" ] || [ ! -r "$r/registers" ]; then
+	rpm=$(cat "$dev/af00000.clock-controller/power/runtime_status" 2>/dev/null)
+	if [ "$rpm" != active ]; then
+		echo "dispcc runtime_status '$rpm': registers not read"
+	elif [ -z "$r" ] || [ ! -r "$r/registers" ]; then
 		echo 'no dispcc regmap in debugfs'
 	else
 		first=$(head -n1 "$r/registers")

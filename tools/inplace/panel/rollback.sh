@@ -1,6 +1,7 @@
 #!/bin/sh
-# Put back the vendor_boot the tablet had before the first apply.sh run (the
-# copy in /var/backups/ubuntu-gts9u-panel-exp/), or, without that copy, fix2-s2's
+# Put back the vendor_boot the tablet had before the experiments (the last
+# non-variant vendor_boot apply.sh found, kept in
+# /var/backups/ubuntu-gts9u-panel-exp/vendor_boot.first.img), or, without that copy, fix2-s2's
 # own vendor_boot from ~/display-exp/fix2-s2/.  Root; then reboot.  Nothing else
 # needs undoing: the variants change the kernel command line only, and the
 # unit masks they carry (systemd.mask=) live only as long as that boot.

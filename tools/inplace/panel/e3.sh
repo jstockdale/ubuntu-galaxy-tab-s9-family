@@ -4,7 +4,7 @@
 #
 #   sudo sh ~/panel/e3.sh
 #
-# Since the DP controller stopped holding the MDSS (device 2.55 / Stage 1) and
+# Since the DP controller stopped holding the MDSS (fix1/fix2 kernels) and
 # the display clock controller reaches sync_state, a blank runtime-suspends
 # the whole display and powers the MDSS GDSC down; the unblank brings it up
 # and runs the panel's full power-on.  That is the platform cycle's display
@@ -51,6 +51,16 @@ say "before: panel id '$id_before', VT $vt_before, MDSS $(cat "$mdss"), mdss_gds
 
 timeout 15 chvt 3 || say 'chvt 3 did not complete'
 sleep 3
+# The console takes the display back with its own mode; if that differs from
+# the login screen's, the switch was a modeset that re-powered the panel (no
+# GDSC collapse inside one commit).  Record it, and wait for the unblank's
+# power-on from here.
+lines_vt=$(id_lines)
+id_vt=$(cat "$pid" 2>/dev/null)
+if [ "$lines_vt" -gt "$lines_before" ]; then
+	say "the switch to VT 3 re-powered the panel (console modeset): panel id '$id_vt'"
+fi
+lines_before=$lines_vt
 echo 4 > "$fb" || say 'fb0 blank write failed'
 n=0
 while [ "$(cat "$mdss")" != suspended ] && [ "$n" -lt 40 ]; do
@@ -79,7 +89,9 @@ if [ "$mdss_blank" = suspended ] && { [ "${gdsc_blank%%-*}" = off ] ||
 	{ [ -n "$usage_before" ] && [ -n "$usage_blank" ] && [ "$usage_blank" -gt "$usage_before" ]; }; }; then
 	collapsed=yes
 fi
-if [ "$collapsed" = yes ] && [ "$id_after" = '80 00 04' ]; then
+if [ "$id_vt" = '80 00 04' ]; then
+	say 'E3 NOT TESTED: the console modeset of the VT switch (panel power cycle, no GDSC collapse) already recovered the DDIC; note it (panel side)'
+elif [ "$collapsed" = yes ] && [ "$id_after" = '80 00 04' ]; then
 	say 'E3 PASS: a runtime blank/unblank (MDSS GDSC off, panel supplies cycled) recovered the DDIC; no system suspend'
 elif [ "$collapsed" = yes ]; then
 	say "E3 FAIL: the GDSC went off and the panel was powered again, but it still answers '$id_after'"

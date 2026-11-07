@@ -100,7 +100,10 @@ Do not plug in a DisplayPort monitor during the masked boots (see Couplings).
    00 00 00, 80 00 04`, `recovered after a system suspend cycle`, `enable 1
    ... answer 00 00 00`, `enable 2 ... answer 80 00 04`, and a register
    comparison (`-- leftovers ...: N`). Any N is a result; the leftover lines
-   are the answer to DISP-5 if N > 0.
+   are the answer to DISP-5 if N > 0. This boot is also the control for the
+   others: if it reports `the FIRST power-on answered`, the register dumps
+   alone changed the outcome, and an E1/E2 PASS below cannot be credited to
+   its switch.
 
 2. **panel-e0 + E3** (panel dark after the Samsung logo until E3):
 
@@ -119,6 +122,9 @@ Do not plug in a DisplayPort monitor during the masked boots (see Couplings).
      `sudo /usr/libexec/ubuntu-gts9u-panel-coldboot-recover; sudo sh ~/panel/collect.sh e0-platform`
      (expect `80 00 04`).
    * `E3 RECOVERED WITHOUT A GDSC COLLAPSE` - panel side; note it.
+   * `E3 NOT TESTED` - the console's own modeset at the switch to VT 3 (a
+     panel power cycle inside one commit, no GDSC collapse) already brought
+     `80 00 04`; panel side as well, note it. The line before it says so.
    * `E3 INCONCLUSIVE` - the console could not blank the display (the login
      screen kept the display). Fallback: `sudo chvt 1`, do not touch the
      tablet for 6 minutes (the login screen blanks on idle), check
@@ -134,7 +140,9 @@ Do not plug in a DisplayPort monitor during the masked boots (see Couplings).
 
    PASS: `E1 (GDSC cycle at probe): PASS - bootloader hand-off: MDSS GDSC
    power-cycled` and no `display errors`. Then log in and do three
-   power-key blank/wake rounds; each must light within ~1 s, and
+   power-key blank/wake rounds; each must light within ~3 s (the register
+   dumps add ~1.5 s of serial-console output to every wake: `loglevel=7`,
+   `console=ttyMSM0,115200`), and
    `journalctl -k -b | grep 'panel id'` (no sudo) shows `80 00 04` for each.
    If the glass stays dark instead (FAIL), the boot is still a masked one:
    `sudo sh ~/panel/e3.sh` gives E3 on it as well. No SSH after 3 minutes,
@@ -146,14 +154,26 @@ Do not plug in a DisplayPort monitor during the masked boots (see Couplings).
         sudo sh ~/panel/collect.sh e2
 
    PASS: `E2 (display-only boot cycle): PASS - boot display cycle: MDSS
-   GDSC power-cycled[ (noirq-style)], N ms`, login screen visible without
-   the cycle. `stayed on` in that line means the GDSC refused to collapse.
+   GDSC power-cycled[ (noirq-style)], N ms; its power-on answered 80 00 04`,
+   login screen visible without the cycle. The verdict reads the power-on
+   the cycle itself makes (logged just before its summary line), not a later
+   one such as the login screen's modeset. `stayed on` in that line means
+   the GDSC refused to collapse; any `boot display cycle:` warning is a FAIL.
    Dark glass: `sudo sh ~/panel/e3.sh` as in step 3.
 
 5. **Back to fix2-s2**:
 
         sudo sh ~/panel/rollback.sh && sudo reboot
         cat /sys/class/backlight/ae94000.dsi.0/panel_id     # 80 00 04 after the usual cycle
+
+`apply.sh` keeps the vendor_boot it finds in
+`/var/backups/ubuntu-gts9u-panel-exp/vendor_boot.first.img` whenever that
+is not one of the four variants, and `rollback.sh` restores it. So if
+another kit flashes vendor_boot (the wifi or flags kits) between two
+rounds of these experiments, the next `apply.sh` backs that one up
+(the older backup becomes `vendor_boot.prev.img`) and the next rollback
+returns to it. Within one round, run the variants back to back and roll
+back once at the end.
 
 Everything lands in `/var/log/gts9u-panel-exp/<boot>/<NN>-<label>/`
 (`report.txt` first, then the raw `dmesg.txt`, `state.txt`, `genpd*.txt`,
@@ -236,7 +256,7 @@ parameters, both off by default, set as `panel_samsung_ana38407.<name>=`:
 | --- | --- | --- |
 | `make-images.sh` | host | builds the variants from fix2-s2's vendor_boot, round-trip checked, reproducible |
 | `IMAGES.sha256` | both | expected hashes of the four variants |
-| `apply.sh` | tablet, sudo | checks board, kit, image and that boot holds fix2-s2, backs up vendor_boot once, flashes, reads back |
+| `apply.sh` | tablet, sudo | checks board, kit, image and that boot holds fix2-s2, backs up the non-variant vendor_boot it finds, flashes, reads back |
 | `rollback.sh` | tablet, sudo | restores the backed-up vendor_boot (or fix2-s2's), reads back |
 | `collect.sh` | tablet, sudo | evidence of one moment of a boot, plus `report.txt` |
 | `e3.sh` | tablet, sudo | E3 on a panel-e0 boot |

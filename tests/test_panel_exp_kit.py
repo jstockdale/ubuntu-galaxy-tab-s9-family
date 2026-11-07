@@ -27,7 +27,11 @@ def dump(t, dev, when, block, regs, size):
 
 
 def boot_log(extra_cmdline="", first="00 00 00", handoff=None, cycle=None,
-             suspend=True, leftover=True):
+             suspend=True, leftover=True, cycle_answer="80 00 04", later=None):
+    """A boot as dmesg shows it.  With cycle, msm.boot_display_cycle's own
+    re-enable (dumps and id cycle_answer) comes before its summary line, as
+    in msm_kms_boot_display_cycle(); later adds a power-on after it (the
+    display manager's modeset) that answers later."""
     ctrl_probe = {0x004: 0x00000135, 0x0ac: 0x10000000, 0x000: 0x20070000}
     phy_probe = {0x024: 0x7f, 0x0a4: 0x60 if leftover else 0, 0x0a0: 0x1f}
     ctrl_bad = {**ctrl_probe, 0x004: 0x00000105, 0x11c: 0x23f}
@@ -48,10 +52,18 @@ def boot_log(extra_cmdline="", first="00 00 00", handoff=None, cycle=None,
     if first == "00 00 00":
         out.append("[   12.257938] panel-samsung-ana38407 ae94000.dsi.0: panel id 00 00 00: the DDIC did not answer; the panel will stay dark")
     if cycle:
+        if "power-cycled" in cycle:
+            out += dump(12.6, "msm_dsi ae94000.dsi", "enable", "ctrl", ctrl_good, 0x404)
+            out += dump(12.6, "msm_dsi_phy ae95000.phy", "enable", "phy", phy_good, 0x200)
+            out.append("[   12.800000] panel-samsung-ana38407 ae94000.dsi.0: ana38407 panel id: "
+                       + cycle_answer)
         out.append("[   12.900000] msm_dpu ae01000.display-controller: boot display cycle: MDSS GDSC " + cycle)
+    if later:
+        out += dump(18.0, "msm_dsi ae94000.dsi", "enable", "ctrl", ctrl_good, 0x404)
+        out.append("[   18.200000] panel-samsung-ana38407 ae94000.dsi.0: ana38407 panel id: " + later)
     if suspend:
         out.append("[   23.978376] PM: suspend entry (deep)")
-    if first == "00 00 00":
+    if first == "00 00 00" and suspend:
         out += dump(30.0, "msm_dsi ae94000.dsi", "enable", "ctrl", ctrl_good, 0x404)
         out += dump(30.0, "msm_dsi_phy ae95000.phy", "enable", "phy", phy_good, 0x200)
         out.append("[   31.473566] panel-samsung-ana38407 ae94000.dsi.0: ana38407 panel id: 80 00 04")
@@ -83,7 +95,8 @@ class ReportTest(unittest.TestCase):
 
     def test_runtime_recovery_is_e3(self):
         out = self.report(boot_log(
-            "systemd.mask=ubuntu-gts9u-panel-coldboot-recover.service", suspend=False))
+            "systemd.mask=ubuntu-gts9u-panel-coldboot-recover.service", suspend=False,
+            later="80 00 04"))
         self.assertIn("MASKED for this boot", out)
         self.assertIn("WITHOUT any system suspend (a blank/unblank: E3 PASS)", out)
 
@@ -92,13 +105,47 @@ class ReportTest(unittest.TestCase):
                                    handoff="power-cycled", suspend=False))
         self.assertIn("E1 (GDSC cycle at probe): PASS", out)
         out = self.report(boot_log("msm.mdss_handoff_gdsc_cycle=1", handoff="power-cycled",
-                                   suspend=False))
+                                   suspend=False, later="80 00 04"))
         self.assertIn("E1 (GDSC cycle at probe): FAIL", out)
 
-    def test_e2_verdict(self):
+    def test_e2_verdict_reads_the_cycles_own_power_on(self):
+        # The id of the cycle's re-enable precedes its summary line; nothing after.
         out = self.report(boot_log("msm.boot_display_cycle=1",
                                    cycle="power-cycled (noirq-style), 180 ms", suspend=False))
         self.assertIn("E2 (display-only boot cycle): PASS", out)
+        self.assertIn("its power-on answered 80 00 04", out)
+        self.assertIn("enable 2 at 12.600: blocks ctrl,phy, answer 80 00 04", out)
+        self.assertIn("leftovers (probe == bad != good, status registers excluded): 2", out)
+
+    def test_e2_fails_when_only_a_later_power_on_answers(self):
+        out = self.report(boot_log("msm.boot_display_cycle=1",
+                                   cycle="power-cycled (noirq-style), 180 ms", suspend=False,
+                                   cycle_answer="00 00 00", later="80 00 04"))
+        self.assertIn("E2 (display-only boot cycle): FAIL", out)
+        self.assertIn("its power-on answered 00 00 00", out)
+
+    def test_e2_gdsc_that_stayed_on_fails(self):
+        out = self.report(boot_log("msm.boot_display_cycle=1", cycle="stayed on, 90 ms",
+                                   suspend=False))
+        self.assertIn("E2 (display-only boot cycle): FAIL - boot display cycle: MDSS GDSC stayed on", out)
+
+    def test_e2_is_not_tested_when_the_first_power_on_answered(self):
+        out = self.report(boot_log("msm.boot_display_cycle=1", first="80 00 04",
+                                   cycle="power-cycled (noirq-style), 180 ms", suspend=False))
+        self.assertIn("E2 (display-only boot cycle): NOT TESTED", out)
+
+    def test_e2_warning_fails(self):
+        text = boot_log("msm.boot_display_cycle=1", cycle="power-cycled (noirq-style), 180 ms",
+                        suspend=False)
+        text = text.replace("[   12.900000]", "[   12.890000] msm_dpu ae01000.display-controller:"
+                            " boot display cycle: re-enable failed: -110\n[   12.900000]")
+        out = self.report(text)
+        self.assertIn("E2 (display-only boot cycle): FAIL", out)
+        self.assertIn("re-enable failed: -110", out)
+
+    def test_first_power_on_that_answers_is_flagged(self):
+        out = self.report(boot_log(first="80 00 04"))
+        self.assertIn("the FIRST power-on answered", out)
 
     def test_log_without_dumps(self):
         text = "\n".join(l for l in boot_log().splitlines() if "regdump" not in l)
@@ -126,8 +173,8 @@ class KitTest(unittest.TestCase):
             subprocess.run(["dash", "-n", str(KIT / name)], check=True)
         subprocess.run(["bash", "-n", str(KIT / "make-images.sh")], check=True)
 
-    def test_dispcc_registers_are_read_by_seeking(self):
-        """collect.sh reads single regmap debugfs lines; check the offsets."""
+    def dispcc_block(self, runtime_status):
+        """Run collect.sh's dispcc block on a simulated debugfs and sysfs."""
         text = (KIT / "collect.sh").read_text()
         start = text.index("{\n\tr=$(ls -d")
         end = text.index('} > "$out/dispcc.txt"')
@@ -140,12 +187,23 @@ class KitTest(unittest.TestCase):
             with open(regs / "registers", "w") as f:
                 for reg in range(0, 0x11008 + 4, 4):
                     f.write("%05x: %08x\n" % (reg, special.get(reg, reg)))
+            power = root / "devices/af00000.clock-controller/power"
+            power.mkdir(parents=True)
+            (power / "runtime_status").write_text(runtime_status + "\n")
             script = root / "block.sh"
-            script.write_text("d=%s\n%s" % (root, block))
-            out = subprocess.run(["dash", str(script)], capture_output=True, text=True,
-                                 check=True).stdout.splitlines()
-        self.assertEqual(out, ["08000: 00008000", "09000: 80008001", "0a000: 0000a000",
-                               "0b000: 0000b000", "0f000: 00000001"])
+            script.write_text("d=%s\ndev=%s/devices\n%s" % (root, root, block))
+            return subprocess.run(["dash", str(script)], capture_output=True, text=True,
+                                  check=True).stdout.splitlines()
+
+    def test_dispcc_registers_are_read_by_seeking(self):
+        """collect.sh reads single regmap debugfs lines; check the offsets."""
+        self.assertEqual(self.dispcc_block("active"),
+                         ["08000: 00008000", "09000: 80008001", "0a000: 0000a000",
+                          "0b000: 0000b000", "0f000: 00000001"])
+
+    def test_dispcc_registers_are_not_read_while_it_is_suspended(self):
+        self.assertEqual(self.dispcc_block("suspended"),
+                         ["dispcc runtime_status 'suspended': registers not read"])
 
     @unittest.skipUnless(os.environ.get("PANEL_BASE_VENDOR_BOOT"), "no fix2-s2 vendor_boot")
     def test_make_images_reproduces_the_kit_hashes(self):
@@ -242,6 +300,152 @@ class FlashTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.sha(self.vb), original)
         self.assertIn("not fix2-s2's vendor_boot", result.stdout)
+
+    def test_a_vendor_boot_flashed_after_a_rollback_is_backed_up_again(self):
+        """Another kit's vendor_boot installed between two experiment rounds
+        must come back at the second rollback, not the first round's backup."""
+        result = self.run_kit("apply.sh", "panel-e1", env={"FORCE_BOOT": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first_backup = self.sha(self.tmp / "backup/vendor_boot.first.img")
+        result = self.run_kit("rollback.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(self.vb, "r+b") as f:          # e.g. the wifi kit's vendor_boot
+            f.write(b"W" * 4096)
+        foreign = self.sha(self.vb)
+        result = self.run_kit("apply.sh", "panel-e2", env={"FORCE_BOOT": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("kept the older backup", result.stdout)
+        self.assertEqual(self.sha(self.tmp / "backup/vendor_boot.first.img"), foreign)
+        self.assertEqual(self.sha(self.tmp / "backup/vendor_boot.prev.img"), first_backup)
+        result = self.run_kit("apply.sh", "panel-e0", env={"FORCE_BOOT": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sha(self.tmp / "backup/vendor_boot.first.img"), foreign)
+        result = self.run_kit("rollback.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sha(self.vb), foreign)
+
+    def test_reapplying_over_the_same_vendor_boot_keeps_one_backup(self):
+        result = self.run_kit("apply.sh", "panel-ref", env={"FORCE_BOOT": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.run_kit("rollback.sh")
+        result = self.run_kit("apply.sh", "panel-ref", env={"FORCE_BOOT": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("already holds this vendor_boot", result.stdout)
+        self.assertFalse((self.tmp / "backup/vendor_boot.prev.img").exists())
+
+
+# A stand-in for the kernel, run as `sleep`: e3.sh polls with sleep, so each
+# call lets the simulated display react to what the script wrote to fb0.
+KERNEL_SIM = r"""#!/bin/sh
+s=%(root)s
+blank=$(cat "$s/fb0_blank")
+if [ "$blank" = 4 ] && [ "$(cat "$s/scenario_collapse")" = yes ]; then
+	echo suspended > "$s/mdss_status"
+	echo off-0 > "$s/gd/current_state"
+	printf 'State          Time Spent(ms) Usage      Rejected\nS0             10             6          0\n' > "$s/gd/idle_states"
+elif [ "$blank" = 0 ] && [ ! -e "$s/unblanked" ]; then
+	: > "$s/unblanked"
+	echo active > "$s/mdss_status"
+	echo on > "$s/gd/current_state"
+	cat "$s/scenario_answer" > "$s/panel_id"
+	echo "[  99.0] panel-samsung-ana38407 ae94000.dsi.0: ana38407 panel id: $(cat "$s/scenario_answer")" >> "$s/dmesg"
+fi
+"""
+
+CHVT_SIM = r"""#!/bin/sh
+s=%(root)s
+echo "tty$1" > "$s/active_vt"
+if [ -s "$s/scenario_vt_answer" ]; then
+	cat "$s/scenario_vt_answer" > "$s/panel_id"
+	echo "[  90.0] panel-samsung-ana38407 ae94000.dsi.0: ana38407 panel id: $(cat "$s/scenario_vt_answer")" >> "$s/dmesg"
+fi
+"""
+
+
+class E3Test(unittest.TestCase):
+    """e3.sh against a simulated display: files for sysfs/debugfs, stubs for
+    chvt, dmesg and sleep (the last one advances the simulated kernel)."""
+
+    def run_e3(self, collapse=True, answer="80 00 04", vt_answer="", cmdline=None):
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        (root / "gd").mkdir()
+        (root / "bin").mkdir()
+        files = {
+            "panel_id": "00 00 00\n", "mdss_status": "active\n", "fb0_blank": "",
+            "active_vt": "tty1\n", "state_synced": "1\n",
+            "cmdline": cmdline if cmdline is not None else
+            "root=LABEL=x msm.dsi_regdump=1 systemd.mask=ubuntu-gts9u-panel-coldboot-recover.service\n",
+            "dmesg": "[  12.0] panel-samsung-ana38407 ae94000.dsi.0: ana38407 panel id: 00 00 00\n",
+            "gd/current_state": "on\n",
+            "gd/idle_states": "State          Time Spent(ms) Usage      Rejected\nS0             10             5          0\n",
+            "scenario_collapse": "yes\n" if collapse else "no\n",
+            "scenario_answer": answer + "\n", "scenario_vt_answer": vt_answer,
+        }
+        for name, content in files.items():
+            (root / name).write_text(content)
+        for name, body in (("sleep", KERNEL_SIM), ("chvt", CHVT_SIM),
+                           ("dmesg", '#!/bin/sh\ncat %(root)s/dmesg\n')):
+            path = root / "bin" / name
+            path.write_text(body % {"root": root})
+            path.chmod(0o755)
+        text = (KIT / "e3.sh").read_text()
+        for old, new in (('[ "$(id -u)" = 0 ]', "true"),
+                         ("/var/log/gts9u-panel-exp.log", str(root / "log")),
+                         ("/var/log/gts9u-panel-exp/", str(root / "exp") + "/"),
+                         ("/sys/class/backlight/ae94000.dsi.0/panel_id", str(root / "panel_id")),
+                         ("/sys/bus/platform/devices/ae00000.display-subsystem/power/runtime_status",
+                          str(root / "mdss_status")),
+                         ("/sys/kernel/debug/pm_genpd/mdss_gdsc", str(root / "gd")),
+                         ("/sys/class/graphics/fb0/blank", str(root / "fb0_blank")),
+                         ("/sys/devices/genpd_provider/mdss_gdsc/state_synced",
+                          str(root / "state_synced")),
+                         ("/sys/class/tty/tty0/active", str(root / "active_vt")),
+                         ("/proc/cmdline", str(root / "cmdline")),
+                         ('sh "$kit/collect.sh" e3-before', 'mkdir -p "%s/exp/$(cut -c1-8 '
+                          '/proc/sys/kernel/random/boot_id)/01-e3-before"' % root),
+                         ('sh "$kit/collect.sh" e3-after', 'mkdir -p "%s/exp/$(cut -c1-8 '
+                          '/proc/sys/kernel/random/boot_id)/02-e3-after"' % root)):
+            self.assertIn(old, text)
+            text = text.replace(old, new)
+        script = root / "e3.sh"
+        script.write_text(text)
+        env = dict(os.environ, PATH="%s:%s" % (root / "bin", os.environ["PATH"]))
+        result = subprocess.run(["dash", str(script)], capture_output=True, text=True,
+                                env=env, timeout=60)
+        return result, root
+
+    def test_pass(self):
+        result, root = self.run_e3()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("blanked: MDSS suspended", result.stdout)
+        self.assertIn("E3 PASS", result.stdout)
+        self.assertIn("sudo chvt 1", result.stdout)
+        self.assertIn("02-e3-after", result.stdout)
+        self.assertEqual((root / "active_vt").read_text().strip(), "tty3")
+
+    def test_fail(self):
+        result, _root = self.run_e3(answer="00 00 00")
+        self.assertIn("E3 FAIL", result.stdout)
+
+    def test_inconclusive_without_a_collapse(self):
+        result, _root = self.run_e3(collapse=False, answer="00 00 00")
+        self.assertIn("E3 INCONCLUSIVE", result.stdout)
+
+    def test_panel_side_recovery(self):
+        result, _root = self.run_e3(collapse=False)
+        self.assertIn("E3 RECOVERED WITHOUT A GDSC COLLAPSE", result.stdout)
+
+    def test_vt_switch_modeset_is_reported(self):
+        result, _root = self.run_e3(vt_answer="80 00 04")
+        self.assertIn("the switch to VT 3 re-powered the panel", result.stdout)
+        self.assertIn("E3 NOT TESTED", result.stdout)
+        self.assertNotIn("E3 PASS", result.stdout)
+
+    def test_refuses_a_boot_that_ran_the_cycle(self):
+        result, root = self.run_e3(cmdline="root=LABEL=x msm.dsi_regdump=1\n")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual((root / "fb0_blank").read_text(), "")
 
 
 if __name__ == "__main__":
