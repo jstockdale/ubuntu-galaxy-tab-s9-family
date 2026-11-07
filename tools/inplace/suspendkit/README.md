@@ -36,17 +36,21 @@ DSP start is still going, or while another run is active.
 2. **RTC alarm while awake** (25 s, the first time IRQ 21 is ever exercised):
    `sudo sh ~/suspendkit/gts9u-suspend-cycles.sh rtc-check`
    Expect `rtc-check: ok, IRQ 21 pm8xxx_rtc_alarm N -> N+1, wakealarm cleared`.
-3. **Smoke run**, two s2idle cycles (about 2 min):
+3. **Smoke run**, two s2idle cycles (about 3 min):
    `sudo sh ~/suspendkit/gts9u-suspend-cycles.sh run --s2idle 2 --deep 0`
    then `sh ~/suspendkit/gts9u-suspend-cycles.sh status`.
    Expect two `PASS` lines (`entered=s2idle wake=21(pm8xxx_rtc_alarm)`),
    `RESULT: PASS`.
-4. **Full run**, 20 s2idle then 20 deep (about 50 min):
+4. **Full run**, 20 s2idle then 20 deep (about 50 to 60 min; before each
+   sleep it lets the last resume's sensor recovery finish):
    `sudo sh ~/suspendkit/gts9u-suspend-cycles.sh run`
    Leave the tablet alone; `status` any time. Deep has resumed once on the
-   baseline kernel but never on Stage 2: if the tablet does not come back
-   within a minute of a sleep, hold Power + Volume Down until it restarts,
-   then `status` names the cycle that never returned.
+   baseline kernel but never on Stage 2. If the tablet does not come back
+   within a minute of a sleep, press Power once first: if that wakes it, the
+   RTC alarm cannot wake it from that mode (the cycle fails with
+   `wake=22(pmic_pwrkey)`), which is the finding. Only if Power does nothing
+   within 30 s, hold Power + Volume Down until it restarts; `status` then
+   names the cycle that never returned.
 5. **Key wakes**, at the tablet:
    `sudo sh ~/suspendkit/gts9u-suspend-cycles.sh key power` and press Power
    once after the panel goes dark (within 90 s); then

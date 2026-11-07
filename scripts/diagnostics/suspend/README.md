@@ -27,12 +27,21 @@ The numbers move with probe order, so both tools look them up by name in
 
 Before the RTC was registered, Power was 21 and Volume Down 22; older notes
 (the suspend unit's README of 2026-11-06, the Ultra's development notes) use
-those numbers. The Ultra has no PMIC RTC and keeps Power on 21.
+those numbers. The X710 builds `rtc-pm8xxx` in (`config-gts9wifi.fragment`),
+so it probes before the PMIC keys; on the Ultra it is only `=m` in the shared
+config, so the keys register first and Power stays on 21 there.
 
 ## How a cycle sleeps
 
 The way `systemd-suspend.service` would, minus logind:
 
+0. If `ubuntu-gts9u-sensors-resume` is still running (the sensor recovery
+   that the sensors hook starts after every resume, or the boot's), the run
+   waits for it to finish, at most `--sensors-wait` seconds (default 120, `0`
+   to skip). Stopping the sensor protection domain in the middle of that
+   recovery, 40 times a run, is ADSP churn of the tool's own making; an ADSP
+   crash from it would end a run as a suspend failure. A recovery that ends
+   badly is logged as a `note:`, never failed on.
 1. The units that conflict with `suspend.target` are stopped, as the
    suspend transaction would stop them (today only
    `hexagonrpcd-adsp-sensorspd.service`; the sensors hook starts it again
@@ -70,11 +79,15 @@ One line per cycle in `run.log` and `cycles.tsv`; any of these fails it:
   device suspend/resume failures, UFS, PCIe/ath11k/MHI, USB, GMU/GPU faults,
   RPMh/GDSC, APM timeouts, remoteproc crashes, lockups, splats).
   Correctable AER and the known late GMU bandwidth-vote answer are only
-  counted (`noted=`).
+  counted (`noted=`). The detail lines printed under every AER report
+  (`device [17cb:1103] error status/mask=...`, `[12] Timeout`) are ignored:
+  they carry the Wi-Fi driver's name but no severity, and the report's own
+  `severity=` line decides (Uncorrectable and Fatal fail the cycle).
 
-Recorded, not judged: time asleep (`Timekeeping suspended for`, printed because
-the run sets `pm_debug_messages`), device resume time, the `qcom_stats` deltas
-and the s2idle usage of the CPU idle states.
+Recorded, not judged: time asleep (the sum of the `Timekeeping suspended for`
+lines, printed because the run sets `pm_debug_messages`; s2idle prints one per
+idle round), device resume time, the `qcom_stats` deltas and the s2idle usage
+of the CPU idle states.
 
 ### Sleep depth: aosd, cxsd, ddr
 
@@ -106,6 +119,13 @@ tablet restarts; it comes back on plain Stage 2.
 | root `ro`, UFS lines | UFS resume | stop; TWRP and fsck as in `docs/resume-recovery.md` |
 
 ## A cycle that does not come back
+
+First press Power once. The RTC alarm has only been proven while awake
+(`rtc-check`); if it cannot wake the SoC from a mode, the tablet sleeps on
+and a key press brings it back, and the cycle then fails with
+`woken by IRQ 22 (pmic_pwrkey), not pm8xxx_rtc_alarm`: the RTC wake is the
+finding, not a hang. Only if Power does nothing within 30 s, hold Power and
+Volume Down until it restarts.
 
 The log is synced line by line and the cycle's name is written to `IN-CYCLE`
 before it sleeps. After a forced restart, `status` reports

@@ -109,6 +109,8 @@ run options:
   --gap SECS          awake time after one cycle's checks, before the next sleep (default 30)
   --settle SECS       wait after resume before the checks (default 5)
   --wifi-wait SECS    how long Wi-Fi may take to reconnect (default 45)
+  --sensors-wait SECS before each sleep, wait at most this long for the sensor
+                      recovery of the last resume to finish (default 120; 0: never)
   --release-icc       release gem_noc and mc_virt first (irreversible until reboot)
   --icc-watch SECS    awake watch after that release, before the first cycle (default 120)
   --no-rtc-check      skip the awake RTC alarm test before the first cycle
@@ -118,7 +120,7 @@ run options:
   --foreground        do not detach into gts9u-suspendkit.service
   --any-board         run on a board other than the SM-X710 too
 key options: power|voldown, then --mode s2idle|deep (default s2idle), --timeout SECS
-  (RTC backup alarm, default 90), --wifi-wait, --settle, --foreground
+  (RTC backup alarm, default 90), --wifi-wait, --settle, --sensors-wait, --foreground
 EOF
 }
 
@@ -282,12 +284,20 @@ STRICT_C='Oops|BUG:|WARNING:|Internal error|Unable to handle|Call trace:|cut her
 # nothing released (docs/gpu-recovery.md); a correctable AER on the Wi-Fi link
 # also shows up without any suspend.
 NOTED='HFI_H2F_MSG_GX_BW_PERF_VOTE|Unexpected message id|AER: Correctable|severity=Correctable'
+# The detail lines under every AER report carry the endpoint's driver name
+# but no severity, for example (tablet, 2026-11-07, no suspend involved):
+#   ath11k_pci 0000:01:00.0:   device [17cb:1103] error status/mask=00001000/0000e000
+#   ath11k_pci 0000:01:00.0:    [12] Timeout
+# so they would match "ath11k.*(error|timeout)".  The report's own
+# "severity=" line decides (Uncorrectable/Fatal are in STRICT_I), so these are
+# neither fatal nor counted.
+AER_DETAIL='error status/mask=|: {3,}\[ ?[0-9]+\] '
 
 # scan FILE: the fatal lines of a kernel log excerpt, at most 20.
 scan() {
 	{
-		grep -vE "$NOTED" "$1" | grep -E -i "$STRICT_I"
-		grep -vE "$NOTED" "$1" | grep -E "$STRICT_C"
+		grep -vE "$NOTED|$AER_DETAIL" "$1" | grep -E -i "$STRICT_I"
+		grep -vE "$NOTED|$AER_DETAIL" "$1" | grep -E "$STRICT_C"
 	} 2>/dev/null | sort -u | head -n 20
 }
 
@@ -343,6 +353,39 @@ restart_stopped() {
 			say "started $u again"
 		fi
 	done
+}
+
+# Before a sleep, let the sensor recovery that the last resume (or the boot)
+# started run to its end, at most $sensors_wait seconds.  After a resume the
+# sensors hook restarts ubuntu-gts9u-sensors-resume, which attaches the
+# sensor protection domain, waits for SSC and watches the handover IRQ for up
+# to a minute; with the default gap the next cycle would stop the domain in
+# the middle of that, 40 times a run.  An ADSP crash caused by that churn
+# would end a run as a suspend failure.  Never fatal: a recovery that ends
+# badly is logged, and one that is still running at the limit is left to the
+# sensors hook, as a real suspend would leave it.
+wait_sensors() {
+	[ "$sensors_wait" -gt 0 ] || return 0
+	_sw=0
+	while :; do
+		case "$(unit_state "$SENSORS_RESUME")" in
+		activating|deactivating|reloading) ;;
+		*) break ;;
+		esac
+		stop_check && return 0
+		if [ "$_sw" -ge "$sensors_wait" ]; then
+			say "note: $SENSORS_RESUME is still running after ${_sw}s; sleeping anyway"
+			return 0
+		fi
+		sleep 1
+		_sw=$((_sw + 1))
+	done
+	[ "$_sw" = 0 ] || say "waited ${_sw}s for $SENSORS_RESUME to finish"
+	_sr=$(systemctl show -p Result --value "$SENSORS_RESUME" 2>/dev/null)
+	case "$_sr" in
+	''|success) ;;
+	*) say "note: $SENSORS_RESUME ended with result '$_sr': the sensors may not have come back (journalctl -u $SENSORS_RESUME)" ;;
+	esac
 }
 
 # ------------------------------------------------------------ RTC check ---
@@ -468,13 +511,18 @@ cycle() {
 	wirq=$(wake_irq)
 	rm -f "$rundir/IN-CYCLE"
 	say "cycle $id: systemd-sleep returned $rc; checking"
-	pause "$settle"
+	# Plain sleep, not pause: a stop request ends the run after this
+	# cycle's checks, and must not cut them short into a false failure.
+	[ "$settle" -gt 0 ] && sleep "$settle"
 
 	kmsg_since "$marker" > "$rundir/$id-kmsg.txt"
 	k=$rundir/$id-kmsg.txt
 	entered=$(sed -n 's/.*PM: suspend entry (\([a-z0-9]*\)).*/\1/p' "$k" | tail -n 1)
 	exits=$(grep -c 'PM: suspend exit' "$k")
-	slept=$(sed -n 's/.*Timekeeping suspended for \([0-9.]*\) seconds.*/\1/p' "$k" | tail -n 1)
+	# s2idle prints one line per idle round (a non-wake IRQ that brings the
+	# CPUs back is followed by another round): the time asleep is their sum.
+	slept=$(sed -n 's/.*Timekeeping suspended for \([0-9.]*\) seconds.*/\1/p' "$k" |
+		awk '{s += $1; n++} END {if (n) printf "%.3f\n", s}')
 	resume_ms=$(sed -n 's/.*PM: resume of devices complete after \([0-9.]*\) msecs.*/\1/p' "$k" | tail -n 1)
 	wname=$(irq_name "$wirq")
 	post_q=$(stats_line)
@@ -502,7 +550,6 @@ cycle() {
 	wt=0
 	if [ "$wifi_expected" = 1 ]; then
 		while ! wifi_ok "$ws" && [ "$wt" -lt "$wifi_wait" ]; do
-			stop_check && break
 			sleep 1
 			wt=$((wt + 1))
 			ws=$(wifi_state)
@@ -675,7 +722,7 @@ setup_run() {
 
 # --------------------------------------------------------------- commands ---
 cmd_run() {
-	n_s2idle=20 n_deep=20 sleep_s=30 gap=30 settle=5 wifi_wait=45
+	n_s2idle=20 n_deep=20 sleep_s=30 gap=30 settle=5 wifi_wait=45 sensors_wait=120
 	release=0 icc_watch=120 rtc_pre=1 do_conflicts=1 print_times=0 keep_going=0
 	foreground=0 any_board=0 rtc_secs=20
 	orig="$*"
@@ -687,6 +734,7 @@ cmd_run() {
 		--gap) gap=$2; shift ;;
 		--settle) settle=$2; shift ;;
 		--wifi-wait) wifi_wait=$2; shift ;;
+		--sensors-wait) sensors_wait=$2; shift ;;
 		--release-icc) release=1 ;;
 		--icc-watch) icc_watch=$2; shift ;;
 		--no-rtc-check) rtc_pre=0 ;;
@@ -701,7 +749,7 @@ cmd_run() {
 		esac
 		shift
 	done
-	for v in "$n_s2idle" "$n_deep" "$sleep_s" "$gap" "$settle" "$wifi_wait" "$icc_watch" "$rtc_secs"; do
+	for v in "$n_s2idle" "$n_deep" "$sleep_s" "$gap" "$settle" "$wifi_wait" "$sensors_wait" "$icc_watch" "$rtc_secs"; do
 		case "$v" in ''|*[!0-9]*) echo "not a number: '$v'" >&2; exit 2 ;; esac
 	done
 	[ "$sleep_s" -ge 5 ] || { echo '--sleep must be at least 5 s' >&2; exit 2; }
@@ -733,6 +781,7 @@ cmd_run() {
 		if [ "$m" = s2idle ]; then total=$n_s2idle; else total=$n_deep; fi
 		i=1
 		while [ "$i" -le "$total" ]; do
+			wait_sensors
 			if stop_check; then
 				say "stopped by request before cycle $m-$i"
 				summary
@@ -771,7 +820,7 @@ cmd_key() {
 	voldown) expect=$RESIN_IRQ_NAME ;;
 	*) echo 'usage: key power|voldown [--mode s2idle|deep] [--timeout SECS]' >&2; exit 2 ;;
 	esac
-	kmode=s2idle timeout=90 settle=5 wifi_wait=45 foreground=0 any_board=0
+	kmode=s2idle timeout=90 settle=5 wifi_wait=45 sensors_wait=120 foreground=0 any_board=0
 	do_conflicts=1 print_times=0
 	orig="$*"
 	while [ $# -gt 0 ]; do
@@ -780,6 +829,7 @@ cmd_key() {
 		--timeout) timeout=$2; shift ;;
 		--settle) settle=$2; shift ;;
 		--wifi-wait) wifi_wait=$2; shift ;;
+		--sensors-wait) sensors_wait=$2; shift ;;
 		--foreground) foreground=1 ;;
 		--any-board) any_board=1 ;;
 		*) echo "unknown option $1" >&2; exit 2 ;;
@@ -787,7 +837,7 @@ cmd_key() {
 		shift
 	done
 	case "$kmode" in s2idle|deep) ;; *) echo "--mode is s2idle or deep" >&2; exit 2 ;; esac
-	for v in "$timeout" "$settle" "$wifi_wait"; do
+	for v in "$timeout" "$settle" "$wifi_wait" "$sensors_wait"; do
 		case "$v" in ''|*[!0-9]*) echo "not a number: '$v'" >&2; exit 2 ;; esac
 	done
 	need_root key "$key"
@@ -803,6 +853,8 @@ cmd_key() {
 	say "$TAG key: one $kmode sleep woken by $expect (IRQ $(irq_num "$expect")), RTC backup in ${timeout}s"
 	describe
 	preflight
+	wait_sensors
+	stop_check && { say 'stopped by request before the sleep'; : > "$rundir/STOPPED"; exit 3; }
 	if cycle "$kmode" "$kmode-$key" "$timeout" "$expect"; then
 		: > "$rundir/DONE"
 		say "RESULT: PASS, $key woke the tablet from $kmode"
@@ -819,6 +871,9 @@ cmd_rtc_check() {
 	case "$secs" in ''|*[!0-9]*) echo "not a number: '$secs'" >&2; exit 2 ;; esac
 	need_root rtc-check
 	take_lock
+	# The lock proves no run is active, so a stop file is a stale one from a
+	# `stop` sent while nothing ran; it would end this check at once.
+	rm -f "$STOPFILE"
 	trap 'stop_requested=1' TERM INT
 	rtc_check "$secs"
 }

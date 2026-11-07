@@ -91,6 +91,11 @@ STUB_SLEEPCMD = """#!/bin/sh
 R=$FAKE_ROOT
 """ + BUMP + """
 echo "sleep $*" >> "$R/sleep.log"
+# A file "after-sleep" holds shell run (and removed) at the next sleep.
+if [ -f "$R/after-sleep" ]; then
+	mv "$R/after-sleep" "$R/after-sleep.run"
+	. "$R/after-sleep.run"
+fi
 if [ -s "$R/sys/class/rtc/rtc0/wakealarm" ] && [ ! -e "$R/rtc-deaf" ]; then
 	: > "$R/sys/class/rtc/rtc0/wakealarm"
 	bump 21
@@ -107,6 +112,7 @@ show)
 	*ConflictedBy*) echo; echo hexagonrpcd-adsp-sensorspd.service ;;
 	*LoadState*) echo masked ;;
 	*ActiveState*) for u; do :; done; cat "$R/units/$u" 2>/dev/null || echo inactive ;;
+	*Result*) for u; do :; done; cat "$R/results/$u" 2>/dev/null || echo success ;;
 	esac ;;
 stop) echo inactive > "$R/units/$2" ;;
 esac
@@ -368,6 +374,78 @@ class SuspendCyclesTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("noted=1", (self.latest() / "run.log").read_text())
 
+    def test_multiline_correctable_aer_does_not_fail(self):
+        # Verbatim from the tablet's kernel log of 2026-11-07 (no suspend
+        # involved): the detail lines name ath11k and say "error"/"Timeout".
+        self.scenario(1, "extra='pcieport 0000:00:00.0: AER: Correctable error message received from 0000:01:00.0\n"
+                         "[  100.2] ath11k_pci 0000:01:00.0: PCIe Bus Error: severity=Correctable, type=Data Link Layer, (Transmitter ID)\n"
+                         "[  100.3] ath11k_pci 0000:01:00.0:   device [17cb:1103] error status/mask=00001000/0000e000\n"
+                         "[  100.4] ath11k_pci 0000:01:00.0:    [12] Timeout               '\n")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--no-rtc-check")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.rows()[0]["result"], "PASS")
+        self.assertIn("noted=2", (self.latest() / "run.log").read_text())
+
+    def test_uncorrectable_aer_still_fails(self):
+        self.scenario(1, "extra='ath11k_pci 0000:01:00.0: PCIe Bus Error: severity=Uncorrectable (Fatal), type=Transaction Layer, (Receiver ID)\n"
+                         "[  100.3] ath11k_pci 0000:01:00.0:   device [17cb:1103] error status/mask=00040000/00400000\n"
+                         "[  100.4] ath11k_pci 0000:01:00.0:    [18] MalfTLP                (First)'\n")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--no-rtc-check")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("severity=Uncorrectable", self.rows()[0]["reasons"])
+
+    def test_slept_sums_s2idle_rounds(self):
+        self.scenario(1, "extra='PM: Timekeeping suspended for 10.000 seconds'\n")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--no-rtc-check")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.rows()[0]["slept_s"], "40.012")
+
+    def test_stop_during_the_wifi_wait_is_not_a_failure(self):
+        # Wi-Fi is still reconnecting when the checks start, and a stop was
+        # asked for during the sleep: the cycle still waits for Wi-Fi.
+        self.scenario(1, "echo connecting > \"$R/wifi\"; touch \"$R/run/gts9u-suspendkit.stop\"\n"
+                         "echo 'echo connected > \"$R/wifi\"' > \"$R/after-sleep\"\n")
+        result = self.run_cycles("--s2idle", "2", "--deep", "0", "--no-rtc-check", "--wifi-wait", "5")
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertEqual([r["result"] for r in self.rows()], ["PASS"])
+        self.assertTrue((self.latest() / "STOPPED").exists())
+        self.assertFalse((self.latest() / "FAILED").exists())
+
+    def test_waits_for_the_sensor_recovery_before_sleeping(self):
+        f = self.fake
+        (f.root / "results").mkdir()
+        f.write("units/ubuntu-gts9u-sensors-resume.service", "activating\n")
+        f.write("after-sleep", "echo 'echo inactive > \"$R/units/ubuntu-gts9u-sensors-resume.service\"' > \"$R/after-sleep\"\n")
+        f.write("results/ubuntu-gts9u-sensors-resume.service", "exit-code\n")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--no-rtc-check")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        log = (self.latest() / "run.log").read_text()
+        self.assertIn("waited 2s for ubuntu-gts9u-sensors-resume.service to finish", log)
+        self.assertIn("ended with result 'exit-code'", log)
+        self.assertLess(log.index("waited 2s"), log.index("sleep starts"))
+
+    def test_sensors_wait_has_a_limit_and_can_be_off(self):
+        self.fake.write("units/ubuntu-gts9u-sensors-resume.service", "activating\n")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--no-rtc-check", "--sensors-wait", "3")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("still running after 3s; sleeping anyway", (self.latest() / "run.log").read_text())
+        # A plain file keeps the last write; the kernel's list would not.
+        self.fake.write("sys/power/mem_sleep", "s2idle [deep]\n")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--no-rtc-check", "--sensors-wait", "0")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("sensors-resume", (self.latest() / "run.log").read_text().split("run:")[1])
+
+    def test_not_started_row_has_every_column(self):
+        self.fake.write("rtc-broken", "")
+        result = self.run_cycles("--s2idle", "1", "--deep", "0", "--no-rtc-check")
+        self.assertEqual(result.returncode, 1)
+        lines = (self.latest() / "cycles.tsv").read_text().splitlines()
+        self.assertEqual(len(lines[1].split("\t")), len(lines[0].split("\t")))
+        row = self.rows()[0]
+        self.assertEqual(row["result"], "FAIL")
+        self.assertIn("not started: the RTC alarm did not arm", row["reasons"])
+        self.assertFalse(self.fake.exists("sleep-calls"))
+
     def test_dead_panel_fails(self):
         self.scenario(1, "panel='00 00 00'\n")
         result = self.run_cycles("--s2idle", "1", "--deep", "0")
@@ -501,6 +579,14 @@ class SuspendCyclesTest(unittest.TestCase):
         result = self.fake.run(self.script, "rtc-check")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.fake.read("sys/class/rtc/rtc0/wakealarm"), "")
+
+    def test_rtc_check_ignores_a_stale_stop_file(self):
+        # `stop` sent while no run was active leaves the file behind.
+        self.fake.write("run/gts9u-suspendkit.stop", "")
+        result = self.fake.run(self.script, "rtc-check")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rtc-check: ok", result.stdout)
+        self.assertFalse(self.fake.exists("run/gts9u-suspendkit.stop"))
 
     def test_stop_file_ends_the_run_between_cycles(self):
         self.scenario(1, "touch \"$R/run/gts9u-suspendkit.stop\"\n")
