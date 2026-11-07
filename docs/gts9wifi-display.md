@@ -34,8 +34,11 @@ How these were settled (builds 10 to 13, all as command-line switches on one
 kernel): a continuous clock alone blacks the glass out (the build-10 black
 panel); 1.524 Gbps with the timings mainline computes gave frame-done
 timeouts and more speckle; Samsung's table at 1.524 Gbps ran clean.  The DDR
-bandwidth monitor, the third build-10 change, made no difference either way
-(`icc_bwmon` stays a blacklisted module).  The switches still exist and
+bandwidth monitor, the third build-10 change, made no difference either way.
+It is built in now, because its probe is what lets the interconnect leave
+INT_MAX (sync_state); the first boots of that change hold it back with
+`initcall_blacklist=bwmon_driver_init`, the one switch that can, since a
+modprobe blacklist does not reach a built-in driver.  The switches still exist and
 override the defaults:
 `panel_samsung_ana38407.hback_porch=` (preferred mode only),
 `panel_samsung_ana38407.continuous_clock=`, `msm.dsi_phy_timings=<14 bytes>`.
@@ -92,9 +95,12 @@ whether it was high before the reset and how long it took to rise after it.
   occasional mirrored or stretched copy of a buffer region (GPU/UBWC path is
   the current suspect; `FD_MESA_DEBUG=noubwc` test pending).
 * Square blocking shared with the Ultra (GMU bandwidth-vote timeouts).
-* Nothing on this board may suspend yet: resume from deep suspend does not
-  work, and the result is a black panel with USB gone until a hard reset.
-  `ubuntu-gts9u-suspend-mode` defaults `samsung,gts9wifi` to mode `off`, which
+* Suspend is not released yet.  On the clean baseline kernel (2026-11-06)
+  every pm_test level passed, and one real s2idle (43.6 s) and one real deep
+  sleep (44.5 s) both resumed on the power key; the black panel with USB gone
+  that experimental builds showed did not reproduce.  Until RTC-driven
+  repeat runs (about 20 cycles of each mode) back that up,
+  `ubuntu-gts9u-suspend-mode` keeps `samsung,gts9wifi` at mode `off`, which
   makes logind refuse every suspend (power key, cover, idle, menus); the power
   key locks and blanks instead, and the cover locks.  Test s2idle for one boot
   with `echo s2idle > /run/ubuntu-gts9u/suspend-mode` and

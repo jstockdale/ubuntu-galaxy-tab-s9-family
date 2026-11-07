@@ -103,9 +103,17 @@ cat > "$overlay/etc/modprobe.d/gts9u-qcomtee.conf" <<'EOF'
 # Load manually while diagnosing the EL721 secure-world bridge.
 blacklist qcomtee
 EOF
-# The gts9wifi DDR bandwidth monitor is built in now (config-gts9wifi.fragment):
-# a modprobe blacklist cannot hold it back, initcall_blacklist=bwmon_driver_init
-# on the kernel command line does.
+if [ "${DEVICE:-}" = gts9wifi ]; then
+	# Keeps the DDR bandwidth monitor, and with it the interconnect's
+	# sync_state(), out of the boot: an interconnect that leaves INT_MAX before
+	# the boot-time pm_test cycle hangs that cycle on this board (Stage 3 and
+	# 3b, 2026-11-07; config-gts9wifi.fragment).  `modprobe icc_bwmon` by hand
+	# is the experiment switch.
+	cat > "$overlay/etc/modprobe.d/gts9u-bwmon.conf" <<'EOF'
+# Bring-up experiment switch: load by hand with `modprobe icc_bwmon`.
+blacklist icc_bwmon
+EOF
+fi
 
 # --- Adreno 740 -----------------------------------------------------------
 for f in a740_zap.mdt a740_zap.b00 a740_zap.b01 a740_zap.b02 a740_sqe.fw \
@@ -273,6 +281,9 @@ dir=$mnt/bringup/$boot
 mkdir -p "$dir"
 stamp=$(cat /proc/uptime | cut -d. -f1)
 dmesg > "$dir/dmesg-${stamp}s.txt" 2>&1
+# What the previous boot left in ramoops: during a boot loop each attempt
+# saves the console of the one before, up to its panic or watchdog reset.
+for f in /sys/fs/pstore/*; do [ -f "$f" ] && cp "$f" "$dir/pstore-${f##*/}"; done
 journalctl -b --no-pager -o short-monotonic > "$dir/journal-${stamp}s.txt" 2>&1
 {
 	for c in /sys/class/drm/card*-*; do

@@ -295,7 +295,16 @@ CONFIG_SM_VIDEOCC_8550=y
 # deep suspends from the power key, and the module loaded by hand on build 11
 # left the display unchanged.  Nor was DDR ever starved: it sat at the
 # INT_MAX boot vote above.
-CONFIG_QCOM_ICC_BWMON=y
+#
+# Modular and blacklisted again (build-rootfs-overlay.sh), on purpose: its two
+# PMUs are the last consumers that keep gem_noc and mc_virt from sync_state().
+# Built in (Stage 3, 2026-11-07), or with both PMUs disabled in the DT so the
+# interconnect synced without it (Stage 3b), every interconnect left INT_MAX
+# at about 13 s and the boot-time pm_test=platform cycle (about 24 s) hung
+# both times, watchdog reset, boot loop.  The same release at runtime after
+# the cycle (Stage 0) held for 10 minutes and through that cycle.  So the
+# interconnect stays at its boot vote until it is released after the cycle.
+CONFIG_QCOM_ICC_BWMON=m
 CONFIG_DEVFREQ_GOV_PERFORMANCE=y
 
 # SoC sleep statistics in /sys/kernel/debug/qcom_stats: aosd (AOSS sleep),

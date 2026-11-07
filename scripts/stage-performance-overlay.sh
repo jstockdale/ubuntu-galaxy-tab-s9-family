@@ -22,7 +22,10 @@ for name, symbol in (('gts9u-performance', 'gts9u_performance_overlay'),
                      ('gts9-performance', 'gts9_performance_overlay'),
                      ('gts9-family', 'gts9_family_overlay')):
     data = (target / f'{name}.dtbo').read_bytes()
-    lines.append(f'static const unsigned char {symbol}[] __initconst = {{')
+    # of_overlay_fdt_apply() -> fdt_check_header() rejects a blob that is not
+    # 8-byte aligned (-FDT_ERR_ALIGNMENT, logged as "Invalid overlay_fdt
+    # header"); a plain char array lands wherever the linker puts it.
+    lines.append(f'static const unsigned char {symbol}[] __initconst __aligned(8) = {{')
     for offset in range(0, len(data), 12):
         lines.append('\t' + ', '.join(f'0x{b:02x}' for b in data[offset:offset+12]) + ',')
     lines.append('};')

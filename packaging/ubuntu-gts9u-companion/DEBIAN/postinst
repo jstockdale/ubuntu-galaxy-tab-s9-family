@@ -1,6 +1,13 @@
 #!/bin/sh
 set -e
 
+# First: the package does not ship a compiled schema cache, so an upgrade
+# from a release that did removes the system's cache at unpack.  Rebuild it
+# before anything else, and before anything is restarted.
+if command -v glib-compile-schemas >/dev/null 2>&1; then
+	glib-compile-schemas /usr/share/glib-2.0/schemas
+fi
+
 # Reproducible packages normalize source mtimes. A same-size edit can otherwise
 # leave a timestamp-based cache from an older release looking valid to Python.
 if command -v py3clean >/dev/null 2>&1; then
@@ -8,10 +15,6 @@ if command -v py3clean >/dev/null 2>&1; then
 fi
 if command -v py3compile >/dev/null 2>&1; then
 	py3compile -p ubuntu-gts9u-companion
-fi
-
-if command -v glib-compile-schemas >/dev/null 2>&1; then
-	glib-compile-schemas /usr/share/glib-2.0/schemas
 fi
 
 if command -v udevadm >/dev/null 2>&1 && [ -e /dev/uinput ]; then

@@ -39,7 +39,12 @@ rm "$resource_dir/io.github.agcarbajo.TabCompanion.gresource.xml" \
 sed -i '5i\from gi.repository import Gio\nGio.resources_register(Gio.Resource.load("/usr/share/tab-companion/io.github.agcarbajo.TabCompanion.gresource"))' \
 	"$staging/usr/bin/tab-companion"
 
-glib-compile-schemas --strict "$staging/usr/share/glib-2.0/schemas"
+# Validate the schema, but do not ship a gschemas.compiled: it would hold this
+# one schema and replace the system's compiled set from unpack until a
+# postinst recompiles it.  postinst, postrm and glib's trigger build the file.
+schemas_check=$(mktemp -d)
+glib-compile-schemas --strict --targetdir="$schemas_check" "$staging/usr/share/glib-2.0/schemas"
+rm -rf -- "$schemas_check"
 desktop-file-validate "$staging/usr/share/applications/io.github.agcarbajo.TabCompanion.desktop"
 appstreamcli validate --no-net "$staging/usr/share/metainfo/io.github.agcarbajo.TabCompanion.metainfo.xml"
 python3 -m compileall -q "$staging/usr/lib/tab-companion"
