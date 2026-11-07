@@ -85,8 +85,8 @@ usbutils,pciutils,ethtool,evtest,i2c-tools,v4l-utils,
 strace,tree
 '
 
-# Two more things ubuntu-desktop-minimal only recommends, and that a build
-# without them gets wrong in ways that look like distro bugs:
+# Three things ubuntu-desktop-minimal or pipewire only recommends, and that a
+# build without them gets wrong in ways that look like distro bugs:
 #
 #   yaru-theme-icon    without it only yaru-theme-gnome-shell arrives, the icon
 #                      theme falls back to Adwaita, and the Ubuntu-specific
@@ -96,6 +96,12 @@ strace,tree
 #                      protected Wi-Fi never prompts for the password, and
 #                      NetworkManager just logs "no secrets: No agents were
 #                      available for this request" and fails.
+#   rtkit              PipeWire's and Mutter's only route to realtime
+#                      priority for a desktop user who is not in the pipewire
+#                      group.  Without it the journal says "RTKit error:
+#                      org.freedesktop.DBus.Error.ServiceUnknown", and the
+#                      PipeWire data loops and Mutter's KMS thread run as
+#                      ordinary SCHED_OTHER threads.
 desktop_packages='
 ubuntu-desktop-minimal,gdm3,gnome-shell,gnome-session,gnome-control-center,
 gnome-initial-setup,
@@ -106,7 +112,7 @@ yaru-theme-icon,yaru-theme-gtk,yaru-theme-sound,yaru-theme-gnome-shell,
 gnome-keyring,libpam-gnome-keyring,
 mesa-utils,mesa-vulkan-drivers,libgl1-mesa-dri,vulkan-tools,
 libdrm-tests,edid-decode,
-pipewire,pipewire-pulse,pipewire-audio,wireplumber,
+pipewire,pipewire-pulse,pipewire-audio,wireplumber,rtkit,
 pulseaudio-utils,
 libspa-0.2-bluetooth,bluez,alsa-ucm-conf,alsa-utils,
 iio-sensor-proxy,upower,power-profiles-daemon,

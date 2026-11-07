@@ -1,0 +1,64 @@
+#!/bin/sh
+# Keep the GDM greeter's WirePlumber off Bluetooth audio.
+#
+# The greeter runs its own PipeWire and WirePlumber as the gdm user.  With the
+# owner's session lingering, both start at boot, and the greeter's bluez
+# monitor registers the A2DP endpoints and the HFP/HSP profiles first: the
+# owner's WirePlumber logs "RegisterProfile() failed: NotPermitted" until the
+# greeter lets go.  Ubuntu's gdm3 already does this for PulseAudio, from its
+# postinst, with /var/lib/gdm3/.config/pulse/default.pa (LP: #1703415); this is
+# the PipeWire counterpart, installed the same way.  Only Bluetooth is turned
+# off: the greeter keeps ALSA, so login sounds and the screen reader still work.
+#
+#   ubuntu-gts9u-greeter-audio            install or refresh (postinst)
+#   ubuntu-gts9u-greeter-audio --remove   take it out again (prerm)
+#
+# It takes effect the next time the greeter's WirePlumber starts (next boot,
+# or the next time the login screen comes up after a logout).
+set -eu
+
+src=/usr/share/ubuntu-gts9u/greeter-wireplumber
+name=51-gts9u-greeter-no-bluez
+
+entry=$(getent passwd gdm || true)
+[ -n "$entry" ] || exit 0
+uid=$(printf '%s\n' "$entry" | cut -d: -f3)
+gid=$(printf '%s\n' "$entry" | cut -d: -f4)
+home=$(printf '%s\n' "$entry" | cut -d: -f6)
+# Only ever write below the system account's own state directory.
+case "$home" in
+/var/lib/?*) ;;
+*) exit 0 ;;
+esac
+[ -d "$home" ] && [ ! -L "$home" ] || exit 0
+conf=$home/.config/wireplumber
+
+# The tree below the greeter's home belongs to gdm.  Refuse to follow a
+# symlink anywhere in it rather than write as root to wherever it points.
+no_link() {
+	for p in "$@"; do
+		if [ -L "$p" ]; then
+			echo "ubuntu-gts9u-greeter-audio: $p is a symlink; left alone" >&2
+			exit 0
+		fi
+	done
+}
+no_link "$home/.config" "$conf" "$conf/bluetooth.lua.d" "$conf/wireplumber.conf.d"
+
+if [ "${1:-}" = --remove ]; then
+	rm -f "$conf/bluetooth.lua.d/$name.lua" \
+		"$conf/wireplumber.conf.d/$name.conf"
+	rmdir "$conf/bluetooth.lua.d" "$conf/wireplumber.conf.d" 2>/dev/null || true
+	rmdir "$conf" 2>/dev/null || true
+	exit 0
+fi
+
+# Create each missing level owned by gdm, as gdm3's postinst does for pulse,
+# so no directory in the greeter's config tree is root's.
+for d in "$home/.config" "$conf" "$conf/bluetooth.lua.d" "$conf/wireplumber.conf.d"; do
+	[ -d "$d" ] || install -d -o "$uid" -g "$gid" -m 0755 "$d"
+done
+no_link "$conf/bluetooth.lua.d/$name.lua" "$conf/wireplumber.conf.d/$name.conf"
+install -m 0644 "$src/bluetooth.lua.d/$name.lua" "$conf/bluetooth.lua.d/$name.lua"
+install -m 0644 "$src/wireplumber.conf.d/$name.conf" \
+	"$conf/wireplumber.conf.d/$name.conf"
