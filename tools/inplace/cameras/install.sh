@@ -126,6 +126,13 @@ if ! run_logged loader systemctl restart "$loader"; then
 	run_logged journal journalctl -b -u "$loader" -n 5 --no-pager -o cat || :
 	die "the loopback loader failed (above); if an application still holds a /dev/video2x node, close it and re-run install.sh"
 fi
+# systemctl prints nothing on success; the loader's own lines (which nodes it
+# removed or created) went to the journal.  Copy this run's lines into the log.
+journalctl --sync 2>/dev/null || :
+invocation=$(systemctl show -p InvocationID --value "$loader" 2>/dev/null || :)
+if [ -n "$invocation" ]; then
+	run_logged loader journalctl -q -b --no-pager -o cat "_SYSTEMD_INVOCATION_ID=$invocation" || :
+fi
 say "camera table: $(wc -l < /run/ubuntu-gts9u/camera-profile) camera(s); $(lsmod | grep -qE '^v4l2loopback ' && echo 'v4l2loopback loaded' || echo 'v4l2loopback not loaded')"
 
 # --- 6. relays again -----------------------------------------------------------

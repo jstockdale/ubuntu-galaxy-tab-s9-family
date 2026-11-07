@@ -91,9 +91,12 @@ cat /sys/module/gts9wifi_camera/parameters/enable                     # none / r
 
 It applies one OF changeset that sets the chosen nodes to `okay`; the OF
 reconfiguration notifiers create the platform and I2C devices and the built-in
-drivers bind them.  CAMSS registers nothing until every sensor in its graph has
-bound, so for `rear` or `front` the changeset also detaches the other camera's
-CAMSS endpoint.  It is one-shot until the next reboot (CAMSS is not built to be
+drivers bind them.  CAMSS registers `/dev/media0` at probe, but its async
+notifier only completes -- sensor links and the `v4l-subdev` nodes libcamera
+needs -- once every sensor in its graph has bound, so for `rear` or `front` the
+changeset also detaches the other camera's CAMSS endpoint (a sensor that
+probes before CAMSS exists defers on that remote endpoint and is retried when
+CAMSS binds).  It is one-shot until the next reboot (CAMSS is not built to be
 torn down by reverting a changeset), it refuses on any other board, and every
 node path and compatible is checked before anything changes.
 `gts9wifi_camera.enable=...` on the kernel command line applies it at late
@@ -113,7 +116,7 @@ One table now drives the userspace camera stack, from
 | board | table |
 |---|---|
 | SM-X910 | the four `GTS9U-*` cameras at `/dev/video20`-`23`, unconditionally: the same numbers, names, sources and module options as before |
-| SM-X710 | `GTS9-Front`, then `GTS9-Rear`, numbered from 20, only for HI1337s that are bound |
+| SM-X710 | `GTS9-Front`, then `GTS9-Rear`, numbered from 20, only for HI1337s that are bound *and* have their `v4l-subdev` node (CAMSS creates those only once its async notifier completed, lens included), so a half-probed camera never becomes a webcam |
 | other | none |
 
 `ubuntu-gts9u-camera-loopback.service` (replacing the `modules-load.d` and
@@ -181,5 +184,6 @@ sudo reboot
 sudo sh ~/cameras-kit/camera-test.sh front             # then check the microphones
 sudo reboot
 sudo sh ~/cameras-kit/camera-test.sh both
+sudo install -d /etc/ubuntu-gts9u                               # no package creates it
 echo both | sudo tee /etc/ubuntu-gts9u/cameras && sudo reboot   # cameras at every boot
 ```

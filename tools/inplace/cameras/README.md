@@ -74,6 +74,7 @@ To have the cameras on at every boot once they work (after the panel's boot
 cycle, before the relays):
 
 ```sh
+sudo install -d /etc/ubuntu-gts9u                  # the directory does not exist yet
 echo both | sudo tee /etc/ubuntu-gts9u/cameras    # or rear / front
 sudo reboot                                        # undo: sudo rm /etc/ubuntu-gts9u/cameras
 ```
