@@ -1,0 +1,14 @@
+[Unit]
+Description=Bring-up: re-dump logs to the microSD card during the first 3 minutes
+
+[Timer]
+# Boot-only and bounded: three more snapshots after the one the service takes
+# at multi-user.target, then nothing for the rest of the uptime.  No
+# OnUnitActiveSec: repeating every minute for the whole uptime filled the card.
+OnBootSec=45s
+OnBootSec=90s
+OnBootSec=180s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

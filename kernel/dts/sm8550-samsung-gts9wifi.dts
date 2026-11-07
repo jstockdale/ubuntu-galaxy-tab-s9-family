@@ -139,6 +139,20 @@
 		 * then appear under /sys/fs/pstore, even when the hang left no
 		 * journal.  Write-combined (mem-type 0), so writes reach DDR before
 		 * a reset; ECC flags a record the reset corrupted.
+		 *
+		 * Checked on the X710 (2026-11-07): the console record survived
+		 * every warm reboot and watchdog reset, and nothing suggests the
+		 * bootloader overruns sec-debug-bl (which ends exactly here) into
+		 * it: zone 0 (the first dmesg record) read back uncorrectable only
+		 * on the two boots that followed a TWRP session, consistent with
+		 * Samsung's kernel there writing its sec_pmsg ring from offset 0.
+		 * The console zone is the second MiB and was intact even then.
+		 * The few corrected header bytes reported in six zones at every
+		 * boot appeared across one clean reboot after Stage 1 had zapped
+		 * every zone and have not changed since: ramoops never rewrites
+		 * the header parity of an empty dmesg zone.  No reason to move or
+		 * shrink the region.  systemd-pstore's copies are kept per boot by
+		 * ubuntu-gts9u-pstore-archive.service (the device package).
 		 */
 		sec_pmsg_mem: sec-pmsg@880900000 {
 			compatible = "ramoops";
