@@ -21,6 +21,21 @@ const BACKLIGHT = '/sys/class/backlight/ae94000.dsi.0';
 const ACTIVE_LEASE = '/run/gts9u-fingerprint/active';
 const UI_BUS_NAME = 'io.github.agcarbajo.Gts9uFingerprintUI';
 const UI_PATH = '/io/github/agcarbajo/Gts9uFingerprintUI';
+// The optical target, its HBM shade and the keyboard fallback all serve the
+// Galaxy Tab S9 Ultra's EL721 under its Goodix touchscreen.  GDM and the
+// package enable this extension on every board they install on; anywhere
+// else it stays inert: no 50 ms poll, no pulses to a broker that is gated off.
+const ULTRA_COMPATIBLE = 'samsung,gts9uwifi';
+
+function boardIsUltra() {
+    try {
+        const [, bytes] = GLib.file_get_contents('/proc/device-tree/compatible');
+        return new TextDecoder().decode(bytes).split('\0').includes(ULTRA_COMPATIBLE);
+    } catch (_) {
+        return false;
+    }
+}
+
 const INTERFACE = `
 <node>
   <interface name="io.github.agcarbajo.Gts9uFingerprintOverlay">
@@ -33,6 +48,11 @@ const INTERFACE = `
 
 export default class Gts9uFingerprintOverlay extends Extension {
     enable() {
+        this._inert = !boardIsUltra();
+        if (this._inert) {
+            console.log('GTS9U fingerprint overlay: not a Galaxy Tab S9 Ultra; inactive');
+            return;
+        }
         this._originalCancel = ShellUserVerifier.prototype.cancel;
         this._recoveryCancel = recoverClosedCancellation(this._originalCancel,
             error => error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CLOSED) ?? false,
@@ -132,6 +152,10 @@ export default class Gts9uFingerprintOverlay extends Extension {
     }
 
     disable() {
+        if (this._inert) {
+            this._inert = false;
+            return;
+        }
         this._keyboardEventGuard?.destroy();
         this._keyboardEventGuard = null;
         if (ShellUserVerifier.prototype.cancel === this._recoveryCancel)
@@ -407,7 +431,7 @@ export default class Gts9uFingerprintOverlay extends Extension {
         // Read-only state for intermittent post-login input failures. No key
         // contents, finger images, credentials, user names or auth answers.
         return JSON.stringify({
-            version: 14,
+            version: 15,
             sessionActive: Boolean(this._session?.Active),
             greeter: Boolean(Main.sessionMode.isGreeter),
             locked: Boolean(Main.screenShield?.locked),

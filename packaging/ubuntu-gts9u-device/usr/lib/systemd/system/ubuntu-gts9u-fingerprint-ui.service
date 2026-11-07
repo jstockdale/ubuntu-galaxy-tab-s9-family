@@ -1,6 +1,10 @@
 [Unit]
 Description=Galaxy Tab fingerprint target availability broker
 After=dbus.service systemd-logind.service
+# Ultra only.  The EL721 path (QTEE, the K250A secure element, Goodix FOD)
+# exists on the SM-X910 alone; the overlay extension that feeds this lease
+# stays inactive on other boards, and fprintd is masked there.
+ConditionFirmware=device-tree-compatible(samsung,gts9uwifi)
 
 [Service]
 Type=dbus

@@ -134,7 +134,7 @@ overlay._seat = {get_touch_mode: () => true};
 overlay._physicalKeyboard = true;
 overlay._session = {Active: true};
 const diagnostics = JSON.parse(overlay.GetDiagnostics());
-assert.equal(diagnostics.version, 14);
+assert.equal(diagnostics.version, 15);
 assert.equal(diagnostics.sessionActive, true);
 assert.equal(diagnostics.targetReactive, false);
 assert.equal(diagnostics.keyboardExists, false);
@@ -193,3 +193,28 @@ delete devices.event9['capabilities/key'];
 assert.equal(scanner._scanPhysicalKeyboards(), true); // Unknown: conservative until next scan.
 assert.equal(closes, 5);
 console.log('PASS: 5 actual sysfs inventory/hotplug paths with closed enumeration handles');
+
+// Off the Ultra the extension stays inert: no prototype patch, actors, poll or
+// bus name.  Main is empty and ShellUserVerifier is not defined here, so any
+// real enable step throws; an unreadable device tree counts as another board.
+const boardGLib = compatible => ({...GLib, file_get_contents(path) {
+    assert.equal(path, '/proc/device-tree/compatible');
+    if (compatible === null)
+        throw new Error('No such file or directory');
+    return [true, new TextEncoder().encode(compatible)];
+}});
+const x710 = 'qcom,kalama-mtp\0qcom,kalama\0qcom,mtp\0samsung,gts9wifi\0qcom,sm8550\0';
+const x910 = 'qcom,kalama-mtp\0qcom,kalama\0qcom,mtp\0samsung,gts9uwifi\0qcom,sm8550\0';
+for (const compatible of [x710, null]) {
+    const InertType = new Function('Extension', 'GLib', 'Main', source)(class {}, boardGLib(compatible), {});
+    const inert = new InertType();
+    inert.enable();
+    assert.equal(inert._inert, true);
+    assert.equal(inert._panelPollId, undefined);
+    assert.equal(inert._busId, undefined);
+    inert.disable();
+    assert.equal(inert._inert, false);
+}
+const UltraType = new Function('Extension', 'GLib', 'Main', source)(class {}, boardGLib(x910), {});
+assert.throws(() => new UltraType().enable(), /ShellUserVerifier/);
+console.log('PASS: inert on the X710 and without a device tree, active on the X910');
