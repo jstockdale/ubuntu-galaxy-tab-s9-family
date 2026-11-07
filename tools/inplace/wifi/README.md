@@ -47,12 +47,14 @@ address.
 
 1. **(host) Stage the kit.** A staged copy built overnight is in
    `/tmp/claude-1000/-home-jstockdale-projects-ubuntu-galaxy-tab-s9-ultra/0b18c5c0-eba0-4cb6-977b-893306d69db3/scratchpad/overnight/wifi/kit`.
-   To rebuild it (needs the fix2-s2 `vendor_boot.img`; the tablet has it in
-   `~/display-exp/fix2-s2/`):
+   To rebuild it (needs the fix2-s2 `vendor_boot.img`, sha256 `0742866c…`: the
+   host keeps it in
+   `~/ubuntu-gts9u/backups/x710-fix-integration-2026-11-06/fix2-images/fix2-s2/`,
+   the tablet in `~/display-exp/fix2-s2/`):
 
    ```
-   scp jstockdale@10.42.0.2:display-exp/fix2-s2/vendor_boot.img /tmp/fix2-s2-vendor_boot.img
-   tools/inplace/wifi/stage.sh ~/ubuntu-gts9u/out/inplace-wifi /tmp/fix2-s2-vendor_boot.img
+   tools/inplace/wifi/stage.sh ~/ubuntu-gts9u/out/inplace-wifi \
+       ~/ubuntu-gts9u/backups/x710-fix-integration-2026-11-06/fix2-images/fix2-s2/vendor_boot.img
    ```
 
    Expected: `self-test: repack reproduces … (0742866cbfb0) exactly`, then the
