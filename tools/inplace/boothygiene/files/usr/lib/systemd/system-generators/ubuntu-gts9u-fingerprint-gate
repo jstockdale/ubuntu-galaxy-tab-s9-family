@@ -1,0 +1,34 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Mask fprintd for this boot on every board but the Galaxy Tab S9 Ultra.
+#
+# The only fingerprint path this port has is the Ultra's EL721 (QTEE, the K250A
+# secure element and Goodix FOD); its units carry
+# ConditionFirmware=device-tree-compatible(samsung,gts9uwifi).  fprintd itself
+# is not ours and is started by D-Bus activation (GDM, the lock screen,
+# gdm-fingerprint PAM).  A condition on it would not help: dbus-daemon hears
+# nothing back from a start job that ends without the bus name appearing, and
+# the caller waits out the activation timeout.  On the X710 GDM waited 25 s for
+# net.reactivated.Fprint at every greeter and unlock, while fprintd itself
+# failed a minute later.  Activating a masked unit fails at once instead
+# ("Unit fprintd.service is masked"), and every client then falls back to the
+# password.
+#
+# A runtime mask in the generator directory: nothing persistent, decided again
+# at every boot and daemon-reload, and a unit an administrator puts in
+# /etc/systemd/system still takes precedence over it.
+#
+# Arguments: normal-dir early-dir late-dir (systemd.generator(7)).
+set -u
+
+dir=${1:-}
+[ -n "$dir" ] && [ -d "$dir" ] || exit 0
+
+compatible=/proc/device-tree/compatible
+if [ -r "$compatible" ] &&
+	tr '\0' '\n' < "$compatible" | grep -qx 'samsung,gts9uwifi'; then
+	exit 0
+fi
+
+ln -sf /dev/null "$dir/fprintd.service"
+exit 0

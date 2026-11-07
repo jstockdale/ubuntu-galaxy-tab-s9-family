@@ -1,0 +1,13 @@
+1f47bd36f569fb8484561736a0bba46d  usr/lib/systemd/system/ubuntu-gts9u-rtc-restore.service
+61981e8d4a8b199e2a8fbd54c2266db9  usr/libexec/ubuntu-gts9u-rtc-offset
+3220f229e18ad5e86f38aae9c97f2c5d  usr/lib/systemd/system/ubuntu-gts9u-fingerprint-secure.service
+39760eeea200e11f8c08560207fde55b  usr/lib/systemd/system/ubuntu-gts9u-fingerprint-ui.service
+8b6cf9ea3dc08bda02fa06a894287b50  usr/lib/systemd/system/ubuntu-gts9u-qcomtee.service
+24001a6ec892ab9288b6eda5a5c8d479  usr/lib/systemd/system/fprintd.service.d/10-gts9u-el721.conf
+a318785396a3f4369f26ce98bb10cde6  usr/share/gnome-shell/extensions/gts9u-fingerprint-overlay@agcarbajo/extension.js
+a17da7acd177639a776b55e0d520e622  usr/share/gnome-shell/extensions/gts9u-fingerprint-overlay@agcarbajo/metadata.json
+2687a7561ea028c88b265f9d0a5cc3b5  usr/lib/systemd/system/ubuntu-gts9u-panel-coldboot-recover.service
+a8f77c4ea75523c1b9d42b334edc816e  usr/lib/systemd/system/ubuntu-gts9u-pogo-firmware.service
+56ae90a0f7ddedb1efefd9a9cf8ed453  usr/libexec/gts9u-bringup-sdlog
+1e161c6b2adba37098934f94f676f5dc  usr/lib/systemd/system/gts9u-bringup-sdlog.service
+6871a5907d423eb264d5bbc0402af724  usr/lib/systemd/system/gts9u-bringup-sdlog.timer

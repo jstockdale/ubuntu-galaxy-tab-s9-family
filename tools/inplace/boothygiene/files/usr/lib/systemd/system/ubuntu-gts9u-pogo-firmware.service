@@ -1,0 +1,28 @@
+[Unit]
+Description=Restore the Samsung STM32 pogo keyboard application
+Documentation=file:/usr/share/doc/ubuntu-gts9u-device/pogo-keyboard.md
+# After the cold-boot panel cycle, not before it.  The two must not overlap:
+# the flash holds the controller lock for ~15 s, and the cycle freezes
+# userspace and suspends the I2C controller.  Run first, a needed flash held
+# the panel dark for those ~15 s (on the X710, the first boot after each TWRP
+# session: Samsung's kernel there appears to put the controller back on V34).
+# Run after it, the panel lights first and only the keyboard waits; a
+# controller already on V37 costs a tenth of a second either way.
+After=local-fs.target ubuntu-gts9u-panel-coldboot-recover.service
+
+# Only the firmware blob is asserted here.  The controller's sysfs node used to
+# be a condition too, and it made the unit unreliable: systemd cannot order a
+# unit behind the very target that pulls it in, so an earlier
+# "After=multi-user.target" was silently ignored, the unit ran alongside
+# everything else at about three seconds, and the driver had not yet bound at
+# 3.9 s.  The condition then failed and the whole restore was skipped without a
+# word.  Waiting for the device belongs in the helper, where it can be bounded
+# and logged.
+ConditionPathExists=/lib/firmware/keyboard_stm/stm32_gts9family.bin
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/ubuntu-gts9u-pogo-firmware-update
+
+[Install]
+WantedBy=multi-user.target

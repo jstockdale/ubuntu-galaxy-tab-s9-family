@@ -1,0 +1,82 @@
+#!/bin/sh
+# Dump this boot's logs onto the microSD card (first partition), for reading
+# from TWRP when the panel is dark.  Reads the system, writes only the card.
+#
+# Boot-only and bounded.  gts9u-bringup-sdlog.service runs it once when the
+# boot reaches multi-user.target and gts9u-bringup-sdlog.timer at 45 s, 90 s
+# and 180 s, never again: what it is for is a boot that dies or stays dark
+# early (a boot loop, a hang in the cold-boot cycle), and the copy every
+# minute it used to make for the whole uptime filled the card (4.6 GB in 54
+# boot directories on the X710 after two days).  The card keeps the newest
+# $GTS9U_SDLOG_KEEP (20) boot directories this logger numbered; directories
+# from older loggers (named by boot id alone) are left for their owner.
+#
+# Installed only by GTS9U_BRINGUP_SDLOG=1 builds (scripts/build-rootfs-overlay.sh).
+dev=/dev/mmcblk1p1
+mnt=/run/bringup-sd
+keep=${GTS9U_SDLOG_KEEP:-20}
+state=/run/gts9u-bringup-sdlog.dir
+
+for i in $(seq 1 30); do [ -b "$dev" ] && break; sleep 1; done
+[ -b "$dev" ] || exit 0
+mkdir -p "$mnt"
+mountpoint -q "$mnt" || mount -t exfat "$dev" "$mnt" 2>/dev/null || mount "$dev" "$mnt" || exit 0
+mkdir -p "$mnt/bringup"
+
+# One directory per boot: <seq>-<boot id>, the sequence so that pruning keeps
+# the newest even when the clock was wrong.  awk, not $((...)): sh reads the
+# zero-padded numbers as octal.
+first=no
+if [ -s "$state" ]; then
+	name=$(cat "$state")
+else
+	first=yes
+	seq=$(ls -1 "$mnt/bringup" 2>/dev/null |
+		awk -F- '/^[0-9]+-/ { n = $1 + 0; if (n > max) max = n } END { print max + 1 }')
+	name=$(printf '%06d-%s' "$seq" "$(cut -c1-8 /proc/sys/kernel/random/boot_id)")
+	echo "$name" > "$state"
+fi
+dir=$mnt/bringup/$name
+mkdir -p "$dir"
+
+stamp=$(cut -d. -f1 /proc/uptime)
+dmesg > "$dir/dmesg-${stamp}s.txt" 2>&1
+# What the previous boot left in ramoops: its console up to the panic or the
+# watchdog reset.  systemd-pstore has moved the records out of /sys/fs/pstore
+# into /var/lib/systemd/pstore before this runs (copying /sys/fs/pstore alone
+# found it empty on every boot); /sys/fs/pstore covers a boot where
+# systemd-pstore did not run.  Once per boot: they do not change.
+if [ "$first" = yes ]; then
+	for p in /var/lib/systemd/pstore /sys/fs/pstore; do
+		[ -d "$p" ] || continue
+		find "$p" -type f | while IFS= read -r f; do
+			rel=${f#"$p"/}
+			cp "$f" "$dir/pstore-$(printf '%s' "$rel" | tr / _)"
+		done
+	done
+fi
+journalctl -b --no-pager -o short-monotonic > "$dir/journal-${stamp}s.txt" 2>&1
+{
+	for c in /sys/class/drm/card*-*; do
+		[ -d "$c" ] || continue
+		printf '%s: status=%s enabled=%s dpms=%s\n' "$c" "$(cat "$c/status" 2>/dev/null)" \
+			"$(cat "$c/enabled" 2>/dev/null)" "$(cat "$c/dpms" 2>/dev/null)"
+		cat "$c/modes" 2>/dev/null
+	done
+	echo; echo '== backlight'; for b in /sys/class/backlight/*; do [ -d "$b" ] && printf '%s: %s/%s power=%s\n' "$b" "$(cat "$b/brightness")" "$(cat "$b/max_brightness")" "$(cat "$b/bl_power" 2>/dev/null)"; done
+} > "$dir/drm-${stamp}s.txt" 2>&1
+{
+	tr -d '\0' < /proc/device-tree/model; echo
+	echo '== failed units'; systemctl --failed --no-pager 2>&1
+	echo '== network'; ip -brief address 2>&1
+	echo '== pci'; lspci 2>&1
+	echo '== regulators'; for r in /sys/class/regulator/*; do printf '%s %s %s\n' "$(cat "$r/name" 2>/dev/null)" "$(cat "$r/state" 2>/dev/null)" "$(cat "$r/microvolts" 2>/dev/null)"; done
+} > "$dir/system-${stamp}s.txt" 2>&1
+
+# Keep the newest $keep numbered boot directories (once per boot).
+if [ "$first" = yes ]; then
+	ls -1 "$mnt/bringup" | grep -E '^[0-9]+-' | sort -n | head -n "-$keep" |
+		while IFS= read -r old; do rm -rf -- "${mnt:?}/bringup/$old"; done
+fi
+sync
+umount "$mnt"

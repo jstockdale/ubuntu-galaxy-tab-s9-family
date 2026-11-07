@@ -1,0 +1,23 @@
+[Unit]
+Description=Keep the ramoops records of earlier boots, by boot (last 10)
+Documentation=file:/usr/libexec/ubuntu-gts9u-pstore-archive
+# systemd-pstore moves the records out of /sys/fs/pstore first; from there the
+# next boot overwrites them and systemd-tmpfiles-clean deletes them 15 minutes
+# after boot (see the helper).  Early and outside the default dependencies, so
+# that a boot-loop attempt that dies ~24 s into the boot (the coldboot cycle)
+# has already kept the console of the attempt before it.
+DefaultDependencies=no
+After=systemd-pstore.service systemd-journal-flush.service local-fs.target systemd-remount-fs.service systemd-tmpfiles-setup.service
+Before=sysinit.target systemd-tmpfiles-clean.service shutdown.target
+Conflicts=shutdown.target
+RequiresMountsFor=/var/lib/ubuntu-gts9u /var/lib/systemd/pstore
+ConditionDirectoryNotEmpty=/var/lib/systemd/pstore
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/ubuntu-gts9u-pstore-archive
+TimeoutStartSec=30
+
+[Install]
+WantedBy=sysinit.target

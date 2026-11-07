@@ -1,0 +1,36 @@
+[Unit]
+Description=Set the clock from the PMIC RTC and the offset saved at the last NTP sync
+# The PMK8550 RTC counts on while the tablet is off but cannot hold the wall
+# clock under Samsung's firmware (see /usr/libexec/ubuntu-gts9u-rtc-offset).
+#
+# Before journald, not only before time-set.target.  Until this runs the clock
+# reads systemd's build date (PID 1 advances a 1970 clock to it), and journald
+# stamps every entry, the kernel lines it reads back from the ring buffer
+# included, with the clock as it finds it.  Started before this unit, journald
+# put the start of every boot into a persistent file whose head time and
+# creation time were that build date.  At the boot's first rotation (the user
+# journal's sequence-number change at login, ~39 s; an NTP step back) journald
+# archived that file and its vacuum, sorting by those times, deleted it as the
+# oldest file over SystemMaxUse: every boot lost its first ~39 s.
+# The helper only reads (the RTC, and the saved offset on the root file system
+# the initramfs mounted) and sets the clock, so it needs neither journald nor
+# the remount nor udev: rtc-pm8xxx is built in and registers rtc0 at ~3 s.
+DefaultDependencies=no
+RequiresMountsFor=/var/lib/ubuntu-gts9u
+Before=systemd-journald.service time-set.target sysinit.target systemd-timesyncd.service
+Wants=time-set.target
+ConditionPathExists=/sys/class/rtc/rtc0/since_epoch
+ConditionPathExists=/var/lib/ubuntu-gts9u/rtc-offset
+
+[Service]
+Type=oneshot
+# Without it the finished oneshot went back to inactive, and every later
+# transaction that pulled in sysinit.target started it again: up to three runs
+# per boot, each one stepping the clock to the RTC's next whole second.
+RemainAfterExit=yes
+ExecStart=/usr/libexec/ubuntu-gts9u-rtc-offset restore
+# journald waits for this unit; an RTC read that hangs must not hold it long.
+TimeoutStartSec=10
+
+[Install]
+WantedBy=sysinit.target

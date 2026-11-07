@@ -1,0 +1,7 @@
+[Unit]
+Description=Bring-up: dump kernel and journal logs to the microSD card
+After=local-fs.target systemd-udevd.service systemd-pstore.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /usr/libexec/gts9u-bringup-sdlog
