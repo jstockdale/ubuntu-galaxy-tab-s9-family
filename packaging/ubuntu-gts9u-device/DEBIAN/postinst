@@ -119,6 +119,10 @@ case "$1" in
 		if [ -x /usr/share/gdm/generate-config ]; then
 			/usr/share/gdm/generate-config
 		fi
+		# Keep the login screen's own WirePlumber off Bluetooth audio, the
+		# PipeWire counterpart of gdm3's pulse/default.pa.  Effective the
+		# next time the greeter starts; nothing is restarted here.
+		/usr/libexec/ubuntu-gts9u-greeter-audio || true
 		if command -v gtk-update-icon-cache >/dev/null 2>&1; then
 			gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
 		fi
