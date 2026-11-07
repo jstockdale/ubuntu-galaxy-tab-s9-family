@@ -75,9 +75,12 @@ works after `ubuntu-gts9u-panel-coldboot-recover` has run a
 `pm_test=platform` cycle; GDM is ordered after it.  Blanking and a
 `pm_test=devices` cycle do not recover it (measured on the Ultra).
 Display-wise, the platform level adds the noirq phase, in which genpd powers
-the MDSS GDSC down; at runtime that never happens because the DP controller
-keeps the MDSS active.  The kernel carries switches to test in-kernel
-replacements, all inert by default:
+the MDSS GDSC down.  At runtime that used to be impossible, because the DP
+controller kept the MDSS active; since the DP controller no longer holds it
+and the display clock controller reaches sync_state (device 2.55, fix2
+kernels), every blank collapses the GDSC, which makes a blank/unblank the
+cheapest test.  The kernel carries switches to test in-kernel replacements,
+all inert by default:
 
 | switch | what it does |
 | --- | --- |
@@ -88,6 +91,22 @@ replacements, all inert by default:
 The panel also waits for the DDIC's TCON_RDY line (TLMM 88) after reset, as
 Samsung's Anapass power sequence does, and reports at the first power-on
 whether it was high before the reset and how long it took to rise after it.
+Every boot so far: high before, high again 114-115 ms after, then
+`00 00 00`, so the DDIC itself resets and comes back and the host side is
+the main suspect.  Two more panel switches, also inert by default:
+`panel_samsung_ana38407.cold_start_ms=<ms>` takes the bootloader's DDIC
+down as a blank does before the first power-on (the panel half of what a
+working power-on has), and `panel_samsung_ana38407.trace_power_on=1` logs
+supplies, TCON_RDY timing and the id of every power-on.
+
+`tools/inplace/panel/` holds the experiment kit: vendor_boot variants of a
+running image that add only command-line switches (with
+`systemd.mask=ubuntu-gts9u-panel-coldboot-recover.service` to skip the cycle
+for one boot), flash/rollback scripts, a runtime blank/unblank test that
+collapses the MDSS GDSC without a system suspend (E3), and `report.py`,
+which compares the register dumps of the dead first power-on with a working
+one.  Its README has the comparison of the mainline, Samsung and bootloader
+power-on states and the decision tree.
 
 ## Still open
 
