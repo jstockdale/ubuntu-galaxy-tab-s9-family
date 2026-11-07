@@ -1,0 +1,424 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Late release of the interconnect boot floor on the SM-X710 (samsung,gts9wifi).
+#
+# Until every interconnect provider has reached sync_state(), the kernel keeps
+# a floor of INT_MAX under every node (drivers/interconnect/core.c,
+# aggregate_requests()): every NoC, LLCC and DDR stays at its top vote in the
+# active, wake and sleep sets, so DDR never scales and the SoC can never reach
+# CX collapse or DDR low power, awake or asleep.  icc_sync_state() is global:
+# it only counts the providers that have synced, and drops the floor of all
+# fourteen at once when the last one does.  A provider reading state_synced=1
+# therefore says nothing about its own floor.
+#
+# On this board two providers never sync by themselves: gem_noc
+# (24100000.interconnect) and mc_virt (interconnect-1) wait for their last
+# consumers, the DDR bandwidth monitors pmu@240b6400 and pmu@24091000, whose
+# driver is held back on purpose (modprobe blacklist, or
+# initcall_blacklist=bwmon_driver_init on a kernel that builds it in).  Letting
+# the floor go early in boot - bwmon built in (Stage 3), or its PMUs disabled
+# in the DT (Stage 3b) - hung the boot-time pm_test=platform cycle of
+# ubuntu-gts9u-panel-coldboot-recover every time (watchdog reset, boot loop).
+# Releasing it at runtime, after that cycle, held (Stage 0 on the baseline
+# kernel, including a later pm_test=platform cycle; Stage 2 on 2026-11-07).
+# docs/gts9wifi-interconnect.md has the evidence and the open questions.
+#
+# So this runs once per boot, after the panel cycle has returned, and writes
+# "1" to state_synced of every interconnect provider that is still unsynced
+# and is held back by nothing but those unbound monitors.  It does nothing:
+#   - on any other board (the unit also carries ConditionFirmware);
+#   - unless the panel cycle unit finished successfully this boot (or cannot
+#     run on this kernel at all): after a failed or skipped cycle the floor is
+#     kept, because a retried cycle would then run without it;
+#   - while a pm_test level is selected;
+#   - while /etc/ubuntu-gts9u/icc-hold exists (the owner's persistent off
+#     switch; it can also be created from TWRP, under /data);
+#   - if any unsynced interconnect provider waits for anything else.  The
+#     release is all or nothing: a partial one would hand the moment the floor
+#     drops to whichever consumer binds last.
+# It never touches a provider that is not an interconnect (rpmhpd, gcc,
+# gpu_cc, ...), whatever it reads.  A release cannot be undone; a reboot
+# brings the floor back.
+#
+#   ubuntu-gts9u-icc-late-release release   what the unit runs (root)
+#   ubuntu-gts9u-icc-late-release check     what release would do now; writes nothing
+#   ubuntu-gts9u-icc-late-release status    providers, blockers and the last release
+#
+# check and status need no root (the INT_MAX count needs debugfs, so without
+# root it comes from the last release's record).  The record of each boot's
+# decision is /run/ubuntu-gts9u/icc-release (key=value) and
+# /var/log/ubuntu-gts9u-icc-release.log (group adm), since this board's
+# journal usually loses its first ~40 s and this runs at ~33 s.
+set -u
+
+PLATFORM_DEVICES=/sys/bus/platform/devices
+DT_COMPATIBLE=/proc/device-tree/compatible
+ICC_SUMMARY=/sys/kernel/debug/interconnect/interconnect_summary
+PM_TEST=/sys/power/pm_test
+SUSPEND_STATS=/sys/power/suspend_stats
+KMSG=/dev/kmsg
+LOG=/var/log/ubuntu-gts9u-icc-release.log
+STATE=/run/ubuntu-gts9u/icc-release
+BOOT_ID=/proc/sys/kernel/random/boot_id
+HOLD_FILE=/etc/ubuntu-gts9u/icc-hold
+UPTIME=/proc/uptime
+
+BOARD=samsung,gts9wifi
+CYCLE_UNIT=ubuntu-gts9u-panel-coldboot-recover.service
+# The only consumers allowed to stand between a provider and its release:
+# the two DDR bandwidth monitors, and only while no driver is bound to them.
+ALLOWED_BLOCKERS='24091000.pmu 240b6400.pmu'
+# Never written, even if one ever showed up with interconnect cells.
+NEVER_WRITE='17a00000.rsc:power-controller 100000.clock-controller 3d90000.clock-controller'
+# How long to wait for the cycle unit when it is still running (it is ordered
+# before this unit, so normally it has long finished).
+CYCLE_WAIT_POLLS=${GTS9U_ICC_CYCLE_WAIT_POLLS:-120}
+INT_MAX=2147483647
+
+me=ubuntu-gts9u-icc-late-release
+
+say() {
+	echo "$me: $*"
+	if [ -n "${log_ok:-}" ]; then
+		printf '%s up=%s %s\n' "$(date '+%F %T')" "$(uptime_s)" "$*" >> "$LOG" 2>/dev/null || :
+	fi
+}
+
+uptime_s() {
+	cut -d' ' -f1 "$UPTIME" 2>/dev/null || echo '?'
+}
+
+kmsg() {
+	[ -w "$KMSG" ] && printf '%s: %s\n' "$me" "$*" >> "$KMSG" 2>/dev/null || :
+}
+
+is_board() {
+	[ -r "$DT_COMPATIBLE" ] && tr '\0' '\n' < "$DT_COMPATIBLE" | grep -qx "$BOARD"
+}
+
+in_list() { # word list
+	for w in $2; do
+		[ "$w" = "$1" ] && return 0
+	done
+	return 1
+}
+
+intmax_count() {
+	# grep -c prints 0 and fails when nothing matches; an unreadable file
+	# (no root, no debugfs) prints nothing.
+	n=$(grep -c "$INT_MAX" "$ICC_SUMMARY" 2>/dev/null) || :
+	[ -n "$n" ] && echo "$n" || echo n/a
+}
+
+synced_of() {
+	cat "$1/state_synced" 2>/dev/null || echo n/a
+}
+
+# Interconnect providers with a bound sync_state() driver: platform devices
+# whose DT node has #interconnect-cells and that expose state_synced.
+icc_providers() {
+	for d in "$PLATFORM_DEVICES"/*; do
+		[ -e "$d/state_synced" ] || continue
+		[ -e "$d/of_node/#interconnect-cells" ] || continue
+		in_list "${d##*/}" "$NEVER_WRITE" && continue
+		echo "$d"
+	done
+}
+
+has_compatible() { # device fragment
+	[ -r "$1/of_node/compatible" ] && tr '\0' '\n' < "$1/of_node/compatible" | grep -q -- "$2"
+}
+
+# Sets $allowed (unbound bwmon consumers) and $foreign (anything else that
+# keeps provider $1 from syncing), each a space-separated list.
+classify_consumers() {
+	allowed=
+	foreign=
+	for link in "$1"/consumer:*; do
+		[ -e "$link" ] || continue
+		status=$(cat "$link/status" 2>/dev/null || echo unknown)
+		# Only managed links hold sync_state() back, and an active one is
+		# satisfied.  "not tracked" is a stateless (unmanaged) link.
+		case "$status" in
+		active|'not tracked') continue ;;
+		esac
+		c=$(readlink -f "$link/consumer" 2>/dev/null) || c=
+		name=${c##*/}
+		[ -n "$name" ] || name=${link##*/consumer:}
+		if in_list "$name" "$ALLOWED_BLOCKERS" && [ ! -e "$c/driver" ] &&
+			has_compatible "$c" bwmon; then
+			allowed="$allowed $name"
+		else
+			foreign="$foreign $name($status)"
+		fi
+	done
+	allowed=${allowed# }
+	foreign=${foreign# }
+}
+
+# Sets $eligible (provider paths to release), $held_by (why not), $synced_list.
+plan() {
+	eligible=
+	held_by=
+	synced_list=
+	for p in $(icc_providers); do
+		s=$(synced_of "$p")
+		if [ "$s" = 1 ]; then
+			synced_list="$synced_list ${p##*/}"
+			continue
+		fi
+		classify_consumers "$p"
+		if [ -n "$foreign" ]; then
+			held_by="$held_by ${p##*/} waits for $foreign;"
+		elif [ -z "$allowed" ]; then
+			# Every managed consumer is bound, yet it has not synced:
+			# nothing this script understands.  Leave it to the kernel.
+			held_by="$held_by ${p##*/} reads $s with no unbound consumer;"
+		else
+			eligible="$eligible $p"
+			say "${p##*/}: state_synced=$s, waiting only for unbound $allowed"
+		fi
+	done
+	eligible=${eligible# }
+	held_by=${held_by# }
+	synced_list=${synced_list# }
+}
+
+# key=value lines in $STATE, readable without root.
+record() {
+	mkdir -p "${STATE%/*}" 2>/dev/null || return 0
+	{
+		echo "boot_id=$(cat "$BOOT_ID" 2>/dev/null)"
+		echo "uptime=$(uptime_s)"
+		echo "result=$1"
+		echo "reason=$2"
+		echo "released=${released:-}"
+		echo "intmax_before=${intmax_before:-n/a}"
+		echo "intmax_after=${intmax_after:-n/a}"
+	} > "$STATE.tmp" 2>/dev/null && chmod 0644 "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+}
+
+open_log() {
+	if [ ! -e "$LOG" ]; then
+		: > "$LOG" 2>/dev/null || return 0
+		chmod 0640 "$LOG" 2>/dev/null
+		chgrp adm "$LOG" 2>/dev/null
+	fi
+	# Keep the last few hundred lines (one boot writes about ten).
+	if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 600 ]; then
+		tail -n 400 "$LOG" > "$LOG.tmp" 2>/dev/null && cat "$LOG.tmp" > "$LOG" 2>/dev/null
+		rm -f "$LOG.tmp"
+	fi
+	log_ok=1
+}
+
+# Sets $cycle_ok (yes/no) and $cycle_why from the panel cycle unit's state.
+cycle_verdict() {
+	cycle_ok=no
+	polls=0
+	while :; do
+		load= active= result= cond= condts= exitts=
+		props=$(systemctl show "$CYCLE_UNIT" -p LoadState -p ActiveState \
+			-p Result -p ConditionResult -p ConditionTimestampMonotonic \
+			-p ExecMainExitTimestampMonotonic 2>/dev/null) || props=
+		while IFS='=' read -r key value; do
+			case "$key" in
+			LoadState) load=$value ;;
+			ActiveState) active=$value ;;
+			Result) result=$value ;;
+			ConditionResult) cond=$value ;;
+			ConditionTimestampMonotonic) condts=$value ;;
+			ExecMainExitTimestampMonotonic) exitts=$value ;;
+			esac
+		done <<EOF
+$props
+EOF
+		case "$active" in
+		activating|deactivating|reloading|refreshing) ;;
+		*) break ;;
+		esac
+		if [ "$polls" -ge "$CYCLE_WAIT_POLLS" ]; then
+			cycle_why="$CYCLE_UNIT still $active after $polls s"
+			return
+		fi
+		[ "$polls" = 0 ] && say "waiting for $CYCLE_UNIT ($active)"
+		sleep 1
+		polls=$((polls + 1))
+	done
+	state="load=$load active=$active result=$result condition=$cond"
+	case "$load" in
+	'')
+		cycle_why="cannot read $CYCLE_UNIT from systemd"
+		return
+		;;
+	not-found)
+		cycle_ok=yes
+		cycle_why="no $CYCLE_UNIT installed, so there is no boot cycle to protect"
+		return
+		;;
+	masked)
+		cycle_why="$CYCLE_UNIT is masked: no boot cycle ran, and one run by hand later must not run without the floor"
+		return
+		;;
+	esac
+	if [ "${condts:-0}" != 0 ] && [ "$cond" = no ]; then
+		cycle_ok=yes
+		cycle_why="$CYCLE_UNIT skipped by its condition (no pm_test on this kernel): no cycle can run"
+		return
+	fi
+	if [ "$result" = success ] && { [ "$active" = active ] || [ "${exitts:-0}" != 0 ]; }; then
+		cycle_ok=yes
+		cycle_why="$CYCLE_UNIT finished ($state)"
+		return
+	fi
+	if [ "${condts:-0}" = 0 ]; then
+		cycle_why="$CYCLE_UNIT has not run this boot ($state)"
+	else
+		cycle_why="$CYCLE_UNIT did not succeed ($state)"
+	fi
+}
+
+pm_test_idle() {
+	[ -r "$PM_TEST" ] || return 0
+	grep -q '\[none\]' "$PM_TEST"
+}
+
+others_line() {
+	echo "not touched: rpmhpd=$(synced_of "$PLATFORM_DEVICES/17a00000.rsc:power-controller")" \
+		"gcc=$(synced_of "$PLATFORM_DEVICES/100000.clock-controller")" \
+		"gpu_cc=$(synced_of "$PLATFORM_DEVICES/3d90000.clock-controller")"
+}
+
+do_release() {
+	dry=$1
+	if ! is_board; then
+		echo "$me: not $BOARD; nothing to do"
+		[ "$dry" = no ] && record not-board "not $BOARD"
+		return 0
+	fi
+	[ "$dry" = no ] && open_log
+	say "boot $(cut -c1-8 "$BOOT_ID" 2>/dev/null), kernel $(uname -r)$([ "$dry" = yes ] && echo ', dry run')"
+
+	plan
+	[ -n "$synced_list" ] && say "already synced: $synced_list"
+	if [ -z "$eligible" ] && [ -z "$held_by" ]; then
+		say 'every interconnect provider is synced; nothing to release'
+		[ "$dry" = no ] && record nothing 'all synced'
+		return 0
+	fi
+	if [ -n "$held_by" ]; then
+		say "HOLD: $held_by nothing is released (all or nothing)"
+		[ "$dry" = no ] && record held "$held_by"
+		return 0
+	fi
+
+	if [ -e "$HOLD_FILE" ]; then
+		say "HOLD: $HOLD_FILE exists; remove it to let the next boot release the floor"
+		[ "$dry" = no ] && record held "$HOLD_FILE"
+		return 0
+	fi
+
+	cycle_verdict
+	if [ "$cycle_ok" != yes ]; then
+		say "HOLD: $cycle_why; the floor stays this boot (once the cycle unit has succeeded, 'systemctl restart ${me}.service' releases it)"
+		[ "$dry" = no ] && record held "$cycle_why"
+		return 0
+	fi
+	say "panel cycle: $cycle_why"
+	if ! pm_test_idle; then
+		say "HOLD: a pm_test level is selected ($(cat "$PM_TEST")); a test cycle may be in progress"
+		[ "$dry" = no ] && record held 'pm_test selected'
+		return 0
+	fi
+
+	intmax_before=$(intmax_count)
+	names=
+	for p in $eligible; do names="$names ${p##*/}"; done
+	names=${names# }
+	if [ "$dry" = yes ]; then
+		say "would release: $names (INT_MAX nodes now: $intmax_before)"
+		return 0
+	fi
+
+	say "releasing: $names (INT_MAX nodes: $intmax_before; suspend_stats $(cat "$SUSPEND_STATS/success" 2>/dev/null)/$(cat "$SUSPEND_STATS/fail" 2>/dev/null))"
+	kmsg "releasing $names (blocked only by the unbound DDR bandwidth monitors)"
+	sync
+	released=
+	failed=
+	for p in $eligible; do
+		n=${p##*/}
+		# printf, not echo: state_synced_store() accepts exactly "1"; a
+		# trailing newline is -EINVAL.
+		if printf 1 > "$p/state_synced" 2>/dev/null; then
+			:
+		elif [ "$(synced_of "$p")" = 1 ]; then
+			say "$n: synced by itself meanwhile"
+		else
+			failed="$failed $n(write)"
+			continue
+		fi
+		got=$(synced_of "$p")
+		if [ "$got" = 1 ]; then
+			released="$released $n"
+		else
+			failed="$failed $n(reads $got)"
+		fi
+	done
+	released=${released# }
+	failed=${failed# }
+	intmax_after=$(intmax_count)
+	say "read back:$(for p in $eligible; do printf ' %s=%s' "${p##*/}" "$(synced_of "$p")"; done); INT_MAX nodes $intmax_before -> $intmax_after"
+	say "$(others_line)"
+	kmsg "released ${released:-nothing}; INT_MAX nodes $intmax_before -> $intmax_after"
+	if [ -n "$failed" ]; then
+		say "FAILED: $failed"
+		record failed "$failed"
+		return 1
+	fi
+	case "$intmax_after" in
+	0|n/a) ;;
+	*) say "note: $intmax_after nodes still read INT_MAX; the floor only drops when every provider has synced" ;;
+	esac
+	record released "$cycle_why"
+	return 0
+}
+
+do_status() {
+	is_board || echo "board: not $BOARD (this helper does nothing here)"
+	echo "interconnect providers (the floor of all of them drops when the last one syncs):"
+	for p in $(icc_providers); do
+		s=$(synced_of "$p")
+		if [ "$s" = 1 ]; then
+			echo "${p##*/}: state_synced=1"
+		else
+			classify_consumers "$p"
+			echo "${p##*/}: state_synced=$s; unbound bwmon: ${allowed:-none}; other blockers: ${foreign:-none}"
+		fi
+	done
+	echo "$(others_line)"
+	echo "INT_MAX nodes now: $(intmax_count) (n/a: needs root and debugfs)"
+	if [ -r "$STATE" ]; then
+		echo "--- $STATE"
+		cat "$STATE"
+	else
+		echo "--- no release record this boot ($STATE)"
+	fi
+	if [ -r "$LOG" ]; then
+		echo "--- $LOG (last 12 lines)"
+		tail -n 12 "$LOG"
+	fi
+}
+
+case "${1:-release}" in
+release)
+	[ "$(id -u)" = 0 ] || { echo "$me: release needs root" >&2; exit 1; }
+	do_release no
+	;;
+check) do_release yes ;;
+status) do_status ;;
+*)
+	echo "usage: ${0##*/} [release|check|status]" >&2
+	exit 2
+	;;
+esac
