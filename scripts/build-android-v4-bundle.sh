@@ -86,6 +86,30 @@ case " $cmdline " in
 	*) echo "cmdline.txt carries no root=LABEL=UBTS9U_UFS token to retarget" >&2; exit 1 ;;
 esac
 cmdline=${cmdline/root=LABEL=UBTS9U_UFS/root=LABEL=$DEVICE_LABEL}
+# Tokens of cmdline.txt to leave out of one experiment's image, e.g. one of
+# the bring-up flags clk_ignore_unused, pd_ignore_unused or
+# regulator_ignore_unused, without editing cmdline.txt, which both tablets
+# share.  Each token has to be a whole word of cmdline.txt: a typo fails the
+# build instead of packaging the unchanged cmdline.  root= is never dropped.
+if [ -n "${GTS9U_DROP_CMDLINE:-}" ]; then
+	read -r -a drop_tokens <<< "$GTS9U_DROP_CMDLINE"
+	for token in "${drop_tokens[@]}"; do
+		case "$token" in
+			root=*) echo "GTS9U_DROP_CMDLINE: refusing to drop $token" >&2; exit 1 ;;
+		esac
+		padded=" $cmdline "
+		case "$padded" in
+			*" $token "*) ;;
+			*) echo "GTS9U_DROP_CMDLINE: '$token' is not a token of cmdline.txt" >&2; exit 1 ;;
+		esac
+		while [[ $padded == *" $token "* ]]; do
+			padded=${padded/" $token "/ }
+		done
+		cmdline=${padded# }
+		cmdline=${cmdline% }
+	done
+	echo "vendor_boot cmdline drop: ${GTS9U_DROP_CMDLINE}"
+fi
 # Extra tokens for bring-up experiments (module parameters of built-in
 # drivers, initcall_blacklist=...).  Only vendor_boot.img carries them, so an
 # experiment is a repack of that one image, not a kernel rebuild.
