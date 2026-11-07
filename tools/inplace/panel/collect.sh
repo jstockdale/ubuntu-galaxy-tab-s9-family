@@ -103,4 +103,5 @@ chgrp -R adm "$base"
 chmod 2750 "$base" "$base/$boot" "$out"
 find "$out" -type f -exec chmod 0640 {} +
 echo "saved $out ($(wc -l < "$out/dmesg.txt") dmesg lines)"
-sed -n '1,/^== registers/p' "$out/report.txt" | head -n 60
+head -n 120 "$out/report.txt"
+[ "$(wc -l < "$out/report.txt")" -le 120 ] || echo "... (full report: $out/report.txt)"

@@ -126,6 +126,27 @@ class KitTest(unittest.TestCase):
             subprocess.run(["dash", "-n", str(KIT / name)], check=True)
         subprocess.run(["bash", "-n", str(KIT / "make-images.sh")], check=True)
 
+    def test_dispcc_registers_are_read_by_seeking(self):
+        """collect.sh reads single regmap debugfs lines; check the offsets."""
+        text = (KIT / "collect.sh").read_text()
+        start = text.index("{\n\tr=$(ls -d")
+        end = text.index('} > "$out/dispcc.txt"')
+        block = text[start:end] + "}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            regs = root / "regmap/af00000.clock-controller"
+            regs.mkdir(parents=True)
+            special = {0x9000: 0x80008001, 0xf000: 0x00000001}
+            with open(regs / "registers", "w") as f:
+                for reg in range(0, 0x11008 + 4, 4):
+                    f.write("%05x: %08x\n" % (reg, special.get(reg, reg)))
+            script = root / "block.sh"
+            script.write_text("d=%s\n%s" % (root, block))
+            out = subprocess.run(["dash", str(script)], capture_output=True, text=True,
+                                 check=True).stdout.splitlines()
+        self.assertEqual(out, ["08000: 00008000", "09000: 80008001", "0a000: 0000a000",
+                               "0b000: 0000b000", "0f000: 00000001"])
+
     @unittest.skipUnless(os.environ.get("PANEL_BASE_VENDOR_BOOT"), "no fix2-s2 vendor_boot")
     def test_make_images_reproduces_the_kit_hashes(self):
         with tempfile.TemporaryDirectory() as directory:
