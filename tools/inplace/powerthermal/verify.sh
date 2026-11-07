@@ -35,10 +35,31 @@ state=$(systemctl is-active rtkit-daemon.service 2>/dev/null || true)
 
 pw=$(pgrep -u "$me" -x pipewire | head -n 1 || true)
 if [ -n "$pw" ]; then
+	# The desktop user lingers: PipeWire may have started at boot, before the
+	# graphical session existed, when polkit had no session to vouch for it.
+	gsess=$(loginctl list-sessions --no-legend 2>/dev/null |
+		awk -v u="$me" '$3 == u && $4 == "seat0" { print $1; exit }')
+	early=no
+	if [ -n "$gsess" ]; then
+		smono=$(loginctl show-session "$gsess" -p TimestampMonotonic --value 2>/dev/null || true)
+		pstart=$(awk '{ print $22 }' "/proc/$pw/stat" 2>/dev/null || true)
+		hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+		if [ -n "$smono" ] && [ -n "$pstart" ] &&
+		   [ $((pstart / hz)) -lt $((smono / 1000000)) ]; then
+			early=yes
+			info "pipewire $pw started before your graphical session $gsess (lingering user manager)"
+		fi
+	fi
 	cls=$(ps -L -o cls=,rtprio=,comm= -p "$pw" | awk '$3 == "pw-data-loop" { print $1 "/" $2; exit }')
 	case "$cls" in
 	FF/*|RR/*) ok "pipewire $pw data loop runs $cls" ;;
-	*) check "pipewire $pw data loop runs ${cls:-?} (expected FF/n): log out and back in, or reboot, after installing rtkit" ;;
+	*)
+		check "pipewire $pw data loop runs ${cls:-?} (expected RR/20 via rtkit)"
+		if [ "$early" = yes ]; then
+			info '  started before login, when polkit has no session for it and rtkit policy says allow_any=no: restart the audio services now; for boots see README.md (optional polkit rule)'
+		fi
+		info '  restart: systemctl --user restart pipewire.service filter-chain.service pipewire-pulse.service wireplumber.service'
+		;;
 	esac
 	rterr=$(journalctl --user -b --no-pager _PID="$pw" 2>/dev/null | grep -c 'RTKit error' || true)
 	[ "$rterr" = 0 ] && ok "no 'RTKit error' from this pipewire" ||
@@ -49,10 +70,13 @@ fi
 gs=$(pgrep -u "$me" -x gnome-shell | head -n 1 || true)
 if [ -n "$gs" ]; then
 	kms=$(ps -L -o cls=,rtprio=,comm= -p "$gs" | awk '/KMS thread/ { print $1 "/" $2; exit }')
+	# Informational only: Mutter drops the KMS thread back to SCHED_OTHER
+	# around mode sets, and a GNOME 49 desktop with rtkit was seen running it
+	# as TS too, so TS here is not a failure.
 	case "$kms" in
 	FF/*|RR/*) ok "gnome-shell KMS thread runs $kms" ;;
 	'') info 'gnome-shell has no KMS thread' ;;
-	*) check "gnome-shell KMS thread runs $kms (expected FF/n after a new login with rtkit)" ;;
+	*) info "gnome-shell KMS thread runs $kms (RR after a new login with rtkit if Mutter asks; not required)" ;;
 	esac
 fi
 

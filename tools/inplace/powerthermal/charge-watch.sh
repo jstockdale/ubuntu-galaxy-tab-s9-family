@@ -70,5 +70,10 @@ count() { printf '%s\n' "$klog" | grep -c -e "$1" || true; }
 	echo "UPower states seen: $(cut -d, -f16 "$csv" | tail -n +2 | sort | uniq -c | tr '\n' ' ')"
 	neg_chg=$(awk -F, 'NR > 1 && $2 == "Charging" && $4 < -100000' "$csv" | wc -l)
 	echo "samples 'Charging' with current_avg < -100 mA: $neg_chg (expected 0 with the powerthermal kernel)"
-	echo "report_net_drain parameter: $(r /sys/module/sm5714_battery/parameters/report_net_drain || echo absent)"
+	p=/sys/module/sm5714_battery/parameters/report_net_drain
+	if [ -r "$p" ]; then
+		echo "report_net_drain parameter: $(r "$p")"
+	else
+		echo 'report_net_drain parameter: absent (kernel without the powerthermal commits)'
+	fi
 } | tee "$sumf"

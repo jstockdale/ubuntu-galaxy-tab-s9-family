@@ -21,8 +21,15 @@
 #      writes two snippets into the gdm user's ~/.config/wireplumber.  When the
 #      installed device package already ships the helper, only the helper runs.
 #
-# rtkit reaches PipeWire and Mutter's KMS thread at the next login (log out and
-# back in, or reboot); the greeter snippet at the next boot.  The kernel half
+# rtkit reaches PipeWire when its user services restart inside the logged-in
+# session: the desktop user lingers, so logging out does not restart them, and
+# at boot they start before anyone logs in, when polkit finds no session for
+# them and rtkit's stock policy (allow_any=no) refuses.  So, as the desktop
+# user while logged in:
+#   systemctl --user restart pipewire.service filter-chain.service \
+#       pipewire-pulse.service wireplumber.service
+# Mutter asks again at the next login.  The greeter snippet applies the next
+# time the login screen starts (next boot).  See README.md.  The kernel half
 # (SM5440/SM5714 charging fixes, thermal DT) needs the next kernel build and is
 # not in this kit.
 set -eu
@@ -147,5 +154,5 @@ else
 fi
 
 say "done: rtkit=$rtkit_ok greeter=$greeter_ok"
-say 'next: log out and back in (or reboot) so PipeWire and Mutter ask rtkit; the greeter change applies from the next boot; then: sh ~/powerthermal/verify.sh'
+say 'next, as the desktop user while logged in: systemctl --user restart pipewire.service filter-chain.service pipewire-pulse.service wireplumber.service; then sh ~/powerthermal/verify.sh.  The greeter change applies from the next boot.'
 [ "$rtkit_ok" = 1 ] && [ "$greeter_ok" = 1 ]

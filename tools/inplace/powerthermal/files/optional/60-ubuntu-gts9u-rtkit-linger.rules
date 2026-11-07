@@ -1,0 +1,19 @@
+// Optional, from the powerthermal kit; install.sh does NOT install it.
+//
+//   sudo install -m 0644 60-ubuntu-gts9u-rtkit-linger.rules /etc/polkit-1/rules.d/
+//   sudo rm /etc/polkit-1/rules.d/60-ubuntu-gts9u-rtkit-linger.rules   (undo)
+//
+// The desktop user lingers, so their PipeWire starts at boot before anyone
+// logs in.  polkit then finds no session for it, and rtkit's stock policy for
+// org.freedesktop.RealtimeKit1.* says allow_any=no, so rtkit refuses and the
+// audio data loops stay SCHED_OTHER for the whole boot.  This lets members of
+// the audio group ask rtkit from outside a session as well.  rtkit still caps
+// the priority (20), insists on RLIMIT_RTTIME and demotes every realtime
+// thread if its canary starves.
+polkit.addRule(function (action, subject) {
+	if ((action.id == "org.freedesktop.RealtimeKit1.acquire-real-time" ||
+	     action.id == "org.freedesktop.RealtimeKit1.acquire-high-priority") &&
+	    subject.isInGroup("audio")) {
+		return polkit.Result.YES;
+	}
+});

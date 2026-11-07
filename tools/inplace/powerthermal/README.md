@@ -15,11 +15,43 @@ Copy it to the tablet and check it first (from the build host):
 | `rollback.sh` | sudo | undoes exactly what `install.sh` did (rtkit only if the kit installed it) |
 | `verify.sh` | user | read-only checks for both halves; `ok` / `CHECK` / `info` lines |
 | `charge-watch.sh [min] [label]` | user | logs charging every 5 s to `~/powerthermal-logs`, then counts the kernel lines of the window |
-| `thermal-loadtest.py` | user | sustained 3.36 GHz prime-core load with temperature, clock and LMh logging |
+| `thermal-loadtest.py` | user | sustained 3.36 GHz prime-core load with temperature, clock and LMh logging; its workers die with it (Ctrl-C, hangup, even kill -9) |
 | `files/` | - | copies of what `ubuntu-gts9u-device` will ship for the greeter |
+| `files/optional/60-ubuntu-gts9u-rtkit-linger.rules` | sudo, by hand | polkit rule, only if PipeWire stays SCHED_OTHER after a reboot (see below); not installed by `install.sh` |
 
-Nothing in the kit restarts a service.  rtkit reaches PipeWire and Mutter at
-the next login; the greeter snippet at the next boot.
+Nothing in the kit restarts a service.  The greeter snippet applies the next
+time the login screen starts (next boot).  For rtkit, see the next section.
+
+## rtkit, linger and when PipeWire actually gets realtime
+
+The desktop user lingers (`loginctl show-user jstockdale -p Linger` is `yes`),
+so `pipewire`, `filter-chain` (the speaker DSP chain), `pipewire-pulse` and
+`wireplumber` run in the user manager from boot until shutdown:
+
+- logging out and back in does **not** restart them.  After `install.sh`,
+  restart them by hand, as the desktop user, while logged in (a short audio
+  gap; `filter-chain` is listed because it is BindsTo pipewire and a plain
+  `restart pipewire` would leave the speakers' DSP chain stopped):
+
+      systemctl --user restart pipewire.service filter-chain.service pipewire-pulse.service wireplumber.service
+
+- at boot they start before anyone logs in.  rtkit asks polkit, polkit finds
+  no session for a process outside one (`sd_uid_get_display` has nothing yet),
+  and the stock rtkit policy says `allow_any=no`, so realtime is most likely
+  refused for that whole boot.  `verify.sh` says when PipeWire started before
+  the graphical session.  If the data loop is still `TS` after a reboot, the
+  optional rule lets members of the `audio` group (only `jstockdale` here)
+  ask rtkit from outside a session too; rtkit still caps the priority at 20,
+  requires RLIMIT_RTTIME and demotes everything if its canary starves:
+
+      sudo install -m 0644 ~/powerthermal/files/optional/60-ubuntu-gts9u-rtkit-linger.rules /etc/polkit-1/rules.d/
+      sudo rm /etc/polkit-1/rules.d/60-ubuntu-gts9u-rtkit-linger.rules   # undo (rollback.sh removes it too)
+
+  polkitd rereads its rules by itself; the effect shows at the next boot.
+
+rtkit grants SCHED_RR, so `verify.sh` expects `RR/20`.  Mutter's KMS thread
+may stay `TS` (Mutter drops it back around mode sets, and a GNOME 49 desktop
+with rtkit was seen running it as TS); that line is informational.
 
 ## What was found
 
@@ -46,6 +78,19 @@ Kernel fix (`sm5440_direct.c`):
 - re-evaluate about 1 s after any TCPM change (a power-supply notifier), so a
   PPS charger no longer waits up to 30 s;
 - in suspend, stop the work first and then hand back.
+
+What this does not change: a direct-charge *session* that starts and then
+dies.  On this X710 with a PPS charger (kern.log, 2026-11-06 13:11-13:17)
+three sessions ended the same way: TCPM dropped back to the fixed 9 V PDO
+("USB-PD contract: 9000 mV, 1660 mA", once 48 ms after the PPS contract,
+then after 2 min and after 47 s), so the next PPS refresh got -95 because
+`pps_data.active` was false, the driver handed back ("enabled charging") and
+started again 30.7 s later; the fourth ran 49 s until the cable was pulled.  Mainline
+TCPM renegotiates a fixed PDO whenever the source sends Source_Capabilities
+in SNK_READY, and that is the likely trigger; TCPM's own log
+(`/sys/kernel/debug/usb/tcpm-4-0033/log`, root) during a PPS charge would
+settle it.  The 30 s pause after a stop is unchanged, so with that charger
+expect a restart every 1-2.5 minutes, not one continuous session.
 
 Kernel fix (`sm5714_battery.c`):
 - `configure_charging()` now re-checks `direct_charging` under its lock.  The
@@ -85,7 +130,10 @@ runtime switch is `/sys/module/sm5714_battery/parameters/report_net_drain`
 **Audio userspace.**
 - rtkit was not installed: PipeWire logged `RTKit error: ServiceUnknown`, and
   `pw-data-loop` and Mutter's `KMS thread` ran as SCHED_OTHER.  rtkit is now
-  in the rootfs package list, and this kit installs it.
+  in the rootfs package list, and this kit installs it.  Because the desktop
+  user lingers, see "rtkit, linger and when PipeWire actually gets realtime"
+  above: without the optional polkit rule, PipeWire is likely to get realtime
+  only after a manual restart inside the session, not at boot.
 - The GDM greeter's WirePlumber took the Bluetooth profiles at boot.  The
   device package now writes a WirePlumber snippet into the gdm user's
   `~/.config/wireplumber` that turns off the greeter's bluez (and bluez-midi)
@@ -94,7 +142,8 @@ runtime switch is `/sys/module/sm5714_battery/parameters/report_net_drain`
 
 ## Rollback
 
-- userspace: `sudo sh ~/powerthermal/rollback.sh`
+- userspace: `sudo sh ~/powerthermal/rollback.sh` (also removes the optional
+  polkit rule if it was installed), then restart the audio services as above
 - the net-drain status alone, at runtime:
   `echo 0 | sudo tee /sys/module/sm5714_battery/parameters/report_net_drain`
 - the kernel half: boot the previous boot/vendor_boot images (fix2-s2), as
