@@ -35,8 +35,8 @@ DDIC would keep TCON_RDY low, so the host side is the main suspect.
 | display boost MAX77816 (i2c hub, 0x18) | configured | `03=70, 02=8E` before every reset | not described, never written | never written |
 
 What a working power-on has that the first one lacks is, on the host side, a
-GDSC collapse of the MDSS (which resets the DSI controller and asserts the
-reset into the PHY) and, on the panel side, a DDIC that came up from its
+GDSC collapse of the MDSS (which should reset the DSI controller and, unless
+DISP_CC_MISC_CMD bit 0 masks it, the PHY) and, on the panel side, a DDIC that came up from its
 supplies instead of from a reset pulse. A continuous HS clock is not the
 answer: `continuous_clock=1` blacked the glass but still read `80 00 04`.
 The experiments below separate the two sides; the register dumps name what
@@ -136,7 +136,9 @@ Do not plug in a DisplayPort monitor during the masked boots (see Couplings).
    power-cycled` and no `display errors`. Then log in and do three
    power-key blank/wake rounds; each must light within ~1 s, and
    `journalctl -k -b | grep 'panel id'` (no sudo) shows `80 00 04` for each.
-   No SSH after 3 minutes, or a reboot loop: recovery below.
+   If the glass stays dark instead (FAIL), the boot is still a masked one:
+   `sudo sh ~/panel/e3.sh` gives E3 on it as well. No SSH after 3 minutes,
+   or a reboot loop: recovery below.
 
 4. **panel-e2** (skip if E1 passed and time is short):
 
@@ -146,6 +148,7 @@ Do not plug in a DisplayPort monitor during the masked boots (see Couplings).
    PASS: `E2 (display-only boot cycle): PASS - boot display cycle: MDSS
    GDSC power-cycled[ (noirq-style)], N ms`, login screen visible without
    the cycle. `stayed on` in that line means the GDSC refused to collapse.
+   Dark glass: `sudo sh ~/panel/e3.sh` as in step 3.
 
 5. **Back to fix2-s2**:
 
@@ -221,7 +224,8 @@ parameters, both off by default, set as `panel_samsung_ana38407.<name>=`:
   its supplies released) for N ms (at most 2000), so the first power-on
   starts like every later one. Logs `first power-on: DDIC held off N ms
   before it (TCON_RDY high, then low|high)` - `then high` means a rail this
-  driver does not control (`panel_ldo_en`, GPIO 187) kept it up.
+  driver does not switch kept the DDIC up (`panel_ldo_en` on GPIO 187, or
+  vddio/vci, which the touchscreen and the digitizer hold).
 * `trace_power_on=1` - one line per power-on with the supplies, the TCON_RDY
   timing and the id, so later power-ons can be compared with the first
   one's 114-115 ms.
