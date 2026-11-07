@@ -10,8 +10,10 @@
 # clock and applied early on the next boot.  The kernel no longer copies the
 # counter into the system clock itself (RTC_HCTOSYS is off for this board).
 #
-#   restore  set the clock to RTC + saved offset, never backwards
-#   save     store wall clock - RTC, only while NTP-synchronised
+#   restore  set the clock to RTC + saved offset, never backwards; runs
+#            before journald (ubuntu-gts9u-rtc-restore.service)
+#   save     store wall clock - RTC, only while NTP-synchronised, and
+#            refresh systemd's clock epoch (/usr/lib/clock-epoch)
 #
 # Alarms need none of this: rtcwake and the alarm timers program the RTC
 # relative to its own counter.
@@ -54,9 +56,9 @@ restore)
 		echo "RTC + saved offset lies beyond 2100; left alone" >&2
 		exit 0
 	fi
-	# systemd has already advanced a 1970 clock to its build epoch, and
-	# timesyncd's clock file may be later still: a counter that was reset
-	# with the battery must not drag the clock back behind either.
+	# PID 1 has already advanced a 1970 clock to its epoch (the mtime of
+	# /usr/lib/clock-epoch, else systemd's build date): a counter that was
+	# reset with the battery must not drag the clock back behind it.
 	when=$(date -u -d "@$now" '+%F %T UTC')
 	if [ "$now" -le "$(date +%s)" ]; then
 		echo "RTC + saved offset ($when) is not ahead of the clock; left alone"
@@ -69,11 +71,21 @@ save)
 	synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
 	[ "$synced" = yes ] || exit 0
 	offset=$(($(date +%s) - counter))
-	# NTP keeps the offset within a second or two between saves; only
-	# rewrite it when the RTC has really drifted or been reset.
+	# PID 1 advances a clock that is behind the mtime of this file to it
+	# before anything else runs (systemd's clock epoch; without the file it
+	# is systemd's build date).  Keeping it at the last NTP-verified time
+	# gives a boot whose restore cannot run (no offset yet, RTC reset with
+	# the battery) a recent clock instead of one weeks old.
+	touch /usr/lib/clock-epoch 2>/dev/null || true
+	# Both sides are whole seconds read at different points of their own
+	# ticks, so one true offset is saved as k or k + 1.  Keep the smaller:
+	# with k the restored clock lies 0-2 s behind the true time and NTP only
+	# ever steps it forward.  With k + 1 it could be up to 1 s ahead, and the
+	# NTP step back made journald rotate ("Time jumped backwards").  Beyond
+	# that, rewrite only when the RTC has really drifted or been reset.
 	if [ -r "$state" ]; then
 		old=$(cat "$state")
-		if valid_offset "$old" && [ "$((offset - old))" -ge -2 ] &&
+		if valid_offset "$old" && [ "$((offset - old))" -ge 0 ] &&
 		   [ "$((offset - old))" -le 2 ]; then
 			exit 0
 		fi

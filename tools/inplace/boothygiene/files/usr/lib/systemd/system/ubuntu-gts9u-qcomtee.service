@@ -1,0 +1,17 @@
+[Unit]
+Description=Qualcomm trusted execution transport for the EL721
+ConditionPathExists=/sys/bus/platform/devices/egis-el721
+# Ultra only.  The EL721 path (QTEE, the K250A secure element, Goodix FOD)
+# exists on the SM-X910 alone.  egis_el721 registers a fallback device on
+# the X710 too, so the path condition alone loaded QTEE and SNVM there.
+ConditionFirmware=device-tree-compatible(samsung,gts9uwifi)
+Before=fprintd.service
+
+[Service]
+Type=oneshot
+# HwVault reconstructs its volatile key context from the K250A secure element
+# every time libfprint opens dualfp.  The live-DT SNVM driver must therefore be
+# present before fprintd is allowed to start, including after a cold boot.
+ExecStart=/sbin/modprobe snvm
+ExecStart=/sbin/modprobe qcomtee
+RemainAfterExit=yes

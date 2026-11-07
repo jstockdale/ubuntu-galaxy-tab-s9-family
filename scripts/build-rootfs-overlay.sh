@@ -274,74 +274,21 @@ done
 # --- bring-up logger (GTS9U_BRINGUP_SDLOG=1 only) ---------------------------
 # A board with no working panel, no account yet and no USB gadget has no way to
 # show its kernel log, and Samsung's sec_log_buf route only ever carries the
-# bootloader's lines through TWRP.  This unit writes dmesg, the journal and the
-# DRM connector state onto the microSD card every minute; TWRP reads the card.
+# bootloader's lines through TWRP.  This unit writes dmesg, the journal, the
+# previous boot's ramoops records and the DRM connector state onto the microSD
+# card during the first three minutes of every boot; TWRP reads the card.
 # Never on by default: it mounts and writes removable media on every boot.
+# The sources live in scripts/bringup-sdlog/ (the in-place kits install the
+# same files).
 if [ "${GTS9U_BRINGUP_SDLOG:-0}" = 1 ]; then
 	echo 'bring-up logger enabled: kernel logs will be written to the microSD card'
+	sdlog=$repo/scripts/bringup-sdlog
 	mkdir -p "$overlay/usr/libexec" "$overlay/usr/lib/systemd/system" \
 		"$overlay/etc/systemd/system/multi-user.target.wants" \
 		"$overlay/etc/systemd/system/timers.target.wants"
-	cat > "$overlay/usr/libexec/gts9u-bringup-sdlog" <<'EOF'
-#!/bin/sh
-# Dump this boot's logs onto the microSD card (first partition), for reading
-# from TWRP when the panel is dark.  Reads the system, writes only the card.
-dev=/dev/mmcblk1p1
-mnt=/run/bringup-sd
-for i in $(seq 1 30); do [ -b "$dev" ] && break; sleep 1; done
-[ -b "$dev" ] || exit 0
-mkdir -p "$mnt"
-mountpoint -q "$mnt" || mount -t exfat "$dev" "$mnt" 2>/dev/null || mount "$dev" "$mnt" || exit 0
-boot=$(cut -c1-8 /proc/sys/kernel/random/boot_id)
-dir=$mnt/bringup/$boot
-mkdir -p "$dir"
-stamp=$(cat /proc/uptime | cut -d. -f1)
-dmesg > "$dir/dmesg-${stamp}s.txt" 2>&1
-# What the previous boot left in ramoops: during a boot loop each attempt
-# saves the console of the one before, up to its panic or watchdog reset.
-for f in /sys/fs/pstore/*; do [ -f "$f" ] && cp "$f" "$dir/pstore-${f##*/}"; done
-journalctl -b --no-pager -o short-monotonic > "$dir/journal-${stamp}s.txt" 2>&1
-{
-	for c in /sys/class/drm/card*-*; do
-		[ -d "$c" ] || continue
-		printf '%s: status=%s enabled=%s dpms=%s\n' "$c" "$(cat "$c/status" 2>/dev/null)" \
-			"$(cat "$c/enabled" 2>/dev/null)" "$(cat "$c/dpms" 2>/dev/null)"
-		cat "$c/modes" 2>/dev/null
-	done
-	echo; echo '== backlight'; for b in /sys/class/backlight/*; do [ -d "$b" ] && printf '%s: %s/%s power=%s\n' "$b" "$(cat "$b/brightness")" "$(cat "$b/max_brightness")" "$(cat "$b/bl_power" 2>/dev/null)"; done
-} > "$dir/drm-${stamp}s.txt" 2>&1
-{
-	tr -d '\0' < /proc/device-tree/model; echo
-	echo '== failed units'; systemctl --failed --no-pager 2>&1
-	echo '== network'; ip -brief address 2>&1
-	echo '== pci'; lspci 2>&1
-	echo '== regulators'; for r in /sys/class/regulator/*; do printf '%s %s %s\n' "$(cat "$r/name" 2>/dev/null)" "$(cat "$r/state" 2>/dev/null)" "$(cat "$r/microvolts" 2>/dev/null)"; done
-} > "$dir/system-${stamp}s.txt" 2>&1
-sync
-umount "$mnt"
-EOF
-	chmod 0755 "$overlay/usr/libexec/gts9u-bringup-sdlog"
-	cat > "$overlay/usr/lib/systemd/system/gts9u-bringup-sdlog.service" <<'EOF'
-[Unit]
-Description=Bring-up: dump kernel and journal logs to the microSD card
-After=local-fs.target systemd-udevd.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh /usr/libexec/gts9u-bringup-sdlog
-EOF
-	cat > "$overlay/usr/lib/systemd/system/gts9u-bringup-sdlog.timer" <<'EOF'
-[Unit]
-Description=Bring-up: re-dump logs to the microSD card every minute
-
-[Timer]
-OnBootSec=45s
-OnUnitActiveSec=60s
-AccuracySec=5s
-
-[Install]
-WantedBy=timers.target
-EOF
+	install -m 0755 "$sdlog/gts9u-bringup-sdlog" "$overlay/usr/libexec/gts9u-bringup-sdlog"
+	install -m 0644 "$sdlog/gts9u-bringup-sdlog.service" "$sdlog/gts9u-bringup-sdlog.timer" \
+		"$overlay/usr/lib/systemd/system/"
 	ln -sf /usr/lib/systemd/system/gts9u-bringup-sdlog.timer \
 		"$overlay/etc/systemd/system/timers.target.wants/gts9u-bringup-sdlog.timer"
 	ln -sf /usr/lib/systemd/system/gts9u-bringup-sdlog.service \

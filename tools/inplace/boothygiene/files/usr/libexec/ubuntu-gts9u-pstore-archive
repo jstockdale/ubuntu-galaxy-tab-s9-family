@@ -1,0 +1,104 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Keep what the previous boots left in ramoops, by boot, for the last ten.
+#
+# The kernel's ramoops region holds the console of the boot before this one (up
+# to its watchdog reset or panic) and any oops/panic records.  systemd-pstore
+# moves them from /sys/fs/pstore into /var/lib/systemd/pstore early in the
+# boot, and that is not a place where they survive:
+#   - the next boot's systemd-pstore replaces console-ramoops-0 with its own;
+#   - the copy keeps the pstore file's time stamp, which predates the restored
+#     clock (1970 or systemd's build date), so the 14-day age rule in
+#     tmpfiles.d/systemd-pstore.conf deletes it at systemd-tmpfiles-clean, 15
+#     minutes after boot.  On the X710 the directory was always empty.
+# This copies every record not already kept into
+#   /var/lib/ubuntu-gts9u/pstore/<seq>-<UTC time>-boot-<previous boot id>/
+# with an INFO file (boot ids, the ramoops header lines of this boot's kernel
+# log) and SHA256SUMS, syncs it to disk (a boot-loop attempt may die seconds
+# later) and keeps the newest $GTS9U_PSTORE_KEEP (10) archives.  Readable by
+# root and the adm group, like the kernel log in /var/log.
+set -eu
+
+src=${GTS9U_PSTORE_SOURCE:-/var/lib/systemd/pstore}
+dst=${GTS9U_PSTORE_ARCHIVE:-/var/lib/ubuntu-gts9u/pstore}
+keep=${GTS9U_PSTORE_KEEP:-10}
+
+case "$keep" in
+''|*[!0-9]*|0) echo "GTS9U_PSTORE_KEEP must be a positive number" >&2; exit 2 ;;
+esac
+
+log() { echo "ubuntu-gts9u-pstore-archive: $*"; }
+
+[ -d "$src" ] || { log "no $src"; exit 0; }
+
+install -d -m 0750 -o root -g adm "$dst" 2>/dev/null || install -d -m 0750 "$dst"
+# A run cut short by a reset leaves only its staging directory behind.
+rm -rf -- "$dst"/.incoming-*
+
+# Hashes of everything already kept, so a record that outlived its boot (the
+# next boot came within 15 minutes, or systemd-pstore found nothing new) is
+# not archived twice.
+known=$(cat "$dst"/*/SHA256SUMS 2>/dev/null | cut -d' ' -f1 | sort -u)
+
+# Not in /tmp: this runs beside systemd-tmpfiles-setup, which empties it.
+new=$(mktemp "$dst/.incoming-list.XXXXXX")
+trap 'rm -f "$new"' EXIT
+(cd "$src" && find . -type f | LC_ALL=C sort) | while IFS= read -r rel; do
+	rel=${rel#./}
+	hash=$(sha256sum < "$src/$rel" | cut -d' ' -f1)
+	if [ -n "$known" ] && printf '%s\n' "$known" | grep -qxF "$hash"; then
+		continue
+	fi
+	printf '%s  %s\n' "$hash" "$rel" >> "$new"
+done
+
+if [ ! -s "$new" ]; then
+	log "nothing new in $src"
+	exit 0
+fi
+
+# Sequence numbers keep the order even when the clock was wrong at archive
+# time; the UTC time is for people.  awk, not $((...)): sh reads the
+# zero-padded numbers as octal.
+seq=$(ls -1 "$dst" 2>/dev/null |
+	awk -F- '/^[0-9]+-/ { n = $1 + 0; if (n > max) max = n } END { print max + 1 }')
+boot=$(cat /proc/sys/kernel/random/boot_id)
+# The records were written by the boot before this one.  Best effort: the
+# journal may have lost that boot or never had it.
+prev=$(journalctl --list-boots --no-pager -q 2>/dev/null |
+	awk '$1 == "-1" { print $2; exit }') || prev=
+prev_short=$(printf '%s' "${prev:-unknown}" | cut -c1-8)
+name=$(printf '%06d-%s-boot-%s' "$seq" "$(date -u +%Y%m%dT%H%M%SZ)" "$prev_short")
+dir=$dst/$name
+tmp=$dst/.incoming-$$
+rm -rf -- "$tmp"
+install -d -m 0750 "$tmp"
+
+while read -r hash rel; do
+	install -d -m 0750 "$tmp/$(dirname "$rel")"
+	cp "$src/$rel" "$tmp/$rel"
+	chmod 0640 "$tmp/$rel"
+done < "$new"
+cp "$new" "$tmp/SHA256SUMS"
+{
+	echo "archived:      $(date -u '+%F %T UTC') by boot $boot"
+	echo "written by:    boot ${prev:-unknown} (the one before; best effort)"
+	echo "source:        $src (systemd-pstore)"
+	echo "kernel:        $(uname -r)"
+	echo
+	echo "ramoops/pstore lines of the archiving boot's kernel log:"
+	dmesg 2>/dev/null | grep -E 'ramoops|pstore' || echo '(none)'
+} > "$tmp/INFO"
+chmod 0640 "$tmp/SHA256SUMS" "$tmp/INFO"
+chgrp -R adm "$tmp" 2>/dev/null || true
+mv "$tmp" "$dir"
+sync -f "$dir" 2>/dev/null || sync
+log "kept $(wc -l < "$new") record(s) in $dir"
+
+# Prune: the newest $keep archives stay.
+ls -1 "$dst" | grep -E '^[0-9]+-' | sort -n | head -n "-$keep" |
+	while IFS= read -r old; do
+		rm -rf -- "${dst:?}/$old"
+		log "pruned $old"
+	done
+exit 0

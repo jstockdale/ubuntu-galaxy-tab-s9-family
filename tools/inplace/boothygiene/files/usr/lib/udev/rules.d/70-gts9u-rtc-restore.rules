@@ -1,0 +1,7 @@
+# ubuntu-gts9u-rtc-restore.service runs before journald, which needs rtc0 to
+# exist before PID 1 starts: true on the X710, whose kernel builds rtc-pm8xxx
+# in.  Where it is a module (the Ultra's config inherits =m), rtc0 appears
+# after that early run was skipped on its condition; restore the clock then.
+# Where the early run happened, the unit is still active (RemainAfterExit) and
+# this start request is a no-op.
+ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ubuntu-gts9u-rtc-restore.service"

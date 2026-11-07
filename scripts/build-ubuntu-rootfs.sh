@@ -538,13 +538,14 @@ chroot "\$target" systemctl enable systemd-timesyncd.service || true
 chroot "\$target" systemctl enable ubuntu-gts9u-grow-rootfs.service || true
 
 # Persistent journal: the panel can stay dark long before a display manager
-# starts, so the journal is the primary diagnostic channel.
+# starts, so the journal is the primary diagnostic channel.  The size cap is
+# the device package's (journald.conf.d/60-ubuntu-gts9u.conf); a 256M cap
+# here kept the directory permanently full.
 mkdir -p "\$target/var/log/journal"
 mkdir -p "\$target/etc/systemd/journald.conf.d"
 cat > "\$target/etc/systemd/journald.conf.d/10-gts9uwifi-persistent.conf" <<EOF
 [Journal]
 Storage=persistent
-SystemMaxUse=256M
 EOF
 
 # No apt-installed kernel: this port boots the mainline kernel written to the

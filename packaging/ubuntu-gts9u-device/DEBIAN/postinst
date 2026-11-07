@@ -11,6 +11,7 @@ ubuntu-gts9u-chromium-desktops.path:multi-user.target
 ubuntu-gts9u-grow-rootfs.service:basic.target
 ubuntu-gts9u-rtc-restore.service:sysinit.target
 ubuntu-gts9u-rtc-save.path:multi-user.target
+ubuntu-gts9u-pstore-archive.service:sysinit.target
 ubuntu-gts9u-zram.service:basic.target
 ubuntu-gts9u-suspend-mode.service:basic.target
 ubuntu-gts9u-swapfile.service:multi-user.target
@@ -42,6 +43,11 @@ case "$1" in
 	configure)
 		/usr/libexec/ubuntu-gts9u-chromium-launchers
 		/usr/libexec/ubuntu-gts9u-chromium-desktops
+		# systemd's clock epoch: PID 1 advances a clock that is behind
+		# this file's mtime before anything else starts, so seed it with
+		# the install (or image build) time instead of systemd's own build
+		# date.  ubuntu-gts9u-rtc-offset save keeps it at the last NTP sync.
+		[ -e /usr/lib/clock-epoch ] || touch /usr/lib/clock-epoch || true
 		# Index the signed IRQ bridge for the matching installed kernel. Never
 		# load/unload it or restart the boot-lifetime secure owner on upgrade.
 		for module in /usr/lib/modules/*/updates/qcom_spss_irq.ko; do
@@ -80,11 +86,25 @@ case "$1" in
 				ubuntu-gts9u-desktop-user.path \
 				ubuntu-gts9u-camera-relays.service || true
 			systemctl restart ubuntu-gts9u-desktop-user.path || true
-			# fprintd is D-Bus activated and normally inactive.  If a client kept
-			# it alive during this upgrade, restart it so the new QTEE dependency
-			# and device sandbox are effective immediately.
-			systemctl try-restart ubuntu-gts9u-fingerprint-ui.service || true
-			systemctl try-restart fprintd.service || true
+			if tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null |
+				grep -qx 'samsung,gts9uwifi'; then
+				# fprintd is D-Bus activated and normally inactive.  If a
+				# client kept it alive during this upgrade, restart it so the
+				# new QTEE dependency and device sandbox are effective
+				# immediately.
+				systemctl try-restart ubuntu-gts9u-fingerprint-ui.service || true
+				systemctl try-restart fprintd.service || true
+			else
+				# Gated off on every other board (the daemon-reload above ran
+				# the generator that masks fprintd): clear what the stack left
+				# failed.  Leave the broker running until the next boot, when
+				# its condition keeps it off: the Shell running now still has
+				# the old overlay, which pulses it twice a second, and with the
+				# broker stopped each pulse would become a D-Bus activation
+				# that the condition refuses.
+				systemctl reset-failed fprintd.service \
+					ubuntu-gts9u-fingerprint-secure.service >/dev/null 2>&1 || true
+			fi
 		fi
 
 		# The gsettings override that keeps gnome-settings-daemon off the
