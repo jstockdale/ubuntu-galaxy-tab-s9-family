@@ -18,7 +18,7 @@
 #   4. cam -l, then per camera 60 frames at 640x480 BGR888 through libcamera's
 #      software ISP; the last frame is kept as a PPM
 #   5. rebuilds the V4L2 nodes from the new table, starts the relays and reads
-#      60 frames of /dev/video20 (YUYV 640x480); the last one is kept as a PPM
+#      150 frames of /dev/video20 (YUYV 640x480); the last one is kept as a PPM
 #
 # A hang or a reset here is the finding: a reboot returns the tablet to the
 # state before the run (the switch is per boot, the DTB is unchanged).
@@ -82,7 +82,17 @@ for m in /dev/media*; do
 	media-ctl -d "$m" -p > "$out/media-ctl-${m##*/}.txt" 2>&1
 	inf "$m: $(media-ctl -d "$m" -p 2>/dev/null | sed -n 's/^driver *//p' | head -1), $(grep -c '^- entity' "$out/media-ctl-${m##*/}.txt") entities"
 done
-ls /dev/media* >/dev/null 2>&1 || ck 'no /dev/media*: CAMSS did not register (its async notifier is still waiting for a sensor or lens)'
+# CAMSS registers /dev/media0 at probe; the sensors' v4l-subdev nodes only
+# appear once its async notifier has every sensor (and the rear lens) bound.
+ls /dev/media* >/dev/null 2>&1 || ck 'no /dev/media*: CAMSS did not probe (see dmesg-camera.txt)'
+for d in /sys/bus/i2c/drivers/hi1337-gts9u/*; do
+	[ -e "$d/of_node" ] || continue
+	if ls "$d"/video4linux/v4l-subdev* >/dev/null 2>&1; then
+		ok "${d##*/} is in the CAMSS graph ($(ls "$d"/video4linux | tr '\n' ' '))"
+	else
+		ck "${d##*/} is bound but has no v4l-subdev node: the CAMSS notifier did not complete (lens or other sensor missing?)"
+	fi
+done
 v4l2-ctl --list-devices > "$out/v4l2-list-devices.txt" 2>&1
 for sd in /dev/v4l-subdev*; do
 	[ -e "$sd" ] || continue

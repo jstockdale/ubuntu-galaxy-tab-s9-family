@@ -106,12 +106,22 @@ class CameraStackTest(unittest.TestCase):
     def board(self, compatible):
         (self.root / "proc/device-tree/compatible").write_bytes(compatible)
 
-    def bind(self, dt_path, i2c_name):
+    def bind(self, dt_path, i2c_name, complete=True):
+        """An HI1337 bound at dt_path.  complete: CAMSS's notifier finished,
+        so the sensor also has its v4l-subdev node."""
         node = self.root / "sys/firmware/devicetree/base" / dt_path
         node.mkdir(parents=True, exist_ok=True)
         dev = self.root / "sys/bus/i2c/drivers/hi1337-gts9u" / i2c_name
         dev.mkdir(parents=True)
         os.symlink(node, dev / "of_node")
+        if complete:
+            self.complete(i2c_name)
+
+    def complete(self, i2c_name):
+        dev = self.root / "sys/bus/i2c/drivers/hi1337-gts9u" / i2c_name
+        subdevs = dev / "video4linux"
+        subdevs.mkdir(exist_ok=True)
+        (subdevs / ("v4l-subdev%d" % len(list(subdevs.iterdir())))).mkdir()
 
     def loaded(self, nodes):
         """A v4l2loopback already loaded with {nr: label}."""
@@ -166,6 +176,15 @@ class CameraStackTest(unittest.TestCase):
         self.assertEqual(self.profile(),
                          "20 GTS9-Front libcamera_input._base_soc_0_cci_ac16000_i2c-bus_1_camera_20 front\n"
                          "21 GTS9-Rear libcamera_input._base_soc_0_cci_ac15000_i2c-bus_1_camera_21 rear\n")
+
+    def test_x710_bound_sensor_without_a_complete_graph_is_no_camera(self):
+        # The rear HI1337 bound, but CAMSS never completed (lens missing, a
+        # CSIPHY failure): no subdev node, so no relay and no phantom webcam.
+        self.bind(REAR_DT, "1-0021", complete=False)
+        self.assertEqual(self.profile(), "")
+        self.complete("1-0021")
+        self.assertEqual(self.profile(),
+                         "20 GTS9-Rear libcamera_input._base_soc_0_cci_ac15000_i2c-bus_1_camera_21 rear\n")
 
     def test_x710_ignores_ultra_only_sensor_paths(self):
         self.bind("soc@0/geniqup@8c0000/i2c@884000/camera@21", "9-0021")
@@ -282,6 +301,17 @@ class CameraStackTest(unittest.TestCase):
         self.camss()
         self.assertIn("ready after 0s: rear", self.enable().stderr)
         self.assertEqual(param.read_text(), "rear\n")
+
+    def test_enable_waits_for_the_complete_graph(self):
+        self.switch()
+        self.bind(REAR_DT, "1-0021", complete=False)
+        self.camss()
+        self.assertIn("not ready after 20s", self.enable("rear", expect=1).stderr)
+
+    def test_enable_waits_for_camss(self):
+        self.switch()
+        self.bind(REAR_DT, "1-0021")
+        self.assertIn("CAMSS not bound", self.enable("rear", expect=1).stderr)
 
     def test_enable_waits_for_every_chosen_sensor(self):
         self.switch()

@@ -10,8 +10,10 @@
 # The SM-X710 device tree keeps CAMSS, its CCI buses and both camera modules
 # disabled, so nothing camera-related probes while the board boots.  The
 # kernel's gts9wifi_camera switch enables the chosen ones once, until the next
-# reboot; this asks it, then waits for the HI1337s and CAMSS to bind so that
-# the loopback loader that runs next sees the cameras.  After a manual run:
+# reboot; this asks it, then waits until CAMSS has completed its graph (the
+# chosen HI1337s, and the rear lens, bound and given their V4L2 subdevice
+# nodes) so that the loopback loader that runs next sees usable cameras.
+# After a manual run:
 #
 #   systemctl stop ubuntu-gts9u-camera-relays.service
 #   systemctl restart ubuntu-gts9u-camera-loopback.service
@@ -44,23 +46,30 @@ if [ ! -w "$param" ]; then
 	exit 1
 fi
 
-bound() {
+# usable DT_PATH_SUFFIX: the HI1337 at that node is bound and has its V4L2
+# subdevice node, which CAMSS creates only once its async notifier completed
+# (the same test ubuntu-gts9u-camera-profile applies).
+usable() {
 	for dev in "$hi1337"/*; do
 		[ -e "$dev/of_node" ] || continue
 		case "$(readlink -f "$dev/of_node")" in
-		*"$1") return 0 ;;
+		*"$1") ;;
+		*) continue ;;
 		esac
+		for subdev in "$dev"/video4linux/v4l-subdev*; do
+			[ -e "$subdev" ] && return 0
+		done
 	done
 	return 1
 }
 ready() {
+	[ -e "$camss/acb7000.isp" ] || return 1
 	case "$choice" in
-	rear | both) bound /cci@ac15000/i2c-bus@1/camera@21 || return 1 ;;
+	rear | both) usable /cci@ac15000/i2c-bus@1/camera@21 || return 1 ;;
 	esac
 	case "$choice" in
-	front | both) bound /cci@ac16000/i2c-bus@1/camera@20 || return 1 ;;
+	front | both) usable /cci@ac16000/i2c-bus@1/camera@20 || return 1 ;;
 	esac
-	[ -e "$camss/acb7000.isp" ]
 }
 
 state=$(cat "$param")
@@ -70,12 +79,13 @@ none) log "enabling: $choice"; echo "$choice" > "$param" ;;
 *) log "the cameras were already switched to '$state' this boot; reboot to choose '$choice'"; exit 1 ;;
 esac
 
-# Sensors probe from the reconfiguration notifier or, when a supply is late,
-# from the deferred-probe work.  Twenty seconds is generous for both.
+# Sensors probe from the reconfiguration notifier or, when a supplier (CAMSS,
+# a regulator) is created later in the same changeset, from the deferred-probe
+# work.  Twenty seconds is generous for both.
 waited=0
 while ! ready; do
 	if [ "$waited" -ge 20 ]; then
-		log "not ready after ${waited}s (switch: $(cat "$param")); see: dmesg | grep -iE 'gts9wifi-camera|hi1337|dw9808|cci|camss'"
+		log "not ready after ${waited}s (switch: $(cat "$param"); CAMSS $([ -e "$camss/acb7000.isp" ] && echo bound || echo 'not bound')); see: dmesg | grep -iE 'gts9wifi-camera|hi1337|dw9808|cci|camss'"
 		exit 1
 	fi
 	sleep 1

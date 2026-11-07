@@ -14,11 +14,16 @@
  * sets the chosen nodes to "okay".  The OF reconfiguration notifiers then
  * create the platform and I2C devices and the built-in drivers bind them.
  *
- * CAMSS registers nothing until every sensor its graph names has bound, so a
+ * CAMSS registers its media device at probe, but its async notifier completes
+ * -- linking the sensors to the CSIPHYs and creating the subdevice nodes
+ * libcamera needs -- only once every sensor its graph names has bound, so a
  * camera that was not chosen must not stay in that graph: the changeset also
- * detaches its CAMSS endpoint.  Nothing here is ever undone (CAMSS and its
- * async notifier are not built to be torn down by reverting a changeset), so
- * the switch is one-shot until the next reboot.
+ * detaches its CAMSS endpoint.  A sensor probing before CAMSS exists defers on
+ * its remote-endpoint supplier and is retried when CAMSS binds.
+ *
+ * Nothing here is ever undone (CAMSS and its async notifier are not built to
+ * be torn down by reverting a changeset), so the switch is one-shot until the
+ * next reboot.
  */
 #include <linux/bits.h>
 #include <linux/init.h>

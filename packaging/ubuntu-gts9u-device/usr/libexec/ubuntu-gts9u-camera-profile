@@ -14,7 +14,8 @@
 #                                same order and with the same names as the
 #                                fixed configuration this table replaces.
 #   samsung,gts9wifi (SM-X710)   front then rear, but only modules whose
-#                                HI1337 is bound.  Its cameras are off unless
+#                                HI1337 is bound and part of a complete CAMSS
+#                                graph.  Its cameras are off unless
 #                                gts9wifi_camera enabled them, and a relay with
 #                                no camera behind it is a phantom webcam.
 #   anything else                nothing.
@@ -27,13 +28,23 @@ board() {
 	[ -r "$compatible" ] && tr '\0' '\n' < "$compatible" | grep -qx "$1"
 }
 
-# bound DT_PATH_SUFFIX: an HI1337 bound to its driver at that device-tree node.
-bound() {
+# usable DT_PATH_SUFFIX: an HI1337 bound to its driver at that device-tree
+# node AND carrying its V4L2 subdevice node.  CAMSS creates the sensors'
+# subdevice nodes only when its async notifier completes (every sensor in its
+# graph and the rear lens bound, the CSIPHY links made); /dev/media0 itself
+# exists from CAMSS probe on.  A sensor that is merely bound -- the lens or
+# the other sensor missing -- is no camera libcamera can open, and a relay
+# for it would be exactly the phantom webcam this table exists to avoid.
+usable() {
 	for dev in "$hi1337"/*; do
 		[ -e "$dev/of_node" ] || continue
 		case "$(readlink -f "$dev/of_node")" in
-		*"$1") return 0 ;;
+		*"$1") ;;
+		*) continue ;;
 		esac
+		for subdev in "$dev"/video4linux/v4l-subdev*; do
+			[ -e "$subdev" ] && return 0
+		done
 	done
 	return 1
 }
@@ -47,11 +58,11 @@ if board samsung,gts9uwifi; then
 EOF
 elif board samsung,gts9wifi; then
 	nr=20
-	if bound /cci@ac16000/i2c-bus@1/camera@20; then
+	if usable /cci@ac16000/i2c-bus@1/camera@20; then
 		echo "$nr GTS9-Front libcamera_input._base_soc_0_cci_ac16000_i2c-bus_1_camera_20 front"
 		nr=$((nr + 1))
 	fi
-	if bound /cci@ac15000/i2c-bus@1/camera@21; then
+	if usable /cci@ac15000/i2c-bus@1/camera@21; then
 		echo "$nr GTS9-Rear libcamera_input._base_soc_0_cci_ac15000_i2c-bus_1_camera_21 rear"
 	fi
 fi
