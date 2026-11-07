@@ -14,8 +14,8 @@
 #      /usr/lib/clock-epoch; journald gets SystemMaxUse=1G
 #   2. the fingerprint stack is gated to the SM-X910: three units get
 #      ConditionFirmware, a generator masks fprintd on other boards (GDM no
-#      longer waits 25 s for net.reactivated.Fprint), the overlay extension
-#      stays inactive
+#      longer waits 25 s for net.reactivated.Fprint), the overlay extension's
+#      fingerprint part stays inactive (its GNOME 46 guards stay on)
 #   3. ubuntu-gts9u-pstore-archive keeps the ramoops records of the last 10
 #      boots in /var/lib/ubuntu-gts9u/pstore (readable by group adm)
 #   4. ubuntu-gts9u-pogo-firmware runs after the cold-boot panel cycle

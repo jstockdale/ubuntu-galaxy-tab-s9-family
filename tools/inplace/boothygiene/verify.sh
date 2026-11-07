@@ -48,7 +48,10 @@ n=$(journalctl -b --no-pager 2>/dev/null | grep -c 'Time jumped backwards')
 echo "       'Time jumped backwards' this boot: $n (0 expected once rtc-offset holds the smaller offset)"
 
 # --- 2. RTC restore: once, before journald ----------------------------------
-starts=$(journalctl -b -u ubuntu-gts9u-rtc-restore.service --no-pager 2>/dev/null | grep -c 'Starting ubuntu-gts9u-rtc-restore')
+# Not with -u: PID 1 logs this start before journald runs, so the line reaches
+# the journal through the kernel log, without the UNIT= field -u matches (it
+# would count 0).  PID 1's own lines carry SYSLOG_IDENTIFIER=systemd either way.
+starts=$(journalctl -b -o cat --no-pager SYSLOG_IDENTIFIER=systemd 2>/dev/null | grep -c '^Starting ubuntu-gts9u-rtc-restore\.service')
 [ "$starts" = 1 ] && pass "rtc-restore ran once" || fail "rtc-restore started $starts times (expected 1)"
 state="$(show ubuntu-gts9u-rtc-restore.service ActiveState)/$(show ubuntu-gts9u-rtc-restore.service SubState)"
 [ "$state" = active/exited ] && pass "rtc-restore active/exited (RemainAfterExit)" || fail "rtc-restore $state (expected active/exited)"
@@ -59,7 +62,7 @@ if [ "${r:-0}" -gt 0 ] && [ "${j:-0}" -gt "$r" ]; then
 else
 	fail "rtc-restore at ${r:-?} us, journald at ${j:-?} us (expected restore first)"
 fi
-journalctl -b -u ubuntu-gts9u-rtc-restore.service -o cat --no-pager 2>/dev/null | grep -E 'clock set|left alone' | sed 's/^/       /'
+journalctl -b -t ubuntu-gts9u-rtc-offset -o cat --no-pager 2>/dev/null | grep -E 'clock set|left alone' | sed 's/^/       /'
 [ -e /usr/lib/clock-epoch ] && pass "/usr/lib/clock-epoch $(stat -c %y /usr/lib/clock-epoch | cut -c1-19)" || fail "/usr/lib/clock-epoch missing"
 
 # --- 3. fingerprint stack gated off ------------------------------------------

@@ -40,7 +40,10 @@ the bring-up microSD logger where it is already installed.
    `/usr/lib/systemd/system-generators/ubuntu-gts9u-fingerprint-gate` masks it
    for the boot on every board but the Ultra; activation then fails at once
    and GDM, the lock screen and gdm-fingerprint fall back to the password. The
-   overlay extension stays inactive off the Ultra (no 50 ms poll, no pulses).
+   overlay extension's fingerprint part stays inactive off the Ultra (no 50 ms
+   poll, no pulses, no target, no keyboard fallback); its two GNOME 46 guards
+   (the closed GDM connection in `cancel()`, which fired on this X710 on
+   2026-11-06, and targetless keyboard events) stay on as before.
    QTEE and SNVM are no longer loaded on the X710.
 4. **pstore.** systemd-pstore moves the records to `/var/lib/systemd/pstore`,
    where the next boot replaces `console-ramoops-0` and, because the copy

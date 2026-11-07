@@ -24,7 +24,11 @@ const UI_PATH = '/io/github/agcarbajo/Gts9uFingerprintUI';
 // The optical target, its HBM shade and the keyboard fallback all serve the
 // Galaxy Tab S9 Ultra's EL721 under its Goodix touchscreen.  GDM and the
 // package enable this extension on every board they install on; anywhere
-// else it stays inert: no 50 ms poll, no pulses to a broker that is gated off.
+// else that part stays inert: no 50 ms poll, no pulses to a broker that is
+// gated off, no bus name.  The two GNOME 46 guards (a closed GDM verification
+// connection in cancel(), targetless events in the keyboard manager) are not
+// fingerprint-specific and stay on everywhere: the closed-connection recovery
+// fired on the SM-X710 too (2026-11-06).
 const ULTRA_COMPATIBLE = 'samsung,gts9uwifi';
 
 function boardIsUltra() {
@@ -48,16 +52,19 @@ const INTERFACE = `
 
 export default class Gts9uFingerprintOverlay extends Extension {
     enable() {
-        this._inert = !boardIsUltra();
-        if (this._inert) {
-            console.log('GTS9U fingerprint overlay: not a Galaxy Tab S9 Ultra; inactive');
-            return;
-        }
+        // Every board: GNOME 46 workarounds, not part of the fingerprint path.
         this._originalCancel = ShellUserVerifier.prototype.cancel;
         this._recoveryCancel = recoverClosedCancellation(this._originalCancel,
             error => error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CLOSED) ?? false,
             () => console.log('GTS9U auth: cleared closed GDM verification connection'));
         ShellUserVerifier.prototype.cancel = this._recoveryCancel;
+        this._keyboardEventGuard = new KeyboardEventGuard(Main.keyboard,
+            event => global.stage.get_event_actor(event));
+        this._inert = !boardIsUltra();
+        if (this._inert) {
+            console.log('GTS9U fingerprint overlay: not a Galaxy Tab S9 Ultra; inactive (GNOME auth/keyboard guards only)');
+            return;
+        }
         this._displayCancellable = new Gio.Cancellable();
         this._session = null;
         this._uiAllowed = false;
@@ -66,8 +73,6 @@ export default class Gts9uFingerprintOverlay extends Extension {
         this._uiPending = false;
         this._uiLastSent = null;
         this._feedbackUntil = 0;
-        this._keyboardEventGuard = new KeyboardEventGuard(Main.keyboard,
-            event => global.stage.get_event_actor(event));
         this._enableAuthKeyboard();
         const lifetime = this._displayCancellable;
         getLoginManager().getCurrentSessionProxy().then(session => {
@@ -152,16 +157,16 @@ export default class Gts9uFingerprintOverlay extends Extension {
     }
 
     disable() {
-        if (this._inert) {
-            this._inert = false;
-            return;
-        }
         this._keyboardEventGuard?.destroy();
         this._keyboardEventGuard = null;
         if (ShellUserVerifier.prototype.cancel === this._recoveryCancel)
             ShellUserVerifier.prototype.cancel = this._originalCancel;
         this._originalCancel = null;
         this._recoveryCancel = null;
+        if (this._inert) {
+            this._inert = false;
+            return;
+        }
         this._displayCancellable.cancel();
         this._displayCancellable = null;
         this._session = null;
