@@ -8,12 +8,23 @@ the window is closed.
 ## Architecture
 
 - The GTK4/libadwaita window uses only GSettings and D-Bus.
-- `tab-companion-hardware.service` detects the capabilities present and
-  publishes `io.github.agcarbajo.TabCompanion.Hardware`.
+- `tab-companion-hardware@UID.service` detects the capabilities present and
+  publishes `io.github.agcarbajo.TabCompanion.Hardware` on that user's
+  session bus. It is a system service running as the user, started by
+  `user@UID.service`, because only a system service can be given a group the
+  rest of the session lacks: it alone has `input` and so opens the cover, the
+  pen, the vibrator and `/dev/uinput`. The account itself is not in `input`;
+  that membership let every program in the session read every keystroke and
+  touch and inject keys. Python runs isolated (`-I`), the process is not
+  dumpable, and applications and commands it launches start in the user's own
+  service manager (`systemd-run --user`), never as its children.
 - `tab-companion-spen-pairing.service` reproduces the pairing the dock starts
   when the pen goes in, authorises only a SPEN carrying both Samsung UUIDs, and
   exposes the privileged control that connects or disconnects its remote
-  features.
+  features. `71-tab-companion-spen.rules` starts it when the Wacom digitiser's
+  driver binds, so a tablet without a working digitiser never runs it: there
+  the unit stays inactive, or shows as skipped on its `pen_docked` condition
+  when something else asked for it, and both are expected.
 - Only the backend touches sysfs, evdev and `uinput`.
 - The backend grabs the attached cover and relays its events through
   `Tab Companion virtual keyboard`. Under "Keep the default action" it lets
@@ -244,6 +255,27 @@ reply. The EF-DX920 is the only one available and physically validated;
 enumeration and special keys for the other four are in place, but their
 keyboards and touchpads still need a real test.
 
+On the Galaxy Tab S9 (SM-X710) the protocol identifiers mean other covers.
+Samsung's own SM-X710 table, which the kernel and the app both follow there:
+
+| Id | Model | Kernel input name | AI key | Touchpad |
+|---|---|---|---|---|
+| `0xfd` | EF-DX715 | Book Cover Keyboard (EF-DX715) | no | yes |
+| `0x02` | EF-DX710 | Book Cover Keyboard Slim (EF-DX710) | no | no |
+| `0xd1` | EF-DX725 | Book Cover Keyboard (EF-DX725) | yes | yes |
+| `0x03` | EF-DX720 | Book Cover Keyboard Slim (EF-DX720) | yes | no |
+| `0x51` | — | Neos Keyboard (not remapped) | yes | none created |
+
+The special-key codes were measured on the EF-DX920; the EF-DX720 has not
+been measured yet (use "Save keyboard cover logs" to record it).
+
+The cover's switches have their own kernel device on the SM-X710,
+`Samsung Book Cover Switch`, which this service never grabs: `SW_LID` while
+the cover is closed over the screen, and `SW_TABLET_MODE` while it is folded
+behind the tablet or detached. logind and UPower read the lid directly, and
+mutter turns tablet mode into GNOME's touch mode (on-screen keyboard and
+automatic rotation).
+
 There is no "Learn" mode: the measured codes are part of the factory values.
 "Reset values" restores actions, targets and physical codes in one go. On the
 EF-DX920 they are Galaxy AI 760, DeX 701, Finder 710, Fn+Finder/Settings 709,
@@ -333,7 +365,7 @@ Bluetooth addresses, MACs, SSIDs and credentials must never be documented.
 ## Quick diagnosis
 
 ```sh
-systemctl --user status tab-companion-hardware.service
+systemctl status "tab-companion-hardware@$(id -u).service"
 systemctl status tab-companion-spen-pairing.service
 gnome-extensions info tab-companion-haptics@agcarbajo
 gdbus introspect --session \
@@ -359,7 +391,9 @@ Three things in the companion affected it, and all three are fixed:
 1. **`SW_LID` on the virtual keyboard.** It was declared but never emitted.
    Declaring it was enough for UPower to publish `LidIsPresent=true` on a
    machine with no lid. The Book Cover's real lid is reported by the pogo
-   controller, which only exists with the cover attached.
+   driver: on the SM-X710 on `Samsung Book Cover Switch`, which is never
+   grabbed, and on the SM-X910 still on the keyboard device itself. The
+   backend relays only keys, LEDs and frame ends.
 2. **The `BTN_MOUSE` range on the virtual keyboard.** The keyboard declared
    every code from `1` to `KEY_MAX`, and inside that lies the range udev walks
    — `0x110` to `0x11F` — to decide whether something has mouse buttons. It was

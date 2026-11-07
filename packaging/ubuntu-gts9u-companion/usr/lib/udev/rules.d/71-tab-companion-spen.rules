@@ -1,2 +1,8 @@
 # Allow the desktop user to change only the two boolean S Pen policy knobs.
 SUBSYSTEM=="i2c", DRIVER=="samsung-wacom-w90xx", RUN+="/usr/libexec/tab-companion-spen-permissions %p"
+
+# The docked S Pen pairing service belongs to the digitiser, so the digitiser
+# starts it: once its driver has bound, on whichever board has one.  The match
+# is on DRIVER rather than ACTION because the driver binds after the device's
+# first add event, and a later coldplug add or change must keep the tag.
+SUBSYSTEM=="i2c", DRIVER=="samsung-wacom-w90xx", TAG+="systemd", ENV{SYSTEMD_WANTS}+="tab-companion-spen-pairing.service"

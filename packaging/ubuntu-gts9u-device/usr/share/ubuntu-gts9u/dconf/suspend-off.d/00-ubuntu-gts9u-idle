@@ -1,0 +1,10 @@
+# GNOME's idle timeout must not ask for a suspend that the suspend mode has
+# turned off.  ubuntu-gts9u-suspend-mode compiles this into the defaults it
+# puts under the owner's own dconf database, and only in mode "off", so a
+# value chosen in Settings or with gsettings still wins and the stock
+# 'suspend' comes back as soon as the mode allows suspending again.
+#
+# 'nothing' rather than 'blank': the screen is blanked at idle-delay anyway.
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-battery-type='nothing'
+sleep-inactive-ac-type='nothing'

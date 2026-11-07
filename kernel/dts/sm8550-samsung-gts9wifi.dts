@@ -131,9 +131,22 @@
 			no-map;
 		};
 
+		/*
+		 * Samsung's own kernel keeps its pstore pmsg log in this carve-out
+		 * (samsung,pstore_pmsg in the stock gts9wifi overlay) so that it
+		 * survives a reset.  Nothing else uses it here: make it the ramoops
+		 * backend.  The previous boot's console and its oops/panic records
+		 * then appear under /sys/fs/pstore, even when the hang left no
+		 * journal.  Write-combined (mem-type 0), so writes reach DDR before
+		 * a reset; ECC flags a record the reset corrupted.
+		 */
 		sec_pmsg_mem: sec-pmsg@880900000 {
+			compatible = "ramoops";
 			reg = <0x8 0x80900000 0x0 0x200000>;
 			no-map;
+			record-size = <0x20000>;
+			console-size = <0x100000>;
+			ecc-size = <16>;
 		};
 
 		google_debug_kinfo_mem: google-debug-kinfo@880b00000 {
@@ -315,6 +328,18 @@
 		};
 	};
 
+	/*
+	 * Stock dc_vibrator: Samsung drives the coin motor from TLMM GPIO18.  The
+	 * r04 overlay wires it exactly as the Ultra's does -- COINDC, gpio_en
+	 * TLMM 18 active high (their "mot_ldo_en"), no regulator -- so the
+	 * Ultra's node applies unchanged.  Tab Companion's keyboard and
+	 * notification haptics find it by its input name, gpio-vibrator.
+	 */
+	vibrator {
+		compatible = "gpio-vibrator";
+		enable-gpios = <&tlmm 18 GPIO_ACTIVE_HIGH>;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 		pinctrl-names = "default";
@@ -346,7 +371,7 @@
 	};
 
 	/*
-	 * Unlike the SM8550 QRD, the X910 has no WSA884x speaker path and no
+	 * Unlike the SM8550 QRD, the X710 has no WSA884x speaker path and no
 	 * WCD938x. Its four CS35L45 amplifiers consume PRIMARY_MI2S_RX over
 	 * TLMM126..129. Keep the first card deliberately small: one playback
 	 * backend plus the native VA-macro DMIC capture backend.
@@ -727,6 +752,12 @@
 
 &pon_resin {
 	linux,code = <KEY_VOLUMEDOWN>;
+	/*
+	 * Volume Down wakes the tablet like Volume Up and the power key, as
+	 * under Android: Samsung's pm8941-pwrkey arms both PMIC keys and its
+	 * init writes volkey_wakeup=1.  Mainline leaves resin unarmed.
+	 */
+	wakeup-source;
 	status = "okay";
 };
 
@@ -766,6 +797,15 @@
 		function = "mdp_vsync";
 		drive-strength = <2>;
 		bias-pull-down;
+	};
+
+	/* DDIC TCON_RDY input, as the stock panel_fa01_tcon_rdy_active state. */
+	panel_tcon_rdy: panel-tcon-rdy-state {
+		pins = "gpio88";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-disable;
 	};
 
 	bt_default: bt-default-state {
@@ -892,6 +932,36 @@
 		function = "gpio";
 		drive-strength = <2>;
 		input-enable;
+		bias-disable;
+	};
+
+	/*
+	 * S Pen digitiser interrupt lines, as Samsung's r04 epen-int-active and
+	 * epen-pdct-active states (and the Ultra's node): gpio154 is the data
+	 * interrupt, gpio137 the pen-in-silo detect.  Both are inputs with the
+	 * pull disabled.
+	 */
+	epen_irqs: epen-irqs-state {
+		pins = "gpio154", "gpio137";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-disable;
+	};
+
+	/*
+	 * The digitiser's flash enable.  High across a power-up starts the
+	 * controller's loader (Samsung's boot_addr, 0x09) instead of the
+	 * digitiser at 0x56.  Samsung's probe drives it low and keeps it there
+	 * (wacom_compulsory_flash_mode(false) in wacom_i2c.c); only its firmware
+	 * flasher ever raises it, and this port has none.  Hold it low rather
+	 * than leave it at whatever the reset default or ABL left behind.
+	 */
+	epen_fwe: epen-fwe-state {
+		pins = "gpio179";
+		function = "gpio";
+		drive-strength = <2>;
+		output-low;
 		bias-disable;
 	};
 };
@@ -1223,31 +1293,60 @@
  * Neither mainline Wacom driver can drive it, so this port carries its own;
  * the reasons are in kernel/drivers/samsung_wacom_w90xx.c.
  *
- * AVDD is LDO13 of PMIC B, shared with the panel's VCI.  Letting the panel own
- * it was not enough: the display comes up long after this probe, and the first
- * attempt was answered with a NACK at 3.9 s for exactly that reason.  Samsung's
- * pdct and fwe lines are still not wired -- pdct is their pen-detect shortcut
- * and fwe enables flash writes, and the device reports position, pressure, tilt
- * and both buttons without either.
+ * Samsung's r04 node (fragment@81) is the Ultra's line for line: wacom,w90xx
+ * at 0x56, IRQ TLMM154, pdct TLMM137, fwe TLMM179, AVDD pm_humu_l13,
+ * boot_addr 9, origin 0 0, invert 0 0 0, table_swap 2, garage and cover
+ * detection.  Only the firmware image (wez01_gts9.bin) and the sensor grid
+ * (37 x 23 channels against 49 x 31) differ, and this driver loads no
+ * firmware, so the Ultra's node carries over with this panel's size added.
  *
- * The same orientation properties as the Goodix node, and they are measured
- * rather than assumed.  With the tablet in its native landscape, where the
- * compositor applies no rotation of its own, the pen held on two opposite
- * corners reads:
+ * AVDD is LDO13 of PMIC B, shared with the panel's VCI.  The driver holds its
+ * own reference because the display comes up long after this probe.  Samsung
+ * pins that rail at 3.3 V for the digitiser while the panel's VCI entry asks
+ * for 3.0 V; this tree keeps the panel's 3.0 V, which is what the Ultra's
+ * digitiser has run on since its driver was written.
  *
- *   top-left      ABS_X   7 %   ABS_Y  97 %
- *   bottom-right  ABS_X  92 %   ABS_Y   6 %
+ * pdct is the pen-in-silo detect: the driver reports it as SW_PEN_INSERTED,
+ * starts the silo charging from it and, on this board, arms it for wake as
+ * Samsung does, so drawing the pen or docking it wakes the tablet.  fwe only
+ * matters to a firmware flasher, which this port does not have; its pin state
+ * (epen_fwe) holds it low, as Samsung's probe does.
  *
- * so the long axis already counts left to right and only the short one runs
- * backwards.  Dropping the inversion on the strength of how the pen behaved in
- * portrait was a mistake: what is visible there is this transform *and* the
- * compositor's rotation, and attributing the whole of it to the device tree
- * broke the orientation that had been right all along.
+ * The digitiser also reports the keyboard cover closing over the screen, as
+ * SW_MACHINE_COVER and SW_LID.  That is a third lid switch on this board, next
+ * to gpio-keys and the pogo keyboard, and logind acts on each of them.
+ *
+ * Orientation: the same properties as the touchscreen node.  Samsung gives
+ * both tablets' digitisers the same origin and invert flags, the grid runs
+ * portrait against the panel's landscape scanout as the touch controller's
+ * does, and the Ultra's transform was measured with the pen on two opposite
+ * corners in native landscape, where the compositor applies no rotation of
+ * its own.  nacht20-de's X710 driver applies the same transform in code (x
+ * from the controller's y, y from x_max - x).  The corner test still has to
+ * confirm it on this unit.
+ *
+ * touchscreen-x-mm and -y-mm are the controller's own axes, before the swap:
+ * the panel's short side first (236 x 148 mm, as the panel driver reports).
+ * They set the resolution, from which libinput takes the pen's size and the
+ * area around the tip in which it holds touch back.
  */
 &i2c3 {
 	clock-frequency = <400000>;
 	status = "okay";
 
+	digitizer@56 {
+		compatible = "samsung,gts9u-wacom-w90xx";
+		reg = <0x56>;
+		avdd-supply = <&vreg_l13b_3p0>;
+		pdct-gpios = <&tlmm 137 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&tlmm 154 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&epen_irqs>, <&epen_fwe>;
+		touchscreen-inverted-x;
+		touchscreen-swapped-x-y;
+		touchscreen-x-mm = <148>;
+		touchscreen-y-mm = <236>;
+	};
 };
 
 &i2c4 {
@@ -1263,6 +1362,13 @@
 	 * different FingerTipS command set and times out on this firmware;
 	 * samsung_fts1ba90a.c (16-byte events, 0x60/0x61) drives it.  Other
 	 * 11" units carry a Goodix GT9916 at 0x5d instead.
+	 *
+	 * The touch area is the panel's, 148 x 236 mm (stock r04) in the
+	 * controller's portrait axes, which gives the input device its
+	 * resolution.  wakeup-source: TLMM 25 is a PDC wake input (PDC 57);
+	 * the driver arms it only while its double-tap gesture is armed in
+	 * low-power mode, never with the controller powered off (the stock
+	 * driver's enable_irq_wake() in fts_stop_device()).
 	 */
 	touchscreen@49 {
 		compatible = "st,fts1ba90a";
@@ -1274,8 +1380,11 @@
 		vdd-supply = <&vreg_l12b_1p8>;
 		touchscreen-size-x = <1600>;
 		touchscreen-size-y = <2560>;
+		touchscreen-x-mm = <148>;
+		touchscreen-y-mm = <236>;
 		touchscreen-inverted-x;
 		touchscreen-swapped-x-y;
+		wakeup-source;
 	};
 
 };
@@ -1463,6 +1572,33 @@
 	};
 };
 
+/*
+ * The GMU never binds a driver of its own: the Adreno driver takes over this
+ * node's clocks, power domains and registers when the GPU binds.  fw_devlink
+ * still waits for it as a consumer, so gcc and gpucc never reached
+ * sync_state() and genpd kept every GDSC that was on at boot, the GPU's CX
+ * among them, powered for good.  As post-init providers the two links become
+ * FWLINK_FLAG_IGNORE ones, which fw_devlink drops without creating a device
+ * link (fw_devlink_create_devlink()).  Probe order is unchanged: this device
+ * never probes, and the GPU still waits for gpucc through adreno_smmu.
+ */
+&gmu {
+	post-init-providers = <&gcc>, <&gpucc>;
+};
+
+/*
+ * Mainline's QCE driver has no runtime PM: once bound it holds 393.6 MB/s on
+ * its DDR path for good, tagged QCOM_ICC_TAG_ALWAYS, so the vote stays in the
+ * sleep set too (drivers/crypto/qce/core.c).  Samsung's qcedev votes only
+ * while a client holds /dev/qce open.  Nothing here would use it either: the
+ * ARMv8 crypto extensions outrank it (priority 300 against 275).  Left enabled
+ * without a driver it kept aggre2 and mc_virt from sync_state(); disabled, it
+ * is simply not a consumer.
+ */
+&crypto {
+	status = "disabled";
+};
+
 &pcieport0 {
 	wifi@0 {
 		compatible = "pci17cb,1103";
@@ -1530,7 +1666,7 @@
 	clock-frequency = <76800000>;
 };
 
-/* ANA38407 AMSA46AS02 native display pipeline. */
+/* ANA38407 AMSA10FA01 native display pipeline. */
 
 / {
 	/*
@@ -1597,8 +1733,14 @@
 
 		reset-gpios = <&tlmm 125 GPIO_ACTIVE_HIGH>;
 		te-gpios = <&tlmm 86 GPIO_ACTIVE_HIGH>;
+		/*
+		 * samsung,tcon-rdy-gpio of the stock GTS9_ANA38407_AMSA10FA01
+		 * node: the DDIC raises it once it is out of reset, and
+		 * Samsung's Anapass power sequence sends nothing before that.
+		 */
+		tcon-rdy-gpios = <&tlmm 88 GPIO_ACTIVE_HIGH>;
 
-		pinctrl-0 = <&sde_te>;
+		pinctrl-0 = <&sde_te>, <&panel_tcon_rdy>;
 		pinctrl-names = "default";
 
 		port {
@@ -1616,6 +1758,16 @@
 
 &mdss_dsi0_phy {
 	vdds-supply = <&vreg_l1e_0p88>;
+	/*
+	 * Samsung's D-PHY timing table for this glass, TIMING_CTRL_0..13: every
+	 * timing node of the stock GTS9_ANA38407_AMSA10FA01 panel carries it
+	 * as qcom,mdss-dsi-panel-phy-timings, with t-clk-pre/post 0x2a/0x12, at
+	 * its single 1.524 Gbps lane rate.  The PHY replays it whenever the
+	 * requested rate is within 1% of that, and computes its own otherwise.
+	 */
+	qcom,dsi-phy-timings = /bits/ 8 <0x00 0x35 0x0d 0x0d 0x1f 0x27 0x0d
+					 0x0d 0x0c 0x02 0x04 0x00 0x2a 0x12>;
+	qcom,dsi-phy-timings-bitclk-hz = <1524000000>;
 	status = "okay";
 };
 
@@ -1641,6 +1793,70 @@
 };
 
 /*
+ * DMIC pins.  Stock X710 r04 muxes cdc_dmic01, cdc_dmic23 and cdc_dmic45 and
+ * leaves cdc_dmic67 (LPI gpio17/18) disabled: the microphones are on DMIC1,
+ * DMIC3 and DMIC5 only.  It drives all of these pins at 2 mA, so lower the
+ * 8 mA of sm8550.dtsi's dmic01/dmic23 states to match, and describe the third
+ * pair, which the SoC file does not.
+ */
+&lpass_tlmm {
+	dmic01-default-state {
+		clk-pins {
+			drive-strength = <2>;
+		};
+
+		data-pins {
+			drive-strength = <2>;
+		};
+	};
+
+	dmic23-default-state {
+		clk-pins {
+			drive-strength = <2>;
+		};
+
+		data-pins {
+			drive-strength = <2>;
+		};
+	};
+
+	dmic45_default: dmic45-default-state {
+		clk-pins {
+			pins = "gpio12";
+			function = "dmic3_clk";
+			drive-strength = <2>;
+			output-high;
+		};
+
+		data-pins {
+			pins = "gpio13";
+			function = "dmic3_data";
+			drive-strength = <2>;
+			input-enable;
+		};
+	};
+};
+
+&lpass_vamacro {
+	pinctrl-names = "default";
+	pinctrl-0 = <&dmic01_default>, <&dmic23_default>, <&dmic45_default>;
+	/*
+	 * DMIC clock.  The driver divides VA_MACRO_MCLK_FREQ, 9.6 MHz (it runs
+	 * the mclk at twice that), so 2.4 MHz is divider 4.  That is the rate
+	 * stock drives these microphones at for every capture above 16 kHz:
+	 * its TX macro has qcom,tx-dmic-sample-rate = <2400000>, and its VA
+	 * macro, set to 600 kHz for voice wake-up, switches to divider 4 in
+	 * hw_params above 16 kHz (lpass-cdc-va-macro.c, clk_div_switch).
+	 * Without the property the driver falls back to divider 2, 4.8 MHz, a
+	 * rate stock never runs these parts at.
+	 */
+	qcom,dmic-sample-rate = <2400000>;
+	/* See vreg_l10b_1p8: the DMIC bias rail Samsung uses for va-vdd-micb. */
+	vdd-micb-supply = <&vreg_l10b_1p8>;
+	status = "okay";
+};
+
+/*
  * ADSP (audio DSP) — step 1 of internal audio.  Uses Samsung's own signed
  * firmware (adsp.mdt + adsp_dtb.mdt + segments, extracted from apnhlos) because
  * the reference qcom/sm8550/adsp.mbn is Qualcomm-signed and rejected by Samsung
@@ -1651,57 +1867,6 @@
  * The ADSP is not on the boot path (rootfs is on the microSD), so a probe
  * failure does not break booting.  q6/soundwire/codecs/sound come later.
  */
-&lpass_tlmm {
-	dmic45_default: dmic45-default-state {
-		clk-pins {
-			pins = "gpio12";
-			function = "dmic3_clk";
-			drive-strength = <8>;
-			output-high;
-		};
-
-		data-pins {
-			pins = "gpio13";
-			function = "dmic3_data";
-			drive-strength = <8>;
-			input-enable;
-		};
-	};
-
-	dmic67_default: dmic67-default-state {
-		clk-pins {
-			pins = "gpio17";
-			function = "dmic4_clk";
-			drive-strength = <8>;
-			output-high;
-		};
-
-		data-pins {
-			pins = "gpio18";
-			function = "dmic4_data";
-			drive-strength = <8>;
-			input-enable;
-		};
-	};
-};
-
-&lpass_vamacro {
-	pinctrl-names = "default";
-	pinctrl-0 = <&dmic01_default>, <&dmic23_default>,
-		    <&dmic45_default>, <&dmic67_default>;
-	/*
-	 * Without this the driver logs "qcom,dmic-sample-rate dt entry missing"
-	 * and never derives the DMIC clock divider, so the decimators run with
-	 * no clock and capture returns pure silence.  4.8 MHz is what every
-	 * other mainline board with VA-macro DMICs uses and divides cleanly out
-	 * of the VA macro's 19.2 MHz mclk.
-	 */
-	qcom,dmic-sample-rate = <4800000>;
-	/* See vreg_l10b_1p8: the DMIC bias rail Samsung uses for va-vdd-micb. */
-	vdd-micb-supply = <&vreg_l10b_1p8>;
-	status = "okay";
-};
-
 &remoteproc_adsp {
 	firmware-name = "qcom/sm8550/adsp.mdt",
 			"qcom/sm8550/adsp_dtb.mdt";

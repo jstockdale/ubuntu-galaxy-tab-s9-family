@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Wacom W90xx EMR digitiser (Samsung "wez01") on the Galaxy Tab S9 Ultra.
+ * Wacom W90xx EMR digitiser (Samsung "wez01") on the Galaxy Tab S9 Ultra, and
+ * the same part behind the 11" Galaxy Tab S9 (SM-X710), whose Samsung node
+ * differs from the Ultra's only in its firmware image and its sensor grid.
  *
  * Mainline already carries two Wacom I2C drivers and neither can drive this
  * part.  wacom_i2c reads a 19-byte query little-endian from offsets 3, 5 and
@@ -35,6 +37,7 @@
 #include <linux/power_supply.h>
 #include <linux/pm_wakeup.h>
 #include <linux/pm_wakeirq.h>
+#include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/samsung_wacom.h>
 #include <linux/slab.h>
@@ -160,6 +163,27 @@
 #define WACOM_NOTI_COVER_DETECT		0x0a
 #define WACOM_COVER_CLOSED		BIT(7)
 
+/*
+ * libwacom tells GNOME what a tablet is, and it knows a tablet only by bus,
+ * vendor and product.  Nothing else this driver reports tells the two boards
+ * apart: same controller, same name.  Product 0 has always been the Ultra's,
+ * and both its libwacom entry and GNOME's saved per-tablet settings
+ * (tablets/056a:0000) are keyed on it, so it stays.  The SM-X710 reports its
+ * model number instead and gets an entry of its own; on 0 it would inherit the
+ * Ultra's, right about the display integration and wrong in name and size.
+ */
+#define WACOM_PRODUCT_SM_X710		0x0710
+
+/*
+ * What the resolution has always been computed from, as the length in mm of
+ * the controller's X and Y axes.  They are not the Ultra's glass, which is
+ * 196 x 313 mm, but they are what its pen has always reported, and a tree that
+ * gives no touchscreen-x-mm and touchscreen-y-mm -- the Ultra's -- keeps
+ * reporting exactly that.
+ */
+#define WACOM_DEFAULT_X_MM		155
+#define WACOM_DEFAULT_Y_MM		248
+
 enum samsung_wacom_charge_state {
 	WACOM_CHARGE_OFF = 0,
 	WACOM_CHARGE_START,
@@ -205,11 +229,15 @@ struct samsung_wacom {
 	/* Guards in_range and out_of_range against the proximity timer. */
 	spinlock_t lock;
 	struct timer_list prox_timer;
+	int pdct_irq;
 	bool in_range;
 	bool docked;
 	bool cover_closed;
 	bool disable_when_docked;
 	bool pen_irq_disabled;
+	/* Dock detect is armed for system wake (board policy, set at probe). */
+	bool pdct_wake;
+	bool pdct_wake_armed;
 	u8 garage_direction;
 	u8 charge_stage;
 	int charge_status;
@@ -515,6 +543,21 @@ static irqreturn_t samsung_wacom_pdct_irq(int irq, void *dev_id)
 	/* Both edges share the threaded line; ignore duplicate level reports. */
 	if (docked == READ_ONCE(wacom->docked))
 		return IRQ_HANDLED;
+
+	/*
+	 * Where the dock detect wakes the tablet, a transition that lands while
+	 * a suspend is already under way has to abort it.  The line is only
+	 * armed for wake late in that sequence, and an edge taken before then is
+	 * handled here like any other: without this the pen drawn at that moment
+	 * would leave the tablet asleep.  It has to be a hard event.  A soft one
+	 * only counts against /sys/power/wakeup_count, which systemd-sleep never
+	 * writes, so it would not stop a suspend.  The PM core clears the abort
+	 * when the next suspend starts freezing tasks, so a transition while
+	 * awake costs nothing.  It does nothing once userspace has turned the
+	 * device's wakeup off.
+	 */
+	if (wacom->pdct_wake)
+		pm_wakeup_hard_event(&wacom->client->dev);
 
 	WRITE_ONCE(wacom->docked, docked);
 	wacom->charge_stage = 0;
@@ -880,6 +923,42 @@ static void samsung_wacom_clear_wake_irq(void *data)
 	device_init_wakeup(dev, false);
 }
 
+/*
+ * libinput refuses a tablet without a resolution, and turns the pen's
+ * coordinates into millimetres with it: the size udev publishes and the area
+ * around the tip in which libinput holds touch back both come from here.
+ *
+ * touchscreen-x-mm and touchscreen-y-mm, the standard properties, give the
+ * length of the controller's own X and Y axes, before the swap that
+ * touchscreen_parse_properties() applies -- the way wacom_w9000 reads them.
+ * The resolution is set on those same axes here, and the swap carries it
+ * across together with the ranges.
+ */
+static void samsung_wacom_set_resolution(struct device *dev,
+					 struct input_dev *input,
+					 const struct samsung_wacom_features *features)
+{
+	u32 x_mm = WACOM_DEFAULT_X_MM;
+	u32 y_mm = WACOM_DEFAULT_Y_MM;
+
+	if (device_property_present(dev, "touchscreen-x-mm") ||
+	    device_property_present(dev, "touchscreen-y-mm")) {
+		/* A resolution of 0 would make libinput drop the pen. */
+		if (device_property_read_u32(dev, "touchscreen-x-mm", &x_mm) ||
+		    device_property_read_u32(dev, "touchscreen-y-mm", &y_mm) ||
+		    !x_mm || !y_mm ||
+		    x_mm > features->x_max || y_mm > features->y_max) {
+			dev_warn(dev,
+				 "ignoring touchscreen-x-mm/-y-mm: both are needed, in mm\n");
+			x_mm = WACOM_DEFAULT_X_MM;
+			y_mm = WACOM_DEFAULT_Y_MM;
+		}
+	}
+
+	input_abs_set_res(input, ABS_X, features->x_max / x_mm);
+	input_abs_set_res(input, ABS_Y, features->y_max / y_mm);
+}
+
 static int samsung_wacom_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -948,6 +1027,15 @@ static int samsung_wacom_probe(struct i2c_client *client)
 		return dev_err_probe(dev, PTR_ERR(wacom->pdct),
 				     "cannot claim S Pen dock detect\n");
 	wacom->docked = gpiod_get_value_cansleep(wacom->pdct) > 0;
+	/*
+	 * Samsung arms the dock detect for wake together with the data line on
+	 * every board with a garage (wacom_enable_irq_wake() in wacom_i2c.c, for
+	 * wacom,use_garage), so drawing the pen -- or docking it, which only the
+	 * host can start charging -- wakes the tablet.  The SM-X710 follows that.
+	 * The Ultra keeps the data line alone, which is what its suspend was
+	 * measured with, until the same has been tried there.
+	 */
+	wacom->pdct_wake = of_machine_is_compatible("samsung,gts9wifi");
 	wacom->charge_status = POWER_SUPPLY_STATUS_UNKNOWN;
 	mutex_init(&wacom->command_lock);
 	mutex_init(&wacom->option_lock);
@@ -971,6 +1059,8 @@ static int samsung_wacom_probe(struct i2c_client *client)
 	input->name = "Wacom EMR Digitizer";
 	input->id.bustype = BUS_I2C;
 	input->id.vendor = 0x056a;	/* Wacom */
+	if (of_machine_is_compatible("samsung,gts9wifi"))
+		input->id.product = WACOM_PRODUCT_SM_X710;
 	input->id.version = features.module_ver;
 
 	/*
@@ -999,8 +1089,7 @@ static int samsung_wacom_probe(struct i2c_client *client)
 			     features.tilt_x_max, 0, 0);
 	input_set_abs_params(input, ABS_TILT_Y, -features.tilt_y_max,
 			     features.tilt_y_max, 0, 0);
-	input_abs_set_res(input, ABS_X, features.x_max / 155);
-	input_abs_set_res(input, ABS_Y, features.y_max / 248);
+	samsung_wacom_set_resolution(dev, input, &features);
 
 	/*
 	 * The digitiser grid runs the other way round from the panel, exactly
@@ -1036,6 +1125,7 @@ static int samsung_wacom_probe(struct i2c_client *client)
 	if (error)
 		return dev_err_probe(dev, error,
 				     "cannot claim S Pen dock interrupt\n");
+	wacom->pdct_irq = pdct_irq;
 
 	supply_config.drv_data = wacom;
 	supply_config.fwnode = dev_fwnode(dev);
@@ -1080,6 +1170,44 @@ static int samsung_wacom_probe(struct i2c_client *client)
 	return 0;
 }
 
+/*
+ * The data line is the PM core's to arm (dev_pm_set_wake_irq() above).  The
+ * dock detect is a second interrupt of the same device, which that API cannot
+ * carry, so it is armed here, and only while userspace leaves the device's
+ * wakeup on: power/wakeup governs both lines alike.
+ */
+static int samsung_wacom_suspend(struct device *dev)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+	int error;
+
+	if (!wacom->pdct_wake || !device_may_wakeup(dev))
+		return 0;
+
+	error = enable_irq_wake(wacom->pdct_irq);
+	if (error)
+		dev_warn(dev, "S Pen dock detect cannot wake the system: %d\n",
+			 error);
+	wacom->pdct_wake_armed = !error;
+
+	return 0;
+}
+
+static int samsung_wacom_resume(struct device *dev)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+
+	if (wacom->pdct_wake_armed) {
+		disable_irq_wake(wacom->pdct_irq);
+		wacom->pdct_wake_armed = false;
+	}
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(samsung_wacom_pm_ops,
+				samsung_wacom_suspend, samsung_wacom_resume);
+
 static const struct of_device_id samsung_wacom_of_match[] = {
 	{ .compatible = "samsung,gts9u-wacom-w90xx" },
 	{ }
@@ -1090,10 +1218,11 @@ static struct i2c_driver samsung_wacom_driver = {
 	.driver = {
 		.name = "samsung-wacom-w90xx",
 		.of_match_table = samsung_wacom_of_match,
+		.pm = pm_sleep_ptr(&samsung_wacom_pm_ops),
 	},
 	.probe = samsung_wacom_probe,
 };
 module_i2c_driver(samsung_wacom_driver);
 
-MODULE_DESCRIPTION("Wacom W90xx EMR digitiser on the Samsung SM-X910");
+MODULE_DESCRIPTION("Wacom W90xx EMR digitiser on the Samsung SM-X910 and SM-X710");
 MODULE_LICENSE("GPL");

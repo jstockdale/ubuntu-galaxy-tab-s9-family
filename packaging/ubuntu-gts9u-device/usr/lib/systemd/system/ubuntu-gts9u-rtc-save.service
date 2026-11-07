@@ -1,0 +1,8 @@
+[Unit]
+Description=Save the PMIC RTC offset after an NTP synchronisation
+ConditionPathExists=/sys/class/rtc/rtc0/since_epoch
+RequiresMountsFor=/var/lib/ubuntu-gts9u
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/ubuntu-gts9u-rtc-offset save

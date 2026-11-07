@@ -1,0 +1,86 @@
+#!/bin/sh
+# Keep the wall clock across boots with the PMIC RTC, the way Android's
+# time_daemon does it.
+#
+# Under Samsung's firmware the PMK8550 RTC is a free-running seconds counter
+# that Linux may not set: the stock device tree gives it no allow-set-time,
+# Samsung's own driver refuses set_time, and mainline's returns -ENODEV without
+# an offset cell.  It keeps counting while the tablet is off, so the wall clock
+# is that counter plus an offset, saved here whenever NTP has synchronised the
+# clock and applied early on the next boot.  The kernel no longer copies the
+# counter into the system clock itself (RTC_HCTOSYS is off for this board).
+#
+#   restore  set the clock to RTC + saved offset, never backwards
+#   save     store wall clock - RTC, only while NTP-synchronised
+#
+# Alarms need none of this: rtcwake and the alarm timers program the RTC
+# relative to its own counter.
+set -eu
+
+case "${1:-}" in
+	restore|save) ;;
+	*) echo "usage: $0 restore|save" >&2; exit 2 ;;
+esac
+
+rtc=/sys/class/rtc/rtc0
+state=/var/lib/ubuntu-gts9u/rtc-offset
+
+# Only the PMIC's counter has these semantics; leave any other RTC alone.
+case "$(cat "$rtc/name" 2>/dev/null)" in
+	rtc-pm8xxx*) ;;
+	*) exit 0 ;;
+esac
+counter=$(cat "$rtc/since_epoch")
+
+valid_offset() {
+	# Plain decimal only: shell arithmetic reads a leading 0 as octal.
+	case "$1" in
+		''|-|*[!0-9-]*|?*-*|0?*|-0*) return 1 ;;
+	esac
+}
+
+case "$1" in
+restore)
+	[ -r "$state" ] || exit 0
+	offset=$(cat "$state")
+	if ! valid_offset "$offset"; then
+		echo "ignoring malformed $state" >&2
+		exit 0
+	fi
+	now=$((counter + offset))
+	# A clock far in the future breaks TLS and the journal more than a stale
+	# one; NTP corrects a stale one within seconds of a connection.
+	if [ "$now" -ge 4102444800 ]; then
+		echo "RTC + saved offset lies beyond 2100; left alone" >&2
+		exit 0
+	fi
+	# systemd has already advanced a 1970 clock to its build epoch, and
+	# timesyncd's clock file may be later still: a counter that was reset
+	# with the battery must not drag the clock back behind either.
+	when=$(date -u -d "@$now" '+%F %T UTC')
+	if [ "$now" -le "$(date +%s)" ]; then
+		echo "RTC + saved offset ($when) is not ahead of the clock; left alone"
+		exit 0
+	fi
+	date -u -s "@$now" > /dev/null
+	echo "clock set from the PMIC RTC + saved offset: $when"
+	;;
+save)
+	synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
+	[ "$synced" = yes ] || exit 0
+	offset=$(($(date +%s) - counter))
+	# NTP keeps the offset within a second or two between saves; only
+	# rewrite it when the RTC has really drifted or been reset.
+	if [ -r "$state" ]; then
+		old=$(cat "$state")
+		if valid_offset "$old" && [ "$((offset - old))" -ge -2 ] &&
+		   [ "$((offset - old))" -le 2 ]; then
+			exit 0
+		fi
+	fi
+	mkdir -p "${state%/*}"
+	printf '%s\n' "$offset" > "$state.new"
+	mv -f "$state.new" "$state"
+	echo "saved PMIC RTC offset $offset s"
+	;;
+esac

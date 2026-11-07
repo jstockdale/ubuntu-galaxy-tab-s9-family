@@ -15,6 +15,10 @@ BOOST = Path('/sys/devices/system/cpu/cpufreq/boost')
 PRIME_BOOST = Path('/sys/devices/system/cpu/cpufreq/policy7/scaling_boost_frequencies')
 NAME = 'net.hadess.PowerProfiles'
 OBJECT = '/net/hadess/PowerProfiles'
+# Boards whose kernel adds the 3.36 GHz prime boost OPP before cpufreq probes
+# (kernel/dts/gts9-performance.dtso).  Samsung's firmware LUT ends at it on
+# both, and neither stock tree caps the prime core below it.
+BOARDS = (b'samsung,gts9uwifi', b'samsung,gts9wifi')
 
 
 def desired_boost(profile):
@@ -28,7 +32,7 @@ def desired_boost(profile):
 
 def main():
     compatible = Path('/proc/device-tree/compatible').read_bytes().split(b'\0')
-    if b'samsung,gts9uwifi' not in compatible:
+    if not any(board in compatible for board in BOARDS):
         return 0
     # Older kernels reject boost writes because the Galaxy OPP is missing.
     if not PRIME_BOOST.exists() or '3360000' not in PRIME_BOOST.read_text().split():

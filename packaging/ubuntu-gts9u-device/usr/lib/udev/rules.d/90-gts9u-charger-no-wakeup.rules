@@ -1,0 +1,16 @@
+# Stop the SM-X710's charger supplies from aborting suspend.
+#
+# power_supply_register() marks every supply as a system wakeup source (see
+# 90-gts9u-spen-no-wakeup.rules), so each power_supply_changed() counts as a
+# wakeup event.  On the X710 the SM5714 battery and USB supplies and the TCPM
+# source supply each report about every 15 s while charging -- the charger poll
+# re-applies its setup -- and one such event inside the freeze or device
+# suspend window aborts the attempt ("Some devices failed to suspend, or early
+# wake event detected").  None of them can wake a sleeping tablet anyway: the
+# SM5714 is polled, with no interrupt wired up, and the USB-C controller's own
+# interrupt is not a wake source.  The supplies keep reporting, so charging
+# indication is untouched; they only stop counting as wakeups.
+#
+# The Ultra measured no such events (docs/development-notes.md) and keeps its
+# behaviour: the rule only matches when the device tree says samsung,gts9wifi.
+ACTION=="add", SUBSYSTEM=="power_supply", KERNEL=="sm5714-battery|sm5714-usb|tcpm-source-psy-*", PROGRAM=="/usr/bin/grep -qxzF samsung,gts9wifi /proc/device-tree/compatible", ATTR{power/wakeup}="disabled"

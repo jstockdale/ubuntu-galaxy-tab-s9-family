@@ -1,0 +1,100 @@
+Subject: [PATCH] driver core: Postpone the deferred probe timeout while probing is blocked
+
+deferred_probe_timeout_work_func() runs from a workqueue the freezer does
+not stop, so it can fire in the middle of a system suspend/resume
+transition.  Its final retry cannot probe anything then, the devices it
+reports as "deferred probe pending" are only waiting for the system to
+resume, and with fw_devlink.sync_state=timeout fw_devlink_probing_done()
+forces sync_state() on suppliers while their consumers are suspended.  On
+a Galaxy Tab S9 the timeout regularly lands inside the boot-time
+platform-level suspend test, and the only two boots made with
+fw_devlink.sync_state=timeout both stopped as that test began.
+
+If the timeout expires while probing is blocked, record it and let
+device_unblock_probing() run it once devices have resumed.
+device_block_probing() also waits for an instance that was already
+running, so that it cannot overlap with suspending devices.
+
+Applies on top of driver-core-no-deferred-retry-while-probing-blocked.patch.
+
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -70,6 +70,15 @@ static bool async_probe_default;
+  */
+ static bool defer_all_probes;
+ 
++/*
++ * Set when the deferred probe timeout expires while probing is blocked, so
++ * that device_unblock_probing() runs it.  Protected by deferred_probe_mutex.
++ */
++static bool deferred_probe_timeout_postponed;
++
++static void deferred_probe_timeout_work_func(struct work_struct *work);
++static DECLARE_DELAYED_WORK(deferred_probe_timeout_work, deferred_probe_timeout_work_func);
++
+ static void __device_set_deferred_probe_reason(const struct device *dev, char *reason)
+ {
+ 	kfree(dev->p->deferred_probe_reason);
+@@ -233,6 +242,12 @@ void device_block_probing(void)
+ 	mutex_unlock(&deferred_probe_mutex);
+ 	/* sync with probes to avoid races. */
+ 	wait_for_device_probe();
++	/*
++	 * Also let a deferred probe timeout that was already running finish
++	 * before any device is suspended.  One that expires from now on is
++	 * postponed until device_unblock_probing().
++	 */
++	flush_work(&deferred_probe_timeout_work.work);
+ }
+ 
+ /**
+@@ -243,10 +258,18 @@ void device_block_probing(void)
+  */
+ void device_unblock_probing(void)
+ {
++	bool timeout_postponed;
++
+ 	mutex_lock(&deferred_probe_mutex);
+ 	defer_all_probes = false;
++	timeout_postponed = deferred_probe_timeout_postponed;
++	deferred_probe_timeout_postponed = false;
+ 	mutex_unlock(&deferred_probe_mutex);
+ 	driver_deferred_probe_trigger();
++
++	/* Run a deferred probe timeout that expired while probing was blocked. */
++	if (timeout_postponed)
++		schedule_delayed_work(&deferred_probe_timeout_work, 0);
+ }
+ 
+ /**
+@@ -331,6 +354,22 @@ static void deferred_probe_timeout_work_func(struct work_struct *work)
+ {
+ 	struct device_private *p;
+ 
++	/*
++	 * Probing is blocked while devices are suspended or shutting down.  The
++	 * final retry below could not probe anything then, the devices it
++	 * reports as pending would only be waiting for the system to resume,
++	 * and fw_devlink.sync_state=timeout would force sync_state() on
++	 * suppliers whose consumers are suspended.  Let
++	 * device_unblock_probing() run the timeout instead.
++	 */
++	mutex_lock(&deferred_probe_mutex);
++	if (defer_all_probes) {
++		deferred_probe_timeout_postponed = true;
++		mutex_unlock(&deferred_probe_mutex);
++		return;
++	}
++	mutex_unlock(&deferred_probe_mutex);
++
+ 	fw_devlink_drivers_done();
+ 
+ 	driver_deferred_probe_timeout = 0;
+@@ -344,7 +383,6 @@ static void deferred_probe_timeout_work_func(struct work_struct *work)
+ 
+ 	fw_devlink_probing_done();
+ }
+-static DECLARE_DELAYED_WORK(deferred_probe_timeout_work, deferred_probe_timeout_work_func);
+ 
+ void deferred_probe_extend_timeout(void)
+ {

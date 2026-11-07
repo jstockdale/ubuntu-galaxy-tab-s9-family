@@ -9,12 +9,17 @@
  * from the stock DTBO; see docs/panel-ana38407-bringup.md.  Samsung's
  * proprietary gamma/VRR/ACL/mdnie machinery is intentionally NOT ported: the
  * DPU switches refresh rate by mode-set, and brightness goes through the
- * standard DCS 0x51 path.
+ * standard DCS 0x51 path.  The one exception is the 11" glass, whose DDIC
+ * sets its own refresh in command mode: there the mode being enabled selects
+ * Samsung's VRR_SETTING and GLUT_SETTING branches (see
+ * ana38407_amsa10fa01_on()).
  */
 
 #include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -24,9 +29,13 @@
 
 #include <drm/display/drm_dsc.h>
 #include <drm/display/drm_dsc_helper.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
+
+#include "panel-samsung-ana38407-glut.h"
 
 /*
  * Boot-time switches for the display experiments, so a change of DSI timing
@@ -39,10 +48,19 @@ module_param_named(continuous_clock, param_continuous_clock, int, 0444);
 MODULE_PARM_DESC(continuous_clock,
 		 "keep the DSI clock lane in HS between frames (-1 per-glass default, 0 no, 1 yes)");
 
+/*
+ * Only the preferred mode: the other modes take Samsung's own porches, which
+ * already land on the same lane rate (see ana38407_amsa10fa01_modes).
+ */
 static int param_hback_porch = -1;
 module_param_named(hback_porch, param_hback_porch, int, 0444);
 MODULE_PARM_DESC(hback_porch,
-		 "override the horizontal back porch of every declared mode, recomputing its clock (-1 keeps the table)");
+		 "override the horizontal back porch of the preferred mode, recomputing its clock (-1 keeps the table)");
+
+static bool param_mode_30hz;
+module_param_named(mode_30hz, param_mode_30hz, bool, 0444);
+MODULE_PARM_DESC(mode_30hz,
+		 "also offer the 30 Hz mode of glasses that have one (experimental)");
 
 /*
  * DCS 0x51 carries 11 significant bits on this DDIC, not 12: Samsung's own
@@ -59,8 +77,21 @@ MODULE_PARM_DESC(hback_porch,
 #define ANA38407_FOD_WATCHDOG_MS	15000
 #define ANA38407_FOD_SETTLE_MS		35
 
-/* Revision D, as read back by the bootloader (lcd_id=0x800004). */
+/*
+ * Revision D, as read back by the bootloader (lcd_id=0x800004).  The 11"
+ * AMSA10FA01 answers the same id: the SM-X710 cmdline carries
+ * msm_drm.lcd_id=800004 and every working init on that board read 80 00 04.
+ * Samsung's own X710 driver also knows revision C (0x800003) glass, which
+ * needs the SSCG_OFF_SETTING block this driver does not send.
+ */
 static const u8 ana38407_expected_id[3] = { 0x80, 0x00, 0x04 };
+
+/* Refresh-rate families of Samsung's VRR_SETTING ("HS" = normal speed). */
+enum ana38407_vrr {
+	ANA38407_VRR_120HS,
+	ANA38407_VRR_60HS,
+	ANA38407_VRR_30HS,
+};
 
 /*
  * One driver serves the ANA38407 across the Tab S9 family; the glass differs.
@@ -91,6 +122,12 @@ struct ana38407_desc {
 	 * LP->HS re-entry at 1.524 Gbps with mainline's generic PHY timings.
 	 */
 	bool continuous_clock;
+	/*
+	 * The DDIC sets its own refresh in command mode: the mode being enabled
+	 * selects Samsung's VRR_SETTING and GLUT_SETTING branches, and below
+	 * 120 Hz a brightness change re-sends the matching GLUT_OFFSET_60HS row.
+	 */
+	bool vrr_by_mode;
 };
 
 /*
@@ -104,8 +141,13 @@ struct ana38407_desc {
  * state the bootloader left behind after painting its logo.
  *
  * Log the mismatch so the cause is visible, but do not burn boot time cycling
- * the panel for a fix that does not work at this level.
+ * the panel for a fix that does not work at this level.  Where the board
+ * describes Samsung's TCON_RDY line, prepare also waits for it after reset,
+ * as Samsung's Anapass power sequence does, and the first prepare reports how
+ * the DDIC came out of reset: a DDIC that never raises TCON_RDY is dead on
+ * the panel side, one that does but still reads 00:00:00 points at the host.
  */
+#define ANA38407_TCON_RDY_TIMEOUT_US	200000
 
 struct ana38407 {
 	struct drm_panel panel;
@@ -113,6 +155,9 @@ struct ana38407 {
 	struct drm_dsc_config dsc;
 	struct regulator_bulk_data *supplies;
 	struct gpio_desc *reset_gpio;
+	struct gpio_desc *tcon_rdy_gpio;
+	/* Set by get_modes(); prepare() reads the mode being enabled from it. */
+	struct drm_connector *connector;
 	/* Serializes panel lifetime, normal brightness and optical FOD state. */
 	struct mutex lock;
 	struct delayed_work fod_watchdog;
@@ -121,6 +166,11 @@ struct ana38407 {
 	bool enabled;
 	bool fod_mode;
 	bool fod_circle;
+	bool prepared_once;
+	bool id_read;
+	enum ana38407_vrr vrr;
+	/* GLUT_OFFSET_60HS row the DDIC holds, -1 for none (120 Hz zeroes). */
+	int glut_row;
 	u8 id[3];
 	char cell_id[23];
 	const struct ana38407_desc *desc;
@@ -184,6 +234,105 @@ static void ana38407_reset(struct ana38407 *ctx)
 	usleep_range(10000, 11000);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	usleep_range(10000, 11000);
+}
+
+/*
+ * Samsung's Anapass power sequence (samsung,anapass-power-seq): VDD on, LP11,
+ * reset, then no command until the DDIC raises TCON_RDY.  Samsung polls every
+ * 2 ms for up to a second and carries on either way; the DDIC normally takes a
+ * few tens of milliseconds.  Returns the wait in milliseconds or -ETIMEDOUT.
+ */
+static int ana38407_wait_tcon_ready(struct ana38407 *ctx)
+{
+	ktime_t start = ktime_get();
+	int ret, val;
+
+	ret = read_poll_timeout(gpiod_get_value_cansleep, val, val > 0,
+				2000, ANA38407_TCON_RDY_TIMEOUT_US, false,
+				ctx->tcon_rdy_gpio);
+	if (ret)
+		return ret;
+
+	return ktime_ms_delta(ktime_get(), start);
+}
+
+/*
+ * The 11" glass at 60 and 30 Hz ("60HS"/"30HS"): Samsung's GLUT_SETTING loads
+ * a gamma LUT offset that depends on the platform brightness level, and its
+ * BRIGHTNESS_SETTING re-sends it with every level change.  The level of a raw
+ * DCS 0x51 value is the highest NORMAL_CANDELA_MAP entry that does not exceed
+ * it.  HBM is only ever entered for the fingerprint sensor, for at most
+ * ANA38407_FOD_WATCHDOG_MS, and keeps the user's row.
+ */
+static unsigned int ana38407_amsa10fa01_level(u16 brightness)
+{
+	unsigned int lo = 0, hi = ARRAY_SIZE(ana38407_amsa10fa01_wrdisbv) - 1;
+
+	while (lo < hi) {
+		unsigned int mid = (lo + hi + 1) / 2;
+
+		if (ana38407_amsa10fa01_wrdisbv[mid] <= brightness)
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+
+	return lo;
+}
+
+/* GLUT_OFFSET_60HS row for the current mode and brightness, -1 at 120 Hz. */
+static int ana38407_glut_row(struct ana38407 *ctx)
+{
+	if (!ctx->desc->vrr_by_mode || ctx->vrr == ANA38407_VRR_120HS)
+		return -1;
+
+	return ana38407_amsa10fa01_glut60_row[ana38407_amsa10fa01_level(ctx->user_brightness)];
+}
+
+/*
+ * GLUT_SETTING: the offsets go to 0xEB from gpara 0x91 (110 bytes) and on into
+ * 0xEC (82 bytes); the 120 Hz branch writes the same pages with zeroes.  The
+ * trailing EB 02 / 93 20 writes select the table and are common to both.
+ */
+static void ana38407_glut_multi(struct mipi_dsi_multi_context *dsi_ctx, int row)
+{
+	u8 eb[1 + ANA38407_GLUT_EB_LEN] = { 0xeb };
+	u8 ec[1 + ANA38407_GLUT_EC_LEN] = { 0xec };
+
+	if (row >= 0) {
+		memcpy(&eb[1], ana38407_amsa10fa01_glut60[row], ANA38407_GLUT_EB_LEN);
+		memcpy(&ec[1], &ana38407_amsa10fa01_glut60[row][ANA38407_GLUT_EB_LEN],
+		       ANA38407_GLUT_EC_LEN);
+	}
+
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb0, 0x91, 0xeb);
+	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, eb, sizeof(eb));
+	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, ec, sizeof(ec));
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xeb, 0x02);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb0, 0x26, 0x93);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x93, 0x20);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xf0, 0xa5, 0xa5);
+}
+
+/* Re-send the GLUT row when a brightness change below 120 Hz moved it. */
+static int ana38407_sync_glut_locked(struct ana38407 *ctx)
+{
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	unsigned long mode_flags = ctx->dsi->mode_flags;
+	int row = ana38407_glut_row(ctx);
+
+	if (row < 0 || row == ctx->glut_row)
+		return 0;
+
+	/* High speed, like the 0x51 write that follows it. */
+	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	ana38407_glut_multi(&dsi_ctx, row);
+	ctx->dsi->mode_flags = mode_flags;
+	if (!dsi_ctx.accum_err)
+		ctx->glut_row = row;
+
+	return dsi_ctx.accum_err;
 }
 
 /*
@@ -284,6 +433,13 @@ static int ana38407_fod_cleanup_locked(struct ana38407 *ctx)
 	}
 
 	if (ctx->fod_mode) {
+		/*
+		 * Brightness changes made while sampling were only remembered;
+		 * below 120 Hz their GLUT row goes out ahead of the 0x51 restore.
+		 */
+		tmp = ana38407_sync_glut_locked(ctx);
+		if (!ret)
+			ret = tmp;
 		tmp = ana38407_write_fod_locked(ctx, false);
 		if (!ret)
 			ret = tmp;
@@ -482,16 +638,31 @@ static int ana38407_on(struct ana38407 *ctx)
  * with the Ultra glass, but brackets them with slew boosting and uses its own
  * display-on-delay and TSP sync registers; the Ultra's VBP_SETTING_FOR_SDC_IP
  * writes a vertical porch for the 1848-line panel and must not be sent here.
+ *
+ * In command mode the DDIC runs its own refresh, so a mode below 120 Hz only
+ * takes effect through VRR_SETTING, and needs GLUT_SETTING's 60 Hz gamma
+ * offsets on top.  Both follow the mode prepare() found in the commit: the
+ * normal-speed "60HS" and "30HS" branches, which One UI uses for its
+ * 60 Hz setting; the frame-skipping "PHS" modes are not offered.
  */
-/* GLUT pages cleared at 120 Hz: DCS register followed by the zero payload. */
-static const u8 ana38407_glut_zero_eb[1 + 110] = { 0xeb };
-static const u8 ana38407_glut_zero_ec[1 + 82] = { 0xec };
+struct ana38407_vrr_cmds {
+	u8 scan;	/* 0x60: 0x00 120 Hz scan, 0x10 60 Hz scan */
+	u8 skip;	/* 0xDD at gpara 0x13: frames skipped per refresh */
+	u8 b9[4];	/* 0xB9 at gpara 0x10, revision C onwards */
+};
+
+static const struct ana38407_vrr_cmds ana38407_amsa10fa01_vrr[] = {
+	[ANA38407_VRR_120HS] = { 0x00, 0x00, { 0x80, 0x00, 0x00, 0x00 } },
+	[ANA38407_VRR_60HS]  = { 0x10, 0x00, { 0xaa, 0xaa, 0xaa, 0xaa } },
+	[ANA38407_VRR_30HS]  = { 0x10, 0x01, { 0xaa, 0xaa, 0xaa, 0xaa } },
+};
 
 static int ana38407_amsa10fa01_on(struct ana38407 *ctx)
 {
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
 	struct drm_dsc_picture_parameter_set pps;
 	static const u8 slew_regs[] = { 0x4f, 0x62, 0x75, 0x88 };
+	const struct ana38407_vrr_cmds *vrr = &ana38407_amsa10fa01_vrr[ctx->vrr];
 	u8 module_info[11] = {};
 	u8 id[3] = {};
 	ssize_t module_info_len;
@@ -600,20 +771,11 @@ static int ana38407_amsa10fa01_on(struct ana38407 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x91, 0x02);
 
 	/*
-	 * GLUT_SETTING, 120 Hz branch: Samsung clears both gamma LUT pages
-	 * (110 + 82 bytes at 0xEB/0xEC via index 0x91) and then selects
-	 * them.  The 60/30 Hz branch loads a per-panel LUT and is not sent.
+	 * GLUT_SETTING: both gamma LUT pages cleared at 120 Hz, the
+	 * GLUT_OFFSET_60HS row of the current brightness at 60 and 30 Hz.
 	 */
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x91, 0xeb);
-	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, ana38407_glut_zero_eb,
-					sizeof(ana38407_glut_zero_eb));
-	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, ana38407_glut_zero_ec,
-					sizeof(ana38407_glut_zero_ec));
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xeb, 0x02);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x26, 0x93);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x93, 0x20);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	ctx->glut_row = ana38407_glut_row(ctx);
+	ana38407_glut_multi(&dsi_ctx, ctx->glut_row);
 
 	/* BRIGHTNESS_DIMMING_SETTING: normal mode plus a real level. */
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
@@ -642,14 +804,15 @@ static int ana38407_amsa10fa01_on(struct ana38407 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
 
-	/* VRR_SETTING, 120 Hz, revision C+ variant. */
+	/* VRR_SETTING, revision C+ variant, for the mode being enabled. */
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0x5a, 0x5a);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x00);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0x60, vrr->scan);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x13, 0xdd);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdd, 0x00);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xdd, vrr->skip);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x10, 0xb9);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x80, 0x00, 0x00, 0x00);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xb9, vrr->b9[0], vrr->b9[1],
+					 vrr->b9[2], vrr->b9[3]);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
 
@@ -722,9 +885,42 @@ static int ana38407_sleep_in(struct ana38407 *ctx)
 	return dsi_ctx.accum_err;
 }
 
+/*
+ * prepare() runs inside the atomic commit that enables a mode, after the new
+ * state has been swapped in, so the connector's CRTC state holds the mode the
+ * DDIC must be set up for.  Glasses without per-mode DDIC settings, and any
+ * prepare outside a commit, keep the 120 Hz settings.
+ */
+static enum ana38407_vrr ana38407_target_vrr(struct ana38407 *ctx)
+{
+	struct drm_connector *connector = ctx->connector;
+	int refresh;
+
+	if (!ctx->desc->vrr_by_mode || !connector || !connector->state ||
+	    !connector->state->crtc)
+		return ANA38407_VRR_120HS;
+
+	refresh = drm_mode_vrefresh(&connector->state->crtc->state->mode);
+	if (refresh <= 40)
+		return ANA38407_VRR_30HS;
+	if (refresh <= 90)
+		return ANA38407_VRR_60HS;
+
+	return ANA38407_VRR_120HS;
+}
+
+static const char *const ana38407_vrr_names[] = {
+	[ANA38407_VRR_120HS] = "120HS",
+	[ANA38407_VRR_60HS] = "60HS",
+	[ANA38407_VRR_30HS] = "30HS",
+};
+
 static int ana38407_prepare(struct drm_panel *panel)
 {
 	struct ana38407 *ctx = to_ana38407(panel);
+	struct device *dev = &ctx->dsi->dev;
+	const u8 *expected = ctx->desc->expected_id;
+	int tcon_before = 0, tcon_ms = 0;
 	int ret;
 
 	mutex_lock(&ctx->lock);
@@ -733,30 +929,63 @@ static int ana38407_prepare(struct drm_panel *panel)
 		goto out_unlock;
 	}
 
+	ctx->vrr = ana38407_target_vrr(ctx);
+
 	ret = ana38407_power_on(ctx);
 	if (ret)
 		goto out_unlock;
 
+	if (ctx->tcon_rdy_gpio)
+		tcon_before = gpiod_get_value_cansleep(ctx->tcon_rdy_gpio);
 	ana38407_reset(ctx);
+	if (ctx->tcon_rdy_gpio) {
+		tcon_ms = ana38407_wait_tcon_ready(ctx);
+		/*
+		 * The first power-on takes over the bootloader's splash: record
+		 * how the DDIC came out of reset, for the cold-boot fault above.
+		 */
+		if (!ctx->prepared_once && tcon_ms < 0)
+			dev_info(dev, "first power-on: TCON_RDY %s before reset, still low %d ms after it\n",
+				 tcon_before > 0 ? "high" : "low",
+				 ANA38407_TCON_RDY_TIMEOUT_US / 1000);
+		else if (!ctx->prepared_once)
+			dev_info(dev, "first power-on: TCON_RDY %s before reset, high %d ms after it\n",
+				 tcon_before > 0 ? "high" : "low", tcon_ms);
+		else if (tcon_ms < 0)
+			dev_warn(dev, "TCON_RDY still low %d ms after reset\n",
+				 ANA38407_TCON_RDY_TIMEOUT_US / 1000);
+	}
+	ctx->prepared_once = true;
 
 	ret = ctx->desc->on(ctx);
+	/* on() reads the id whether or not its writes went through. */
+	ctx->id_read = true;
 	if (ret) {
+		ctx->glut_row = -1;
 		gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 		regulator_bulk_disable(ARRAY_SIZE(ana38407_supplies), ctx->supplies);
 		goto out_unlock;
 	}
 	ctx->prepared = true;
 
-	if (!ctx->desc->expected_id)
-		dev_info(&ctx->dsi->dev,
-			 "panel id %02x %02x %02x (no expected id pinned for this glass yet)\n",
+	if (ctx->vrr != ANA38407_VRR_120HS)
+		dev_info(dev, "VRR_SETTING %s, GLUT_OFFSET_60HS row %d\n",
+			 ana38407_vrr_names[ctx->vrr], ctx->glut_row);
+
+	/*
+	 * 00 00 00 is not a glass revision but a DDIC that never answered the
+	 * read (the cold-boot fault described above); anything else that is
+	 * not the pinned id is glass this power-on sequence was not written for.
+	 */
+	if (!memchr_inv(ctx->id, 0, sizeof(ctx->id)))
+		dev_warn(dev, "panel id 00 00 00: the DDIC did not answer; the panel will stay dark until a suspend/resume re-initialises the DSI host\n");
+	else if (!expected)
+		dev_info(dev, "panel id %02x %02x %02x (no expected id pinned for this glass yet)\n",
 			 ctx->id[0], ctx->id[1], ctx->id[2]);
-	else if (memcmp(ctx->id, ctx->desc->expected_id, sizeof(ctx->id)))
-		dev_warn(&ctx->dsi->dev,
-			 "panel id %02x %02x %02x, expected %02x %02x %02x: the panel will stay dark until a suspend/resume re-initialises the DSI host\n",
+	else if (memcmp(ctx->id, expected, sizeof(ctx->id)))
+		dev_warn(dev, "panel id %02x %02x %02x, expected %02x %02x %02x: the power-on sequence is written for that revision\n",
 			 ctx->id[0], ctx->id[1], ctx->id[2],
-			 ctx->desc->expected_id[0], ctx->desc->expected_id[1],
-			 ctx->desc->expected_id[2]);
+			 expected[0], expected[1], expected[2]);
 
 out_unlock:
 	mutex_unlock(&ctx->lock);
@@ -776,6 +1005,8 @@ static int ana38407_unprepare(struct drm_panel *panel)
 	ret = ana38407_sleep_in(ctx);
 	ctx->enabled = false;
 	ctx->prepared = false;
+	/* The DDIC loses its gamma LUT with its supplies. */
+	ctx->glut_row = -1;
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 	regulator_bulk_disable(ARRAY_SIZE(ana38407_supplies), ctx->supplies);
 
@@ -806,28 +1037,46 @@ static const struct drm_display_mode ana38407_modes[] = {
 
 /*
  * Tab S9 11" (gts9wifi): AMSA10FA01 glass, 2560x1600, command mode.  The
- * vertical porches are the stock r04 timings (42/64/32).  The horizontal
  * blanking is not transmitted in command mode; it only sets the DSI byte
  * clock: msm's dsi_adjust_pclk_for_compression() shrinks hdisplay to
  * DIV_ROUND_UP(2560 * 8 / 24) = 854 columns, keeps the blanking, and the lane
- * rate is six times that pixel clock.  With the stock porches (34/64/34) that
- * is (854 + 132) * 1738 * 120 = 205.7 MHz, i.e. 1.234 Gbps per lane: the
- * configuration that is known to light the glass (builds 8 and 9).  Stock
- * Android drives 1.524 Gbps (qcom,mdss-dsi-panel-clockrate, 7533 us frame
- * transfer), which a 266-pixel back porch reproduces here ((854 + 364) * 1738
- * * 120 = 254 MHz); build 10 shipped that together with a continuous DSI
- * clock and the panel stayed black although the DDIC answered and the DPU ran,
- * so both are now boot-time experiments (panel_samsung_ana38407.hback_porch=266,
- * panel_samsung_ana38407.continuous_clock=1) rather than defaults.  Only the
- * 120 Hz mode is declared until the 60 Hz VRR path is wired.
+ * rate is six times that pixel clock.  Stock Android runs every mode at
+ * 1.524 Gbps (qcom,mdss-dsi-panel-clockrate), with the D-PHY timing table the
+ * board DTS hands the PHY.
+ *
+ * 120 Hz (wqxga120hs): the stock porches 34/64/34 would give 1.234 Gbps; a
+ * 266-pixel back porch reproduces the stock rate ((854 + 364) * 1738 * 120 =
+ * 254 MHz).  That rate needs Samsung's PHY table: with the timings mainline
+ * computes it showed frame-done timeouts and more speckle, with the table it
+ * ran smoothly.  Build 10's black panel was the continuous clock, which stays
+ * off (stock declares no qcom,mdss-dsi-force-clock-lane-hs).
+ *
+ * 60 and 30 Hz (wqxga60hs, wqxga30hs): Samsung's own porches, which land on the
+ * same lane rate (1.525 Gbps), so the PHY table applies unchanged and a mode
+ * switch does not move the link.  30 Hz is offered only with
+ * panel_samsung_ana38407.mode_30hz=1.
  */
 static const struct drm_display_mode ana38407_amsa10fa01_modes[] = {
-	{	/* 120 Hz, 1.234 Gbps per lane */
-		.clock = (2560 + 34 + 64 + 34) * (1600 + 42 + 64 + 32) * 120 / 1000,
+	{	/* 120 Hz, 1.524 Gbps per lane */
+		.clock = (2560 + 34 + 64 + 266) * (1600 + 42 + 64 + 32) * 120 / 1000,
 		.hdisplay = 2560, .hsync_start = 2560 + 34, .hsync_end = 2560 + 34 + 64,
-		.htotal = 2560 + 34 + 64 + 34,
+		.htotal = 2560 + 34 + 64 + 266,
 		.vdisplay = 1600, .vsync_start = 1600 + 42, .vsync_end = 1600 + 42 + 64,
 		.vtotal = 1600 + 42 + 64 + 32,
+	},
+	{	/* 60 Hz, 1.525 Gbps per lane */
+		.clock = (2560 + 128 + 512 + 203) * (1600 + 127 + 512 + 257) * 60 / 1000,
+		.hdisplay = 2560, .hsync_start = 2560 + 128, .hsync_end = 2560 + 128 + 512,
+		.htotal = 2560 + 128 + 512 + 203,
+		.vdisplay = 1600, .vsync_start = 1600 + 127, .vsync_end = 1600 + 127 + 512,
+		.vtotal = 1600 + 127 + 512 + 257,
+	},
+	{	/* 30 Hz, 1.525 Gbps per lane */
+		.clock = (2560 + 600 + 735 + 512) * (1600 + 512 + 512 + 512) * 30 / 1000,
+		.hdisplay = 2560, .hsync_start = 2560 + 600, .hsync_end = 2560 + 600 + 735,
+		.htotal = 2560 + 600 + 735 + 512,
+		.vdisplay = 1600, .vsync_start = 1600 + 512, .vsync_end = 1600 + 512 + 512,
+		.vtotal = 1600 + 512 + 512 + 512,
 	},
 };
 
@@ -858,10 +1107,10 @@ static const struct ana38407_desc ana38407_amsa10fa01_desc = {
 	/* Stock r04 DSC geometry: two 1280 x 100 slices, 8 bpc / 8 bpp. */
 	.slice_width = 1280,
 	.slice_height = 100,
-	/* Off: the build-9 configuration; 1 via the module parameter to test. */
+	/* Off: stock has no forced HS clock lane, and on it the glass stays black. */
 	.continuous_clock = false,
-	/* Read on first hardware boot, then pin it here. */
-	.expected_id = NULL,
+	.expected_id = ana38407_expected_id,
+	.vrr_by_mode = true,
 };
 
 static int ana38407_get_modes(struct drm_panel *panel,
@@ -872,11 +1121,15 @@ static int ana38407_get_modes(struct drm_panel *panel,
 	struct drm_display_mode *mode;
 	int i, count = 0;
 
+	ctx->connector = connector;
+
 	for (i = 0; i < desc->num_modes; i++) {
+		if (drm_mode_vrefresh(&desc->modes[i]) == 30 && !param_mode_30hz)
+			continue;
 		mode = drm_mode_duplicate(connector->dev, &desc->modes[i]);
 		if (!mode)
 			continue;
-		if (param_hback_porch >= 0) {
+		if (i == 0 && param_hback_porch >= 0) {
 			int vrefresh = drm_mode_vrefresh(&desc->modes[i]);
 
 			mode->htotal = mode->hsync_end + param_hback_porch;
@@ -920,8 +1173,14 @@ static int ana38407_bl_update(struct backlight_device *bl)
 		brightness = ctx->desc->min_brightness;
 	mutex_lock(&ctx->lock);
 	ctx->user_brightness = brightness;
-	if (ctx->prepared && !ctx->fod_mode)
+	if (ctx->prepared && !ctx->fod_mode) {
+		/* Samsung's BRIGHTNESS_SETTING: GLUT first, then 0x51. */
+		int glut_ret = ana38407_sync_glut_locked(ctx);
+
 		ret = ana38407_write_brightness_locked(ctx, brightness);
+		if (!ret)
+			ret = glut_ret;
+	}
 	mutex_unlock(&ctx->lock);
 
 	return ret;
@@ -1085,11 +1344,32 @@ static ssize_t cell_id_show(struct device *dev,
 	return ret;
 }
 
+/*
+ * What the DDIC answered to DA/DB/DC at the last power-on: "00 00 00" after a
+ * cold boot that the DSI host has not recovered from yet, ENODATA before the
+ * first power-on.  Lets the boot-time recovery skip work the kernel already
+ * did.
+ */
+static ssize_t panel_id_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct ana38407 *ctx = ana38407_from_bl_dev(dev);
+	ssize_t ret;
+
+	mutex_lock(&ctx->lock);
+	ret = ctx->id_read ? sysfs_emit(buf, "%02x %02x %02x\n", ctx->id[0],
+					ctx->id[1], ctx->id[2]) : -ENODATA;
+	mutex_unlock(&ctx->lock);
+
+	return ret;
+}
+
 static DEVICE_ATTR_RW(fod_mode);
 static DEVICE_ATTR_RW(fod_circle);
 static DEVICE_ATTR_RO(fod_ready);
 static DEVICE_ATTR_RO(fod_brightness);
 static DEVICE_ATTR_RO(cell_id);
+static DEVICE_ATTR_RO(panel_id);
 
 static struct attribute *ana38407_bl_attrs[] = {
 	&dev_attr_fod_mode.attr,
@@ -1097,6 +1377,7 @@ static struct attribute *ana38407_bl_attrs[] = {
 	&dev_attr_fod_ready.attr,
 	&dev_attr_fod_brightness.attr,
 	&dev_attr_cell_id.attr,
+	&dev_attr_panel_id.attr,
 	NULL,
 };
 
@@ -1205,11 +1486,19 @@ static int ana38407_probe(struct mipi_dsi_device *dsi)
 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
 				     "failed to get reset gpio\n");
 
+	/* Samsung's samsung,tcon-rdy-gpio; optional, boards that lack it skip the wait. */
+	ctx->tcon_rdy_gpio = devm_gpiod_get_optional(dev, "tcon-rdy", GPIOD_IN);
+	if (IS_ERR(ctx->tcon_rdy_gpio))
+		return dev_err_probe(dev, PTR_ERR(ctx->tcon_rdy_gpio),
+				     "failed to get TCON_RDY gpio\n");
+
 	ctx->dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
 	mutex_init(&ctx->lock);
 	INIT_DELAYED_WORK(&ctx->fod_watchdog, ana38407_fod_watchdog_work);
 	ctx->user_brightness = ANA38407_MAX_BRIGHTNESS;
+	ctx->vrr = ANA38407_VRR_120HS;
+	ctx->glut_row = -1;
 
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;

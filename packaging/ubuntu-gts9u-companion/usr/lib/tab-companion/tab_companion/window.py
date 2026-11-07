@@ -6,6 +6,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from . import VERSION
 from . import boot_sets
+from . import update_bundle
 from .actions import action_for, action_label, actions_for
 from .fingerprint_page import FingerprintPage
 from .update_page import UpdatePage
@@ -53,6 +54,24 @@ COMPATIBLE_KEYBOARDS = (
     ("EF-DX920", "Galaxy Tab S10 Ultra | S9 Ultra Book Cover Keyboard Slim (AI Key)", True, False),
     ("EF-DX925", "Galaxy Tab S10 Ultra | S9 Ultra Book Cover Keyboard (AI Key)", True, True),
 )
+# Samsung's SM-X710 keypad table.  The touchpad covers are the ones its
+# touchpad driver sizes (EF-DX715/725); the AI key follows its KEY_AI_HOT gate.
+COMPATIBLE_KEYBOARDS_GTS9WIFI = (
+    ("EF-DX710", "Galaxy Tab S9 Book Cover Keyboard Slim", False, False),
+    ("EF-DX715", "Galaxy Tab S9 Book Cover Keyboard", False, True),
+    ("EF-DX720", "Book Cover Keyboard Slim (AI Key)", True, False),
+    ("EF-DX725", "Book Cover Keyboard (AI Key)", True, True),
+)
+AI_KEY_MODELS = {
+    model
+    for model, _name, has_ai, _touchpad in COMPATIBLE_KEYBOARDS + COMPATIBLE_KEYBOARDS_GTS9WIFI
+    if has_ai
+}
+
+
+def compatible_keyboards():
+    """The covers this tablet's own firmware tables list."""
+    return COMPATIBLE_KEYBOARDS_GTS9WIFI if update_bundle.device() == "gts9wifi" else COMPATIBLE_KEYBOARDS
 
 
 def icon_label(icon_name, label, spacing=7):
@@ -1028,7 +1047,7 @@ class CompanionWindow(Adw.ApplicationWindow):
         group.set_margin_bottom(18)
         group.set_margin_start(18)
         group.set_margin_end(18)
-        for model, name, has_ai, has_touchpad in COMPATIBLE_KEYBOARDS:
+        for model, name, has_ai, has_touchpad in compatible_keyboards():
             details = []
             if has_ai:
                 details.append(_("AI key"))
@@ -1103,7 +1122,7 @@ class CompanionWindow(Adw.ApplicationWindow):
         connection = _("Connected") if connected else _("Disconnected")
         self.keyboard_row.set_subtitle(f"{model} · {connection}")
         self.forget_keyboard_button.set_visible(not connected)
-        self.key_rows["galaxy-ai"].set_visible(model in {"EF-DX920", "EF-DX925"})
+        self.key_rows["galaxy-ai"].set_visible(model in AI_KEY_MODELS)
 
     def _update_hardware(self, *_args):
         state = self.hardware.state

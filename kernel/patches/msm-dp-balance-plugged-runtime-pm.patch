@@ -1,0 +1,112 @@
+Subject: drm/msm/dp: balance the plugged runtime PM reference
+
+msm_dp_hpd_plug_handle() takes a runtime PM reference on every call and
+msm_dp_hpd_unplug_handle() drops one.  Plug runs far more often than
+unplug: typec_displayport sends a connected event for every DP Status
+Update and Attention while HPD is high, and drm_bridge_connector follows
+each detect() with hpd_notify(), so every userspace connector probe of a
+plugged sink ran the plug handler again.  msm_dp_bridge_detect() also kept
+its own reference whenever the sink was plugged, even when the plugged
+state already held one, and on a failed DPCD read it cleared the plugged
+flag, which made the following unplug skip both the teardown and the put.
+After the first DP session the controller, the MDSS, mdss_gdsc and the
+display clock controller therefore stayed powered until reboot.
+
+Make the plugged state own exactly one reference: the plug handler takes
+it only on the unplugged-to-plugged transition, detect keeps its reference
+only when it is what found the sink, and a plugged sink that stops
+answering stays plugged until the unplug handler that runs right after
+detect tears it down.  The automated upstream reviews of the v5 and v6
+"Drop the HPD state machine" series raised the same imbalance.
+
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -400,10 +400,22 @@ static int msm_dp_hpd_plug_handle(struct
+ 
+ 	guard(mutex)(&dp->plugged_lock);
+ 
+-	ret = pm_runtime_resume_and_get(&pdev->dev);
+-	if (ret) {
+-		DRM_ERROR("failed to pm_runtime_resume\n");
+-		return ret;
++	/*
++	 * The plugged state owns exactly one runtime PM reference, and
++	 * msm_dp_hpd_unplug_handle() drops exactly one.  A plug while already
++	 * plugged only refreshes the sink state: typec_displayport reports
++	 * "connected" for every DP Status Update and Attention while HPD is
++	 * high, and the bridge connector replays each detect() result through
++	 * hpd_notify.  Taking a reference for each of those kept the
++	 * controller, MDSS and the display clock controller powered until
++	 * reboot after the first DP session.
++	 */
++	if (!dp->plugged) {
++		ret = pm_runtime_resume_and_get(&pdev->dev);
++		if (ret) {
++			DRM_ERROR("failed to pm_runtime_resume\n");
++			return ret;
++		}
+ 	}
+ 
+ 	msm_dp_aux_enable_xfers(dp->aux, true);
+@@ -829,7 +841,7 @@ enum drm_connector_status msm_dp_bridge_
+ 	struct msm_dp_display_private *priv;
+ 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+ 	struct drm_dp_desc desc;
+-	bool phy_deinit;
++	bool phy_deinit, was_plugged;
+ 	int ret;
+ 
+ 	dp = to_dp_bridge(bridge)->msm_dp_display;
+@@ -843,6 +855,7 @@ enum drm_connector_status msm_dp_bridge_
+ 		return status;
+ 	}
+ 
++	was_plugged = priv->plugged;
+ 	phy_deinit = msm_dp_display_host_phy_init(priv);
+ 
+ 	msm_dp_aux_enable_xfers(priv->aux, true);
+@@ -855,17 +868,22 @@ enum drm_connector_status msm_dp_bridge_
+ 		goto end;
+ 	}
+ 
++	/*
++	 * A sink that was plugged but no longer answers stays plugged here,
++	 * so that its reference is not lost: the bridge connector follows
++	 * every detect() with hpd_notify(), and the unplug handler it runs
++	 * for the disconnected status tears the link down and drops the
++	 * plugged reference.
++	 */
+ 	ret = drm_dp_read_dpcd_caps(priv->aux, dpcd);
+ 	if (ret) {
+ 		DRM_DEBUG_DP("failed to read caps\n");
+-		priv->plugged = false;
+ 		goto end;
+ 	}
+ 
+ 	ret = drm_dp_read_desc(priv->aux, &desc, drm_dp_is_branch(dpcd));
+ 	if (ret) {
+ 		DRM_DEBUG_DP("failed to read desc\n");
+-		priv->plugged = false;
+ 		goto end;
+ 	}
+ 
+@@ -884,7 +902,9 @@ enum drm_connector_status msm_dp_bridge_
+ end:
+ 	/*
+ 	 * If we detected the DPRX, leave the controller on so that it doesn't
+-	 * lose the state.
++	 * lose the state.  Only a newly found DPRX keeps this call's
++	 * reference, as the one the plugged state owns; when it was already
++	 * plugged, that reference exists and this one is dropped.
+ 	 */
+ 	if (!priv->plugged) {
+ 		if (phy_deinit) {
+@@ -893,6 +913,8 @@ end:
+ 		}
+ 
+ 		pm_runtime_put_sync(&dp->pdev->dev);
++	} else if (was_plugged) {
++		pm_runtime_put_sync(&dp->pdev->dev);
+ 	}
+ 
+ 	return status;

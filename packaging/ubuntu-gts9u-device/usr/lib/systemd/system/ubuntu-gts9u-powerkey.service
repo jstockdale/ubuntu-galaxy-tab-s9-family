@@ -1,5 +1,5 @@
 [Unit]
-Description=Power button: short press suspends (locks on boards without resume), long press confirms shutdown
+Description=Power button: short press suspends (locks and blanks while suspend is off), long press confirms shutdown
 Documentation=file:///usr/libexec/ubuntu-gts9u-powerkey
 After=systemd-logind.service
 Wants=systemd-logind.service
@@ -10,7 +10,8 @@ Type=simple
 ExecStart=/usr/libexec/ubuntu-gts9u-powerkey
 Restart=always
 RestartSec=5
-# It reads one input device and calls systemctl and runuser; nothing else.
+# It reads one input device, asks logind, and calls systemctl, loginctl and the
+# owner's session bus (runuser, gdbus); nothing else.
 #
 # ProtectHome is deliberately off: it would empty /run/user, and the long press
 # needs the owner's session bus socket there to raise the shutdown dialog.

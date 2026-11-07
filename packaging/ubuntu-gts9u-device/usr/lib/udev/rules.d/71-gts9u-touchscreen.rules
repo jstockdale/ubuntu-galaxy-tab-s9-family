@@ -1,0 +1,10 @@
+# Let the desktop user switch the SM-X710 touchscreen's double tap to wake.
+#
+# samsung_fts1ba90a creates double_tap_to_wake root-only; the setting is off
+# by default, as in the stock kernel, because armed it keeps the controller
+# scanning in low-power mode while the screen is off and powered through
+# system sleep.
+# Only that attribute is opened up: power/wakeup (whether an armed gesture may
+# also wake the system from sleep) stays with root.  The rule matches the
+# driver, so it does nothing on boards without this controller.
+ACTION!="remove", SUBSYSTEM=="i2c", DRIVER=="samsung_fts1ba90a", RUN+="/usr/libexec/ubuntu-gts9u-touch-permissions %p"

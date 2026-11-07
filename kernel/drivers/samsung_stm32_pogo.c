@@ -39,7 +39,11 @@
 #define POGO_MAX_PAYLOAD	100
 #define POGO_MODEL_EF_DX925	0xd3
 #define POGO_MODEL_EF_DX920	0xd6
-#define POGO_HALL_LID_OPEN	2
+/* Hall states, named as in Samsung's hall_ic_logical.c (E_LID_*). */
+#define POGO_HALL_NONE		0	/* no cover attached */
+#define POGO_HALL_CLOSED	1	/* E_LID_0: folded over the screen */
+#define POGO_HALL_NORMAL	2	/* E_LID_NORMAL: typing position */
+#define POGO_HALL_BACK		3	/* E_LID_360: folded behind the tablet */
 
 #define MAX77816_CONFIG1	0x02
 #define MAX77816_CONFIG2	0x03
@@ -77,7 +81,55 @@ module_param_named(connection_wakeup, pogo_connection_wakeup, bool, 0644);
 MODULE_PARM_DESC(connection_wakeup,
 		 "allow the pogo connection GPIO to wake the system");
 
+struct samsung_pogo_model {
+	u8 id;
+	const char *name;
+};
+
+/*
+ * Samsung's SM-X710 pogo_kpd node pairs keypad,support_keyboard_model
+ * <0xfd 0x02 0xd1 0x03 0x51> with these keypad,input_name strings, identical
+ * in all four board entries of the stock dtbo.  As on the stock kernel, a
+ * protocol id outside the list gets no input device.
+ */
+static const struct samsung_pogo_model samsung_pogo_x710_models[] = {
+	{ 0xfd, "Book Cover Keyboard (EF-DX715)" },
+	{ 0x02, "Book Cover Keyboard Slim (EF-DX710)" },
+	{ 0xd1, "Book Cover Keyboard (EF-DX725)" },
+	{ 0x03, "Book Cover Keyboard Slim (EF-DX720)" },
+	{ 0x51, "Neos Keyboard" },
+};
+
+struct samsung_pogo_board {
+	const char *name;
+	/* NULL: the SM-X910 naming in samsung_pogo_model_name(). */
+	const struct samsung_pogo_model *models;
+	unsigned int nr_models;
+	/*
+	 * Report the cover's hall states on a switch-only input device, as
+	 * SW_LID and SW_TABLET_MODE, and give the keyboard keys only.  Both
+	 * change what GNOME does with an attached cover, so the SM-X910 keeps
+	 * its validated behaviour until this is tested there.
+	 */
+	bool cover_switch;
+	/* Sleep callbacks, and the data-ready line as an opt-in wake source. */
+	bool key_wakeup;
+};
+
+static const struct samsung_pogo_board samsung_pogo_x910 = {
+	.name = "SM-X910",
+};
+
+static const struct samsung_pogo_board samsung_pogo_x710 = {
+	.name = "SM-X710",
+	.models = samsung_pogo_x710_models,
+	.nr_models = ARRAY_SIZE(samsung_pogo_x710_models),
+	.cover_switch = true,
+	.key_wakeup = true,
+};
+
 struct samsung_pogo {
+	const struct samsung_pogo_board *board;
 	struct i2c_client *client;
 	struct i2c_client *booster;
 	struct regulator *vddo;
@@ -87,6 +139,7 @@ struct samsung_pogo {
 	struct gpio_desc *reset;
 	struct input_dev *input;
 	struct input_dev *touchpad;
+	struct input_dev *cover_switch;
 	u16 touchpad_max_x;
 	u16 touchpad_max_y;
 	struct delayed_work connection_work;
@@ -100,13 +153,15 @@ struct samsung_pogo {
 	u8 caps_request;
 	u8 flash_version[4];
 	u8 app_version[4];
-	u16 last_key_event;
+	u8 hall_state;
 	bool attached;
 	bool bootloader_reachable;
 	bool data_irq_enabled;
 	bool powered;
 	bool wake_enabled;
-	bool lid_closed;
+	bool data_wake_armed;
+	bool connection_wake_armed;
+	bool resume_application;
 	atomic64_t data_irq_count;
 	atomic64_t data_irq_deasserted;
 	atomic64_t connection_irq_high;
@@ -118,6 +173,8 @@ struct samsung_pogo {
 	atomic64_t touchpad_packets;
 	atomic64_t touchpad_bad_packets;
 	atomic64_t init_attempts;
+	atomic64_t hall_events;
+	atomic64_t wake_arms;
 	int last_init_error;
 };
 
@@ -127,9 +184,24 @@ static void samsung_pogo_set_data_irq(struct samsung_pogo *pogo, bool enable);
 static void samsung_pogo_release_keys(struct samsung_pogo *pogo);
 static void samsung_pogo_release_touchpad(struct samsung_pogo *pogo);
 
-static const char *samsung_pogo_model_name(u8 protocol_model,
+static const char *samsung_pogo_model_name(const struct samsung_pogo *pogo,
+					   u8 protocol_model,
 					   const u8 version[4])
 {
+	const struct samsung_pogo_board *board = pogo->board;
+	unsigned int i;
+
+	/*
+	 * The keypad names are board data on Samsung's kernels: 0x03 is the
+	 * EF-DX720 Slim in the SM-X710 table and absent from the SM-X910 one.
+	 */
+	if (board->models) {
+		for (i = 0; i < board->nr_models; i++)
+			if (board->models[i].id == protocol_model)
+				return board->models[i].name;
+		return NULL;
+	}
+
 	/* Mirror stm32_read_version() from Samsung's X910 source. */
 	if (protocol_model == 0xd1 || protocol_model == 0xd2)
 		return "Book Cover Keyboard (EF-DX900)";
@@ -599,15 +671,14 @@ static int samsung_pogo_enable_power(struct samsung_pogo *pogo)
 		if (!ret)
 			ret = samsung_pogo_booster_write(pogo, MAX77816_CONFIG1,
 						     MAX77816_LIMIT_3P1A);
+		/* Only a board that has the booster has anything to report. */
+		if (!ret)
+			dev_info(&pogo->client->dev,
+				 "MAX77816 output enabled (config2=%#x, config1=%#x)\n",
+				 MAX77816_OUTPUT_ENABLE, MAX77816_LIMIT_3P1A);
 	}
-	if (ret) {
+	if (ret)
 		samsung_pogo_power_off_locked(pogo);
-		goto out_unlock;
-	}
-
-	dev_info(&pogo->client->dev,
-		 "MAX77816 output enabled (config2=%#x, config1=%#x)\n",
-		 MAX77816_OUTPUT_ENABLE, MAX77816_LIMIT_3P1A);
 out_unlock:
 	mutex_unlock(&pogo->power_lock);
 	return ret;
@@ -915,6 +986,24 @@ malformed:
 	dev_warn_ratelimited(&pogo->client->dev, "invalid touchpad frame (%zu bytes)\n", len);
 }
 
+/*
+ * udev's input_id calls anything with a code in BTN_MOUSE..BTN_JOYSTICK-1 a
+ * mouse, and an I2C mouse a pointing stick.  libinput then gives the cover a
+ * pointer, and mutter leaves touch mode (no on-screen keyboard, no automatic
+ * rotation) for as long as any pointer exists, in every posture.  The STM32
+ * reports keys only; a touchpad has a device of its own.  So withhold the
+ * classic button blocks (misc, mouse, joystick, gamepad, digitiser, wheel)
+ * and the D-pad.  Samsung itself leaves out only the gamepad block and
+ * BTN_TOUCH.  BTN_TRIGGER_HAPPY stays declared: Samsung's own key codes live
+ * there (KEY_APPS 0x2c1 to KEY_FN_UNLOCK 0x2cb, sec_input.h), and with every
+ * keyboard key present udev does not take the result for a joystick.
+ */
+static bool samsung_pogo_key_withheld(unsigned int code)
+{
+	return (code >= BTN_MISC && code <= BTN_GEAR_UP) ||
+	       (code >= BTN_DPAD_UP && code <= BTN_DPAD_RIGHT);
+}
+
 static int samsung_pogo_register_input(struct samsung_pogo *pogo,
 				       const char *model_name)
 {
@@ -938,10 +1027,15 @@ static int samsung_pogo_register_input(struct samsung_pogo *pogo,
 	input->id.product = 0xa035;
 	input->event = samsung_pogo_input_event;
 	input_set_drvdata(input, pogo);
-	for (code = 1; code <= KEY_MAX; code++)
+	for (code = 1; code <= KEY_MAX; code++) {
+		if (pogo->board->cover_switch && samsung_pogo_key_withheld(code))
+			continue;
 		input_set_capability(input, EV_KEY, code);
+	}
 	input_set_capability(input, EV_LED, LED_CAPSL);
-	input_set_capability(input, EV_SW, SW_LID);
+	/* With a cover switch device the lid is reported there instead. */
+	if (!pogo->board->cover_switch)
+		input_set_capability(input, EV_SW, SW_LID);
 
 	ret = input_register_device(input);
 	if (ret) {
@@ -986,12 +1080,22 @@ static void samsung_pogo_report_keys(struct samsung_pogo *pogo,
 		if (event == 0xffff || event == 0x7fff)
 			continue;
 
-		WRITE_ONCE(pogo->last_key_event, event);
+		/*
+		 * Count transitions, but keep no record of which key: the
+		 * diagnostics used to show the last one, a keystroke side
+		 * channel for anything that could read them.
+		 */
 		atomic64_inc(&pogo->key_event_count);
 
 		if (!code || code > KEY_MAX) {
 			dev_warn_ratelimited(&pogo->client->dev,
 				"invalid key event %#06x\n", event);
+			continue;
+		}
+		/* A withheld button code would be dropped by the input core. */
+		if (!test_bit(code, pogo->input->keybit)) {
+			dev_warn_ratelimited(&pogo->client->dev,
+				"undeclared key code %u ignored\n", code);
 			continue;
 		}
 
@@ -1005,23 +1109,65 @@ static void samsung_pogo_report_keys(struct samsung_pogo *pogo,
 
 }
 
+static void samsung_pogo_report_cover(struct samsung_pogo *pogo)
+{
+	bool closed = pogo->hall_state == POGO_HALL_CLOSED;
+
+	if (pogo->cover_switch) {
+		/*
+		 * Tablet mode as for Microsoft's Surface type covers
+		 * (surface_aggregator_tabletsw.c): typing position or closed
+		 * over the screen is a laptop, detached or folded back is a
+		 * tablet.  mutter turns this switch into GNOME's touch mode,
+		 * which is what shows the on-screen keyboard and lets the
+		 * accelerometer rotate the panel.
+		 */
+		input_report_switch(pogo->cover_switch, SW_LID, closed);
+		input_report_switch(pogo->cover_switch, SW_TABLET_MODE,
+				    !closed && pogo->hall_state != POGO_HALL_NORMAL);
+		input_sync(pogo->cover_switch);
+	} else if (pogo->input) {
+		input_report_switch(pogo->input, SW_LID, closed);
+		input_sync(pogo->input);
+	}
+}
+
 static void samsung_pogo_report_hall(struct samsung_pogo *pogo,
 				     const u8 *payload, size_t len)
 {
-	bool closed;
+	static const char * const postures[] = {
+		[POGO_HALL_CLOSED] = "closed",
+		[POGO_HALL_NORMAL] = "open",
+		[POGO_HALL_BACK] = "folded back",
+	};
+	u8 state;
 
-	if (!len || !pogo->input)
+	if (!pogo->input)
 		return;
 
-	closed = payload[0] != POGO_HALL_LID_OPEN;
-	if (closed == pogo->lid_closed)
+	atomic64_inc(&pogo->hall_events);
+	/*
+	 * Samsung's hall_ic_logical.c takes a one-byte payload and acts on
+	 * three values: E_LID_0 closes the cover (SW_FLIP), E_LID_NORMAL opens
+	 * it and E_LID_360 only flags the back-fold.  The back-fold is not a
+	 * closed lid: reporting it as one would make logind suspend a tablet
+	 * that is merely being held with its keyboard folded behind it.
+	 */
+	if (len != 1 || payload[0] < POGO_HALL_CLOSED ||
+	    payload[0] > POGO_HALL_BACK) {
+		dev_warn_ratelimited(&pogo->client->dev,
+				     "ignoring hall packet %*ph\n",
+				     (int)min_t(size_t, len, 8), payload);
+		return;
+	}
+
+	state = payload[0];
+	if (state == pogo->hall_state)
 		return;
 
-	pogo->lid_closed = closed;
-	input_report_switch(pogo->input, SW_LID, closed);
-	input_sync(pogo->input);
-	dev_info(&pogo->client->dev, "keyboard cover %s\n",
-		 closed ? "closed" : "open");
+	pogo->hall_state = state;
+	samsung_pogo_report_cover(pogo);
+	dev_info(&pogo->client->dev, "keyboard cover %s\n", postures[state]);
 }
 
 static int samsung_pogo_read_event(struct samsung_pogo *pogo)
@@ -1061,7 +1207,7 @@ static int samsung_pogo_read_event(struct samsung_pogo *pogo)
 					 "immediate version read failed: %d\n", ret);
 				return 0;
 			}
-			model_name = samsung_pogo_model_name(pogo->model,
+			model_name = samsung_pogo_model_name(pogo, pogo->model,
 							    pogo->app_version);
 			if (!model_name) {
 				dev_warn(&pogo->client->dev,
@@ -1079,6 +1225,14 @@ static int samsung_pogo_read_event(struct samsung_pogo *pogo)
 				ret = samsung_pogo_register_input(pogo, model_name);
 				if (ret)
 					return ret;
+				/*
+				 * A new attachment: hall_ic_logical.c also starts
+				 * from "open" and waits for the cover to say
+				 * otherwise.  A re-announcement after an
+				 * application reset keeps the known posture.
+				 */
+				pogo->hall_state = POGO_HALL_NORMAL;
+				samsung_pogo_report_cover(pogo);
 				dev_info(&pogo->client->dev,
 					 "%s protocol confirmed; input enabled\n",
 					 model_name);
@@ -1237,7 +1391,8 @@ static void samsung_pogo_connection_work(struct work_struct *work)
 		pogo->attached = false;
 		pogo->model = 0;
 		pogo->caps_request = 1;
-		pogo->lid_closed = false;
+		pogo->hall_state = POGO_HALL_NONE;
+		samsung_pogo_report_cover(pogo);
 		samsung_pogo_power_off(pogo);
 		dev_info(dev, "keyboard physically disconnected\n");
 	}
@@ -1302,10 +1457,16 @@ static ssize_t diagnostics_show(struct device *dev,
 	 * driver can talk to from one it cannot: the mainline sequence only
 	 * drives the V37 application.  Exposing it here means the check costs
 	 * a cat instead of grepping a boot-time dmesg line that rotates away.
+	 *
+	 * Root only since revision 3, which also stopped naming the last key.
+	 * Sampled often enough, the IRQ and key counters time every keystroke.
+	 * That alone does not close the channel: the data line's row in
+	 * /proc/interrupts counts the same packets and stays world-readable.
+	 * cover_state carries what an unprivileged client needs.
 	 */
 	return sysfs_emit(buf,
-		"driver_revision=2 attached=%u model=%#04x connected=%d data_ready=%d caps=%u data_irq=%lld data_irq_deasserted=%lld connection_high=%lld connection_low=%lld manual_polls=%lld key_events=%lld last_key=%#06x keys_down=%u recoveries=%lld read_retry_releases=%lld bootloader=%u flash_version=%*phN app_version=%*phN init_attempts=%lld last_init_error=%d touchpad=%u touchpad_packets=%lld touchpad_bad_packets=%lld\n",
-		pogo->attached, pogo->model,
+		"driver_revision=3 board=%s attached=%u model=%#04x connected=%d data_ready=%d caps=%u data_irq=%lld data_irq_deasserted=%lld connection_high=%lld connection_low=%lld manual_polls=%lld key_events=%lld keys_down=%u recoveries=%lld read_retry_releases=%lld bootloader=%u flash_version=%*phN app_version=%*phN init_attempts=%lld last_init_error=%d touchpad=%u touchpad_packets=%lld touchpad_bad_packets=%lld hall=%u hall_events=%lld wake_arms=%lld\n",
+		pogo->board->name, pogo->attached, pogo->model,
 		gpiod_get_value_cansleep(pogo->connected),
 		gpiod_get_value_cansleep(pogo->data_ready),
 		READ_ONCE(pogo->caps_request),
@@ -1315,7 +1476,6 @@ static ssize_t diagnostics_show(struct device *dev,
 		atomic64_read(&pogo->connection_irq_low),
 		atomic64_read(&pogo->manual_poll_count),
 		atomic64_read(&pogo->key_event_count),
-		READ_ONCE(pogo->last_key_event),
 		bitmap_weight(pogo->keys_down, KEY_MAX + 1),
 		atomic64_read(&pogo->recovery_count),
 		atomic64_read(&pogo->read_retry_release_count),
@@ -1324,9 +1484,24 @@ static ssize_t diagnostics_show(struct device *dev,
 		(int)sizeof(pogo->app_version), pogo->app_version,
 		atomic64_read(&pogo->init_attempts), pogo->last_init_error,
 		pogo->touchpad != NULL, atomic64_read(&pogo->touchpad_packets),
-		atomic64_read(&pogo->touchpad_bad_packets));
+		atomic64_read(&pogo->touchpad_bad_packets),
+		READ_ONCE(pogo->hall_state), atomic64_read(&pogo->hall_events),
+		atomic64_read(&pogo->wake_arms));
 }
-static DEVICE_ATTR_RO(diagnostics);
+static DEVICE_ATTR_ADMIN_RO(diagnostics);
+
+static ssize_t cover_state_show(struct device *dev,
+				struct device_attribute *attribute, char *buf)
+{
+	struct samsung_pogo *pogo = dev_get_drvdata(dev);
+
+	/* The world-readable subset: whether a cover is there, and which. */
+	return sysfs_emit(buf, "attached=%u connected=%d model=%#04x\n",
+			  READ_ONCE(pogo->attached),
+			  gpiod_get_value_cansleep(pogo->connected),
+			  READ_ONCE(pogo->model));
+}
+static DEVICE_ATTR_RO(cover_state);
 
 static ssize_t event_poll_store(struct device *dev,
 				struct device_attribute *attribute,
@@ -1353,6 +1528,145 @@ static ssize_t event_poll_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(event_poll);
 
+static int samsung_pogo_register_cover_switch(struct samsung_pogo *pogo)
+{
+	struct input_dev *input;
+	int ret;
+
+	/*
+	 * Registered once, for the life of the driver: a tablet-mode switch
+	 * that came and went with the cover would leave mutter holding the
+	 * last state it saw, because libinput announces a newly added switch
+	 * only when it is on.  The keyboard is a separate device, and this
+	 * one must not be named "Book Cover Keyboard ...": Tab Companion
+	 * grabs that name, and the grab is what hid the lid from logind.
+	 */
+	input = devm_input_allocate_device(&pogo->client->dev);
+	if (!input)
+		return -ENOMEM;
+
+	input->name = "Samsung Book Cover Switch";
+	input->phys = "samsung-pogo/input2";
+	input->id.bustype = BUS_I2C;
+	input->id.vendor = 0x04e8;
+	input->id.product = 0xa035;
+	input_set_capability(input, EV_SW, SW_LID);
+	input_set_capability(input, EV_SW, SW_TABLET_MODE);
+	/* No cover yet: a bare tablet, with no lid to be closed. */
+	__set_bit(SW_TABLET_MODE, input->sw);
+
+	ret = input_register_device(input);
+	if (ret)
+		return ret;
+
+	pogo->cover_switch = input;
+	return 0;
+}
+
+static int samsung_pogo_suspend(struct device *dev)
+{
+	struct samsung_pogo *pogo = dev_get_drvdata(dev);
+	bool arm_data;
+	int ret;
+
+	if (!pogo->board->key_wakeup)
+		return 0;
+
+	/*
+	 * Hold both interrupt paths until .resume.  Their threads and the
+	 * connection work talk I2C, and a line that fires while the system
+	 * sleeps is replayed when interrupts return in the noirq phase, before
+	 * the GENI controllers have runtime PM back.  Samsung's
+	 * stm32_dev_suspend() waits up to 3 s for a transfer in flight and its
+	 * handlers wait for resume_done; disable_irq() waits for a running
+	 * thread and the synchronous cancels for a running work.  The data
+	 * line's disable nests on top of whatever connection_work last set.
+	 */
+	disable_irq(pogo->connection_irq);
+	cancel_delayed_work_sync(&pogo->connection_work);
+	disable_irq(pogo->data_irq);
+	pogo->resume_application =
+		cancel_delayed_work_sync(&pogo->application_work);
+
+	if (!device_may_wakeup(dev))
+		return 0;
+
+	/*
+	 * Samsung arms the data line whenever a cover is connected.  A disabled
+	 * line still wakes the system: the TLMM chip sets
+	 * IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND.  Without VDDO the line means
+	 * nothing, so a cover cut off by a contact bounce is not armed.
+	 */
+	mutex_lock(&pogo->lock);
+	mutex_lock(&pogo->power_lock);
+	arm_data = pogo->attached && pogo->powered;
+	mutex_unlock(&pogo->power_lock);
+	mutex_unlock(&pogo->lock);
+
+	if (arm_data) {
+		ret = enable_irq_wake(pogo->data_irq);
+		if (ret)
+			dev_warn(dev, "keyboard cannot wake the tablet: %d\n", ret);
+		else
+			pogo->data_wake_armed = true;
+	}
+	if (pogo_connection_wakeup) {
+		ret = enable_irq_wake(pogo->connection_irq);
+		if (ret)
+			dev_warn(dev, "connection IRQ cannot wake the tablet: %d\n",
+				 ret);
+		else
+			pogo->connection_wake_armed = true;
+	}
+	if (pogo->data_wake_armed || pogo->connection_wake_armed)
+		atomic64_inc(&pogo->wake_arms);
+
+	return 0;
+}
+
+static int samsung_pogo_resume(struct device *dev)
+{
+	struct samsung_pogo *pogo = dev_get_drvdata(dev);
+
+	if (!pogo->board->key_wakeup)
+		return 0;
+
+	if (pogo->data_wake_armed) {
+		disable_irq_wake(pogo->data_irq);
+		pogo->data_wake_armed = false;
+	}
+	if (pogo->connection_wake_armed) {
+		disable_irq_wake(pogo->connection_irq);
+		pogo->connection_wake_armed = false;
+	}
+
+	/*
+	 * Re-check the connection unconditionally: the connection line is not
+	 * a wake source by default, so an attach or detach during sleep need
+	 * not come back as an edge.  connection_work only reconciles.
+	 */
+	enable_irq(pogo->connection_irq);
+	mod_delayed_work(system_dfl_wq, &pogo->connection_work, 0);
+
+	/*
+	 * Level-triggered: a key that woke the system and is still asserting
+	 * DATA fires as soon as the line is enabled.  Never poll otherwise:
+	 * reading an empty queue times out and makes the STM32 cycle the
+	 * connection.
+	 */
+	enable_irq(pogo->data_irq);
+	if (pogo->resume_application) {
+		pogo->resume_application = false;
+		mod_delayed_work(system_dfl_wq, &pogo->application_work,
+				 msecs_to_jiffies(10));
+	}
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(samsung_pogo_pm_ops, samsung_pogo_suspend,
+				samsung_pogo_resume);
+
 static int samsung_pogo_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -1368,6 +1682,9 @@ static int samsung_pogo_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	pogo->client = client;
+	/* Samsung keeps the cover tables in each board's tree; key on it. */
+	pogo->board = of_machine_is_compatible("samsung,gts9wifi") ?
+		      &samsung_pogo_x710 : &samsung_pogo_x910;
 	pogo->caps_request = 1;
 	atomic64_set(&pogo->data_irq_count, 0);
 	atomic64_set(&pogo->data_irq_deasserted, 0);
@@ -1377,6 +1694,8 @@ static int samsung_pogo_probe(struct i2c_client *client)
 	atomic64_set(&pogo->key_event_count, 0);
 	atomic64_set(&pogo->recovery_count, 0);
 	atomic64_set(&pogo->read_retry_release_count, 0);
+	atomic64_set(&pogo->hall_events, 0);
+	atomic64_set(&pogo->wake_arms, 0);
 	mutex_init(&pogo->lock);
 	mutex_init(&pogo->power_lock);
 	INIT_DELAYED_WORK(&pogo->connection_work, samsung_pogo_connection_work);
@@ -1441,6 +1760,14 @@ static int samsung_pogo_probe(struct i2c_client *client)
 		return dev_err_probe(dev, pogo->data_irq,
 				     "failed to map data-ready IRQ\n");
 
+	/* Before the IRQs: their threads and connection_work report to it. */
+	if (pogo->board->cover_switch) {
+		ret = samsung_pogo_register_cover_switch(pogo);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to register cover switch\n");
+	}
+
 	ret = devm_request_threaded_irq(dev, pogo->data_irq,
 					samsung_pogo_irq,
 					samsung_pogo_irq_thread,
@@ -1471,15 +1798,29 @@ static int samsung_pogo_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to request connection IRQ\n");
 
-	device_init_wakeup(dev, pogo_connection_wakeup &&
-			   device_property_read_bool(dev, "wakeup-source"));
-	if (device_may_wakeup(dev)) {
-		ret = enable_irq_wake(pogo->connection_irq);
-		if (ret) {
-			dev_warn(dev, "connection IRQ cannot wake the tablet: %d\n",
-				 ret);
-		} else {
-			pogo->wake_enabled = true;
+	if (pogo->board->key_wakeup) {
+		/*
+		 * The I2C core has already made this "wakeup-source" client
+		 * wake-capable and enabled it.  Stay capable, so the keys can
+		 * wake the tablet once power/wakeup says "enabled", but start
+		 * disabled until that is validated on this board's resume.
+		 * The suspend callback arms the lines.  connection_wakeup=1
+		 * keeps its old meaning: wake enabled from boot, with the
+		 * connection line armed as well.
+		 */
+		if (device_can_wakeup(dev) && !pogo_connection_wakeup)
+			device_wakeup_disable(dev);
+	} else {
+		device_init_wakeup(dev, pogo_connection_wakeup &&
+				   device_property_read_bool(dev, "wakeup-source"));
+		if (device_may_wakeup(dev)) {
+			ret = enable_irq_wake(pogo->connection_irq);
+			if (ret) {
+				dev_warn(dev, "connection IRQ cannot wake the tablet: %d\n",
+					 ret);
+			} else {
+				pogo->wake_enabled = true;
+			}
 		}
 	}
 	ret = device_create_file(dev, &dev_attr_firmware_update);
@@ -1490,11 +1831,16 @@ static int samsung_pogo_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "failed to create diagnostics\n");
+	ret = device_create_file(dev, &dev_attr_cover_state);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to create cover state\n");
 	ret = device_create_file(dev, &dev_attr_event_poll);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "failed to create event poll control\n");
-	dev_info(dev, "STM32 pogo controller ready (connected=%d, data-ready=%d)\n",
+	dev_info(dev, "STM32 pogo controller ready (%s, connected=%d, data-ready=%d)\n",
+		 pogo->board->name,
 		 gpiod_get_value_cansleep(pogo->connected),
 		 gpiod_get_value_cansleep(pogo->data_ready));
 
@@ -1510,12 +1856,20 @@ static void samsung_pogo_remove(struct i2c_client *client)
 
 	device_remove_file(&client->dev, &dev_attr_firmware_update);
 	device_remove_file(&client->dev, &dev_attr_diagnostics);
+	device_remove_file(&client->dev, &dev_attr_cover_state);
 	device_remove_file(&client->dev, &dev_attr_event_poll);
+	/*
+	 * The IRQs are devm-managed and outlive this callback.  Stop each line
+	 * before cancelling the work its thread queues, as
+	 * firmware_update_store() does: the connection thread queues
+	 * connection_work, the data thread application_work.
+	 */
+	disable_irq(pogo->connection_irq);
 	cancel_delayed_work_sync(&pogo->connection_work);
+	samsung_pogo_set_data_irq(pogo, false);
 	cancel_delayed_work_sync(&pogo->application_work);
 	if (pogo->wake_enabled)
 		disable_irq_wake(pogo->connection_irq);
-	samsung_pogo_set_data_irq(pogo, false);
 	mutex_lock(&pogo->lock);
 	samsung_pogo_unregister_input(pogo);
 	samsung_pogo_power_off(pogo);
@@ -1533,6 +1887,7 @@ static struct i2c_driver samsung_pogo_driver = {
 	.driver = {
 		.name = "samsung-gts9u-stm32-pogo",
 		.of_match_table = samsung_pogo_of_match,
+		.pm = pm_sleep_ptr(&samsung_pogo_pm_ops),
 	},
 	.probe = samsung_pogo_probe,
 	.remove = samsung_pogo_remove,

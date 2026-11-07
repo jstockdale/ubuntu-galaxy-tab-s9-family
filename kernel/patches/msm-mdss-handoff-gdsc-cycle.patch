@@ -1,0 +1,73 @@
+--- a/drivers/gpu/drm/msm/msm_mdss.c
++++ b/drivers/gpu/drm/msm/msm_mdss.c
+@@ -13,6 +13,7 @@
+ #include <linux/irqchip/chained_irq.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+ 
+@@ -24,6 +25,21 @@
+ 
+ #define MIN_IB_BW	400000000UL /* Min ib vote 400MB */
+ 
++/*
++ * Bring-up switch for the Samsung SM8550 tablets, whose DSI panel does not
++ * answer on the first enable after a cold boot until a pm_test=platform
++ * cycle.  Display-wise that cycle adds one thing to a devices-only cycle,
++ * which does not help: the noirq phase powers the MDSS GDSC down, which does
++ * not happen at runtime while anything keeps the MDSS active (on these boards
++ * the DP controller's HPD reference).  msm.mdss_handoff_gdsc_cycle=1 powers it
++ * down and up once at probe, right after the core reset, while the
++ * bootloader's display is still all there is.
++ */
++static bool mdss_handoff_gdsc_cycle;
++module_param(mdss_handoff_gdsc_cycle, bool, 0444);
++MODULE_PARM_DESC(mdss_handoff_gdsc_cycle,
++		 "power-cycle the MDSS GDSC once at probe, after the core reset (bring-up)");
++
+ struct msm_mdss_data {
+ 	u32 reg_bus_bw;
+ };
+@@ -306,6 +322,30 @@
+ 	irq_set_chained_handler_and_data(irq, NULL, NULL);
+ }
+ 
++/*
++ * Probe runs before pm_runtime_enable() and before any child device exists,
++ * and the MDSS is the only device in its GDSC's domain, so nothing else can
++ * touch the domain here: the syscore helpers take it down and up the way the
++ * noirq phase of a system suspend does.
++ */
++static void msm_mdss_handoff_gdsc_cycle(struct device *dev)
++{
++	bool collapsed;
++
++	if (!dev_pm_genpd_is_on(dev)) {
++		dev_info(dev, "bootloader hand-off: no powered GDSC to cycle\n");
++		return;
++	}
++
++	dev_pm_genpd_suspend(dev);
++	collapsed = !dev_pm_genpd_is_on(dev);
++	msleep(20);
++	dev_pm_genpd_resume(dev);
++
++	dev_info(dev, "bootloader hand-off: MDSS GDSC %s\n",
++		 collapsed ? "power-cycled" : "did not power down");
++}
++
+ static int msm_mdss_reset(struct device *dev)
+ {
+ 	struct reset_control *reset;
+@@ -373,6 +413,9 @@
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
++	if (mdss_handoff_gdsc_cycle)
++		msm_mdss_handoff_gdsc_cycle(&pdev->dev);
++
+ 	msm_mdss = devm_kzalloc(&pdev->dev, sizeof(*msm_mdss), GFP_KERNEL);
+ 	if (!msm_mdss)
+ 		return ERR_PTR(-ENOMEM);

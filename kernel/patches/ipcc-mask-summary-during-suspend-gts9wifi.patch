@@ -1,0 +1,37 @@
+Subject: [PATCH] mailbox: qcom-ipcc: mask summary IRQ in SM-X710 suspend too
+
+ipcc-mask-summary-during-suspend-gts9u.patch drops IRQF_NO_SUSPEND from the
+IPCC summary interrupt on the SM-X910 only, because ADSP SMP2P traffic made
+that board's firmware return from PSCI SYSTEM_SUSPEND at once.  The SM-X710
+(gts9wifi) runs the same SoC and Samsung firmware stack, and its one deep
+suspend that reached PSCI with a working ADSP also returned within a second
+without a wake IRQ.
+
+Extend the board gate.  For deep suspend this is the Ultra fix.  For
+suspend-to-idle it is not required -- the unmasked IRQ only wakes the CPUs,
+and s2idle goes back to idle when no wakeup event was reported -- but it
+keeps both modes identical: DSP messages stay latched in IPCC and are
+handled after resume.  Other Qualcomm boards keep the upstream flag.
+
+Applies on top of ipcc-mask-summary-during-suspend-gts9u.patch.
+
+--- a/drivers/mailbox/qcom-ipcc.c
++++ b/drivers/mailbox/qcom-ipcc.c
+@@ -325,8 +325,15 @@ static int qcom_ipcc_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_mbox;
+ 
+-	/* Mask IPCC DSP traffic during SM-X910 system suspend. */
+-	if (!of_machine_is_compatible("samsung,gts9uwifi"))
++	/*
++	 * Mask IPCC DSP traffic during SM-X910 system suspend.  The SM-X710
++	 * runs the same Samsung firmware, and one of its deep suspends also
++	 * came back at once without the power-key wake.  In suspend-to-idle
++	 * the mask only leaves DSP messages for resume, as in deep suspend,
++	 * instead of waking the CPUs for each one.
++	 */
++	if (!of_machine_is_compatible("samsung,gts9uwifi") &&
++	    !of_machine_is_compatible("samsung,gts9wifi"))
+ 		irqflags |= IRQF_NO_SUSPEND;
+ 
+ 	ret = devm_request_irq(&pdev->dev, ipcc->irq, qcom_ipcc_irq_fn,

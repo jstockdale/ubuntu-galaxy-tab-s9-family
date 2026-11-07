@@ -26,6 +26,26 @@ TCPM drives the PD policy through the SM5714 transport, including SOP'
 trace against passive adapters are the cable-marker probes timing out, not
 a defect.
 
+## Power
+
+The DP controller is powered only while a sink is plugged, as on stock.
+It is a child of the MDSS, so while it ran, the MDSS, `mdss_gdsc` and the
+display clock controller stayed on with the panel blanked.  Nothing
+resolves past the QMP PHY in the bridge chain (the PS5169 and SM5714
+register no DRM bridge), so msm_dp is the connector's HPD bridge, and its
+`hpd_enable` used to hold a runtime PM reference for an HPD pin that
+nothing drives.  `msm-dp-oob-hpd-no-runtime-pm.patch` drops that reference
+when a usb-c-connector's `displayport` property names the controller, and
+`msm-dp-balance-plugged-runtime-pm.patch` keeps exactly one reference per
+plugged sink, so the controller suspends again after unplug.
+
+With no sink and the panel blanked, `ae90000.displayport-controller`,
+`ae00000.display-subsystem` and `af00000.clock-controller` should read
+`suspended` in `power/runtime_status`, and `mdss_gdsc` should be `off` in
+`/sys/kernel/debug/pm_genpd/pm_genpd_summary`.  To get the old behaviour
+back without a rebuild (A/B testing, or if an unblank misbehaves after
+the MDSS power collapse), write `on` to the controller's `power/control`.
+
 ## The binding race (fixed by the typec re-probe patch)
 
 A dock's DisplayPort mode is usually discovered while the tablet is still

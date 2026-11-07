@@ -6,41 +6,85 @@ The 11" glass is the AMSA10FA01 behind the same ANA38407 DDIC as the Ultra,
 descriptor; the X710 power-on sequence is Samsung's revision-D
 `POWER_ON_PRE_SETTING` transcribed from the X710 kernel sources.
 
-## What is known to work (builds 8, 9, 11)
+## Link defaults
 
 * Panel VDD (L11B) at 1.2 V, the stock X710 level.  At 1.104 V the glass
   showed white single-pixel noise.
-* 120 Hz mode with the stock porches 34/64/34: with msm's
-  `dsi_adjust_pclk_for_compression()` (hdisplay -> 854 columns, blanking
-  kept, lane rate = 6 x pixel clock) that is 1.234 Gbps per lane.
-* Non-continuous DSI clock (`MIPI_DSI_CLOCK_NON_CONTINUOUS`).
-* The panel still needs the cold-boot recovery cycle
-  (`ubuntu-gts9u-panel-coldboot-recover`, a `pm_test=platform` suspend) on
-  this board too: the DDIC answers `00 00 00` on the first probe and
-  `80 00 04` after the cycle, about 25 to 90 s into boot depending on what
-  udev is still settling.  GDM is ordered after it.
+* Every mode runs the stock 1.524 Gbps per lane.  The lane rate follows from
+  the mode: msm's `dsi_adjust_pclk_for_compression()` shrinks hdisplay to
+  854 columns and keeps the blanking, and the lane rate is 6 x that pixel
+  clock.  The 120 Hz mode uses a 266-pixel back porch for this (the stock
+  34/64/34 porches would give 1.234 Gbps); the 60 and 30 Hz modes use
+  Samsung's own porches, which land on the same rate.
+* Samsung's D-PHY timing table `[00 35 0d 0d 1f 27 0d 0d 0c 02 04 00 2a 12]`
+  comes from the DSI PHY node (`qcom,dsi-phy-timings`, valid within 1% of
+  `qcom,dsi-phy-timings-bitclk-hz = <1524000000>`), and its clk_pre/clk_post
+  also go to the controller's `DSI_CLKOUT_TIMING_CTRL`, as the vendor driver
+  programs them.  The Ultra's DTS has no table, so its PHY still computes
+  its timings.
+* Non-continuous DSI clock (`MIPI_DSI_CLOCK_NON_CONTINUOUS`); stock declares
+  no forced HS clock lane.
+* The expected panel id is pinned to `80 00 04` (revision D, the bootloader's
+  `lcd_id=800004`).  `00 00 00` is logged as a DDIC that did not answer;
+  another id as glass the power-on sequence was not written for.  The id the
+  DDIC answered at the last power-on is in
+  `/sys/class/backlight/ae94000.dsi.0/panel_id`.
 
-## What stayed black (build 10)
+How these were settled (builds 10 to 13, all as command-line switches on one
+kernel): a continuous clock alone blacks the glass out (the build-10 black
+panel); 1.524 Gbps with the timings mainline computes gave frame-done
+timeouts and more speckle; Samsung's table at 1.524 Gbps ran clean.  The DDR
+bandwidth monitor, the third build-10 change, made no difference either way
+(`icc_bwmon` stays a blacklisted module).  The switches still exist and
+override the defaults:
+`panel_samsung_ana38407.hback_porch=` (preferred mode only),
+`panel_samsung_ana38407.continuous_clock=`, `msm.dsi_phy_timings=<14 bytes>`.
+A release vendor_boot needs none of them, so it is built without
+`GTS9U_EXTRA_CMDLINE`.
 
-Build 10 shipped three changes together: the stock 1.524 Gbps lane rate
-(back porch 266), a continuous DSI clock, and the DDR bandwidth monitor
-(`CONFIG_QCOM_ICC_BWMON`).  The tablet booted completely, the DDIC reported
-alive after the recovery cycle, the DPU ran, GDM and gnome-shell started,
-backlight was on, and the OLED showed nothing.  Which of the three is
-responsible is not yet known, so build 11 returns to the configuration
-above and turns each into a switch:
+## Refresh rates
 
-| experiment | how |
+The DDIC sets its own refresh in command mode, so a mode below 120 Hz only
+takes effect through Samsung's `VRR_SETTING`, and at 60 Hz the glass also
+needs `GLUT_SETTING`'s gamma offsets for the current brightness level.  The
+driver offers:
+
+| mode | stock node | VRR_SETTING (0x60, 0xDD, 0xB9) | GLUT |
+| --- | --- | --- | --- |
+| 120 Hz (preferred) | wqxga120hs | 00, 00, 80 00 00 00 | cleared |
+| 60 Hz | wqxga60hs | 10, 00, aa aa aa aa | GLUT_OFFSET_60HS row of the brightness level |
+| 30 Hz, only with `panel_samsung_ana38407.mode_30hz=1` | wqxga30hs | 10, 01, aa aa aa aa | as 60 Hz |
+
+A refresh change is a full modeset, so the panel goes through power-off and
+the complete power-on sequence with the new branches; below 120 Hz every
+brightness change that moves the platform level re-sends the GLUT row ahead
+of the 0x51 write, as Samsung's `BRIGHTNESS_SETTING` does.  The tables are
+generated from Samsung's `GTS9_ANA38407_AMSA10FA01.dat` by
+`scripts/gen-ana38407-glut.py` into
+`kernel/drivers/panel-samsung-ana38407-glut.h`.  Not implemented: the
+frame-skipping 60/30 Hz "PHS" modes, low-frequency drive and Samsung's
+seamless VRR.
+
+## Cold boot: the DDIC does not answer the first enable
+
+The DDIC answers `00 00 00` on its first probe after every cold boot and only
+works after `ubuntu-gts9u-panel-coldboot-recover` has run a
+`pm_test=platform` cycle; GDM is ordered after it.  Blanking and a
+`pm_test=devices` cycle do not recover it (measured on the Ultra).
+Display-wise, the platform level adds the noirq phase, in which genpd powers
+the MDSS GDSC down; at runtime that never happens because the DP controller
+keeps the MDSS active.  The kernel carries switches to test in-kernel
+replacements, all inert by default:
+
+| switch | what it does |
 | --- | --- |
-| bandwidth monitor | `modprobe icc_bwmon` on the running system (module, blacklisted by `/etc/modprobe.d/gts9u-bwmon.conf`) |
-| stock lane rate | `panel_samsung_ana38407.hback_porch=266` on the kernel command line |
-| continuous clock | `panel_samsung_ana38407.continuous_clock=1` on the kernel command line |
+| `msm.dsi_regdump=1` | logs DSI controller and PHY registers at probe (as the bootloader left them) and at every enable |
+| `msm.mdss_handoff_gdsc_cycle=1` | power-cycles the MDSS GDSC at probe, after the core reset |
+| `msm.boot_display_cycle=1` | after the first modeset, takes only the display through the cycle's steps, GDSC included |
 
-The command line lives in vendor_boot.img only, so a kernel-parameter
-experiment is `GTS9U_EXTRA_CMDLINE='...' scripts/build-android-v4-bundle.sh`
-and a `dd` of that one image, not a kernel rebuild.  The driver logs the
-effective settings at probe (`DSI clock ... between frames`, `mode 0: back
-porch ...`).
+The panel also waits for the DDIC's TCON_RDY line (TLMM 88) after reset, as
+Samsung's Anapass power sequence does, and reports at the first power-on
+whether it was high before the reset and how long it took to rise after it.
 
 ## Still open
 
@@ -48,11 +92,13 @@ porch ...`).
   occasional mirrored or stretched copy of a buffer region (GPU/UBWC path is
   the current suspect; `FD_MESA_DEBUG=noubwc` test pending).
 * Square blocking shared with the Ultra (GMU bandwidth-vote timeouts).
-* 60 Hz / VRR mode not declared.
-* A short power-button press on this board must not suspend: resume from
-  deep suspend does not work yet, and the result is a black panel with USB
-  gone until a hard reset.  The power-key helper locks the session instead
-  on `samsung,gts9wifi`.
+* Nothing on this board may suspend yet: resume from deep suspend does not
+  work, and the result is a black panel with USB gone until a hard reset.
+  `ubuntu-gts9u-suspend-mode` defaults `samsung,gts9wifi` to mode `off`, which
+  makes logind refuse every suspend (power key, cover, idle, menus); the power
+  key locks and blanks instead, and the cover locks.  Test s2idle for one boot
+  with `echo s2idle > /run/ubuntu-gts9u/suspend-mode` and
+  `systemctl restart ubuntu-gts9u-suspend-mode`.
 
 ## GPU write corruption (2026-11-06): what is known
 

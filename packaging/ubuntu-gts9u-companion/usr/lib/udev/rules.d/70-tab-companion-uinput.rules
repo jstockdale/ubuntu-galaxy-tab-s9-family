@@ -1,3 +1,5 @@
-# The per-user daemon runs as the tablet owner, who is a member of input.
+# Only tab-companion-hardware@UID.service holds input, as a supplementary
+# group of the owner's uid; the desktop session itself is not a member, so
+# other processes can neither read input devices nor inject through uinput.
 KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660"
 KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="gpio-vibrator", GROUP="input", MODE="0660"

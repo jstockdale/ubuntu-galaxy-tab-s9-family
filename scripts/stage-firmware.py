@@ -348,10 +348,18 @@ def order(files):
 
 
 def process(manifest, args, record=False):
+    files = manifest["files"]
+    # A missing generator is not a missing source.  `record` used to drop the
+    # sensor registry as "not in this package" when --sscregistrygen was left
+    # out, and the first X710 manifest shipped without it; refuse up front.
+    generated = [n for n in files
+                 if files[n]["source"].startswith("generated:")
+                 and (not args.groups or files[n].get("group", "core") in args.groups)]
+    if generated and args.sscregistrygen is None:
+        raise SystemExit(f"{', '.join(generated)} needs --sscregistrygen")
     sources = Sources(args)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
-    files = manifest["files"]
     staged, failures = {}, []
     for name in order(files):
         entry = dict(files[name])

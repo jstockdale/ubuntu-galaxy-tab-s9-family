@@ -16,8 +16,17 @@ For that to hold, the other two owners are told to keep their hands off:
 The long press invokes org.gnome.SessionManager.Shutdown on the active user's
 session bus, which is the same call gnome-session-quit --power-off makes: the
 dialog with the sixty second countdown, not an immediate power off.
+
+Whether a short press may suspend is logind's answer to CanSuspend at that
+moment, the same answer the cover, GNOME's idle timeout and the Suspend menu
+get.  ubuntu-gts9u-suspend-mode turns it into "no" on a board that does not
+resume yet, and a masked suspend.target does the same.  Without suspend a
+short press locks the session and turns the panel off, and the next one turns
+the panel back on.
 """
+import glob
 import os
+import pwd
 import re
 import select
 import struct
@@ -38,30 +47,43 @@ LONG_PRESS_MS = 1200
 # is still entering suspend.
 MIN_SLEEP_S = 0.05
 PM_WAKEUP_IRQ = "/sys/power/pm_wakeup_irq"
+SUSPEND_STATS = "/sys/power/suspend_stats"
+
+# A press shortly after our own suspend request may still fall inside the
+# entry, while logind waits for its delay inhibitors (InhibitDelayMaxSec, 5 s)
+# and systemd-sleep runs its hooks.  logind says exactly when that is over
+# (PreparingForSleep); this bound is only for when it cannot be asked.  Past
+# it, a request that never reached the kernel is over and the press is new.
+ENTRY_WINDOW_S = 15.0
+
+# org.gnome.Mutter.DisplayConfig PowerSaveMode, the values gnome-settings-daemon
+# itself writes when it blanks and unblanks the screen.
+POWER_SAVE_ON = 0
+POWER_SAVE_OFF = 3
+
+# How long GNOME gets to put the lock screen up before the panel goes dark, so
+# that what lights up next is the lock screen.
+LOCK_SETTLE_S = 1.0
+
+LOGIN1 = ("org.freedesktop.login1", "/org/freedesktop/login1",
+          "org.freedesktop.login1.Manager")
 
 EVENT_FORMAT = "llHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
-
-# Boards that do not come back from deep suspend yet.  A short press there
-# locks the session instead of suspending: a suspend would otherwise look
-# like a dead tablet (black panel, USB gone) until a hard reset.
-NO_RESUME_COMPATIBLES = (b"samsung,gts9wifi",)
 
 
 def log(message):
     print("ubuntu-gts9u-powerkey: %s" % message, flush=True)
 
 
-def suspend_supported():
+def run(argv, timeout=5, **kwargs):
+    """Run a helper to completion; None when it could not be run at all."""
     try:
-        with open("/proc/device-tree/compatible", "rb") as handle:
-            compatible = handle.read().split(b"\0")
-    except OSError:
-        return True
-    return not any(c in compatible for c in NO_RESUME_COMPATIBLES)
-
-
-SUSPEND_SUPPORTED = suspend_supported()
+        return subprocess.run(argv, capture_output=True, text=True,
+                              errors="replace", timeout=timeout, **kwargs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("%s: %s" % (argv[0], exc))
+        return None
 
 
 def find_power_key():
@@ -82,8 +104,66 @@ def find_power_key():
     return None
 
 
+def can_suspend():
+    """logind's CanSuspend for us: "yes", "no", "na" ... or "unknown"."""
+    result = run(["busctl", "call", *LOGIN1, "CanSuspend"])
+    if result is None or result.returncode != 0:
+        return "unknown"
+    match = re.fullmatch(r's "([a-z-]+)"', result.stdout.strip())
+    return match.group(1) if match else "unknown"
+
+
+def preparing_for_sleep():
+    """Whether logind is taking the machine to sleep; None when unknown."""
+    result = run(["busctl", "get-property", *LOGIN1, "PreparingForSleep"])
+    if result is None or result.returncode != 0:
+        return None
+    return {"b true": True, "b false": False}.get(result.stdout.strip())
+
+
+def session_properties(session, *names):
+    """Some of `loginctl show-session` for one session, as a dict."""
+    argv = ["loginctl", "show-session", session]
+    for name in names:
+        argv += ["-p", name]
+    result = run(argv)
+    if result is None or result.returncode != 0:
+        return {}
+    properties = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            properties[key] = value
+    return properties
+
+
+def front_session():
+    """seat0's active session as (id, uid, user, class, type), or None.
+
+    That is the session on the panel.  A session without a seat, an SSH login
+    for one, reports itself as active too, so scanning every session for
+    Active=yes can land on the wrong one.
+    """
+    result = run(["loginctl", "show-seat", "seat0", "-p", "ActiveSession",
+                  "--value"])
+    if result is None or result.returncode != 0:
+        return None
+    session = result.stdout.strip()
+    if not session:
+        return None
+    properties = session_properties(session, "User", "Name", "Class", "Type")
+    if not properties.get("User") or not properties.get("Name"):
+        return None
+    return (session, properties["User"], properties["Name"],
+            properties.get("Class", ""), properties.get("Type", ""))
+
+
 def active_session():
     """The uid and name of the user whose graphical session is in front."""
+    front = front_session()
+    if front is not None:
+        return front[1], front[2]
+
     try:
         out = subprocess.check_output(
             ["loginctl", "list-sessions", "--no-legend"],
@@ -108,14 +188,162 @@ def active_session():
     return None
 
 
-def short_press():
-    if not SUSPEND_SUPPORTED:
-        log("short press: locking sessions (this board does not resume from suspend yet)")
-        subprocess.Popen(["loginctl", "lock-sessions"])
-        return time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
-    log("short press: suspending")
-    subprocess.Popen(["systemctl", "suspend"])
-    return time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
+def session_locked(session):
+    return session_properties(session, "LockedHint").get("LockedHint") == "yes"
+
+
+def owner_desktop(front):
+    """Whether front_session() is someone's desktop, with a compositor to ask.
+
+    The login screen's compositor sits on a private bus from dbus-run-session,
+    which only its own processes know the address of, and a text console has
+    no compositor at all.
+    """
+    return (front is not None and front[3] == "user" and
+            front[4] in ("wayland", "x11"))
+
+
+def screen_is_off():
+    """True when no connected output is lit; None when there is none to ask.
+
+    Read straight from DRM, so that it can be sampled the moment a press
+    arrives: the compositor sees the same key and may light the panel itself.
+    """
+    seen = False
+    for connector in glob.glob("/sys/class/drm/card*-*"):
+        try:
+            with open(os.path.join(connector, "status")) as handle:
+                if handle.read().strip() != "connected":
+                    continue
+            with open(os.path.join(connector, "enabled")) as handle:
+                enabled = handle.read().strip() == "enabled"
+            with open(os.path.join(connector, "dpms")) as handle:
+                lit = handle.read().strip() == "On"
+        except OSError:
+            continue
+        seen = True
+        if enabled and lit:
+            return False
+    return True if seen else None
+
+
+def session_call(uid, user, argv):
+    """Run argv as `user` against their session bus; True if it succeeded.
+
+    The child drops straight to the user's credentials.  runuser, which the
+    long press uses, opens and closes a PAM session around every call, and the
+    panel is switched on every press.
+    """
+    try:
+        entry = pwd.getpwnam(user)
+    except KeyError:
+        log("no account named %s" % user)
+        return False
+    if str(entry.pw_uid) != str(uid):
+        log("%s is uid %d, not %s; leaving that session alone" %
+            (user, entry.pw_uid, uid))
+        return False
+    runtime = "/run/user/%d" % entry.pw_uid
+    result = run(argv, user=entry.pw_uid, group=entry.pw_gid, extra_groups=[],
+                 cwd="/", env={
+                     "PATH": "/usr/bin:/bin",
+                     "HOME": entry.pw_dir,
+                     "XDG_RUNTIME_DIR": runtime,
+                     "DBUS_SESSION_BUS_ADDRESS": "unix:path=%s/bus" % runtime,
+                 })
+    if result is None:
+        return False
+    if result.returncode != 0:
+        log("%s: %s" % (argv[0], (result.stderr or result.stdout).strip() or
+                        "exit status %d" % result.returncode))
+        return False
+    return True
+
+
+def set_power_save(mode, front=None):
+    """Switch every output of the compositor in front; True if it took it.
+
+    This is the property gnome-settings-daemon itself sets when it blanks the
+    screen, but it does not know about this blank: until its own lock-screen
+    timeout comes round it lights nothing for a touch or a key.  The next
+    short press does it here instead.
+    """
+    if front is None:
+        front = front_session()
+    if front is None:
+        log("no session on seat0; leaving the panel as it is")
+        return False
+    if not owner_desktop(front):
+        log("the %s %s session in front has no compositor to ask; leaving the "
+            "panel as it is" % (front[3] or "unknown", front[4] or "unknown"))
+        return False
+    _, uid, user, _, _ = front
+    return session_call(uid, user, [
+        "gdbus", "call", "--session",
+        "--dest", "org.gnome.Mutter.DisplayConfig",
+        "--object-path", "/org/gnome/Mutter/DisplayConfig",
+        "--method", "org.freedesktop.DBus.Properties.Set",
+        "'org.gnome.Mutter.DisplayConfig'", "'PowerSaveMode'",
+        "<int32 %d>" % mode])
+
+
+def lock_and_blank(why):
+    """What a short press does when the machine may not sleep."""
+    log("short press: locking and turning the panel off (%s)" % why)
+    result = run(["loginctl", "lock-sessions"])
+    if result is None or result.returncode != 0:
+        log("loginctl lock-sessions failed: %s" %
+            (result.stderr.strip() if result is not None else "not run"))
+    front = front_session()
+    if owner_desktop(front):
+        # A lock that never comes is reported, but it does not keep the panel
+        # on: a suspend does not wait for it either.
+        deadline = time.monotonic() + LOCK_SETTLE_S
+        while not session_locked(front[0]):
+            if time.monotonic() >= deadline:
+                log("session %s did not report locked within %.1f s" %
+                    (front[0], LOCK_SETTLE_S))
+                break
+            time.sleep(0.1)
+    # Locking a session that was unlocked blanks it already: GNOME turns the
+    # outputs off as soon as the lock screen is up.  A lock screen that was
+    # already showing stays lit for its own half-minute timeout unless told.
+    if screen_is_off() is not True:
+        set_power_save(POWER_SAVE_OFF, front)
+
+
+def short_press(screen_was_off):
+    """Act on a short press; return our suspend request, if one was made.
+
+    Nothing is returned when no sleep was asked for or logind turned it down,
+    so the next press is always read as a new one.  Without a sleep the press
+    toggles the panel: a dark one comes on, a lit one is locked and turned off.
+    """
+    answer = can_suspend()
+    if answer == "yes":
+        if preparing_for_sleep():
+            log("short press: a suspend is already under way")
+            return None
+        request = (time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME),
+                   suspend_cycles())
+        log("short press: suspending")
+        result = run(["systemctl", "suspend"], timeout=30)
+        if result is not None and result.returncode == 0:
+            return request
+        if result is None:
+            reason = "systemctl did not run"
+        else:
+            reason = ((result.stderr or result.stdout).strip() or
+                      "exit status %d" % result.returncode)
+        why = "the suspend was refused: %s" % reason
+    else:
+        why = "suspend is off: logind CanSuspend=%s" % answer
+    if screen_was_off:
+        log("short press: turning the panel on (%s)" % why)
+        set_power_save(POWER_SAVE_ON)
+    else:
+        lock_and_blank(why)
+    return None
 
 
 def power_key_irq():
@@ -138,6 +366,18 @@ def wake_irq():
         return None
 
 
+def suspend_cycles():
+    """Kernel suspend attempts so far, whether they worked or not."""
+    total = 0
+    for name in ("success", "fail"):
+        try:
+            with open(os.path.join(SUSPEND_STATS, name)) as handle:
+                total += int(handle.read().strip())
+        except (OSError, ValueError):
+            return None
+    return total
+
+
 def slept_since(stamp):
     monotonic_at, boottime_at = stamp
     awake_elapsed = time.monotonic() - monotonic_at
@@ -150,8 +390,34 @@ def suspend_offset():
     return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
 
 
+def suspend_request_outcome(request, irq, pwr_irq):
+    """What became of our last suspend request, now that a press arrived.
+
+      woke-us     it slept and this press is what woke it
+      other-wake  it slept and something else woke it
+      returned    the kernel went down and came straight back, or failed
+      entering    logind is still taking the machine down
+      dropped     it never reached the kernel: refused or failed on the way
+    """
+    monotonic_at, boottime_at, cycles_at = request
+    slept = slept_since((monotonic_at, boottime_at))
+    if slept >= MIN_SLEEP_S:
+        return ("woke-us" if irq == pwr_irq else "other-wake"), slept
+    cycles = suspend_cycles()
+    if cycles is not None and cycles_at is not None and cycles != cycles_at:
+        return "returned", slept
+    preparing = preparing_for_sleep()
+    if preparing is None:
+        preparing = time.monotonic() - monotonic_at < ENTRY_WINDOW_S
+    return ("entering" if preparing else "dropped"), slept
+
+
 def cancel_pending_suspend():
-    """Cancel the transaction when power is pressed during suspend entry."""
+    """Cancel the transaction when power is pressed during suspend entry.
+
+    Best effort: logind starts the sleep as an irreversible job, which systemd
+    may refuse to stop.  The press is swallowed either way.
+    """
     log("power press during suspend entry: cancelling suspend")
     subprocess.Popen(
         ["systemctl", "stop", "suspend.target", "systemd-suspend.service"],
@@ -182,8 +448,9 @@ def main():
     if path is None:
         log("no pmic_pwrkey input device; nothing to do")
         return 1
-    log("watching %s (long press at %d ms; short press %s)" %
-        (path, LONG_PRESS_MS, "suspends" if SUSPEND_SUPPORTED else "locks"))
+    log("watching %s (long press at %d ms; short press suspends while logind "
+        "allows it, otherwise locks and turns the panel off; CanSuspend=%s now)" %
+        (path, LONG_PRESS_MS, can_suspend()))
     pwr_irq = power_key_irq()
     log("pmic power-key wake IRQ is %s" %
         (pwr_irq if pwr_irq is not None else "unknown"))
@@ -191,7 +458,8 @@ def main():
     with open(path, "rb", buffering=0) as dev:
         pressed_at = None
         fired = False
-        suspended_at = None
+        screen_was_off = False
+        request = None          # our last suspend request, until resolved
         last_suspend_offset = suspend_offset()
         while True:
             # When the key is down, wake up in time to fire the long press
@@ -227,40 +495,49 @@ def main():
             if value == 1:              # down
                 now = time.monotonic()
                 irq = wake_irq()
+                # Now, before the compositor, which sees this same key, has a
+                # chance to light the panel.
+                screen_was_off = screen_is_off() is True
                 if (externally_observed_sleep >= MIN_SLEEP_S and
                         irq == pwr_irq):
                     log("ignoring the press that woke us "
                         "(observed %.3f s asleep, IRQ %s)" %
                         (externally_observed_sleep, irq))
-                    suspended_at = None
+                    request = None
                     pressed_at = None
                     fired = True        # swallow the matching release too
                     continue
-                if suspended_at is not None:
-                    slept = slept_since(suspended_at)
-                    if slept >= MIN_SLEEP_S and irq == pwr_irq:
+                if request is not None:
+                    outcome, slept = suspend_request_outcome(request, irq, pwr_irq)
+                    request = None
+                    if outcome == "woke-us":
                         log("ignoring the press that woke us "
                             "(slept %.3f s, IRQ %s)" % (slept, irq))
-                        suspended_at = None
                         pressed_at = None
                         fired = True    # swallow the matching release too
                         continue
-                    if slept < MIN_SLEEP_S:
+                    if outcome == "entering":
                         cancel_pending_suspend()
-                        suspended_at = None
                         pressed_at = None
                         fired = True    # swallow the matching release too
                         continue
-                    # The machine woke for another source. This is a fresh
-                    # power-key command even if it follows resume closely.
-                    log("new press after non-key wake (slept %.3f s, IRQ %s)" %
-                        (slept, irq if irq is not None else "unknown"))
-                    suspended_at = None
+                    # Whatever became of it, that request is over and this is
+                    # a new command, even if it follows closely.
+                    irq_text = irq if irq is not None else "unknown"
+                    if outcome == "other-wake":
+                        log("new press after non-key wake (slept %.3f s, IRQ %s)" %
+                            (slept, irq_text))
+                    elif outcome == "returned":
+                        log("new press: the last suspend came straight back "
+                            "(slept %.3f s, IRQ %s)" % (slept, irq_text))
+                    else:
+                        log("new press: the last suspend request never "
+                            "reached the kernel")
                 pressed_at = now
                 fired = False
             elif value == 0:            # up
                 if pressed_at is not None and not fired:
-                    suspended_at = short_press()
+                    request = short_press(screen_was_off)
                 pressed_at = None
                 fired = False
             # value == 2 is autorepeat; the timer already covers the long press

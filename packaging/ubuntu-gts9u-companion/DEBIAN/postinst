@@ -23,9 +23,35 @@ fi
 if command -v systemctl >/dev/null 2>&1; then
 	systemctl daemon-reload
 	systemctl reload dbus.service >/dev/null 2>&1 || true
-	systemctl enable tab-companion-spen-pairing.service >/dev/null 2>&1 || true
-	systemctl restart tab-companion-spen-pairing.service || true
+	# udev starts the S Pen pairing service when a digitizer binds; remove
+	# the multi-user.target link that older packages created.
+	systemctl disable tab-companion-spen-pairing.service >/dev/null 2>&1 || true
+	systemctl try-restart tab-companion-spen-pairing.service || true
 	systemctl --global enable tab-companion-haptics-enable.service >/dev/null 2>&1 || true
+fi
+
+# The hardware service moved from each user's service manager to the system
+# one, as tab-companion-hardware@UID: only there can it hold the input group
+# without the whole session holding it.  user@.service.d starts it with every
+# later login; hand over the sessions that are already running.  Not in the
+# image chroot, where nothing runs.
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+	systemctl list-units --plain --no-legend --state=active 'user@*.service' 2>/dev/null |
+	while read -r unit _rest; do
+		uid=${unit#user@}
+		uid=${uid%.service}
+		case $uid in
+			''|*[!0-9]*) continue ;;
+		esac
+		[ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] || continue
+		name=$(getent passwd "$uid" | cut -d: -f1)
+		[ -n "$name" ] || continue
+		runuser -u "$name" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+			DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+			systemctl --user stop tab-companion-hardware.service \
+			>/dev/null 2>&1 || true
+		systemctl restart "tab-companion-hardware@$uid.service" || true
+	done
 fi
 
 # The dual boot quick settings entry ships enabled, but it is NOT seeded from

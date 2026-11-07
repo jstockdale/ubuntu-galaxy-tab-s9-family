@@ -155,6 +155,6 @@ def collect_session():
         if source:
             settings = Gio.Settings.new(schema)
             report["settings"][schema] = {key: settings.get_value(key).unpack() for key in keys if source.has_key(key)}
-    report["hardware_service"] = command(["systemctl", "--user", "show", "tab-companion-hardware.service",
+    report["hardware_service"] = command(["systemctl", "show", f"tab-companion-hardware@{os.getuid()}.service",
         "-p", "ActiveState", "-p", "SubState", "-p", "Result", "-p", "NRestarts"])
     return report

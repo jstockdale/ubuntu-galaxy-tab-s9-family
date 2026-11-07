@@ -2,19 +2,15 @@
 /dts-v1/;
 /plugin/;
 
-/* Applied by Linux before cpufreq/DRM probe, never by Samsung ABL. */
+/*
+ * Ultra-only additions, applied by Linux before DRM probes, never by Samsung
+ * ABL.  The prime-CPU boost OPP that every family board needs lives in
+ * gts9-performance.dtso.  719 MHz is the top of Samsung's GPU bin 0, which
+ * kgsl selects by SoC feature code (AC, AF and internal parts); it stays here
+ * until another board's unit is confirmed to be that bin.
+ */
 / {
 	fragment@0 {
-		target-path = "/opp-table-cpu7";
-		__overlay__ {
-			opp-3360000000 {
-				opp-hz = /bits/ 64 <3360000000>;
-				opp-peak-kBps = <14928000 14744000 54067200>;
-			};
-		};
-	};
-
-	fragment@1 {
 		target-path = "/soc@0/gpu@3d00000/opp-table";
 		__overlay__ {
 			opp-719000000 {

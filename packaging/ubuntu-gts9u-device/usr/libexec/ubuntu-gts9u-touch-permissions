@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+devpath=${1-}
+case "$devpath" in
+	/devices/*) ;;
+	*) exit 1 ;;
+esac
+
+device_dir=/sys$devpath
+[ -d "$device_dir" ]
+
+path=$device_dir/double_tap_to_wake
+[ -e "$path" ] || exit 0
+
+# Group write for the desktop user's group; everyone may still read it.
+chgrp input "$path"
+chmod 0664 "$path"
+
+# If the device already has an owner, give them the attribute outright.  Group
+# membership is fixed when a session starts, so a user added to `input` while
+# already logged in cannot use it until they log in again; ownership works
+# immediately.  ubuntu-gts9u-desktop-user records who that is, and this runs
+# again whenever udev re-enumerates the touchscreen.
+owner_file=/run/ubuntu-gts9u/desktop-user
+if [ -r "$owner_file" ]; then
+	owner=$(cat "$owner_file")
+	if [ -n "$owner" ] && id "$owner" >/dev/null 2>&1; then
+		chown "$owner" "$path"
+	fi
+fi

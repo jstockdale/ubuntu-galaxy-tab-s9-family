@@ -1,9 +1,10 @@
 [Unit]
-Description=Normalise the SM-X910 sensor registry tree before the DSP reads it
+Description=Normalise the Samsung sensor registry tree before the DSP reads it
 Documentation=file:///usr/libexec/ubuntu-gts9u-sensor-registry
 After=local-fs.target
 Before=hexagonrpcd-adsp-sensorspd.service
 RequiresMountsFor=/usr/share/qcom
+# The package build rewrites gts9uwifi to the board's DEVICE_SENSOR_DIR.
 ConditionPathIsDirectory=/usr/share/qcom/sm8550/Samsung/gts9uwifi
 
 [Service]

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stage the early, built-in board OPP overlay in a disposable kernel tree.
+# Stage the early, built-in board overlays in a disposable kernel tree.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 tree=${1:?usage: stage-performance-overlay.sh KERNEL_WORKTREE}
@@ -8,15 +8,18 @@ test -f "$target/Makefile"
 command -v dtc >/dev/null
 command -v python3 >/dev/null
 install -m0644 "$repo/kernel/drivers/gts9u-performance.c" "$target/gts9u-performance.c"
-for overlay in gts9u-performance gts9-family; do
+# gts9-* applies to every family board, gts9u-* to the Ultra only; the
+# board split itself lives in gts9u-performance.c.
+for overlay in gts9u-performance gts9-performance gts9-family; do
 	dtc -I dts -O dtb -o "$target/$overlay.dtbo" "$repo/kernel/dts/$overlay.dtso"
 done
 python3 - "$target" <<'PY'
 from pathlib import Path
 import sys
 target = Path(sys.argv[1])
-lines = ['/* Generated from kernel/dts/gts9u-performance.dtso and gts9-family.dtso. */']
+lines = ['/* Generated from kernel/dts/gts9u-performance.dtso, gts9-performance.dtso and gts9-family.dtso. */']
 for name, symbol in (('gts9u-performance', 'gts9u_performance_overlay'),
+                     ('gts9-performance', 'gts9_performance_overlay'),
                      ('gts9-family', 'gts9_family_overlay')):
     data = (target / f'{name}.dtbo').read_bytes()
     lines.append(f'static const unsigned char {symbol}[] __initconst = {{')

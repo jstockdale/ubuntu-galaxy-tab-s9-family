@@ -26,6 +26,7 @@
 # Normalising here fixes both, and costs a few milliseconds at boot.
 set -eu
 
+# The package build rewrites gts9uwifi to the board's DEVICE_SENSOR_DIR.
 tree=/usr/share/qcom/sm8550/Samsung/gts9uwifi
 
 [ -d "$tree" ] || exit 0

@@ -1,12 +1,40 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: MIT
+import grp
 import json
 import os
+import secrets
 import sys
 import select
+import time
 
 sys.path.insert(0, "/usr/lib/tab-companion")
 from tab_companion.keyboard_diagnostics import collect_privileged
+
+TOKEN_DIR = "/run/tab-companion"
+TOKEN = TOKEN_DIR + "/keyboard-capture"
+
+
+def issue_capture_token():
+    """Authorize one cover-key capture by the invoking user's hardware service.
+
+    The service accepts BeginKeyboardCapture only with this token, which the
+    rest of the session cannot read: root and the input group only.  The UI
+    receives it on this helper's stdout and nowhere else.
+    """
+    uid = int(os.environ["PKEXEC_UID"])
+    token = secrets.token_hex(32)
+    os.makedirs(TOKEN_DIR, mode=0o755, exist_ok=True)
+    fd = os.open(TOKEN + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchown(fd, 0, grp.getgrnam("input").gr_gid)
+        os.fchmod(fd, 0o640)
+        os.write(fd, f"{uid} {time.clock_gettime(time.CLOCK_BOOTTIME):.3f} {token}\n".encode())
+    finally:
+        os.close(fd)
+    os.replace(TOKEN + ".new", TOKEN)
+    return token
+
 
 if __name__ == "__main__":
     if os.geteuid() != 0 or sys.argv[1:] not in ([], ["--record-keys"]):
@@ -14,7 +42,21 @@ if __name__ == "__main__":
     if sys.argv[1:]:
         # Authentication is complete. Let the UI start its session-owned recorder
         # before the 20-second system snapshot begins. Never capture auth input.
-        print(json.dumps({"event": "authorized"}), flush=True)
-        if not select.select([sys.stdin], [], [], 10)[0] or sys.stdin.readline().strip() != "start":
-            raise SystemExit("Diagnostic start was cancelled")
-    print(json.dumps(collect_privileged(), ensure_ascii=False, indent=2))
+        try:
+            token = issue_capture_token()
+        except (KeyError, OSError, ValueError) as error:
+            raise SystemExit(f"Cannot authorize the key capture: {error}")
+        try:
+            print(json.dumps({"event": "authorized", "token": token}), flush=True)
+            if not select.select([sys.stdin], [], [], 10)[0] or sys.stdin.readline().strip() != "start":
+                raise SystemExit("Diagnostic start was cancelled")
+            report = collect_privileged()
+        finally:
+            # The capture has started or been abandoned; never leave a token.
+            try:
+                os.unlink(TOKEN)
+            except OSError:
+                pass
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(collect_privileged(), ensure_ascii=False, indent=2))

@@ -1,5 +1,12 @@
 [Unit]
 Description=Tab Companion docked S Pen pairing
+# Started by 71-tab-companion-spen.rules when the Wacom digitiser's driver
+# binds, not by multi-user.target: on a tablet whose digitiser is absent or
+# failed to probe, the daemon has nothing to pair and used to poll BlueZ every
+# 2 s for the whole boot.  The condition turns such a board away however the
+# unit is reached -- the multi-user.target link older packages created, or the
+# package's own restart on upgrade.
+ConditionPathExistsGlob=/sys/bus/i2c/devices/*/pen_docked
 After=bluetooth.service
 Wants=bluetooth.service
 # The daemon's D-Bus proxies bind to one bluetoothd instance; when bluez is
@@ -14,6 +21,3 @@ Type=simple
 ExecStart=/usr/libexec/tab-companion-spen-pairing
 Restart=on-failure
 RestartSec=2
-
-[Install]
-WantedBy=multi-user.target

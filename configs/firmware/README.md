@@ -57,13 +57,23 @@ Stage (verify every hash, refuse anything unexpected, write provenance):
         --vendor-image out-x910/parts/vendor.img \
         --sscregistrygen PATH --out "$UBUNTU_WORKDIR/firmware/x910-bl5"
 
+`PATH` is `tools/sscregistrygen` from sensh v2.0.0, the generator that
+reproduces the pinned `sensor-hexagonfs.tar.gz` of both X910 revisions byte
+for byte. Both commands refuse a manifest with a `generated:` entry when it is
+missing, rather than staging or recording it without the sensor registry.
+The generator writes registry files without truncating them and walks its
+input in directory order, so where two stock configs fill the same entry
+(board-revision variants such as `kailua_ak991x_0`/`_5`) the result follows
+the order of the temporary directory: generate on a tmpfs `/tmp`, where the
+pins reproduce. The pinned sha256 turns any difference into a staging failure.
+
 Record a manifest for a new revision from an existing one's structure
 (measures hashes rather than enforcing them — review the diff, then commit):
 
     scripts/stage-firmware.py record \
         --like configs/firmware/x910-bl5-X910XXS5CYG1.toml \
         --build-id X910XXU1AWHA --odin <rev-1 zip> ... \
-        --write configs/firmware/x910-bl1-X910XXU1AWHA.toml
+        --sscregistrygen PATH --write configs/firmware/x910-bl1-X910XXU1AWHA.toml
 
 Then build with `FIRMWARE_DIR` pointed at the staged output. The release
 pipeline reads `PROVENANCE.json` from there and names the artifact

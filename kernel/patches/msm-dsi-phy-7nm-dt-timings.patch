@@ -1,0 +1,95 @@
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -8,7 +8,9 @@
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
+ #include <linux/iopoll.h>
++#include <linux/math.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ 
+ #include "dsi_phy.h"
+ #include "dsi.xml.h"
+@@ -29,6 +31,36 @@
+ 		 "override the 14 D-PHY TIMING_CTRL registers (bring-up experiments)");
+ 
+ /*
++ * The same table as board data: qcom,dsi-phy-timings holds the 14 bytes the
++ * vendor tuned for the lane rate in qcom,dsi-phy-timings-bitclk-hz (the
++ * Samsung panels' qcom,mdss-dsi-panel-phy-timings and -clockrate).  It is used
++ * only while the requested rate is within 1% of that one; any other rate gets
++ * the computed timings.
++ */
++static bool dsi_7nm_phy_dt_timings(struct msm_dsi_phy *phy,
++				   unsigned long bitclk_rate, u8 *table)
++{
++	struct device_node *np = phy->pdev->dev.of_node;
++	u32 rate;
++
++	if (of_property_count_u8_elems(np, "qcom,dsi-phy-timings") !=
++	    ARRAY_SIZE(dsi_phy_timings) ||
++	    of_property_read_u32(np, "qcom,dsi-phy-timings-bitclk-hz", &rate) ||
++	    !rate)
++		return false;
++
++	if (abs_diff(bitclk_rate, (unsigned long)rate) > rate / 100) {
++		dev_info_once(&phy->pdev->dev,
++			      "D-PHY timing table is for %u bps, computing timings for %lu bps\n",
++			      rate, bitclk_rate);
++		return false;
++	}
++
++	return !of_property_read_u8_array(np, "qcom,dsi-phy-timings", table,
++					  ARRAY_SIZE(dsi_phy_timings));
++}
++
++/*
+  * DSI PLL 7nm - clock diagram (eg: DSI0): TODO: updated CPHY diagram
+  *
+  *           dsi0_pll_out_div_clk  dsi0_pll_bit_clk
+@@ -1189,16 +1221,37 @@
+ 		writel(timing->shared_timings.clk_post,
+ 		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_13);
+ 	}
+-	if (!phy->cphy_mode &&
+-	    dsi_phy_timings_count == ARRAY_SIZE(dsi_phy_timings)) {
++	if (!phy->cphy_mode) {
++		u8 dt_timings[ARRAY_SIZE(dsi_phy_timings)];
++		const u8 *table = NULL;
+ 		int i;
+ 
+-		for (i = 0; i < ARRAY_SIZE(dsi_phy_timings); i++)
+-			writel(dsi_phy_timings[i],
+-			       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0 + 4 * i);
+-		DRM_DEV_INFO(&phy->pdev->dev,
+-			     "D-PHY timings overridden from the command line: %14ph\n",
+-			     dsi_phy_timings);
++		if (dsi_phy_timings_count == ARRAY_SIZE(dsi_phy_timings)) {
++			table = dsi_phy_timings;
++			DRM_DEV_INFO(&phy->pdev->dev,
++				     "D-PHY timings overridden from the command line: %14ph\n",
++				     dsi_phy_timings);
++		} else if (dsi_7nm_phy_dt_timings(phy, clk_req->bitclk_rate,
++						  dt_timings)) {
++			table = dt_timings;
++			dev_info_once(&phy->pdev->dev,
++				      "D-PHY timings from the device tree: %14ph\n",
++				      dt_timings);
++		}
++
++		if (table) {
++			for (i = 0; i < ARRAY_SIZE(dsi_phy_timings); i++)
++				writel(table[i],
++				       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0 + 4 * i);
++			/*
++			 * The vendor driver programs the controller's
++			 * DSI_CLKOUT_TIMING_CTRL from the same clk_pre and
++			 * clk_post (qcom,mdss-dsi-t-clk-pre/post); the host
++			 * takes them from the shared timings.
++			 */
++			timing->shared_timings.clk_pre = table[12];
++			timing->shared_timings.clk_post = table[13];
++		}
+ 	}
+ 
+ 	/* DSI lane settings */

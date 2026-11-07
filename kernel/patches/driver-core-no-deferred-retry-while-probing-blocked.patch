@@ -1,0 +1,100 @@
+Subject: [PATCH] driver core: Don't retry deferred probes while probing is blocked
+
+dpm_prepare() and device_shutdown() call device_block_probing(), after
+which really_probe() defers every probe.  driver_deferred_probe_trigger()
+still queues the deferred probe work in that state, and
+deferred_probe_work_func() calls device_pm_move_to_tail() for each device
+it retries before bus_probe_device() defers it again.
+
+During a system suspend/resume transition that takes the device, its
+children and its consumers off dpm_prepared_list, dpm_suspended_list,
+dpm_late_early_list or dpm_noirq_list and puts them back on dpm_list, so
+they miss the remaining phases.  Without resume_early, the
+pm_runtime_disable() of the late suspend phase is never balanced.  Without
+complete, the usage count taken in device_prepare() leaks, RPM_BLOCKED is
+never cleared and power.is_prepared stays set.  A device moved during a
+suspend phase after its completion was reinitialized is never completed
+either, so an asynchronous parent or supplier waiting for it blocks.
+
+The deferred probe timeout makes this easy to hit: it fires
+deferred_probe_timeout seconds after the last driver registration, from a
+workqueue the freezer does not stop.  On Samsung Galaxy Tab S9 (SM8550)
+boards a platform-level suspend test runs at about that time during boot.
+When the timeout landed inside it, the LPASS LPI pinctrl, still waiting
+for the ADSP, was left with runtime PM disabled.  Every later pin mux
+request then failed with -EACCES and the VA macro probed without its DMIC
+pins:
+
+  gpio gpiochip9: PM: parent 6e80000.pinctrl should not be sleeping
+  va_macro 6d44000.codec: error -EACCES: Error applying setting, reverse things back
+
+Don't retry anything while probing is blocked: leave the pending list
+alone in driver_deferred_probe_trigger() and stop the work at the next
+device.  defer_all_probes is now written under deferred_probe_mutex, which
+both hold when they check it, so no retry can start once
+device_block_probing() has returned.  device_unblock_probing() already
+triggers a retry of every pending device.
+
+Fixes: 013c074f8642 ("PM / sleep: prohibit devices probing during suspend/hibernation")
+
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -97,6 +97,17 @@ static void deferred_probe_work_func(struct work_struct *work)
+ 	 */
+ 	mutex_lock(&deferred_probe_mutex);
+ 	while (!list_empty(&deferred_probe_active_list)) {
++		/*
++		 * While probing is blocked for a system sleep transition or for
++		 * shutdown, every probe below would be deferred again, and
++		 * device_pm_move_to_tail() would take devices that the PM core
++		 * is suspending or resuming off its lists, so they would miss
++		 * their remaining callbacks.  Leave the rest of the list to the
++		 * retry that device_unblock_probing() triggers.
++		 */
++		if (defer_all_probes)
++			break;
++
+ 		private = list_first_entry(&deferred_probe_active_list,
+ 					typeof(*dev->p), deferred_probe);
+ 		dev = private->device;
+@@ -184,6 +195,16 @@ void driver_deferred_probe_trigger(void)
+ 	 * into the active list so they can be retried by the workqueue
+ 	 */
+ 	mutex_lock(&deferred_probe_mutex);
++	/*
++	 * Probing is blocked during system sleep transitions and shutdown, so
++	 * a retry now could only defer every device again.  Keep them on the
++	 * pending list: device_unblock_probing() triggers again once probing
++	 * is allowed.
++	 */
++	if (defer_all_probes) {
++		mutex_unlock(&deferred_probe_mutex);
++		return;
++	}
+ 	atomic_inc(&deferred_trigger_count);
+ 	list_splice_tail_init(&deferred_probe_pending_list,
+ 			      &deferred_probe_active_list);
+@@ -203,7 +224,13 @@ void driver_deferred_probe_trigger(void)
+  */
+ void device_block_probing(void)
+ {
++	/*
++	 * Under deferred_probe_mutex, so that the deferred probe work cannot
++	 * start another retry once this returns.
++	 */
++	mutex_lock(&deferred_probe_mutex);
+ 	defer_all_probes = true;
++	mutex_unlock(&deferred_probe_mutex);
+ 	/* sync with probes to avoid races. */
+ 	wait_for_device_probe();
+ }
+@@ -216,7 +243,9 @@ void device_block_probing(void)
+  */
+ void device_unblock_probing(void)
+ {
++	mutex_lock(&deferred_probe_mutex);
+ 	defer_all_probes = false;
++	mutex_unlock(&deferred_probe_mutex);
+ 	driver_deferred_probe_trigger();
+ }
+ 

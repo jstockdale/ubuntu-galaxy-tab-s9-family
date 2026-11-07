@@ -2,7 +2,8 @@
 # Build the ubuntu-gts9u-device Debian package from packaging/.
 #
 # The tree under packaging/ubuntu-gts9u-device is the package layout verbatim,
-# so what ships is exactly what is versioned here.
+# so what ships is exactly what is versioned here, with two exceptions made
+# below: the sensor registry path follows DEVICE, and translations are compiled.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,6 +26,38 @@ cp -a "$src/." "$staging/"
 # Generated caches are not package source or reproducible runtime artifacts.
 find "$staging" -type f -name '*.pyc' -delete
 find "$staging" -type d -name '__pycache__' -empty -delete
+
+# --- per-device sensor registry tree --------------------------------------
+# hexagonrpcd serves the ADSP sensor protection domain from the HexagonFS tree
+# the firmware overlay installs under qcom/sm8550/Samsung/$DEVICE_SENSOR_DIR.
+# The files naming that tree are versioned with the Ultra's directory, so point
+# them at the board this package is built for.  For gts9uwifi nothing changes.
+# An X710 package carrying the Ultra's path pointed the daemon at a directory
+# that does not exist on that board: SSC never published a sensor, and
+# rotation and the light sensor failed on every boot.
+# hexagonrpcd cannot find the tree by itself either: its compatible-based guess
+# takes the SoC from the first "qcom," entry, and both board DTs list
+# qcom,kalama-mtp first for the bootloader's DTB match.
+sensor_root=/usr/share/qcom/sm8550/Samsung
+sensor_ultra="$sensor_root/gts9uwifi([^[:alnum:]_]|\$)"
+for f in \
+	usr/lib/systemd/system/hexagonrpcd-adsp-sensorspd.service.d/10-gts9u-hexagonfs.conf \
+	usr/lib/systemd/system/ubuntu-gts9u-sensor-registry.service \
+	usr/lib/tmpfiles.d/ubuntu-gts9u-sensors.conf \
+	usr/libexec/ubuntu-gts9u-sensor-registry; do
+	grep -Eq "$sensor_ultra" "$staging/$f" || {
+		echo "$f no longer names $sensor_root/gts9uwifi" >&2
+		exit 1
+	}
+	sed -Ei "s#($sensor_root/)gts9uwifi([^[:alnum:]_]|\$)#\\1$DEVICE_SENSOR_DIR\\2#g" \
+		"$staging/$f"
+done
+# Anything else naming the Ultra's tree would silently miss this board's.
+if [ "$DEVICE_SENSOR_DIR" != gts9uwifi ] &&
+	grep -rIlE "$sensor_ultra" "$staging" >&2; then
+	echo "these files still name $sensor_root/gts9uwifi on $DEVICE" >&2
+	exit 1
+fi
 
 # Boot-lifetime native secure owner and the matching signed IRQ module are
 # built separately. No proprietary runtime/firmware bytes enter this package.
@@ -60,7 +93,7 @@ install -d "$staging/usr/lib/modules/$release/updates"
 install -m0644 "$irq" "$staging/usr/lib/modules/$release/updates/"
 
 # --- flashlight tile translations -----------------------------------------
-# The one place where what ships is not byte-for-byte what is versioned: the
+# The other place where what ships is not byte-for-byte what is versioned: the
 # catalogues are kept as .po next to the extension, because a .po is reviewable
 # and a .mo is not, and they are compiled here.  The .po sources are then
 # dropped from the staging tree so the package carries only the compiled form.

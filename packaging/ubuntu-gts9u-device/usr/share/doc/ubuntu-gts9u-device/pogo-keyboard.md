@@ -41,6 +41,16 @@ coordinates, device serials and user files are excluded. The separate
 key events and can reveal what was typed. Nothing is uploaded automatically.
 Driver diagnostics with `driver_revision=2` include
 initialization attempts/errors and touchpad packet/error counters.
+`driver_revision=3` adds the board, the hall state and counters for hall
+packets and wake arming, and no longer names the last key. It is readable by
+root only: sampled fast enough, its counters time every keystroke (as the data
+IRQ's line in `/proc/interrupts` still does for anyone).
+`cover_state` next to it is the world-readable part (attached, connected,
+protocol id) that Tab Companion reads.
+
+Only the hardware service may record keys: `BeginKeyboardCapture` needs a
+one-time token that the root collector writes after authentication, readable
+by root and the `input` group alone.
 
 ## EF-DX920 firmware background
 
@@ -61,7 +71,8 @@ like a wiring or timing problem, which is why it cost several sessions.
 ## Checking
 
 ```
-cat /sys/bus/i2c/drivers/samsung-gts9u-stm32-pogo/*-002a/diagnostics
+sudo cat /sys/bus/i2c/drivers/samsung-gts9u-stm32-pogo/*-002a/diagnostics
+cat /sys/bus/i2c/drivers/samsung-gts9u-stm32-pogo/*-002a/cover_state
 ```
 
 The Linux I2C adapter number is not stable when other controllers are added to

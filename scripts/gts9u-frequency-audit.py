@@ -16,6 +16,11 @@ import time
 CPU = Path('/sys/devices/system/cpu')
 THERMAL = Path('/sys/class/thermal')
 EXPECTED = {'policy0': 2016000, 'policy3': 2803200, 'policy7': 3360000}
+# Samsung's GPU bin 0 tops out at 719 MHz; the kernel registers it only where
+# the unit is confirmed to be that bin (kernel/dts/gts9u-performance.dtso).
+# Other boards keep sm8550.dtsi's 680 MHz top level.
+GPU_EXPECTED_HZ = {b'samsung,gts9uwifi': 719000000}
+GPU_REFERENCE_HZ = 680000000
 
 
 def read(path):
@@ -28,6 +33,15 @@ def read(path):
 def integer(path):
     value = read(path)
     return int(value) if value and value.lstrip('-').isdigit() else None
+
+
+def gpu_expected_hz():
+    try:
+        compatible = Path('/proc/device-tree/compatible').read_bytes().split(b'\0')
+    except OSError:
+        compatible = []
+    return next((hz for board, hz in GPU_EXPECTED_HZ.items() if board in compatible),
+                GPU_REFERENCE_HZ)
 
 
 def temperatures():
@@ -57,10 +71,12 @@ def snapshot():
             for cpu in (fields['related_cpus'] or '').split()}
         policies[p.name] = fields
     gpus = {}
+    gpu_expected = gpu_expected_hz()
     for p in sorted(Path('/sys/class/devfreq').glob('*gpu*')):
         gpus[p.name] = {f: read(p / f) for f in ('governor', 'available_frequencies',
                                                 'min_freq', 'max_freq', 'cur_freq')}
-        gpus[p.name]['expected_opp_registered'] = '719000000' in (
+        gpus[p.name]['expected_max_hz'] = gpu_expected
+        gpus[p.name]['expected_opp_registered'] = str(gpu_expected) in (
             gpus[p.name]['available_frequencies'] or '').split()
     return {'kernel': platform.release(), 'online': read(CPU / 'online'),
             'global_boost': read(CPU / 'cpufreq/boost'), 'cpu': policies, 'gpu': gpus,
@@ -189,7 +205,7 @@ def main():
         ok &= all(p['expected_opp_registered'] and p['expected_max_allowed']
                   for p in before['cpu'].values())
         ok &= bool(before['gpu']) and all(g['expected_opp_registered'] and
-                                         int(g['max_freq'] or 0) >= 719000000
+                                         int(g['max_freq'] or 0) >= g['expected_max_hz']
                                          for g in before['gpu'].values())
         if args.require_observed_max:
             for run in result['exercises']:

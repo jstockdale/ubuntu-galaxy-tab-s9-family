@@ -48,7 +48,16 @@ fi
 # The groups the hardware needs.  This is the set the build used to pass to
 # useradd, minus the ones the wizard already grants.  A group that does not
 # exist on this system is skipped rather than treated as an error.
-device_groups='video render input audio dialout cdrom netdev plugdev'
+#
+# Not input: membership let every process in the session read every
+# keystroke and touch and inject keys through uinput.  The one thing that
+# needs those devices, Tab Companion's hardware service, now holds the group
+# by itself as the system service tab-companion-hardware@UID.  A Companion
+# from before that still runs as a plain user service, so the account keeps
+# the group for as long as that one is what is installed.
+legacy_companion=/usr/lib/systemd/user/tab-companion-hardware.service
+device_groups='video render audio dialout cdrom netdev plugdev'
+[ -e "$legacy_companion" ] && device_groups="$device_groups input"
 
 for entry in $humans; do
 	name=${entry#*:}
@@ -60,6 +69,22 @@ for entry in $humans; do
 				echo "ubuntu-gts9u: added $name to $group"
 		fi
 	done
+
+	# Earlier builds put the account in input.  Take it out once, when no
+	# legacy Companion needs it; the stamp keeps a later, deliberate
+	# `usermod -aG input` from being undone at every boot.  It takes effect
+	# with the next login.
+	input_stamp=/var/lib/ubuntu-gts9u/input-group-dropped-$name
+	if [ ! -e "$legacy_companion" ] && [ ! -e "$input_stamp" ]; then
+		if id -nG "$name" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
+			gpasswd -d "$name" input >/dev/null && \
+				echo "ubuntu-gts9u: removed $name from input"
+		fi
+		if ! id -nG "$name" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
+			install -d -m 0755 /var/lib/ubuntu-gts9u
+			install -m 0644 /dev/null "$input_stamp"
+		fi
+	fi
 
 	install -d -m 0755 /var/lib/systemd/linger
 	[ -e "/var/lib/systemd/linger/$name" ] || \
@@ -95,6 +120,15 @@ if [ -e "$flash_brightness" ]; then
 	chown "$name" "$flash_brightness" && \
 		echo "ubuntu-gts9u: flash LED handed to $name"
 fi
+
+# The X710 touchscreen's double-tap-to-wake switch, for the same reason: the
+# touch IC binds about 4 s into boot, long before this file exists, so the
+# udev helper cannot know the owner on the boot the wizard creates them.
+for double_tap in /sys/bus/i2c/drivers/samsung_fts1ba90a/*/double_tap_to_wake; do
+	[ -e "$double_tap" ] || continue
+	chown "$name" "$double_tap" && \
+		echo "ubuntu-gts9u: double-tap-to-wake switch handed to $name"
+done
 
 mkdir -p "$dropin_dir"
 cat > "$dropin" <<EOF

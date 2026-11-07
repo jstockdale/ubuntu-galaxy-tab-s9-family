@@ -48,7 +48,8 @@ retaining their originals as `.gts9u-original`. Sourcing the vendor scripts
 preserves their executable discovery and Chrome's public PWA launcher path.
 Package file triggers also cover installation and updates of those apps.
 
-The launcher flags apply only to `samsung,gts9uwifi`. Explicit `--use-angle`
+The launcher flags apply to `samsung,gts9uwifi` and, since 2026-11-06,
+`samsung,gts9wifi` (see [SM-X710](#sm-x710-gts9wifi)). Explicit `--use-angle`
 and `--ozone-platform` arguments take precedence. Foreign diversions and
 edited launchers are not overwritten. Removing the device package restores
 the vendor launchers. For a temporary comparison, fully close the relevant
@@ -63,6 +64,18 @@ The launcher lifecycle and shell/JavaScript syntax checks passed separately.
 A reboot is not required. The package builder marks all libexec helpers
 executable. Lifecycle tests cover repeated installation, original arguments,
 explicit flags, vendor updates, Wayland selection and removal.
+
+## SM-X710 (gts9wifi)
+
+The SM-X710 has the same Adreno 740 and Mesa, so the Freedreno GL-path
+damage that ANGLE/Vulkan avoids on the Ultra is expected there too; until
+2026-11-06 the board gate left it on ANGLE/OpenGL. Both launchers and the
+shared runner now give it the same ANGLE/Vulkan (and, where applicable,
+Wayland) defaults. The X710's GPU write-integrity investigation
+([display notes](gts9wifi-display.md)) is a separate defect below the GL
+driver: no Mesa version or Freedreno flag changes it, and ANGLE/Vulkan is not
+expected to either. The write-check kit drives GL only; to compare Chrome on
+both backends, close it and start it once with `--use-angle=gl`.
 
 ## Reproduce
 

@@ -1,11 +1,19 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: MIT
-"""Session D-Bus boundary and action engine for Tab Companion hardware."""
+"""Session D-Bus boundary and action engine for Tab Companion hardware.
+
+This runs as the owner's tab-companion-hardware@UID system service, with the
+input group as a supplementary group that the rest of the session no longer
+has: it alone opens the cover keyboard, the pen, the vibrator and /dev/uinput.
+"""
 
 import argparse
+import ctypes
 from dataclasses import dataclass, fields
 import fcntl
+import functools
 from glob import glob
+import hmac
 import math
 import json
 import os
@@ -24,6 +32,7 @@ BUS_NAME = "io.github.agcarbajo.TabCompanion.Hardware"
 OBJECT_PATH = "/io/github/agcarbajo/TabCompanion/Hardware"
 INTERFACE = BUS_NAME
 KEYBOARD_PREFIX = "Book Cover Keyboard"
+POGO_DRIVER = "/sys/bus/i2c/drivers/samsung-gts9u-stm32-pogo"
 PEN_NAME = "Wacom EMR Digitizer"
 BLUEZ = "org.bluez"
 BLUEZ_ADAPTER = "org.bluez.Adapter1"
@@ -46,12 +55,26 @@ KEYBOARD_MODELS = {
     "EF-DX915": "Galaxy Tab S9 Ultra Book Cover Keyboard",
     "EF-DX920": "Galaxy Tab S10 Ultra | S9 Ultra Book Cover Keyboard Slim (AI Key)",
     "EF-DX925": "Galaxy Tab S10 Ultra | S9 Ultra Book Cover Keyboard (AI Key)",
+    # The 11" covers in Samsung's SM-X710 keypad table.  The AI key follows
+    # Samsung's KEY_AI_HOT gate (protocol ids 0xd1..0xd6, 0x03 and 0x51).
+    "EF-DX710": "Galaxy Tab S9 Book Cover Keyboard Slim",
+    "EF-DX715": "Galaxy Tab S9 Book Cover Keyboard",
+    "EF-DX720": "Book Cover Keyboard Slim (AI Key)",
+    "EF-DX725": "Book Cover Keyboard (AI Key)",
 }
+# Protocol ids are board data: the stock SM-X910 and SM-X710 trees give them
+# different covers, and 0x03, this port's first 11" cover, is not an Ultra id.
 KEYBOARD_PROTOCOL_MODELS = {
     0xFE: "EF-DX900",
     0xF9: "EF-DX915",
     0xD3: "EF-DX925",
     0xD6: "EF-DX920",
+}
+KEYBOARD_PROTOCOL_MODELS_GTS9WIFI = {
+    0xFD: "EF-DX715",
+    0x02: "EF-DX710",
+    0xD1: "EF-DX725",
+    0x03: "EF-DX720",
 }
 MAPPINGS = {
     "key-galaxy-ai", "key-dex", "key-finder", "key-settings",
@@ -114,6 +137,7 @@ BUS_VIRTUAL = 0x06
 # auto-rotation.  Only this range is withheld, because the rest of the BTN_*
 # codes are legitimate targets for user key mappings.
 BTN_MOUSE_RANGE = (0x110, 0x11F)
+KEY_MUTE = 113
 KEY_F24 = 194
 KEY_MAX = 767
 INPUT_EVENT = struct.Struct("llHHi")
@@ -128,6 +152,54 @@ UI_DEV_SETUP = 0x405C5503
 EVIOCGRAB = 0x40044590
 EVIOCSFF_48 = 0x40304580
 FF_RUMBLE = 0x50
+PR_SET_DUMPABLE = 4
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+# Resolved and launched inside the user's service manager: its XDG_DATA_DIRS
+# has the snap and flatpak application directories this system service lacks,
+# and GLib still uses D-Bus activation for DBusActivatable applications.
+#
+# The launch must be the asynchronous one, waited for.  For a DBusActivatable
+# application (Files, Settings) GLib only sends Activate and returns, and when
+# the application is not running yet dbus-daemon holds that message until the
+# activated service appears -- then drops it if its sender has disconnected
+# meanwhile.  A launcher that exited after launch() would start such an
+# application as a windowless service.  launch_uris_async() finishes when the
+# application has answered Activate (or, for an executable, once it is spawned).
+LAUNCH_APP = """\
+import sys
+from gi.repository import Gio, GLib
+
+name = sys.argv[1]
+try:
+    app = Gio.DesktopAppInfo.new(name)
+except TypeError:
+    app = None
+if app is None:
+    sys.exit(f"No application {name}")
+
+loop = GLib.MainLoop()
+errors = []
+
+
+def launched(source, result):
+    try:
+        source.launch_uris_finish(result)
+    except GLib.Error as error:
+        errors.append(error.message)
+    loop.quit()
+
+
+app.launch_uris_async([], None, None, launched)
+# The D-Bus call itself times out after 25 s; this is only a backstop.
+GLib.timeout_add_seconds(40, loop.quit)
+loop.run()
+if errors:
+    sys.exit(f"Cannot launch {name}: {errors[0]}")
+"""
+# Written by the root diagnostics helper after pkexec authentication, readable
+# only by root and the input group: "<uid> <CLOCK_BOOTTIME seconds> <token>".
+CAPTURE_TOKEN = Path("/run/tab-companion/keyboard-capture")
+CAPTURE_TOKEN_LIFETIME = 60
 
 ACTION_KEYS = {
     "screenshot": 99,       # KEY_SYSRQ
@@ -147,7 +219,7 @@ INTROSPECTION = """
   <interface name="io.github.agcarbajo.TabCompanion.Hardware">
     <method name="TriggerMapping"><arg name="mapping" type="s" direction="in"/><arg name="accepted" type="b" direction="out"/></method>
     <method name="Vibrate"><arg name="duration_ms" type="u" direction="in"/><arg name="magnitude" type="u" direction="in"/><arg name="accepted" type="b" direction="out"/></method>
-    <method name="BeginKeyboardCapture"/>
+    <method name="BeginKeyboardCapture"><arg name="token" type="s" direction="in"/></method>
     <method name="FinishKeyboardCapture"><arg name="report" type="s" direction="out"/></method>
     <property name="PenState" type="s" access="read"/>
     <property name="PenOrientation" type="s" access="read"/>
@@ -200,6 +272,79 @@ def read_text(path, fallback=""):
         return Path(path).read_text(encoding="ascii").strip()
     except (OSError, UnicodeError):
         return fallback
+
+
+def make_undumpable():
+    """Keep the rest of the session out of this process.
+
+    Its credentials differ from the session's only by a supplementary group,
+    and ptrace and /proc/PID access compare user and primary group alone.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    # prctl() is variadic and reads unsigned longs: pass full-width zeros.
+    zero = ctypes.c_ulong(0)
+    if libc.prctl(PR_SET_DUMPABLE, zero, zero, zero, zero) != 0:
+        print(f"Cannot mark the service undumpable: {os.strerror(ctypes.get_errno())}",
+              flush=True)
+
+
+def spawn_in_session(argv):
+    """Start argv in the session's own service manager, not as a child.
+
+    A child of this service would inherit the input group, and would also
+    miss the graphical environment GNOME exports to the user manager.
+    ExitType=cgroup keeps the unit, and so an application a launcher
+    forked, alive after the launcher itself exits.
+    """
+    try:
+        subprocess.Popen(
+            [SYSTEMD_RUN, "--user", "--collect", "--quiet",
+             "--property=ExitType=cgroup", "--", *argv],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except OSError as error:
+        print(f"Cannot start {argv[0]}: {error}", flush=True)
+        return False
+
+
+def capture_token_valid(token, path=CAPTURE_TOKEN, uid=None, now=None, issuer=0):
+    """True for a token the diagnostics helper issued to this user just now."""
+    try:
+        info = os.stat(path)
+        parts = path.read_text(encoding="ascii").split()
+    except (OSError, UnicodeError):
+        return False
+    if info.st_uid != issuer or len(parts) != 3 or not token:
+        return False
+    owner, issued, expected = parts
+    try:
+        owner = int(owner)
+        issued = float(issued)
+    except ValueError:
+        return False
+    if uid is None:
+        uid = os.getuid()
+    if now is None:
+        now = time.clock_gettime(time.CLOCK_BOOTTIME)
+    return (
+        owner == uid
+        and 0 <= now - issued <= CAPTURE_TOKEN_LIFETIME
+        and hmac.compare_digest(expected.encode(), token.encode())
+    )
+
+
+@functools.cache
+def keyboard_protocol_models():
+    """The protocol id table of the board this runs on."""
+    try:
+        compatible = Path("/proc/device-tree/compatible").read_bytes().split(b"\0")
+    except OSError:
+        compatible = []
+    if b"samsung,gts9wifi" in compatible:
+        return KEYBOARD_PROTOCOL_MODELS_GTS9WIFI
+    return KEYBOARD_PROTOCOL_MODELS
 
 
 def classify_spen_motion(points):
@@ -479,6 +624,7 @@ class HardwareService:
         self.haptics = ForceFeedback()
         self.keyboard_capture = KeyboardCapture()
         self.keyboard_capture_cleanup = None
+        self.capture_tokens_used = set()
         self.notification_bus = None
         self.notification_matches = (
             "type='method_call',interface='org.freedesktop.Notifications',"
@@ -1104,13 +1250,19 @@ class HardwareService:
 
     @staticmethod
     def _keyboard_info():
-        for path in glob("/sys/bus/i2c/devices/*/diagnostics"):
+        # cover_state is the driver's world-readable summary.  Kernels before
+        # it only had diagnostics, which also timed every keystroke and is
+        # root-only now; keep reading it so an older kernel still works.
+        paths = glob(POGO_DRIVER + "/*/cover_state")
+        if not paths:
+            paths = glob("/sys/bus/i2c/devices/*/diagnostics")
+        for path in paths:
             diagnostic = read_text(path)
             if "attached=1" not in diagnostic or "connected=1" not in diagnostic:
                 continue
             match = re.search(r"\bmodel=0x([0-9a-fA-F]+)\b", diagnostic)
             protocol = int(match.group(1), 16) if match else -1
-            model = KEYBOARD_PROTOCOL_MODELS.get(protocol, "")
+            model = keyboard_protocol_models().get(protocol, "")
             if not model:
                 for event in glob("/sys/class/input/event*"):
                     input_name = read_text(Path(event) / "device/name")
@@ -1223,11 +1375,26 @@ class HardwareService:
                         self.execute_mapping(mapping)
                 elif mapping and value == 1:
                     self._replace_dynamic(LastSpecialKey=f"{mapping}:{code}")
-            if not suppress and self.virtual_keyboard is not None:
+            # Relay keys, LEDs and frame ends only.  The virtual keyboard has
+            # no switch capability, so an EV_SW written to it was always
+            # dropped; the cover's own switches are reported by the kernel on
+            # a device this service never grabs, where logind and UPower
+            # read them directly.
+            if (
+                not suppress
+                and self.virtual_keyboard is not None
+                and event_type in (EV_SYN, EV_KEY, EV_LED)
+            ):
                 self.virtual_keyboard.emit(event_type, code, value)
         return GLib.SOURCE_CONTINUE
 
     def _mapping_for_code(self, code):
+        # Only special and media keys may be intercepted.  The source codes
+        # live in GSettings, which any process of the session can rewrite;
+        # honouring a typing key there would turn LastSpecialKey into a
+        # keylogger.  Every measured cover code is KEY_MUTE or above.
+        if code < KEY_MUTE:
+            return None
         sources = self.settings.get_value("keyboard-source-codes").unpack()
         return next((name for name, source in sources.items() if source == code), None)
 
@@ -1356,6 +1523,8 @@ class HardwareService:
             level = settings.get_int("brightness") if settings is not None else 128
             argv = ["/usr/bin/gts9u-flashlight", "on", str(max(1, level))]
 
+        # Root-owned helper that only writes the LED's brightness, so it may
+        # run as a child despite the inherited group.
         try:
             subprocess.Popen(argv, start_new_session=True)
         except OSError as error:
@@ -1376,7 +1545,8 @@ class HardwareService:
         settings.set_boolean("on", lit)
         return GLib.SOURCE_REMOVE
 
-    def execute_mapping(self, mapping):
+    def execute_mapping(self, mapping, synthesize=True):
+        """Run a mapping.  synthesize=False refuses actions that type keys."""
         if mapping not in MAPPINGS and not mapping.startswith("gesture-"):
             return False
         action = self.settings.get_string(mapping)
@@ -1394,26 +1564,19 @@ class HardwareService:
             targets = self.settings.get_value("action-targets").unpack()
             target = targets.get(mapping, "").strip()
         if action in ACTION_KEYS:
-            if self.virtual_keyboard is None:
+            if self.virtual_keyboard is None or not synthesize:
                 return False
             self.virtual_keyboard.tap(ACTION_KEYS[action])
             return True
         if action == "flashlight":
             return self.toggle_flashlight()
         if action == "app" and target:
-            app = Gio.DesktopAppInfo.new(target)
-            if app is None:
-                return False
-            try:
-                app.launch([], None)
-                return True
-            except GLib.Error as error:
-                print(f"Cannot launch {target}: {error.message}", flush=True)
-                return False
+            return spawn_in_session(["/usr/bin/python3", "-W", "ignore", "-c", LAUNCH_APP, target])
         if action == "command" and target:
-            subprocess.Popen(["sh", "-lc", target], start_new_session=True)
-            return True
+            return spawn_in_session(["/bin/sh", "-lc", target])
         if action == "key" and target and self.virtual_keyboard is not None:
+            if not synthesize:
+                return False
             try:
                 codes = tuple(int(part) for part in target.split("+") if part)
             except ValueError:
@@ -1505,7 +1668,14 @@ class HardwareService:
         if method in ("BeginKeyboardCapture", "FinishKeyboardCapture"):
             try:
                 if method == "BeginKeyboardCapture":
+                    # Any process of the session can call this, so the
+                    # capture needs the one-time token the root helper
+                    # issues after pkexec authentication.
+                    token = params.unpack()[0]
+                    if token in self.capture_tokens_used or not capture_token_valid(token):
+                        raise ValueError("Keyboard capture is not authorized")
                     self.keyboard_capture.begin(_sender)
+                    self.capture_tokens_used.add(token)
                     # Discard unclaimed data if the diagnostic UI crashes or closes.
                     if self.keyboard_capture_cleanup is not None:
                         GLib.source_remove(self.keyboard_capture_cleanup)
@@ -1524,7 +1694,11 @@ class HardwareService:
                 invocation.return_dbus_error(BUS_NAME + ".CaptureError", str(error))
         elif method == "TriggerMapping":
             mapping = params.unpack()[0]
-            invocation.return_value(GLib.Variant("(b)", (self.execute_mapping(mapping),)))
+            # Any process of the session can call this.  Let it start what the
+            # session could start by itself, never type through uinput.
+            invocation.return_value(GLib.Variant(
+                "(b)", (self.execute_mapping(mapping, synthesize=False),)
+            ))
         elif method == "Vibrate":
             duration_ms, magnitude = params.unpack()
             # Version 1 of the live Shell extension may remain cached until
@@ -1590,6 +1764,7 @@ def main():
         keyboard.close()
         return
 
+    make_undumpable()
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     service = HardwareService()
     owner = Gio.bus_own_name(

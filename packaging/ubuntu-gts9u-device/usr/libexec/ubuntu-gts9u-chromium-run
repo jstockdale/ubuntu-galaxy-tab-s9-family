@@ -5,6 +5,10 @@ from pathlib import Path
 import stat
 import sys
 
+# The same Adreno 740 and Mesa on both boards; Freedreno's GL path damages
+# Chromium content that ANGLE/Vulkan (Turnip) draws correctly.
+BOARDS = (b'samsung,gts9uwifi', b'samsung,gts9wifi')
+
 
 def defaults(args, board, wayland):
     flags = []
@@ -21,9 +25,10 @@ def main():
     if not args:
         sys.exit('Usage: ubuntu-gts9u-chromium-run APPLICATION [ARGUMENTS...]')
     try:
-        board = b'samsung,gts9uwifi' in Path('/sys/firmware/devicetree/base/compatible').read_bytes()
+        compatible = Path('/sys/firmware/devicetree/base/compatible').read_bytes()
     except OSError:
-        board = False
+        compatible = b''
+    board = any(name in compatible for name in BOARDS)
     display = Path(os.environ.get('WAYLAND_DISPLAY', 'wayland-0'))
     if not display.is_absolute():
         display = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/' + str(os.getuid()))) / display

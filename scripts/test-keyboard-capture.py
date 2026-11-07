@@ -36,3 +36,26 @@ with patch.object(module["time"], "monotonic", return_value=120):
     capture.clear()
     assert not capture.events and capture.owner is None
 print("PASS opt-in capture, 20-second deadline, press/release/repeat, caller isolation, clearing and size cap")
+
+# The capture needs the one-time token the root diagnostics helper writes.
+import os
+import tempfile
+valid = module["capture_token_valid"]
+lifetime = module["CAPTURE_TOKEN_LIFETIME"]
+me = os.getuid()
+with tempfile.TemporaryDirectory() as directory:
+    token_file = Path(directory) / "keyboard-capture"
+    assert not valid("abc", token_file, uid=me, now=10.0, issuer=me)
+    token_file.write_text(f"{me} 10.000 {'ab' * 32}\n", encoding="ascii")
+    assert valid("ab" * 32, token_file, uid=me, now=10.0, issuer=me)
+    assert valid("ab" * 32, token_file, uid=me, now=10.0 + lifetime, issuer=me)
+    assert not valid("ab" * 32, token_file, uid=me, now=10.1 + lifetime, issuer=me)
+    assert not valid("ab" * 32, token_file, uid=me, now=9.0, issuer=me)
+    assert not valid("ab" * 31 + "ac", token_file, uid=me, now=10.0, issuer=me)
+    assert not valid("", token_file, uid=me, now=10.0, issuer=me)
+    assert not valid("ab" * 32, token_file, uid=me + 1, now=10.0, issuer=me)
+    # Only a root-owned file counts on the tablet.
+    assert me == 0 or not valid("ab" * 32, token_file, uid=me, now=10.0)
+    token_file.write_text("garbage\n", encoding="ascii")
+    assert not valid("garbage", token_file, uid=me, now=10.0, issuer=me)
+print("PASS capture token: owner, issuer, lifetime, exact match and malformed files")

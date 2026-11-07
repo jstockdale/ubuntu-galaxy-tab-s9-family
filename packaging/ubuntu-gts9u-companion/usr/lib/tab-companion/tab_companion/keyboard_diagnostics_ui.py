@@ -77,10 +77,10 @@ def collect(parent):
             report = {"created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                       "session": collect_session()}
             bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-            def capture_call(method):
+            def capture_call(method, parameters=None):
                 return bus.call_sync("io.github.agcarbajo.TabCompanion.Hardware",
                     "/io/github/agcarbajo/TabCompanion/Hardware",
-                    "io.github.agcarbajo.TabCompanion.Hardware", method, None, None,
+                    "io.github.agcarbajo.TabCompanion.Hardware", method, parameters, None,
                     Gio.DBusCallFlags.NONE, 3000, None)
             started = False
             with subprocess.Popen(["pkexec", "/usr/libexec/tab-companion-keyboard-diagnostics", "--record-keys"],
@@ -96,9 +96,12 @@ def collect(parent):
                             GLib.idle_add(progress.close)
                             return
                         raise RuntimeError(error.strip() or "Diagnostic authorization failed")
-                    if json.loads(authorized).get("event") != "authorized":
+                    authorization = json.loads(authorized)
+                    if authorization.get("event") != "authorized":
                         raise RuntimeError("Unexpected collector response")
-                    capture_call("BeginKeyboardCapture")
+                    # The hardware service records keys only with this token.
+                    capture_call("BeginKeyboardCapture",
+                                 GLib.Variant("(s)", (authorization.get("token", ""),)))
                     started = True
                     GLib.idle_add(show_capture)
                     output, error = process.communicate(input="start\n", timeout=90)

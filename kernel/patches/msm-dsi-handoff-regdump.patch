@@ -1,0 +1,130 @@
+--- a/drivers/gpu/drm/msm/dsi/dsi.h
++++ b/drivers/gpu/drm/msm/dsi/dsi.h
+@@ -151,5 +151,12 @@
+ void msm_dsi_phy_snapshot(struct msm_disp_state *disp_state, struct msm_dsi_phy *phy);
+ bool msm_dsi_phy_set_continuous_clock(struct msm_dsi_phy *phy, bool enable);
+ 
++/* msm.dsi_regdump bring-up switch, see dsi_manager.c */
++extern bool msm_dsi_regdump;
++void msm_dsi_regdump_block(struct device *dev, const char *block,
++			   const char *when, void __iomem *base, size_t size);
++void msm_dsi_host_regdump(struct mipi_dsi_host *host, const char *when);
++void msm_dsi_phy_regdump(struct msm_dsi_phy *phy, const char *when);
++
+ #endif /* __DSI_CONNECTOR_H__ */
+ 
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -228,6 +228,11 @@
+ 		goto disable_clks;
+ 	}
+ 
++	/* The controller as the bootloader left it, before any reset. */
++	if (msm_dsi_regdump)
++		msm_dsi_regdump_block(dev, "ctrl", "probe", msm_host->ctrl_base,
++				      msm_host->ctrl_size);
++
+ 	cfg_hnd = msm_dsi_cfg_get(major, minor);
+ 
+ 	DBG("%s: Version %x:%x\n", __func__, major, minor);
+@@ -2623,6 +2628,30 @@
+ 	return to_msm_dsi_host(host)->mode_flags;
+ }
+ 
++void msm_dsi_regdump_block(struct device *dev, const char *block,
++			   const char *when, void __iomem *base, size_t size)
++{
++	size_t off;
++
++	for (off = 0; off + 16 <= size; off += 16)
++		dev_info(dev, "regdump %s %s +%03zx: %08x %08x %08x %08x\n",
++			 when, block, off, readl_relaxed(base + off),
++			 readl_relaxed(base + off + 4),
++			 readl_relaxed(base + off + 8),
++			 readl_relaxed(base + off + 12));
++}
++
++/* The whole controller window, including the 6G register shift. */
++void msm_dsi_host_regdump(struct mipi_dsi_host *host, const char *when)
++{
++	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++	u32 shift = msm_host->cfg_hnd->cfg->io_offset;
++
++	msm_dsi_regdump_block(&msm_host->pdev->dev, "ctrl", when,
++			      msm_host->ctrl_base - shift,
++			      msm_host->ctrl_size + shift);
++}
++
+ void msm_dsi_host_snapshot(struct msm_disp_state *disp_state, struct mipi_dsi_host *host)
+ {
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -30,6 +30,18 @@
+ 
+ static struct msm_dsi_manager msm_dsim_glb;
+ 
++/*
++ * Bring-up switch for the Samsung SM8550 tablets, whose panel does not answer
++ * on the first enable after a cold boot: msm.dsi_regdump=1 logs the DSI
++ * controller and PHY registers as the bootloader left them (at probe) and as
++ * programmed at every enable, so that whatever survives into the first
++ * enable shows up against a later, working one.
++ */
++bool msm_dsi_regdump;
++module_param_named(dsi_regdump, msm_dsi_regdump, bool, 0444);
++MODULE_PARM_DESC(dsi_regdump,
++		 "log DSI controller and PHY registers at probe and at every enable (bring-up)");
++
+ #define IS_BONDED_DSI()		(msm_dsim_glb.is_bonded_dsi)
+ #define IS_SYNC_NEEDED()	(msm_dsim_glb.is_sync_needed)
+ #define IS_MASTER_DSI_LINK(id)	(msm_dsim_glb.master_dsi_link_id == id)
+@@ -310,6 +322,12 @@
+ 		}
+ 	}
+ 
++	/* Host and PHY fully programmed, before the panel's first command. */
++	if (msm_dsi_regdump) {
++		msm_dsi_host_regdump(host, "enable");
++		msm_dsi_phy_regdump(msm_dsi->phy, "enable");
++	}
++
+ 	return;
+ 
+ host1_en_fail:
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
+@@ -708,6 +708,12 @@
+ 		return dev_err_probe(dev, ret,
+ 				     "Failed to register clk provider\n");
+ 
++	/* The PHY as the bootloader left it; its PLL is not ours yet. */
++	if (msm_dsi_regdump && !pm_runtime_resume_and_get(dev)) {
++		msm_dsi_phy_regdump(phy, "probe");
++		pm_runtime_put(dev);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -847,6 +853,20 @@
+ 	return 0;
+ }
+ 
++void msm_dsi_phy_regdump(struct msm_dsi_phy *phy, const char *when)
++{
++	struct device *dev = &phy->pdev->dev;
++
++	msm_dsi_regdump_block(dev, "phy", when, phy->base, phy->base_size);
++	if (phy->lane_base)
++		msm_dsi_regdump_block(dev, "lane", when, phy->lane_base,
++				      phy->lane_size);
++	/* As msm_dsi_phy_snapshot(): PLL registers only while it runs. */
++	if (phy->pll_on)
++		msm_dsi_regdump_block(dev, "pll", when, phy->pll_base,
++				      phy->pll_size);
++}
++
+ void msm_dsi_phy_snapshot(struct msm_disp_state *disp_state, struct msm_dsi_phy *phy)
+ {
+ 	msm_disp_snapshot_add_block(disp_state,

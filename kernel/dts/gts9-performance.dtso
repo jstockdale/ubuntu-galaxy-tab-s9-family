@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/dts-v1/;
+/plugin/;
+
+/*
+ * Applied by Linux before cpufreq probes, never by Samsung ABL.
+ *
+ * The SM-X910 and the SM-X710 (both soc_id 519, rev 2.0) are programmed with
+ * the same prime-core LUT, which ends at a 3.36 GHz boost entry.
+ * qcom-cpufreq-hw enables only the LUT frequencies the DT also describes, and
+ * sm8550.dtsi stops at 3.1872 GHz (not in this LUT at all), so without this
+ * node the entry is dropped ("Voltage update failed freq=3360000") and the
+ * core tops out at 2.9568 GHz.  Voltage and boost classification still come
+ * from the hardware LUT; the votes are the reference top prime OPP's, the
+ * same ones 2.9568 GHz already places.
+ */
+/ {
+	fragment@0 {
+		target-path = "/opp-table-cpu7";
+		__overlay__ {
+			opp-3360000000 {
+				opp-hz = /bits/ 64 <3360000000>;
+				opp-peak-kBps = <14928000 14744000 54067200>;
+			};
+		};
+	};
+};

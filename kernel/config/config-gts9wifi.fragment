@@ -272,13 +272,49 @@ CONFIG_GUNYAH_IOEVENTFD=y
 # newer toolchain than Ubuntu 24.04 currently ships.
 # CONFIG_RUST is not set
 
-# DDR bandwidth scaling: the CPU and LLCC bandwidth monitors (pmu@240b6400,
-# pmu@24091000) vote the DDR interconnect up with CPU traffic.  As a module it
-# never shipped in the image, so DDR idled at its floor until the GPU or the
-# display voted, and full-screen redraws underran the DPU (white speckle and
-# UBWC tile squares that stay in the command-mode panel until redrawn).
-# Built as a module so the DDR bandwidth monitor can be left out at boot (it is
-# blacklisted on gts9wifi until its effect on the display is understood) and
-# loaded on demand with `modprobe icc_bwmon` for an experiment.
-CONFIG_QCOM_ICC_BWMON=m
+# --- SoC hand-off (sync_state) -----------------------------------------------
+# The RPMh power-domain, clock and interconnect providers keep what the
+# bootloader left on until every consumer the device tree names has bound a
+# driver.  Until then rpmhpd votes CX, MX, MMCX and MXC at their highest corner
+# in the sleep set as well as the active one, and every interconnect node,
+# DDR included, holds an INT_MAX vote, so even a working suspend can never
+# reach CX collapse, AOSS sleep or DDR low power.  Three of the consumers that
+# held it here never bound: the video clock controller (aaf0000, holds rpmhpd
+# and gcc), an =m driver this port never shipped, and the two DDR bandwidth
+# monitors (pmu@240b6400 holds gem_noc, pmu@24091000 holds mc_virt), shipped
+# as a module but blacklisted.  The crypto engine and the driverless GMU are
+# handled in the board DTS.  Each release can be held back for an A/B boot
+# with initcall_blacklist=:
+#   video_cc_sm8550_driver_init   rpmhpd and gcc keep their boot votes
+#   bwmon_driver_init             every interconnect keeps INT_MAX
+CONFIG_SM_VIDEOCC_8550=y
+
+# DDR bandwidth scaling: the monitors vote DDR and LLCC up with CPU traffic.
+# It was blacklisted after build 10, which shipped it built in next to display
+# timing changes and came up black; two of those three black screens were
+# deep suspends from the power key, and the module loaded by hand on build 11
+# left the display unchanged.  Nor was DDR ever starved: it sat at the
+# INT_MAX boot vote above.
+CONFIG_QCOM_ICC_BWMON=y
 CONFIG_DEVFREQ_GOV_PERFORMANCE=y
+
+# SoC sleep statistics in /sys/kernel/debug/qcom_stats: aosd (AOSS sleep),
+# cxsd (CX collapse) and ddr from the AOP message RAM (sram@c3f0000), plus the
+# per-subsystem SMEM records.  The files are 0400, which integrity lockdown
+# still lets root read: debugfs only refuses modes with a write or execute bit
+# and files with ioctl or mmap (fs/debugfs/file.c, debugfs_locked_down()).
+CONFIG_QCOM_STATS=y
+
+# PMK8550 RTC: the alarm that wakes a timed suspend (rtcwake, systemd
+# WakeSystem= timers).  Under Samsung's firmware it is a free-running counter,
+# not the wall clock: the stock tree gives it no allow-set-time and Samsung's
+# driver refuses set_time with -EACCES.  So the kernel must not copy it into
+# the system clock at boot; ubuntu-gts9u-rtc-restore.service sets the clock to
+# the counter plus the offset saved at the last NTP synchronisation instead.
+CONFIG_RTC_DRV_PM8XXX=y
+# CONFIG_RTC_HCTOSYS is not set
+
+# PMIC die-temperature alarms (PM8550 and PM8550VS-D temp-alarm@a00).  Bound,
+# they program the stage 1/2 thresholds from the dtsi trips (95 and 115 C, the
+# values Samsung's tree uses) and register the pm8550*-thermal zones.
+CONFIG_QCOM_SPMI_TEMP_ALARM=y

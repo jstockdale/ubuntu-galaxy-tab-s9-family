@@ -9,7 +9,10 @@ UNITS='
 ubuntu-gts9u-chromium-desktops.service:multi-user.target
 ubuntu-gts9u-chromium-desktops.path:multi-user.target
 ubuntu-gts9u-grow-rootfs.service:basic.target
+ubuntu-gts9u-rtc-restore.service:sysinit.target
+ubuntu-gts9u-rtc-save.path:multi-user.target
 ubuntu-gts9u-zram.service:basic.target
+ubuntu-gts9u-suspend-mode.service:basic.target
 ubuntu-gts9u-swapfile.service:multi-user.target
 ubuntu-gts9u-cpu-boost.service:graphical.target
 ubuntu-gts9u-panel-coldboot-recover.service:multi-user.target
@@ -61,6 +64,12 @@ case "$1" in
 		# and put the path watcher back into service in the same transaction.
 		if [ -d /run/systemd/system ]; then
 			systemctl daemon-reload || true
+			# Re-apply the suspend mode and restart the power key with the new
+			# helper, so an upgrade does not need a reboot to stop suspending a
+			# board that cannot resume.  Neither restarts logind: the mode
+			# script only asks it to reload its drop-ins.
+			systemctl restart ubuntu-gts9u-suspend-mode.service || true
+			systemctl try-restart ubuntu-gts9u-powerkey.service || true
 			systemctl restart ubuntu-gts9u-cpu-boost.service || true
 			systemctl reset-failed \
 				ubuntu-gts9u-desktop-user.service \

@@ -27,26 +27,33 @@ static int __init gts9u_apply(const unsigned char *fdt, u32 size,
 static int __init gts9u_performance_init(void)
 {
 	bool ultra = of_machine_is_compatible("samsung,gts9uwifi");
-	int ret;
+	int ret, err;
 
 	if (!ultra && !of_machine_is_compatible("samsung,gts9wifi"))
 		return 0;
 
+	/*
+	 * The overlays are independent and each is applied as one transaction,
+	 * so a failing one must not cost the board the others.
+	 */
 	ret = gts9u_apply(gts9_family_overlay, sizeof(gts9_family_overlay),
 			  "family");
-	if (ret)
-		return ret;
 
-	/* The OPP values were read from the X910's tables; no other board's yet. */
+	/* Both boards' prime-core LUTs end at the same 3.36 GHz boost. */
+	err = gts9u_apply(gts9_performance_overlay,
+			  sizeof(gts9_performance_overlay), "Galaxy CPU OPP");
+	if (!err)
+		pr_info("gts9u-performance: registered Galaxy 3.36 GHz CPU OPP\n");
+	ret = ret ?: err;
+
+	/* The GPU level was read from the X910's tables; no other board's yet. */
 	if (!ultra)
-		return 0;
-	ret = gts9u_apply(gts9u_performance_overlay,
-			  sizeof(gts9u_performance_overlay), "Galaxy OPP");
-	if (ret)
 		return ret;
-
-	pr_info("gts9u-performance: registered Galaxy 3.36 GHz CPU and 719 MHz GPU OPPs\n");
-	return 0;
+	err = gts9u_apply(gts9u_performance_overlay,
+			  sizeof(gts9u_performance_overlay), "Galaxy GPU OPP");
+	if (!err)
+		pr_info("gts9u-performance: registered Galaxy 719 MHz GPU OPP\n");
+	return ret ?: err;
 }
 /* qcom-cpufreq-hw registers at postcore; OF platform devices appear later. */
 core_initcall(gts9u_performance_init);

@@ -1406,6 +1406,11 @@ The restart was not needed at all: a `logind.conf.d` drop-in applies by itself
 on the next boot, and that was enough. If it has to be applied hot, restart the
 session manager too, not only logind.
 
+Since systemd 254 there is a third way, and it is the one to use:
+`systemctl reload systemd-logind` sends SIGHUP, and logind rereads `logind.conf`
+and its drop-ins in place (the unit is `Type=notify-reload`). Sessions, seats
+and device handles are left alone, so none of the above happens.
+
 ## The power button needs a single owner
 
 What was asked for — a short tap suspends, a long press brings up the
@@ -1446,6 +1451,58 @@ The daemon also tracks the difference between those clocks independently of
 its own suspend requests. This covers suspend initiated by GNOME, systemd or
 a diagnostic tool: the first power-key event after thaw still carries IRQ 21
 and is consumed as a wake event instead of becoming a second suspend request.
+
+That rule — a recent request plus no measurable sleep means "entry in progress"
+— swallowed every second press whenever no sleep followed the first one: the
+lock that stood in for suspend on the SM-X710 (a press eleven minutes after a
+lock was eaten), a suspend logind refused because `suspend.target` was masked
+(every press after a refusal on the Ultra), and a suspend that came straight
+back. A request now ends as soon as anything shows it is over: time actually
+asleep, a new count in `/sys/power/suspend_stats/{success,fail}`, or logind's
+`PreparingForSleep` going false again. Only while logind still reports the
+sleep in progress is a press read as one made during entry. A lock, or a
+refused request, leaves nothing pending at all.
+
+### One switch for every way to suspend
+
+The SM-X710 cannot come back from deep suspend yet, and gating the power key
+alone left every other way in open: the cover (gpio-keys `SW_LID` and the
+keyboard's), GNOME's fifteen-minute idle timeout on battery, the Suspend entry
+in the menus and on the login screen, a keyboard's sleep key, and anyone's
+`systemctl suspend`. All of them end up as a request to logind and then to
+systemd-sleep, so that is where the decision now lives.
+
+`ubuntu-gts9u-suspend-mode.service` runs before logind on every boot and
+picks one of three modes: `off`, `s2idle` or `deep`. The board decides the
+default — `off` on `samsung,gts9wifi`, `deep` (nothing written, the stock
+policy) everywhere else — and `/etc/ubuntu-gts9u/suspend-mode` or, for one
+boot only, `/run/ubuntu-gts9u/suspend-mode` override it. A forced restart after
+a sleep that does not come back therefore always returns to the safe default.
+
+`off` writes `AllowSuspend=no` into `/run/systemd/sleep.conf.d`. logind then
+refuses every suspend and answers `CanSuspend` with `no`, which also takes
+Suspend out of GNOME's menus, and systemd-sleep refuses on its own as well. A
+`/run/systemd/logind.conf.d` drop-in makes the cover lock instead
+(`HandleLidSwitch=lock`, and the same for external power, because logind only
+falls back to the first while the second is unset). GNOME gets `'nothing'` as
+its idle sleep default through a dconf profile that exists only in this mode:
+`/usr/share/dconf/profile/user` links to a file under `/run`, and while that
+file is missing dconf behaves as if no profile existed. The owner's own
+settings still win. `s2idle` writes only `SuspendState=freeze`. Configuration
+files cannot be conditional, which is why all of this is written at boot rather
+than shipped.
+
+The power key follows logind's `CanSuspend` at the moment of each press
+instead of a list of boards. Without suspend a press toggles the panel: a lit
+one is locked and turned off through Mutter's `PowerSaveMode` — the property
+gnome-settings-daemon itself sets when it blanks — and a dark one is turned
+back on. Whether the panel was dark is read from DRM the instant the key goes
+down, before the compositor reacts to the same key. Locking an unlocked session
+blanks it by itself (GNOME turns the outputs off as soon as the lock screen is
+up); the explicit blank matters for a lock screen that was already showing,
+which otherwise stays lit for its thirty-second timeout. gnome-settings-daemon
+does not know about that blank, so for up to those thirty seconds only the
+power key lights the panel again.
 
 ### IPCC traffic must not wake the CPU during system suspend
 

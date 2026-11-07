@@ -1,0 +1,39 @@
+# Samsung Galaxy Tab S9 (SM-X710), S Pen
+#
+# The same Wacom W90xx EMR digitiser as the Ultra's, under the panel at I2C
+# address 0x56 and driven by this port's samsung_wacom_w90xx driver.  Why the
+# desktop needs this file at all is in samsung-gts9u-spen.tablet: without
+# IntegratedIn=Display, GNOME takes the pen for an external tablet, maps it to
+# the whole desktop and leaves it behind when the screen rotates.
+#
+# The match differs from the Ultra's only in its product number.  Both
+# digitisers report the same vendor and name, so the driver gives this board
+# (samsung,gts9wifi) product 0x0710 and leaves the Ultra on 0; on 0 the 11"
+# would pick up the Ultra's entry, its name and its size.
+#
+# The colons are what libwacom 2.10, Ubuntu 24.04's, parses.  2.12 and later
+# take only "i2c|056a|0710" and drop a file written this way as invalid, so a
+# newer suite needs the match rewritten (the Ultra's entry as well).
+#
+# Width and Height are inches: the panel is 11.0 in diagonal at 2560 x 1600,
+# 236 x 148 mm, which is 9.3 by 5.8.
+#
+# The pen in the box is Samsung's Galaxy Tab S9 series S Pen, EJ-PX710: one
+# side button and no eraser.
+#
+# Touch=false for the same reason as on the Ultra: the finger digitiser is a
+# separate controller, the FTS1BA90A, with its own driver and input device.
+
+[Device]
+Name=Samsung Galaxy Tab S9 S Pen
+ModelName=EJ-PX710
+DeviceMatch=i2c:056a:0710
+Class=ISDV4
+Width=9
+Height=6
+IntegratedIn=Display;System
+Styli=@generic-no-eraser;
+
+[Features]
+Stylus=true
+Touch=false

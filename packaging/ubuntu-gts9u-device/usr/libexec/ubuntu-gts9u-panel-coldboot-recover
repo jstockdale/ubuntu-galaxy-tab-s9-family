@@ -14,6 +14,12 @@ set -eu
 
 PM_TEST=/sys/power/pm_test
 PM_STATE=/sys/power/state
+MEM_SLEEP=/sys/power/mem_sleep
+
+# Half-second polls bounding the deferred-probe wait below (30: 15 s).  A
+# drop-in with Environment=GTS9U_DEFERRED_PROBE_POLLS=0 skips the wait, to
+# test the kernel-side fix on its own.
+DEFERRED_PROBE_POLLS=${GTS9U_DEFERRED_PROBE_POLLS:-30}
 
 log() {
 	echo "ubuntu-gts9u-panel-coldboot-recover: $*"
@@ -29,10 +35,68 @@ if ! grep -qw platform "$PM_TEST"; then
 	exit 0
 fi
 
+# The kernel's deferred-probe timeout fires ten seconds after the last driver
+# registration, from a workqueue the freezer leaves running, and that lands
+# inside this cycle on both boards.  A kernel without
+# driver-core-no-deferred-retry-while-probing-blocked.patch then moves the
+# suspended devices that are still deferred back onto dpm_list, and they miss
+# their resume: on the X710 the LPASS LPI pinctrl kept runtime PM disabled and
+# the microphones never got their pins, and both boots made with
+# fw_devlink.sync_state=timeout stopped here.  Let the timeout run first.  It
+# announces itself with "deferred probe pending" / "sync_state() pending" (or,
+# in timeout mode, "Forcing sync_state()") lines; with nothing left pending it
+# prints nothing, hence the bound.
+deferred_probe_timeout_done() {
+	dmesg 2>/dev/null | grep -qE 'deferred probe pending|sync_state\(\) pending|Forcing sync_state'
+}
+
+polls=0
+while ! deferred_probe_timeout_done; do
+	if [ "$polls" -ge "$DEFERRED_PROBE_POLLS" ]; then
+		log "no deferred-probe timeout report after $((polls / 2)) s; running the cycle anyway"
+		break
+	fi
+	sleep 0.5
+	polls=$((polls + 1))
+done
+if [ "$polls" -gt 0 ]; then
+	log "waited $((polls / 2)).$((polls % 2 * 5)) s for the deferred-probe timeout"
+fi
+
+# The test never reaches PSCI, so the sleep mode cannot hang it, but drivers
+# do pick their suspend path from it: PCIe keeps or drops its CPU interconnect
+# vote, TSENS re-initialises after deep, the PCI core assumes lost context.
+# The panel and Wi-Fi bring-up were validated with "deep", so pin it for the
+# cycle on boards that default to s2idle (mem_sleep_default=s2idle on the
+# X710) and put the default back as soon as the cycle returns.
+mem_sleep_default=
+if [ -w "$MEM_SLEEP" ] && grep -qw deep "$MEM_SLEEP" &&
+	! grep -q '\[deep\]' "$MEM_SLEEP"; then
+	mem_sleep_default=$(sed -n 's/.*\[\([a-z0-9]*\)\].*/\1/p' "$MEM_SLEEP")
+fi
+
 restore_pm_test() {
 	echo none > "$PM_TEST" 2>/dev/null || true
 }
-trap restore_pm_test EXIT INT TERM
+
+restore_mem_sleep() {
+	if [ -n "$mem_sleep_default" ]; then
+		echo "$mem_sleep_default" > "$MEM_SLEEP" 2>/dev/null || true
+		mem_sleep_default=
+	fi
+}
+
+cleanup() {
+	restore_pm_test
+	restore_mem_sleep
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+if [ -n "$mem_sleep_default" ]; then
+	log "running the cycle in deep instead of the default $mem_sleep_default"
+	echo deep > "$MEM_SLEEP"
+fi
 
 attempt=1
 while :; do
@@ -44,17 +108,24 @@ while :; do
 	fi
 	restore_pm_test
 	freeze_after=$(cat /sys/power/suspend_stats/failed_freeze 2>/dev/null || echo 0)
-	# A wake event during early boot can abort the userspace freezer before
-	# any device suspend callback runs, leaving the panel untouched. Retry
-	# only that case; a device or UFS resume failure must remain an error.
-	if [ "$freeze_after" -le "$freeze_before" ] || [ "$attempt" -ge 3 ]; then
-		log 'platform cycle failed; no further automatic retry'
+	last_errno=$(cat /sys/power/suspend_stats/last_failed_errno 2>/dev/null || echo 0)
+	# A wake event during early boot can abort the cycle before the panel is
+	# touched: in the userspace freezer, or, now that the X710's S Pen
+	# digitizer arms its data and dock-detect IRQs for wake like the Ultra's,
+	# during device suspend with -EBUSY ("early wake event detected").  Every
+	# suspended device is resumed again on that path.  Retry those two cases
+	# only; any other device or UFS failure must remain an error.
+	if { [ "$freeze_after" -le "$freeze_before" ] && [ "$last_errno" != -16 ]; } || \
+	   [ "$attempt" -ge 3 ]; then
+		log "platform cycle failed (last errno $last_errno); no further automatic retry"
 		exit 1
 	fi
-	log 'userspace freeze was aborted; retrying in two seconds'
+	log "cycle aborted by a wake event (last errno $last_errno); retrying in two seconds"
 	attempt=$((attempt + 1))
 	sleep 2
 done
+restore_pm_test
+restore_mem_sleep
 log 'platform cycle returned'
 
 # Report what the panel driver saw, so the journal records whether the DDIC

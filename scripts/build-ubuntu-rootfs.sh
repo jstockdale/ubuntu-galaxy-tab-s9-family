@@ -387,7 +387,7 @@ if [ "$extra_missing" = 1 ] || [ "$extra_cached" != "$extra_fingerprint" ]; then
 	printf '%s\n' "$extra_fingerprint" > "$extra_stamp"
 fi
 
-# PipeWire rebuilt with the Bluetooth AAC codec (fdk-aac, multiverse).  Ubuntu's
+# PipeWire rebuilt with the Bluetooth AAC codec (fdk-aac, universe).  Ubuntu's
 # own libspa-0.2-bluetooth cannot negotiate AAC, so A2DP sinks fall back to
 # SBC.  The whole binary set from the one source build is installed so the
 # versions stay consistent with the archive packages they replace.
@@ -439,6 +439,14 @@ cp $stage_debs/*.deb "\$target/tmp/local-debs/"
 chroot "\$target" sh -c 'apt-get install -y /tmp/local-debs/*.deb'
 chroot "\$target" apt-get check
 rm -rf "\$target/tmp/local-debs"
+
+# The archive's libspa-0.2-bluetooth has no AAC codec.  Fail the image rather
+# than ship SBC-only Bluetooth audio again if the rebuild did not win.
+chroot "\$target" dpkg -L libspa-0.2-bluetooth |
+	grep -q '/spa-0\.2/bluez5/libspa-codec-bluez5-aac\.so\$' || {
+	echo 'libspa-0.2-bluetooth in the image has no AAC codec' >&2
+	exit 1
+}
 
 # Every language pack.  mmdebstrap's --include takes no globs, so this is the
 # place: apt expands the pattern itself.  Roughly a gigabyte, deliberately —
@@ -494,7 +502,7 @@ chroot "\$target" passwd -l root
 if [ -n '$password' ]; then
 	# Development image: an account the build knows, so SSH works before
 	# anyone has touched the screen.
-	chroot "\$target" useradd -m -s /bin/bash -G sudo,adm,dialout,cdrom,audio,video,plugdev,netdev,input,render '$username'
+	chroot "\$target" useradd -m -s /bin/bash -G sudo,adm,dialout,cdrom,audio,video,plugdev,netdev,render '$username'
 	echo '$username:$password' | chroot "\$target" chpasswd
 	chroot "\$target" /usr/libexec/ubuntu-gts9u-enable-extension \
 		'$username' flashlight@ubuntu-gts9u || true

@@ -57,18 +57,21 @@ that build. An additional physical check confirmed that changing only the DTB
 appended to `boot` leaves the live DT unchanged: ABL uses `vendor_boot` here.
 The appended-only test was rolled back to the original boot image.
 
-`kernel/dts/gts9u-performance.dtso` adds only the two OPP nodes.
-`scripts/stage-performance-overlay.sh` embeds it in a small built-in board
-helper. Its `core_initcall` applies the overlay to Linux's live tree, after
+`kernel/dts/gts9-performance.dtso` adds only the prime-CPU OPP node and
+`kernel/dts/gts9u-performance.dtso` only the GPU OPP node.
+`scripts/stage-performance-overlay.sh` embeds them in a small built-in board
+helper. Its `core_initcall` applies the overlays to Linux's live tree, after
 OF initialization and before cpufreq and DRM can consume their OPP tables.
-It runs only for `samsung,gts9uwifi`. No firmware RPC, memory ownership change,
-Gunyah hook, reserved-memory modification or bootloader DT replacement occurs.
-The full board DTS also records the OPPs for a future unpinned build.
+The CPU overlay runs for `samsung,gts9uwifi` and `samsung,gts9wifi`, the GPU
+overlay only for `samsung,gts9uwifi` (see [SM-X710](#sm-x710-gts9wifi)).
+No firmware RPC, memory ownership change, Gunyah hook, reserved-memory
+modification or bootloader DT replacement occurs. The full Ultra board DTS
+also records the OPPs for a future unpinned build.
 
-The overlay application is transactional and the overlay remains for the boot
-lifetime. `CONFIG_OF_OVERLAY=y` is already required by the port's Gunyah
-integration. It must be built in; loading this helper after the GPU/cpufreq
-drivers probe would be too late.
+Each overlay application is transactional, one failing does not stop the
+others, and the overlays remain for the boot lifetime. `CONFIG_OF_OVERLAY=y`
+is already required by the port's Gunyah integration. It must be built in;
+loading this helper after the GPU/cpufreq drivers probe would be too late.
 
 Two cpufreq fixes are also needed in this kernel:
 
@@ -113,6 +116,52 @@ already installed. There is no evidence here for changing their behavior,
 forcing minimum clocks, disabling idle, or altering storage power management.
 Battery current while charging measures charge flow, not system power; these
 tests do not establish an energy-per-task or battery-life improvement.
+
+## SM-X710 (gts9wifi)
+
+The SM-X710 has the same SoC (`soc_id` 519, revision 2.0) and the same
+prime-core LUT: an identical frequency list up to 2.9568 GHz, then the
+3.36 GHz boost entry. While the CPU overlay was Ultra-only, its log carried
+the same `cpu cpu7: Voltage update failed freq=3360000`,
+`scaling_boost_frequencies` was empty and the core stopped at 2.9568 GHz.
+Samsung's stock X710XXS5CYG1 trees do not limit it either: the Kalama v2 base
+DTB (`qcom,msm-id = <0x207 0x20000>`) leaves CPU frequencies to the EPSS LUT,
+the rev-04 board overlay's `cpufreq_limit` node is identical to the Ultra's
+(silver-cluster tables only), and the vendor perf HAL's `targetconfig.xml`
+sets no prime `MaxFrequency`.
+
+The OPP comes from the runtime overlay rather than the X710 board DTS. This
+board's first image bootlooped in ABL with the Ultra's board-id and 41
+Ultra-inherited extra nodes, the CPU and GPU OPPs among them; since then its
+DTS keeps the node set of a known-booting mainline tree, and the overlay
+leaves that ABL-facing DTB untouched. The 3.36 GHz OPP places the same
+LLCC/DDR/L3 votes as 2.9568 GHz, so it adds no new memory-bus state.
+
+Thermal protection is the Ultra's: the same tsens zones and trips (CPU passive
+90/95 C, critical 110 C, GPU cooling map at 85 C), identical thermal zones in
+both Samsung board overlays, and LMh hardware limiting reported to the
+scheduler through `dcvsh-irq-7`. The 11-inch chassis has less sustained
+headroom; LMh answers that with a lower prime clock. LMh and tsens follow die
+temperature only: neither board runs Android's skin-temperature policy
+(`thermal-engine-v2`'s built-in rules, Samsung's thermal HAL), so a warm back
+under long single-thread load is expected sooner on the smaller body. Power
+Saver still turns boost off, and `ubuntu-gts9u-cpu-boost` covers both boards.
+
+The GPU's 719 MHz level stays Ultra-only. kgsl picks Samsung's bin 0
+(719 MHz) by SoC feature code: `qcom,sku-codes` lists AC (3), AF (6) and
+internal parts; every other part gets bin 1, which stops at 680 MHz. Both
+models' stock tables are identical, so the bin belongs to the individual
+chip. The CPU LUT's 3.36 GHz entry points to the "for Galaxy" AC part, but
+the feature code itself has not been read on either unit. Read it as root
+before extending the GPU overlay:
+
+```sh
+sudo cat /sys/kernel/debug/qcom_socinfo/feature_code /sys/kernel/debug/qcom_socinfo/pcode
+```
+
+A feature code of 3 or 6 is bin 0. The X710 also has an open GPU
+write-integrity investigation ([display notes](gts9wifi-display.md)); a new
+GPU clock should not be added while it is open.
 
 ## Reproduce the checks
 

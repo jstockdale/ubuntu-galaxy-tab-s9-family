@@ -1,0 +1,171 @@
+--- a/drivers/gpu/drm/msm/msm_kms.c
++++ b/drivers/gpu/drm/msm/msm_kms.c
+@@ -6,7 +6,11 @@
+  */
+ 
+ #include <linux/aperture.h>
++#include <linux/delay.h>
+ #include <linux/kthread.h>
++#include <linux/moduleparam.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
+ #include <linux/sched/mm.h>
+ #include <uapi/linux/sched/types.h>
+ 
+@@ -377,6 +381,146 @@
+ 		drm_atomic_helper_shutdown(drm);
+ }
+ 
++/*
++ * Bring-up switch for the Samsung SM8550 tablets, whose DSI panel does not
++ * answer on the first enable after a cold boot.  A pm_test=platform cycle
++ * recovers it, while blanking and a devices-only cycle do not.  With
++ * msm.boot_display_cycle=1 the display alone goes through the steps that
++ * cycle takes, once, right after the first modeset: the pipeline is switched
++ * off, the MDSS children and the MDSS are suspended, the MDSS GDSC powers
++ * down as in the noirq phase, and everything is brought back and re-enabled.
++ * Nothing else in the system is frozen.
++ */
++static bool boot_display_cycle;
++module_param(boot_display_cycle, bool, 0444);
++MODULE_PARM_DESC(boot_display_cycle,
++		 "power-cycle the display subsystem once after the first modeset (bring-up)");
++
++#define MSM_BOOT_CYCLE_MAX_DEVS	8
++
++struct msm_boot_cycle {
++	struct device *devs[MSM_BOOT_CYCLE_MAX_DEVS];
++	unsigned int count;
++};
++
++static int msm_boot_cycle_add(struct device *dev, void *data)
++{
++	struct msm_boot_cycle *cycle = data;
++
++	if (dev->driver && cycle->count < MSM_BOOT_CYCLE_MAX_DEVS - 1)
++		cycle->devs[cycle->count++] = dev;
++
++	return 0;
++}
++
++static void msm_kms_boot_display_cycle(struct drm_device *ddev)
++{
++	struct device *mdss = ddev->dev->parent;
++	struct msm_boot_cycle cycle = {};
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_commit *state;
++	const char *how = "stayed on";
++	bool syscore = false;
++	unsigned int done, i;
++	ktime_t start = ktime_get();
++	int ret;
++
++	/* Children last-registered first, then the MDSS: dpm_suspend() order. */
++	device_for_each_child_reverse(mdss, &cycle, msm_boot_cycle_add);
++	cycle.devs[cycle.count++] = mdss;
++
++	if (ddev->mode_config.poll_enabled)
++		drm_kms_helper_poll_disable(ddev);
++
++	/*
++	 * Userspace is not frozen here, unlike in a system suspend: a display
++	 * manager may be starting.  So this is drm_atomic_helper_suspend() and
++	 * drm_atomic_helper_resume() without the unlock in between.  Holding
++	 * every modeset lock makes such a commit wait until the pipeline is
++	 * back, instead of reaching the DPU while its runtime PM is disabled
++	 * and the GDSC is off; the blocking disable below also waits for any
++	 * commit still in flight.
++	 */
++	DRM_MODESET_LOCK_ALL_BEGIN(ddev, ctx, 0, ret);
++
++	state = drm_atomic_helper_duplicate_state(ddev, &ctx);
++	if (IS_ERR(state)) {
++		ret = PTR_ERR(state);
++		how = "not cycled, saving the display state failed";
++		goto unlock;
++	}
++
++	ret = drm_atomic_helper_disable_all(ddev, &ctx);
++	if (ret) {
++		how = "not cycled, switching the display off failed";
++		goto put_state;
++	}
++
++	/*
++	 * Hold a usage reference across the cycle, as device_prepare() does.
++	 * pm_runtime_force_suspend() counts that reference in: without it a
++	 * device whose driver keeps it active with a single reference of its
++	 * own (the DP controller while HPD is enabled or a sink is plugged)
++	 * is marked suspended and never resumed by pm_runtime_force_resume(),
++	 * unlike after a real system resume.
++	 */
++	for (i = 0; i < cycle.count; i++)
++		pm_runtime_get_noresume(cycle.devs[i]);
++
++	for (done = 0; done < cycle.count; done++) {
++		ret = pm_runtime_force_suspend(cycle.devs[done]);
++		if (ret) {
++			dev_warn(cycle.devs[done],
++				 "boot display cycle: runtime suspend failed: %d\n", ret);
++			how = "not cycled, a display device did not suspend";
++			break;
++		}
++	}
++
++	if (done == cycle.count) {
++		/*
++		 * The MDSS went through its PM domain's runtime suspend, which
++		 * keeps a domain that was on at boot powered until its
++		 * provider's sync_state.  The noirq phase ignores that, so do
++		 * what it does: the MDSS is the domain's only device and has
++		 * runtime PM disabled now.
++		 */
++		if (dev_pm_genpd_is_on(mdss)) {
++			dev_pm_genpd_suspend(mdss);
++			syscore = true;
++		}
++		if (!dev_pm_genpd_is_on(mdss))
++			how = syscore ? "power-cycled (noirq-style)" : "power-cycled";
++		msleep(20);
++		if (syscore)
++			dev_pm_genpd_resume(mdss);
++	}
++
++	while (done--)
++		pm_runtime_force_resume(cycle.devs[done]);
++
++	/* As drm_atomic_helper_resume(): the hardware lost its state. */
++	drm_mode_config_reset(ddev);
++	ret = drm_atomic_helper_commit_duplicated_state(state, &ctx);
++	if (ret)
++		dev_warn(ddev->dev, "boot display cycle: re-enable failed: %d\n", ret);
++
++	/* device_complete(): drop the references taken above. */
++	for (i = 0; i < cycle.count; i++)
++		pm_runtime_put(cycle.devs[i]);
++
++put_state:
++	drm_atomic_commit_put(state);
++unlock:
++	DRM_MODESET_LOCK_ALL_END(ddev, ctx, ret);
++
++	if (ddev->mode_config.poll_enabled)
++		drm_kms_helper_poll_enable(ddev);
++
++	dev_info(ddev->dev, "boot display cycle: MDSS GDSC %s, %lld ms\n",
++		 how, ktime_ms_delta(ktime_get(), start));
++}
++
+ void msm_drm_kms_post_init(struct device *dev)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+@@ -385,4 +529,9 @@
+ 
+ 	drm_kms_helper_poll_init(ddev);
+ 	drm_client_setup(ddev, NULL);
++
++	/* Only under an MDSS: its children are exactly the display blocks. */
++	if (boot_display_cycle && dev->parent && dev->parent->driver &&
++	    !strcmp(dev->parent->driver->name, "msm-mdss"))
++		msm_kms_boot_display_cycle(ddev);
+ }

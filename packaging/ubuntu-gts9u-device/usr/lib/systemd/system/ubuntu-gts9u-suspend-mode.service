@@ -1,0 +1,17 @@
+[Unit]
+Description=Apply the suspend mode (off, s2idle or deep) to logind, systemd-sleep and GNOME
+Documentation=file:/usr/libexec/ubuntu-gts9u-suspend-mode
+# logind reads its drop-ins when it starts and GNOME its dconf profile when the
+# greeter and the session start, so this has to be done before either; the
+# mode file lives on the root filesystem, which is all it waits for.
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=basic.target systemd-logind.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/ubuntu-gts9u-suspend-mode apply
+
+[Install]
+WantedBy=basic.target

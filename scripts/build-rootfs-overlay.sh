@@ -43,6 +43,7 @@ adsp.mdt adsp_dtb.mdt adspr.jsn adsps.jsn adspua.jsn cdspr.jsn
 $DEVICE_CARD-tplg.bin
 $DEVICE_BT_FW
 stm32_gts9family.bin
+sensor-hexagonfs.tar.gz
 "
 case "$DEVICE_WLAN" in
 ath12k)
@@ -64,7 +65,9 @@ done
 if [ -n "$absent" ]; then
 	echo "missing staged firmware in $firmware:" >&2
 	for f in $absent; do echo "  $f" >&2; done
-	echo 'run the reference port stage-stock-*.sh helpers to produce them' >&2
+	echo 'stage them with scripts/stage-firmware.py (configs/firmware/README.md;' >&2
+	echo 'the sensor tree needs --sscregistrygen) or the reference port' >&2
+	echo 'stage-stock-*.sh helpers' >&2
 	exit 1
 fi
 
@@ -100,15 +103,9 @@ cat > "$overlay/etc/modprobe.d/gts9u-qcomtee.conf" <<'EOF'
 # Load manually while diagnosing the EL721 secure-world bridge.
 blacklist qcomtee
 EOF
-if [ "${DEVICE:-}" = gts9wifi ]; then
-	# Build 10 shipped the DDR bandwidth monitor built in together with the
-	# display timing changes and the panel stayed black; keep it out of the
-	# default boot until it has been tested on its own (`modprobe icc_bwmon`).
-	cat > "$overlay/etc/modprobe.d/gts9u-bwmon.conf" <<'EOF'
-# Bring-up experiment switch: load by hand with `modprobe icc_bwmon`.
-blacklist icc_bwmon
-EOF
-fi
+# The gts9wifi DDR bandwidth monitor is built in now (config-gts9wifi.fragment):
+# a modprobe blacklist cannot hold it back, initcall_blacklist=bwmon_driver_init
+# on the kernel command line does.
 
 # --- Adreno 740 -----------------------------------------------------------
 for f in a740_zap.mdt a740_zap.b00 a740_zap.b01 a740_zap.b02 a740_sqe.fw \
@@ -227,16 +224,28 @@ install -m 0644 "$firmware/stm32_gts9family.bin" \
 	"$overlay/usr/lib/firmware/keyboard_stm/stm32_gts9family.bin"
 
 # --- sensors: HexagonFS tree ----------------------------------------------
-if [ -f "$firmware/sensor-hexagonfs.tar.gz" ]; then
-	# --strip-components=1 is required.  The tarball nests everything under
-	# sensor-hexagonfs/, and without it hexagonrpcd looks one level too high
-	# and reports "Could not open /../sns_reg_version: No such file".
-	tar -xzf "$firmware/sensor-hexagonfs.tar.gz" \
-		-C "$overlay/usr/share/qcom/sm8550/Samsung/$DEVICE_SENSOR_DIR" \
-		--strip-components=1
-else
-	echo 'note: sensor-hexagonfs.tar.gz is absent; motion sensors will not work' >&2
-fi
+# Required above, not optional: without the tree hexagonrpcd serves an empty
+# directory, SSC never publishes a sensor, and rotation and the light sensor
+# fail on every boot with nothing but a late "SSC did not become ready".  The
+# first X710 images shipped exactly that while this was only a note.
+#
+# --strip-components=1 is required.  The tarball nests everything under
+# sensor-hexagonfs/, and without it hexagonrpcd looks one level too high
+# and reports "Could not open /../sns_reg_version: No such file".
+sensor_tree=$overlay/usr/share/qcom/sm8550/Samsung/$DEVICE_SENSOR_DIR
+tar -xzf "$firmware/sensor-hexagonfs.tar.gz" -C "$sensor_tree" \
+	--strip-components=1
+# Without the completion marker and the timestamp cache the DSP rebuilds the
+# registry at boot and closes the session doing so (see
+# ubuntu-gts9u-sensor-registry); without the skeletons the PD cannot start.
+for f in sensors/registry/sensors_registry sensors/registry/sns_reg_config \
+	sensors/sns_reg.conf sensors/sns_reg_version socinfo/soc_id \
+	dsp/adsp/sns_tppe.so; do
+	[ -f "$sensor_tree/$f" ] || {
+		echo "sensor-hexagonfs.tar.gz has no $f" >&2
+		exit 1
+	}
+done
 
 # --- bring-up logger (GTS9U_BRINGUP_SDLOG=1 only) ---------------------------
 # A board with no working panel, no account yet and no USB gadget has no way to

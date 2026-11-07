@@ -1,0 +1,12 @@
+[Unit]
+Description=Save the PMIC RTC offset whenever NTP has synchronised the clock
+ConditionPathExists=/sys/class/rtc/rtc0/since_epoch
+
+[Path]
+# systemd-timesyncd touches this file on every successful synchronisation.
+# PathChanged, not PathExists: a level-triggered condition would re-run the
+# oneshot the moment it exits (see ubuntu-gts9u-desktop-user.path).
+PathChanged=/run/systemd/timesync/synchronized
+
+[Install]
+WantedBy=multi-user.target
