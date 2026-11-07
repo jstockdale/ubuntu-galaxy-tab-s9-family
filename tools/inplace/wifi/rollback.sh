@@ -67,7 +67,7 @@ ours=0
 if [ -r "$kit/IMAGES" ]; then
 	while read -r base variant file; do
 		case "$base" in ''|'#'*) continue ;; esac
-		[ "$current" = "$variant" ] && ours=1
+		if [ "$current" = "$variant" ]; then ours=1; fi
 	done < "$kit/IMAGES"
 fi
 if [ "$current" = "$want" ]; then
