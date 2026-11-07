@@ -325,9 +325,9 @@ unclean_check() {
 	kmsg "loop breaker: $unclean"
 }
 
-mark_pending() {
+mark_pending() { # [uptime of the release]
 	mkdir -p "${PENDING%/*}" 2>/dev/null
-	printf 'boot_id=%s\nuptime=%s\n' "$(this_boot)" "$(uptime_s)" > "$PENDING" 2>/dev/null ||
+	printf 'boot_id=%s\nuptime=%s\n' "$(this_boot)" "${1:-$(uptime_s)}" > "$PENDING" 2>/dev/null ||
 		say "note: cannot write $PENDING; the loop breaker cannot cover this boot"
 }
 
@@ -366,6 +366,15 @@ do_release() {
 	plan
 	[ -n "$synced_list" ] && say "already synced: $synced_list"
 	if [ -z "$eligible" ] && [ -z "$held_by" ]; then
+		if [ "$(sed -n 's/^boot_id=//p' "$STATE" 2>/dev/null)" = "$(this_boot)" ] &&
+			grep -qx 'result=released' "$STATE" 2>/dev/null; then
+			# Restarted after its own release this boot: the stop just
+			# cleared the marker, but the floor is still gone.  Keep the
+			# record, and the loop breaker armed.
+			say 'every interconnect provider is synced (released by this unit earlier this boot)'
+			[ "$dry" = no ] && mark_pending "$(sed -n 's/^uptime=//p' "$STATE" | head -n 1)"
+			return 0
+		fi
 		say 'every interconnect provider is synced; nothing to release'
 		[ "$dry" = no ] && record nothing 'all synced'
 		return 0

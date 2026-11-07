@@ -364,12 +364,39 @@ set -- {mode}
         tree = self.make()
         x710_stage2(tree)
         self.assertEqual(self.run_helper(tree).returncode, 0)
-        # Run by hand again in the same boot: everything synced, no hold.
+        # Run by hand again in the same boot: everything synced, no hold,
+        # and the record of this boot's release stays.
         r = self.run_helper(tree)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(self.state(tree)["result"], "nothing")
+        self.assertNotIn("HOLD", r.stdout)
+        self.assertEqual(self.state(tree)["result"], "released")
         self.assertTrue(self.pending(tree).exists())
         self.assertFalse(self.unclean(tree).exists())
+
+    def test_restart_after_its_own_release_keeps_the_breaker_armed(self):
+        tree = self.make()
+        x710_stage2(tree)
+        self.assertEqual(self.run_helper(tree).returncode, 0)
+        # systemctl restart: ExecStop clears the marker, ExecStart finds
+        # nothing left to release, but the floor is still gone.
+        self.assertEqual(self.run_helper(tree, "stop").returncode, 0)
+        self.assertFalse(self.pending(tree).exists())
+        r = self.run_helper(tree)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("released by this unit earlier this boot", r.stdout)
+        self.assertEqual(self.state(tree)["result"], "released")
+        marker = self.pending(tree).read_text()
+        self.assertIn("boot_id=df92b567-453c-4cfe-a950-578d4d595476", marker)
+        self.assertIn("uptime=33.95", marker)
+
+    def test_all_synced_by_the_kernel_arms_nothing(self):
+        tree = self.make()
+        x710_stage2(tree)
+        for name in ("24100000.interconnect", "interconnect-1"):
+            (tree.platform / name / "state_synced").write_text("1\n")
+        self.assertEqual(self.run_helper(tree).returncode, 0)
+        self.assertEqual(self.state(tree)["result"], "nothing")
+        self.assertFalse(self.pending(tree).exists())
 
     def test_check_reports_the_loop_breaker_without_consuming_it(self):
         tree = self.make()
