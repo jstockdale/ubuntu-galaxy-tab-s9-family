@@ -41,8 +41,9 @@ DSP start is still going, or while another run is active.
    then `sh ~/suspendkit/gts9u-suspend-cycles.sh status`.
    Expect two `PASS` lines (`entered=s2idle wake=21(pm8xxx_rtc_alarm)`),
    `RESULT: PASS`.
-4. **Full run**, 20 s2idle then 20 deep (about 50 to 60 min; before each
-   sleep it lets the last resume's sensor recovery finish):
+4. **Full run**, 20 s2idle then 20 deep (about an hour: before each sleep
+   it lets the last resume's sensor recovery finish, typically 50 to 70 s
+   after the resume):
    `sudo sh ~/suspendkit/gts9u-suspend-cycles.sh run`
    Leave the tablet alone; `status` any time. Deep has resumed once on the
    baseline kernel but never on Stage 2. If the tablet does not come back
@@ -53,7 +54,8 @@ DSP start is still going, or while another run is active.
    names the cycle that never returned.
 5. **Key wakes**, at the tablet:
    `sudo sh ~/suspendkit/gts9u-suspend-cycles.sh key power` and press Power
-   once after the panel goes dark (within 90 s); then
+   once after the panel goes dark (within 90 s of that; the panel may take up
+   to two minutes to go dark if a sensor recovery is still running); then
    `sudo sh ~/suspendkit/gts9u-suspend-cycles.sh key voldown` and press Volume
    Down once. `status` after each: `wake=22(pmic_pwrkey)`, then
    `wake=23(pmic_resin)`, `RESULT: PASS`. The Volume Down press also lowers
