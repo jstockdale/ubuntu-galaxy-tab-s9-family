@@ -71,11 +71,25 @@ The SM-X710 has the same Adreno 740 and Mesa, so the Freedreno GL-path
 damage that ANGLE/Vulkan avoids on the Ultra is expected there too; until
 2026-11-06 the board gate left it on ANGLE/OpenGL. Both launchers and the
 shared runner now give it the same ANGLE/Vulkan (and, where applicable,
-Wayland) defaults. The X710's GPU write-integrity investigation
-([display notes](gts9wifi-display.md)) is a separate defect below the GL
-driver: no Mesa version or Freedreno flag changes it, and ANGLE/Vulkan is not
-expected to either. The write-check kit drives GL only; to compare Chrome on
-both backends, close it and start it once with `--use-angle=gl`.
+Wayland) defaults. The X710's GPU write loss
+([display notes](gts9wifi-display.md)) was, as suspected, below the GL
+driver: rpmhpd never reached sync_state(). Kernels that let it sync at boot
+lose no writes in the GL write-check battery, and on 2026-11-07 WebGL
+rendered correctly on the tablet. ANGLE/Vulkan stays the default because of
+the Freedreno GL-path damage above, not because of that defect. The
+write-check kit drives GL only; to compare Chrome on both backends, close it
+and start it once with `--use-angle=gl`.
+
+The kit's `FD_MESA_DEBUG=noubwc` belongs on its own command line only. Left
+in `~/.config/environment.d` and a gnome-shell drop-in after the
+investigation, it made Chrome's GPU process fail on ANGLE/Vulkan ("Internal
+Vulkan error (-8): A requested feature is not supported", then EGLImage and
+native pixmap errors), and because the desktop user lingers, logging out did
+not clear it. With both files removed and a reboot, the WebGL aquarium
+rendered correctly on ANGLE/Vulkan. That test tablet runs Mesa 26.2.6 from
+the kisak PPA, which the image builder does not install; the X710 has not been
+re-checked on Ubuntu's own Mesa. `systemctl --user show-environment | grep
+FD_MESA` shows whether the variable is still set.
 
 ## Reproduce
 
@@ -147,6 +161,14 @@ For a nondefault kernel build, first run `build-spss-irq-module.sh` with matchin
 corresponding released `KERNEL_OUT_DIR` (containing config and kernel.release).
 The normal clean rootfs builder already builds the IRQ bridge immediately
 before the device package with its common default tree.
+
+On the SM-X710, run both scripts with `DEVICE=gts9wifi`: that selects
+`build/linux-gts9wifi` and `out/kernel-gts9wifi` as the defaults and makes
+`build-device-package.sh` rewrite the sensor-tree path. The default
+`SPSS_IRQ_OUT_DIR` (`out/spss-irq-module`) is shared by both boards, so give
+each board its own when building both. `build-device-package.sh` also needs
+`scripts/build-fingerprint-secure-owner.sh` to have run first, and it runs
+`chown -R root:root` on its staging tree, so run it as root.
 
 Desktop precedence/Exec behavior follows the
 [freedesktop desktop entry specification](https://specifications.freedesktop.org/desktop-entry/latest-single/).

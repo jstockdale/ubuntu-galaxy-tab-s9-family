@@ -3,6 +3,9 @@
 Android and Ubuntu on the same internal UFS, switched from either side without
 a PC, a bootloader menu or a second boot slot.
 
+Dual boot is available on the SM-X910 only. The split ZIP refuses the
+SM-X710, which supports whole-tablet installs only.
+
 ## What is actually shared
 
 The two systems do not overlap anywhere except in the boot chain:
@@ -42,12 +45,16 @@ in the set directory.
 
 ## Where the boot images live
 
-Each system keeps its own copy, because neither can read the other's storage:
-Android's `/sdcard` is metadata-encrypted, and Ubuntu's `linuxroot` is ext4
-that Android has no driver for at that layer.
+The sets live once, inside Ubuntu's root filesystem:
+`/var/lib/gts9u-boot-sets/<id>/{boot,init_boot,vendor_boot,dtbo}.img` on
+`linuxroot`. The installer seeds `ubuntu` and `android` there. Ubuntu reads
+them directly. Android's app mounts `linuxroot` read-only at
+`/mnt/gts9u-linuxroot` and reads the same files, and mounts it writable only
+briefly, to refresh Android's set after an Android update.
 
-- Android: `/sdcard/BootSets/<id>/{boot,init_boot,vendor_boot,dtbo}.img`
-- Ubuntu: `/var/lib/gts9u-boot-sets/<id>/` (same four names)
+`/sdcard/BootSets/<id>/` is optional, for adding or overriding a set by hand
+from Android. Ubuntu cannot read it, because Android's storage is
+metadata-encrypted.
 
 A directory name is an id; an optional `name.txt` beside the images is the
 label shown in the UI.
@@ -96,6 +103,34 @@ reading the status is silent and writing asks for a password.
 ## If a switch goes wrong
 
 Nothing here can leave the tablet without a working recovery: TWRP lives in its
-own partition and is never written. From TWRP, `scripts/swap-boot-set.sh`
-restores a set over ADB, and the installation ZIP reinstalls Ubuntu's boot
-images without touching any filesystem.
+own partition and is never written. To make Ubuntu boot again without losing
+anything, boot TWRP and write the saved Ubuntu set back by hand
+(`adb shell`):
+
+```sh
+mkdir -p /mnt/ubuntu
+mount -o ro -t ext4 /dev/block/by-name/linuxroot /mnt/ubuntu ||
+    mount -o ro,noload -t ext4 /dev/block/by-name/linuxroot /mnt/ubuntu
+for p in boot init_boot vendor_boot dtbo; do
+    dd if=/mnt/ubuntu/var/lib/gts9u-boot-sets/ubuntu/$p.img of=/dev/block/by-name/$p bs=4M
+done
+sync
+for p in boot init_boot vendor_boot dtbo; do
+    sha256sum /mnt/ubuntu/var/lib/gts9u-boot-sets/ubuntu/$p.img /dev/block/by-name/$p
+done
+```
+
+Each pair of hashes must match (every image is exactly its partition's size).
+Use `android` instead of `ubuntu` for Android's set. `noload` is the fallback
+for a root left dirty by a hard power-off, as in the Android app.
+
+`scripts/swap-boot-set.sh` does the same from a PC, from copies of the sets.
+It is the author's WSL tool: set `ADB=/path/to/adb` and `BOOT_SETS_DIR` to a
+directory holding `ubuntu-boot-set/` and `oneui-boot-set/`, each with the four
+images. It only inspects (`bash scripts/swap-boot-set.sh --to oneui`) unless
+`--write` is given, accepts only an SM-X910, and stages through
+`/dev/block/sda35` (`linuxroot`), so it works only on a split SM-X910.
+
+Do **not** reflash the installation ZIP to repair a switch. It carries
+`rootfs.img` and rewrites the whole Ubuntu root, which erases Ubuntu's data and
+the saved Android set in `/var/lib/gts9u-boot-sets/android`.

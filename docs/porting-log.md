@@ -6910,3 +6910,104 @@ the next EnrollInit and the next opcode-4 arm still occur only after that
 terminal result. The full ARM64 build and 11 wire tests pass. Package SHA-256
 is `0f107c9585221cf7b42ef98a34e88f4ea86d00e2a64ea1d6990df7af47443881`;
 it was installed live over `gts9u35` with fprintd and FOD idle.
+
+## Session 115 — the Galaxy Tab S9 (SM-X710) joins the build
+
+Dates: 2026-11-04 to 2026-11-07. One SM-X710 at bootloader revision 5
+(`X710XXS5CYG1`). Until now this bring-up was recorded only in working notes;
+the details are in the `gts9wifi-*.md` pages, and this session keeps the
+order of events.
+
+### A device axis, not a fork
+
+`scripts/lib/device.sh` holds everything that differs between the tablets:
+model, artifact slug, root label, sound card, the codenames the installer
+accepts, Wi-Fi driver, Bluetooth files and sensor-registry directory. Every
+build script sources it. `DEVICE` unset keeps the SM-X910 build byte for byte;
+`DEVICE=gts9wifi` builds the SM-X710 from its own DTS
+(`kernel/dts/sm8550-samsung-gts9wifi.dts`), config fragment and firmware
+manifest (`configs/firmware/x710-bl5-X710XXS5CYG1.toml`). The root label is
+scoped per board (`UBTS9_UFS`), the ZIP carries a `DEVICE-IDENTITY` member,
+and the installer takes the model and the bootloader build id from the kernel
+command line, because a family TWRP's properties describe another board. The
+split ZIP stays SM-X910 only, so the SM-X710 installs on the whole tablet.
+
+### First flash: a boot loop before Linux
+
+The first image (2026-11-05) reset on the unlock-warning splash after about
+30 s. `/proc/last_kmsg` held only bootloader lines, and the four boot
+partitions were hash-identical to the ZIP, so ABL itself was refusing the
+board DTB. The DTS was cut back to the node set of a sibling port's X710 DTB
+that boots, and features returned one at a time: the second image booted
+Linux and GNOME's wizard behind a dark panel, and the panel lit with the
+fourth, once the AMSA10FA01 glass got Samsung's revision-D power-on
+sequence. The stock boot chain was restored
+from the Odin package before that second attempt.
+
+### Builds 5 to 13
+
+- Build 5 hung before userspace: the pogo driver dereferenced the keyboard
+  booster the X710 does not have. Build 6 fixed it, and the keyboard cover
+  worked.
+- Build 7 brought the FTS1BA90A touchscreen
+  ([`gts9wifi-touch-fts1ba90a.md`](gts9wifi-touch-fts1ba90a.md)).
+- Build 9 brought the radios: the WCN6855 needed its PDC votes, the XO clock
+  held and a cold reset before the PCIe link came up. Bluetooth worked at
+  once. Wi-Fi needed the IOE build `WLAN.HSP.1.1-04866.5` for hw2.1
+  (linux-firmware's amss crashes into RDDM on this silicon) and Samsung's
+  board data for 5 GHz: with the generic entry the radio heard 2.4 GHz only
+  ([`gts9wifi-wifi.md`](gts9wifi-wifi.md)).
+- Builds 10 to 13 settled the display link as command-line experiments on one
+  kernel: 1.524 Gbps per lane with Samsung's D-PHY timing table, a
+  non-continuous clock (a continuous one blacks the glass)
+  ([`gts9wifi-display.md`](gts9wifi-display.md)). The GPU's lost writes, a
+  lattice of stale pixels, survived every software knob tried: two Mesa
+  versions, UBWC, cached-coherent buffers, ACD, clock gating, LLC and the CCU
+  invalidate.
+
+### The fix set (2026-11-06 and 07)
+
+- **GPU writes.** Releasing rpmhpd's `sync_state()` at runtime took the
+  write-check battery from 168 of 296 frames lost to none, and holding it at
+  boot brought the loss back (197 of 296). rpmhpd never synced because the
+  video clock controller was `=m` and never loaded: the kernel build silently
+  dropped every in-tree `=m` option (videocc, bwmon, the PMIC RTC,
+  `qcom_stats`, the temperature alarms). All but bwmon are built in now, and
+  the build fails on any `=m` a board fragment asks for that it does not
+  ship. With videocc built in, rpmhpd syncs at boot and the battery lost 0 of
+  296.
+- **3.36 GHz.** The embedded CPU OPP overlay was rejected (`Invalid
+  overlay_fdt header`, -22) because its byte array was not 8-byte aligned;
+  `__aligned(8)` fixed it, and the prime core now reaches 3.36 GHz. The Ultra
+  had the same latent fault.
+- **Interconnect.** Two boots that let the interconnect reach `sync_state()`
+  before the boot-time panel cycle (Stage 3 with bwmon built in, Stage 3b with
+  the bwmon PMUs disabled in the DT) both hung that cycle and boot-looped, and
+  were restored with TWRP `dd`. bwmon is therefore a module, blacklisted, and
+  `ubuntu-gts9u-icc-late-release` releases the boot vote after the cycle
+  ([`gts9wifi-interconnect.md`](gts9wifi-interconnect.md)).
+- Confirmed on the tablet in the same set: rotation through the sensor core,
+  with the light sensor present; the S Pen digitizer, charging and dock
+  detection; the EF-DX720 keyboard cover with its posture switch in typing
+  posture; the RTC and sleep statistics. The owner confirmed the 60 Hz mode
+  the same night (`VRR_SETTING 60HS` applied). Double tap to wake is not
+  confirmed yet: twice the screen came back from blank with the touch in
+  low-power and no power-key press, but the kernel's "double tap to wake" line
+  never appeared, so a keyboard keypress may have woken it. Still waiting for
+  at-the-tablet tests: double tap to wake, the light sensor's reading in light,
+  the cover folded back, and drawing with the pen.
+- Suspend stays `off` on this board (`ubuntu-gts9u-suspend-mode`): every
+  `pm_test` level passed and one real s2idle and one real deep sleep resumed
+  on 2026-11-06, but the repeated runs (`scripts/diagnostics/suspend/`) are
+  still to come.
+
+The overnight work of 2026-11-07 then merged: the interconnect late release,
+the suspend runner, the S Pen poll and dock debounce, the X710 cameras (two
+HI1337s, off by default, untested on hardware,
+[`gts9wifi-cameras.md`](gts9wifi-cameras.md)), the Wi-Fi address from EFS and
+its firmware at first probe, boot hygiene (the clock restored before journald,
+the fingerprint stack gated to the SM-X910), the analysis of the three
+`*_ignore_unused` flags ([`gts9wifi-bringup-flags.md`](gts9wifi-bringup-flags.md)),
+the DISP-5 panel experiment kit and the power and thermal fixes. Device package
+2.56 carries them. Still open: the panel needs the boot-time cycle (DISP-5),
+and the suspend runs decide the default mode.

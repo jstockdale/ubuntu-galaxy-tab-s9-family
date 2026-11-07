@@ -15,8 +15,16 @@ pen-hover suppression and the axis resolution described in "Power states and
 double tap to wake" below were added afterwards; see that section for what is
 verified on hardware and what is not.
 
-The four integration snippets for the other session are in the section
-"Integration snippets" below; the search record and provenance follow.
+The driver is integrated: `scripts/build-mainline-kernel.sh` installs it,
+`config-gts9wifi.fragment` enables it (`CONFIG_TOUCHSCREEN_SAMSUNG_FTS1BA90A=y`)
+and the X710 DTS carries the node.  The section "Integration snippets" below
+records what was added; the search record and provenance follow.
+
+The shipped X710 DTS has no Goodix node.  An SM-X710 fitted with the Goodix
+GT9916 (address 0x5d), which some 11" units carry, has no touchscreen on this
+image.  Check which controller your unit has before installing: in TWRP,
+`adb shell ls /sys/bus/i2c/drivers/fts_touch` lists a `*-0049` device (here
+`39-0049`) on an FTS unit.
 
 ## Power states and double tap to wake
 
@@ -125,10 +133,11 @@ scanning slowly for as long as the screen is off instead of stopping, and stays
 powered through system sleep instead of being switched off, so it costs
 standby power.
 
-`71-gts9u-touchscreen.rules` (device package) gives the desktop user's group
-(`input`) write access to the attribute and, where
-`/run/ubuntu-gts9u/desktop-user` names the owner, ownership of it.  The I2C
-bus number is not stable, so use the driver's directory:
+`71-gts9u-touchscreen.rules` (device package) gives the `input` group write
+access to the attribute and, where `/run/ubuntu-gts9u/desktop-user` names the
+desktop user, makes that user its owner.  Ownership is what lets the desktop
+user write it: the account is no longer in `input`.  The I2C bus number is
+not stable, so use the driver's directory:
 
 ```sh
 # now, as the desktop user (no sudo needed once the rule has run)
@@ -149,16 +158,20 @@ the screen merely blanked, write `disabled` to the device's `power/wakeup`
 
 The driver follows every input device that has an `SW_LID` switch (the
 book-cover Hall sensor on GPIO 107, the keyboard cover's Hall payload from
-`samsung_stm32_pogo`, and the digitiser's folio detection once the X710 has
-one) as a passive observer, and never arms the gesture while any of them
-reports closed; downstream turns scanning off under a closed flip cover.  The
-switch state is read directly at every decision, so it is right even while Tab
-Companion has grabbed the keyboard cover, but the change events of a grabbed
-device are not seen: closing the keyboard cover over an already dark screen
-leaves the gesture armed until the next screen-off or suspend.  The pogo driver
-also reports the keyboard folded behind the tablet as closed (assessment
-INPUT-03), which disarms the gesture in that position until that is fixed.  The
-lid does not affect the touchscreen while it has a reader.
+`samsung_stm32_pogo`, and the digitiser's cover detection, `SW_LID` together
+with `SW_MACHINE_COVER` on `digitizer@56`) as a passive observer, and never
+arms the gesture while any of them reports closed; downstream turns scanning
+off under a closed flip cover.  The switch state is read directly at every
+decision.  On the SM-X710 the keyboard cover's switches sit on the separate
+`Samsung Book Cover Switch` device, which Tab Companion never grabs, so its
+change events are seen too.  (On a board whose pogo driver still reports
+`SW_LID` on the keyboard device, as the SM-X910's does, Tab Companion's grab
+hides those events, and closing the cover over an already dark screen would
+leave the gesture armed until the next screen-off or suspend.)  The pogo
+driver no longer reports the keyboard folded behind the tablet as closed (the
+back-fold becomes `SW_TABLET_MODE`, not `SW_LID`), so the gesture stays
+available in that position.  The lid does not affect the touchscreen while it
+has a reader.
 
 ### Charger mode, pen hover, resolution
 
@@ -168,8 +181,8 @@ lid does not affect the touchscreen while it has a reader.
   downstream's VBUS notifier.  The X710 sits on USB power most of the time.
 - While the S Pen is in range (`samsung_wacom_should_suppress_touch()`, the
   contract of the Ultra's Goodix patch) contacts are not reported and the ones
-  already down are released.  It takes effect once the X710 DTS describes its
-  digitiser again.
+  already down are released.  This is active on the X710: its DTS describes
+  the digitiser (`digitizer@56` on `&i2c3`), and the digitiser binds.
 - `touchscreen-x-mm = <148>` / `touchscreen-y-mm = <236>` (the panel's stock r04
   size, in the controller's portrait axes) set the axis resolution to 11
   units/mm after the swap, so libinput and mutter can size-match the
@@ -195,9 +208,12 @@ whenever the controller is off).
 
 ### 1. DTS node for `kernel/dts/sm8550-samsung-gts9wifi.dts`
 
-Replaces the existing `touchscreen@49` node under `&i2c4` (currently
-`compatible = "st,stmfts"`).  The regulator labels `vreg_l14b_3p2` and
-`vreg_l12b_1p8` already exist in that file.
+This is the `touchscreen@49` node under `&i2c4` in
+`kernel/dts/sm8550-samsung-gts9wifi.dts`; it replaced the earlier
+`compatible = "st,stmfts"` node.  The regulator labels `vreg_l14b_3p2` and
+`vreg_l12b_1p8` are defined in that file.  The shipped node also carries
+`pinctrl-names = "default"; pinctrl-0 = <&ts_int_default>;`, so the
+"Optional" pin state below is applied.
 
 ```dts
 &i2c4 {
@@ -252,7 +268,8 @@ sibling ports run without it, relying on the bootloader's pin setup):
 
 and in the node: `pinctrl-names = "default"; pinctrl-0 = <&ts_int_default>;`.
 
-If the Goodix GT9916 node at 0x5d is kept for the other 11" units, both
+The shipped DTS has no Goodix GT9916 node (see the note at the top).  If one
+is added at 0x5d for the other 11" units, both
 nodes can coexist on the bus: only the controller that is fitted answers, and
 the other driver fails its probe (the FTS driver with "no ready event" then
 "controller never became ready", -ETIMEDOUT, after about six seconds of
@@ -260,11 +277,10 @@ polling; the rails are released again on that path).
 
 ### 2. Install hook for `scripts/build-mainline-kernel.sh`
 
-Modeled on the `samsung_stm32_pogo` hook at lines 504-522.  Place it after
-the `samsung_wacom_w90xx` block (lines 524-543) so `touch_dir` is already
-defined; otherwise add `touch_dir=$kernel_tree/drivers/input/touchscreen`
-first.  The driver includes `<linux/samsung_wacom.h>`, which the same script
-installs into the kernel tree before the touchscreen drivers.
+Modeled on the `samsung_stm32_pogo` hook in `scripts/build-mainline-kernel.sh`.
+It sits right after the `samsung_wacom_w90xx` block, which defines
+`touch_dir`.  The driver includes `<linux/samsung_wacom.h>`, which the same
+script installs into the kernel tree before the touchscreen drivers.
 
 ```sh
 install -m 0644 "$drv/samsung_fts1ba90a.c" \
@@ -485,10 +501,15 @@ downloaded files sit under the session scratchpad only.
   sense off rather than downstream's power-off: the touch keeps holding L12B
   while the screen is blank, as it always has here.  Downstream can power off
   because its display stack sequences VDDIO itself.
-- Not yet verified on hardware when this section was written: the low-power
-  IRQ rate, the gesture library being present in firmware 0x0124 (nacht20-de
-  validated the same sequence on an SM-X710 without recording its firmware),
-  and wake from a real s2idle sleep, which waits on the suspend work.
+- Verified on hardware since this section was written (2026-11-07):
+  firmware 0x0124 carries the gesture library (the probe log reports version
+  3, model 101, name X716); the `double_tap_to_wake` attribute and the Wake
+  Gesture input device are present, the desktop user owns the attribute, and
+  with it set the controller goes to `low-power` while the screen is blanked
+  and a double tap turns the screen back on.  Still unverified: the
+  low-power IRQ rate, and double-tap wake from a real s2idle.  Suspend stays
+  off by default on the X710, although one s2idle and one deep sleep resumed
+  from the power key on 2026-11-06.
 - The force-calibration step (0x13) on every probe is what Samsung's
   `fts_init` does; nacht20-de's X710 driver skips it and still works, so it
   can be dropped if it ever misbehaves.

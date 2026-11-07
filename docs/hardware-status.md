@@ -1,11 +1,13 @@
-# SM-X910 hardware status under Ubuntu 24.04
+# SM-X910 and SM-X710 hardware status under Ubuntu 24.04
 
-Last updated: 2026-09-03, after the owner confirmed the complete fingerprint
-workflow and accepted the feature for integration into main.
+Last updated: 2026-11-07, for the v1.2.0 suspend and camera rows and the first
+SM-X710 matrix.
 
 Ubuntu **boots** on the tablet. This matrix explicitly separates what is
 inherited from what has been checked, and no component reaches ✅ without a real
-observation.
+observation. The main matrix covers the SM-X910 (Galaxy Tab S9 Ultra); the
+SM-X710 (Galaxy Tab S9) has its own matrix in
+[SM-X710 (Galaxy Tab S9)](#sm-x710-galaxy-tab-s9).
 
 ## Baseline
 
@@ -53,7 +55,7 @@ accepted as proof that something works.
 | Brightness / blanking | ✅ | ✅ | confirmed | Manual and GNOME automatic brightness work. Samsung's SSC `auto_brightness` stream supplies lux; room lighting tests verified dimming and brightening ([evidence](light-sensor-reference.md)). Resume reliability is tracked separately below |
 | Goodix GT9916 touch | ✅ | ✅ | confirmed | Samsung's 16-byte event layout |
 | Power and volume buttons | ✅ | ✅ | confirmed | |
-| Internal UFS | ✅ | ✅ | measured | Six LUNs, `sda`–`sdf`. Since v0.18 it also holds the root. Whole-tablet installs reuse `userdata` (`sda34`, 1,007,985,586,176 B) **exactly as it is, creating, deleting and resizing nothing**; split installs add `linuxroot` (entry 35) and only then is the table rewritten, by the split ZIP. On the first boot only the filesystem is resized, with `resize2fs` |
+| Internal UFS | ✅ | ✅ | measured | Six LUNs, `sda`–`sdf`. Since v0.18 it also holds the root. Whole-tablet installs reuse `userdata` (`sda34`, 1,007,985,586,176 B on the 1 TB test unit) **exactly as it is, creating, deleting and resizing nothing**; split installs add `linuxroot` (entry 35) and only then is the table rewritten, by the split ZIP. On the first boot only the filesystem is resized, with `resize2fs` |
 | microSD | ✅ | ✅ | confirmed | Works normally as removable storage on the current UFS installation. Up to v0.17 it also held the `UBTS9U_ROOT` root; those images use a journal and `errors=remount-ro` to tolerate dirty shutdowns |
 | WCN7850 Wi-Fi / ath12k | ✅ | ✅ | confirmed | Connected to the network by the owner; SSH in use for development |
 | Bluetooth and A2DP | ✅ | ✅ | confirmed | The unit waits for `bluetoothd`, feeds `btmgmt` correctly and reapplies the native address; controller and A2DP validated |
@@ -61,7 +63,7 @@ accepted as proof that something works.
 | Speaker DSP protection | ❌ | ❌ | assumed | Cirrus firmware not loaded; conservative hardware volume |
 | Battery | ✅ | ✅ | confirmed | SM5714: percentage, voltage, current and pack temperature |
 | USB-PD/PPS charging | ✅ | ✅ | measured | SM5714 TCPM + SM5440 2:1. **25.2–25.5 W** sustained for five minutes with the EP-T4510, die at 49.5 °C and pack at 36.4 °C. The ceiling was the current requested in the PPS contract, fixed at 3000 mA; swept on hardware, the optimum is 3400 (above that `ibus` rises and the power does not, only the die). Adjustable in `/sys/module/sm5440_direct/parameters/pps_op_curr_ma` |
-| Deep suspend | ✅ | ⚠️ | measured | A 2026-09-09 cycle failed UFS PHY calibration on resume and forced root read-only. Offline repair completed; ordinary suspend is temporarily disabled on the test tablet. Earlier successful cycles do not establish reliability ([diagnosis](resume-recovery.md)) |
+| Deep suspend | ✅ | ✅ | measured | A 2026-09-09 cycle failed UFS PHY calibration on resume and forced root read-only ([diagnosis](resume-recovery.md)). v1.2.0 enables by default the UFS PCS reset validated in kernel #11 ([build inputs](release-1.2.0-build.md)), and deep is the default mode. An occasional resume may still need a hard reset (README known issues) |
 | Cover switch | ✅ | ✅ | confirmed | Closing the cover blanks the screen and opening it wakes the tablet. It is **not** a Hall sensor: the Wacom digitizer reports the cover in a `0x0d` notification packet, bit 7 of `0x0a`, and the driver publishes `SW_MACHINE_COVER` and `SW_LID` from it. logind gets a 5 s `HoldoffTimeoutSec` so the lock screen does not swallow the first event after a resume |
 | Accelerometer and auto-rotation | ✅ | ✅ | confirmed | SSC exposed to GNOME. `iio-sensor-proxy` no longer spins: libssc's synchronous wait blocks in `poll()` instead of iterating the context without blocking. 1 tick per 2 s against 199, and 48.9 °C against 94.7. The owner confirmed by rotating the tablet that rotation still works after the change |
 | LSM6DSO gyroscope | ✅ | ✅ | measured | The same SSC channel. The LSM6DSO hangs off **SPI** (`bus_type=3`, `bus_instance=1`) |
@@ -86,7 +88,7 @@ accepted as proof that something works.
 | Fingerprint: enrolment, verification and GDM | ❌ | ✅ | confirmed | The owner confirmed enrolment/deletion/re-enrolment through Ubuntu Settings and Tab Companion, correct acceptance and rejection, identification with a single held touch, GDM login and screen unlock. Both saved fingers work after reboot/resume; rotation, password fallback and portrait keyboard overlap handling were validated. Functional implementation accepted as complete on 2026-09-03 |
 | Haptics | ❌ | ✅ | confirmed | The stock DTS identifies a `dc_vibrator` COINDC on TLMM GPIO18 and mainline publishes it as `gpio-vibrator`/`FF_RUMBLE`. The owner confirmed the motor and the on-screen keyboard; Tab Companion offers 24/42/66 ms pulses. Notifications vibrate optionally, and a real test measured GPIO554 active for 64.5 ms |
 | Flash / torch | ❌ | ✅ | observed | PM8550 SID 1, channels 0+1 grouped by `leds-qcom-flash`; real illumination observed in strobe and torch modes. The **Flashlight** quick-settings tile is installed, active and physically tested, with a brightness submenu and state shared with the shortcut actions |
-| Cameras | ❌ | 🟡 | observed | All four sensors take pictures and go through `libcamera` simple plus the software ISP, appearing as exactly four normal, named V4L2 cameras. GNOME Camera, Chrome WebRTC and OBS opened and switched between all four with changing video, including after a cold boot; the main rear focuses with its DW9808. Switching between sensors is closed. Factory calibration and automatic photographic flash remain open |
+| Cameras | ❌ | ✅ | observed | All four sensors take pictures and go through `libcamera` simple plus the software ISP, appearing as exactly four normal, named V4L2 cameras with the full field of view. GNOME Camera, Chrome WebRTC and OBS opened and switched between all four with changing video, including after a cold boot; the main rear focuses with its DW9808. Switching between sensors is closed. Limitations: factory colour calibration and automatic photographic flash are not implemented (the torch works) |
 | Modem | — | — | — | Not applicable to the Wi-Fi model |
 
 ### Cameras and flash: the exact scope of the validation
@@ -290,15 +292,17 @@ alone and then with VDDO/MAX77816 active and 100 ms of settling. The bootloader
 accepted both jumps, but the application still did not raise DATA or announce
 `0xd6`; GPIO62 kept pulsing every ~2.126 s. That was the V34 application, which
 the mainline driver does not know how to talk to. The final source went back
-exactly to the driver of the last known good state (`504ff29`). Automatic
-writes to the accessory remain blocked: they require the explicit
-`GTS9U_ALLOW_POGO_FLASH=YES` guard and the service stays masked, so no MCU
-programming happens during boot.
+exactly to the driver of the last known good state (`504ff29`). The restore is
+now automatic: `ubuntu-gts9u-pogo-firmware.service` runs at every boot, checks
+the pinned SHA-256 of Samsung's V37 image and reprograms the MCU only when it
+reports another version. Set `GTS9U_ALLOW_POGO_FLASH=NO` in the unit's
+environment to disable writes.
 
 ## Inherited invariants that cannot be broken
 
-- Critical providers **built in**; only ath12k/ath12k_wifi7 as isolated signed
-  modules, and always from the same build as `boot`.
+- Critical providers **built in**; only ath12k/ath12k_wifi7 (SM-X910) as
+  isolated signed modules, and always from the same build as `boot`. On the
+  SM-X710 ath11k is built in.
 - Changing the DTS means rewriting `vendor_boot`.
 - Do not re-enable `lpass_ag_noc`: it caused hangs, and audio works without it.
 - Keep the DisplayPort HPD deferred until after the panel's cold-boot recovery.
@@ -308,3 +312,35 @@ programming happens during boot.
 - Do not add improvised MMIO/ioremap reads to diagnose probes.
 - Never write the PIT, EFS, persist, modem/modemst or the calibration
   partitions.
+
+## SM-X710 (Galaxy Tab S9)
+
+State on 2026-11-07, one SM-X710 with bootloader revision 5
+(`X710XXS5CYG1`), built with `DEVICE=gts9wifi` from this tree (kernel 7.2-rc3,
+device package 2.56). The evidence levels are the ones above. The SM-X710
+installs on the whole tablet only (`gts9u-split.zip` refuses it), and no
+SM-X710 ZIP is published.
+
+| Component | Ubuntu | Level | Notes |
+|---|---|---|---|
+| Boot with the root on the UFS | ✅ | confirmed | Installed from TWRP into `userdata`, label `UBTS9_UFS` |
+| Internal display 2560×1600 | ✅ | measured | AMSA10FA01 glass behind the Ultra's ANA38407 DDIC; 120 Hz and 60 Hz modes. The panel answers `80 00 04` only after the boot-time `pm_test=platform` cycle, as on the SM-X910; replacing that cycle in the kernel (DISP-5) is open ([display](gts9wifi-display.md)) |
+| Adreno 740 GPU | ✅ | measured | The lost writes (missing pixels, lattice specks) came from rpmhpd never reaching `sync_state`. With `videocc` built in it does, and the GPU test battery lost 0 of 296 frames, against 168 on a control boot. No 719 MHz step: the GPU overlay is the Ultra's only ([display](gts9wifi-display.md)) |
+| CPU frequency scaling | ✅ | measured | The prime core boosts to 3.36 GHz (`scaling_boost_frequencies` 3360000) once the CPU OPP overlay is 8-byte aligned |
+| FTS1BA90A touch | ✅ | confirmed | Port driver `samsung_fts1ba90a`. Double tap to wake works and is off by default ([touch](gts9wifi-touch-fts1ba90a.md)) |
+| S Pen | ✅ | measured | The digitizer binds; garage charging, dock and undock detection and the BLE pairing service work. Not yet checked by hand: pressure, hover, the side button and coordinate mapping ([Tab Companion](tab-companion.md)) |
+| EF-DX720 keyboard cover | ✅ | confirmed | Classified as a keyboard (no touchpad), with its switches on the separate `Samsung Book Cover Switch` device: typing posture keeps laptop mode, detaching gives tablet mode and rotation. The folded-back posture is not yet confirmed, and the special-key codes are still the EF-DX920 defaults, unmeasured ([pogo keyboard](../packaging/ubuntu-gts9u-device/usr/share/doc/ubuntu-gts9u-device/pogo-keyboard.md)) |
+| WCN6855 Wi-Fi and Bluetooth / ath11k | ✅ | confirmed | Wi-Fi in daily use over SSH; the Bluetooth controller comes up (audio over Bluetooth not yet recorded). ath11k is built in ([Wi-Fi](gts9wifi-wifi.md)) |
+| Auto-rotation | ✅ | confirmed | SSC up through the ADSP; rotation confirmed with the keyboard detached. In typing posture GNOME does not rotate, by design ([sensors](gts9wifi-sensors.md)) |
+| Ambient light (VEML3328) | ✅ | measured | libssc's standard `ambient_light` stream; `iio-sensor-proxy` reports the light sensor to GNOME. The only reading so far, 0 lux, was taken at night; the response to room light is still to be checked ([sensors](gts9wifi-sensors.md)) |
+| RTC and sleep statistics | ✅ | measured | `rtc-pm8xxx` and `qcom_stats` bound. An RTC alarm wake is not yet proven |
+| Suspend | ⚠️ | measured | Off by default (`ubuntu-gts9u-suspend-mode`): the power key locks and blanks the screen, the cover locks. On 2026-11-06 every `pm_test` level passed and one real s2idle and one real deep sleep resumed; repeated RTC-woken runs ([tools](../scripts/diagnostics/suspend/README.md)) must pass before a mode is enabled |
+| Interconnect | ⚠️ | measured | gem_noc and mc_virt keep their boot-time INT_MAX vote until `ubuntu-gts9u-icc-late-release` releases it after the boot cycle; releasing it before that cycle hung the cycle on every boot (Stage 3 and 3b). The DDR bandwidth monitor `icc_bwmon` is a module and blacklisted ([interconnect](gts9wifi-interconnect.md)) |
+| Early-boot journal | ⚠️ | measured | The first ~40 s of each boot's journal were lost to a backwards clock jump; device package 2.56 restores the clock before journald, not yet checked on hardware |
+| 4× CS35L45 speakers and DMICs | 🟡 | measured | The amplifiers probe with Samsung's X710 firmware and tuning and the UCM profile loads; playback and recording are not yet validated |
+| Cameras | 🟡 | assumed | Two HI1337 (rear 13 MP with DW9808 focus, front 12 MP), described in the DTS but off unless enabled; not tested on hardware ([cameras](gts9wifi-cameras.md)) |
+| USB-C charging, USB host, DisplayPort | ❓ | assumed | Not yet assessed |
+| Bring-up flags | ⚠️ | measured | `clk_ignore_unused`, `pd_ignore_unused` and `regulator_ignore_unused` are still on the shared command line ([flags](gts9wifi-bringup-flags.md)) |
+| Fingerprint reader | ❌ | — | Not supported; the fingerprint services are skipped on this model |
+| NPU | ❌ | — | Not built for this model (`GTS9U_INCLUDE_NPU=0`) |
+| Hardware video decode | ❌ | — | Not supported |

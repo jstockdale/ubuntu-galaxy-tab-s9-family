@@ -8,8 +8,11 @@ descriptor; the X710 power-on sequence is Samsung's revision-D
 
 ## Link defaults
 
-* Panel VDD (L11B) at 1.2 V, the stock X710 level.  At 1.104 V the glass
-  showed white single-pixel noise.
+* Panel VDD (L11B) at 1.2 V, the stock tree's base vote.  Every stock X710
+  camera overlay entry sets L11B to 1.1 V, so which level stock runs the glass
+  at is not settled (see the [camera notes](gts9wifi-cameras.md)).  At 1.104 V
+  the glass showed white single-pixel noise; that was before the GPU
+  write-loss fix below and has not been re-tested since.
 * Every mode runs the stock 1.524 Gbps per lane.  The lane rate follows from
   the mode: msm's `dsi_adjust_pclk_for_compression()` shrinks hdisplay to
   854 columns and keeps the blanking, and the lane rate is 6 x that pixel
@@ -35,15 +38,31 @@ kernel): a continuous clock alone blacks the glass out (the build-10 black
 panel); 1.524 Gbps with the timings mainline computes gave frame-done
 timeouts and more speckle; Samsung's table at 1.524 Gbps ran clean.  The DDR
 bandwidth monitor, the third build-10 change, made no difference either way.
-It is built in now, because its probe is what lets the interconnect leave
-INT_MAX (sync_state); the first boots of that change hold it back with
-`initcall_blacklist=bwmon_driver_init`, the one switch that can, since a
-modprobe blacklist does not reach a built-in driver.  The switches still exist and
-override the defaults:
+It is a module again (`CONFIG_QCOM_ICC_BWMON=m`), and the X710 image
+blacklists it (`/etc/modprobe.d/gts9u-bwmon.conf`, which
+`build-rootfs-overlay.sh` writes for `DEVICE=gts9wifi`).  Its two PMUs are
+the last consumers that keep gem_noc and mc_virt from sync_state(), so the
+interconnect keeps its INT_MAX boot vote on purpose.  Two boots on
+2026-11-07 let the interconnect sync before the boot-time `pm_test=platform`
+cycle: Stage 3 had bwmon built in, Stage 3b had both PMUs disabled in the
+DT.  Both hung that cycle at about 24 s and boot-looped through the
+watchdog.  Released at runtime, after the cycle, it held.  Device package
+2.56 ships `ubuntu-gts9u-icc-late-release`, which releases the interconnect
+once the cycle has returned; see the [interconnect notes](gts9wifi-interconnect.md).
+`initcall_blacklist=bwmon_driver_init` is no longer needed, and
+`sudo modprobe icc_bwmon` after boot is the experiment switch.
+
+The display switches still exist and override the defaults:
 `panel_samsung_ana38407.hback_porch=` (preferred mode only),
 `panel_samsung_ana38407.continuous_clock=`, `msm.dsi_phy_timings=<14 bytes>`.
 A release vendor_boot needs none of them, so it is built without
-`GTS9U_EXTRA_CMDLINE`.
+`GTS9U_EXTRA_CMDLINE`.  For an experiment, build the X710 kernel with
+`UBUNTU_WORKDIR=<workdir> DEVICE=gts9wifi bash scripts/build-mainline-kernel.sh`,
+then pack the switches into vendor_boot with `UBUNTU_WORKDIR=<workdir>
+DEVICE=gts9wifi INITRAMFS=<initramfs> BUNDLE_OUT_DIR=<dir>
+GTS9U_EXTRA_CMDLINE='msm.dsi_regdump=1' bash scripts/build-android-v4-bundle.sh`.
+To vary only the command line of an image that already runs, use the kit in
+`tools/inplace/panel/` (below).
 
 ## Refresh rates
 
@@ -73,7 +92,12 @@ seamless VRR.
 The DDIC answers `00 00 00` on its first probe after every cold boot and only
 works after `ubuntu-gts9u-panel-coldboot-recover` has run a
 `pm_test=platform` cycle; GDM is ordered after it.  Blanking and a
-`pm_test=devices` cycle do not recover it (measured on the Ultra).
+`pm_test=devices` cycle do not recover it (measured on the Ultra).  The unit
+first waits up to 15 s for the kernel's deferred-probe timeout report, so on
+the X710 the cycle runs about 24 s into boot and the panel stays dark until
+then.  This is also the cycle that hangs (watchdog reset, boot loop) when the
+interconnect syncs before it, which is why bwmon stays blacklisted (above).
+Retiring the cycle (DISP-5) is still open.
 Display-wise, the platform level adds the noirq phase, in which genpd powers
 the MDSS GDSC down.  At runtime that used to be impossible, because the DP
 controller kept the MDSS active; since the DP controller no longer holds it
@@ -110,22 +134,73 @@ power-on states and the decision tree.
 
 ## Still open
 
-* Intermittent faint speckle on frames written after an idle gap and the
-  occasional mirrored or stretched copy of a buffer region (GPU/UBWC path is
-  the current suspect; `FD_MESA_DEBUG=noubwc` test pending).
-* Square blocking shared with the Ultra (GMU bandwidth-vote timeouts).
+* The panel still needs the boot-time `pm_test=platform` cycle (DISP-5,
+  above).
+* The speckle and the single-pixel lattice are fixed: they were GPU writes
+  lost while rpmhpd had not reached sync_state() (see "GPU write corruption"
+  below).  Nobody has checked separately whether the occasional mirrored or
+  stretched copy of a buffer region had the same cause.
+* Square blocking shared with the Ultra (GMU bandwidth-vote timeouts).  Late
+  GMU `GX_BW_PERF_VOTE` answers were seen on 2026-11-07 while rpmhpd was
+  still held (one per 30-minute watch), as on earlier baseline boots and on
+  the Ultra; the write-check battery run with every provider released saw 0
+  GMU HFI timeouts.  Whether the late answers, or the blocking, persist with
+  rpmhpd synced has not been checked over normal use
+  (`grep -a GX_BW_PERF_VOTE /var/log/kern.log`).
 * Suspend is not released yet.  On the clean baseline kernel (2026-11-06)
   every pm_test level passed, and one real s2idle (43.6 s) and one real deep
   sleep (44.5 s) both resumed on the power key; the black panel with USB gone
   that experimental builds showed did not reproduce.  Until RTC-driven
-  repeat runs (about 20 cycles of each mode) back that up,
-  `ubuntu-gts9u-suspend-mode` keeps `samsung,gts9wifi` at mode `off`, which
-  makes logind refuse every suspend (power key, cover, idle, menus); the power
-  key locks and blanks instead, and the cover locks.  Test s2idle for one boot
-  with `echo s2idle > /run/ubuntu-gts9u/suspend-mode` and
-  `systemctl restart ubuntu-gts9u-suspend-mode`.
+  repeat runs (about 20 cycles of each mode, `scripts/diagnostics/suspend/`)
+  back that up, `ubuntu-gts9u-suspend-mode` keeps `samsung,gts9wifi` at mode
+  `off`, which makes logind refuse every suspend (power key, cover, idle,
+  menus); the power key locks and blanks instead, and the cover locks.  To
+  test s2idle for one boot, run `echo s2idle | sudo tee
+  /run/ubuntu-gts9u/suspend-mode` and then `sudo systemctl restart
+  ubuntu-gts9u-suspend-mode.service`.  A choice written to
+  `/etc/ubuntu-gts9u/suspend-mode` (`off`, `s2idle`, `deep` or `auto`;
+  `sudo mkdir -p /etc/ubuntu-gts9u` first) persists across boots, and
+  `/usr/libexec/ubuntu-gts9u-suspend-mode status` shows the mode in effect.
+  A masked `sleep.target` or `suspend.target` (the stopgap on the test unit)
+  overrides every mode: `sudo systemctl unmask sleep.target suspend.target`
+  first.  The 2026-11-06 sleeps ran with the interconnect still at its INT_MAX
+  vote, so they say nothing about DDR low power; real s2idle and deep after
+  the late interconnect release are not tested yet.  The X710 kernel now
+  builds in the PMIC RTC (`rtcwake`) and the SoC sleep statistics
+  (`/sys/kernel/debug/qcom_stats`, root), which those runs need to wake
+  unattended and to measure sleep depth.
 
-## GPU write corruption (2026-11-06): what is known
+## GPU write corruption: root cause and fix (2026-11-07)
+
+The cause is that rpmhpd never reached sync_state().  Until it does, rpmhpd
+clamps the active and sleep corners of every RPMh rail it has enabled to the
+maximum level, and while that clamp held, the GPU lost writes.  A control boot
+lost 168 of 296 battery frames, and a boot with rpmhpd held lost 197.
+Releasing only rpmhpd, with gpu_cc, gcc and every interconnect still held,
+lost 0 of 296; so did a boot where rpmhpd synced by itself (Stage 2).  Which
+rail matters (CX, GFX, MX or MXC) is unknown, and the fix does not need it.
+
+The fix is to let every rpmhpd consumer bind.  `CONFIG_SM_VIDEOCC_8550=y`
+binds the video clock controller at aaf0000, which was the blocker.  The X710
+DTS also gives `&gmu` `post-init-providers = <&gcc>, <&gpucc>` and disables
+`&crypto`.  At boot rpmhpd, gcc, gpu_cc, aggre2 and videocc now reach
+`state_synced`; gem_noc and mc_virt stay held until the late release (bwmon,
+above).
+
+To check, `cat /sys/bus/platform/devices/17a00000.rsc:power-controller/state_synced`
+must read 1 (`find /sys/devices/platform -name state_synced -exec grep -H . {} +`
+lists every provider).  Then copy `scripts/diagnostics/gpu-write-check/` to
+the tablet and run `FD_MESA_DEBUG=noubwc python3 late-write-check.py 24` there
+as the desktop user: expect 0 frames with lost pixels.  Set `FD_MESA_DEBUG`
+on that command line only: left in `~/.config/environment.d` or a
+gnome-shell drop-in, it made Chrome's ANGLE/Vulkan GPU process fail
+("Internal Vulkan error (-8)") on 2026-11-07.
+
+The Ultra has the same sync_state blockers but shows no loss; porting the fix
+there is queued.  The rest of this section is the 2026-11-06 record of what
+was ruled out first.
+
+### What was known on 2026-11-06
 
 Single bright or dark pixels on a fixed lattice after large redraws (dark/light
 toggle, WebGL) turned out not to be a display problem at all. A standalone test
@@ -167,8 +242,10 @@ X710 mainline ports (nacht20-de, ygecesefa, Azkali) use the same GPU setup and
 report no artifacts. Register dumps of both GPUs under load differ only in a
 performance-counter select.
 
-Open question: this unit versus the model. A second rev 5 SM-X710 decides it;
-copy the kit and run `late-write-check.py 24`. Specks stick on screen because
+The open question of that day, this unit versus the model, is answered: on
+this unit the loss follows rpmhpd's sync_state (0 of 296 frames lost with it
+synced, 168 to 197 with it held), so no second X710 is needed to decide it.
+The kit stays useful as a regression check. Specks stuck on screen because
 the panel runs in command mode and keeps its frame memory until the next
 commit; the compositor only re-renders damaged regions, so a lost pixel stays
 until something redraws it.

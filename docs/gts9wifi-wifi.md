@@ -52,9 +52,11 @@ channel enabled, and a scan still hears **only 2.4 GHz networks** (14 BSSIDs,
 zero on 5 GHz).  With Samsung's board data the same scan found 14 networks
 on 5 GHz; association on channel 48 at 80 MHz gives Wi-Fi 6 rates.  The
 board file describes the RF front end, so the tablet's own file is not
-optional.  `build-rootfs-overlay.sh` installs it by default and keeps the
-generic set selectable (`GTS9WIFI_ATH11K_BOARD=linux-firmware`) for
-comparisons.
+optional.  `build-rootfs-overlay.sh` installs it by default
+(`GTS9WIFI_ATH11K_BOARD=samsung`) and keeps the generic set selectable for
+comparisons with `GTS9WIFI_ATH11K_BOARD=linux-firmware`.
+`GTS9WIFI_ATH11K_REGDB=linux-firmware|samsung` (default `linux-firmware`)
+selects the regdb the same way.
 
 ## First probe and the L1 substates
 
@@ -169,9 +171,14 @@ backups and has a rollback.
 ## Known gaps
 
 * The address unit is X710-only (above).
-* Suspend is policy-off on this board for now; ath11k power-cycles the chip
-  across a suspend (about 1.5 s of the resume), but Wi-Fi across sleep with
-  the L1 substates on has only seen the boot-time pm_test cycle.
+* Suspend stays off by default on the X710 (`ubuntu-gts9u-suspend-mode`).
+  On 2026-11-06, on a kernel where Wi-Fi still came up through the rescan
+  (L1 substates off), one real s2idle (43.6 s) and one real deep sleep
+  (44.5 s) both resumed with Wi-Fi reconnecting.  ath11k power-cycles the
+  WCN6855 on every cycle and is the slowest resume step: `pci_pm_resume_early`
+  about 1.17 s, `pci_pm_resume` about 0.29 s, `pci_pm_suspend_late` about
+  0.19 s.  Wi-Fi across sleep with the L1 substates on has only seen the
+  boot-time pm_test cycle, and repeated suspend runs are still to do.
 * `regulatory.db` is not in the ramdisk, so the built-in cfg80211 still logs
   one `-2` for it at ~13 s; harmless, the phy is self-managed (US) and the
   rootfs copy from `wireless-regdb` serves every later lookup.

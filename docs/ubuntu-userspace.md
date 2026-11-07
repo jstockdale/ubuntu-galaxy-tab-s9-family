@@ -1,6 +1,8 @@
 # Building the Ubuntu 24.04 arm64 root filesystem
 
-Last revised: 2026-08-19.
+Last revised: 2026-11-07. It covers both tablets the build supports: the
+Galaxy Tab S9 Ultra (SM-X910, `DEVICE=gts9uwifi`, the default) and the
+Galaxy Tab S9 (SM-X710, `DEVICE=gts9wifi`).
 
 This document defines **how the Ubuntu userspace is built** and which decisions
 belong to Ubuntu. The boot chain is in [`boot-strategy.md`](boot-strategy.md);
@@ -15,8 +17,8 @@ with separate responsibilities:
 
 | Half | Source | What it produces |
 |---|---|---|
-| Kernel and boot | Sources imported from the pmOS port (`kernel/`) | `boot`, `init_boot`, `vendor_boot`, `dtbo`, ath12k modules |
-| Userspace | `mmdebstrap` over archive.ubuntu.com/ports | an ext4 root filesystem on the internal UFS |
+| Kernel and boot | `kernel/` (the Ultra's sources inherited from the pmOS port, the SM-X710's written here), selected by `DEVICE` | `boot`, `init_boot`, `vendor_boot`, `dtbo`, and the signed module set in `modules-root` |
+| Userspace | `mmdebstrap` over ports.ubuntu.com | an ext4 root filesystem on the internal UFS |
 
 Neither half may depend on the other having been assembled by hand on a live
 installation.
@@ -27,8 +29,8 @@ installation.
 image, for three concrete reasons:
 
 1. it accepts `--architecture=arm64` with `qemu-user-static` and needs no
-   native arm64 environment, which does not exist here: the build runs in WSL
-   x86-64;
+   native arm64 environment, which does not exist here: the build runs on an
+   x86-64 host (native Linux or WSL);
 2. it allows `--customize-hook` to inject configuration, local packages and
    overlays **inside** the same invocation, so the root filesystem is never
    modified "by hand" afterwards;
@@ -45,7 +47,10 @@ installation" pattern this project forbids.
 - Architecture: `arm64`.
 - Components: `main`, `restricted`, `universe`, `multiverse`.
 - Mirror: `http://ports.ubuntu.com/ubuntu-ports`.
-- Pockets enabled: `noble`, `noble-updates`, `noble-security`.
+- Pockets: the build bootstraps from `noble`, `noble-updates` and
+  `noble-security`; the installed system's apt sources also enable
+  `noble-backports`. `UBUNTU_SUITE` and `UBUNTU_MIRROR` override the suite and
+  the mirror.
 
 `ports.ubuntu.com` is mandatory: `archive.ubuntu.com` publishes no arm64.
 
@@ -56,39 +61,13 @@ SSH. The desktop is installed in the same root filesystem because milestone 3
 needs it and rebuilding is cheap, but the validation order remains console →
 network → desktop.
 
-Base and boot:
-
-```
-ubuntu-minimal, ubuntu-standard, systemd, systemd-sysv, udev,
-initramfs-tools, linux-firmware (generic only; the Samsung/Qualcomm blobs
-arrive through the ZIP's overlay), e2fsprogs, dosfstools, parted, gdisk,
-zstd, xz-utils
-```
-
-Network and access:
-
-```
-netplan.io, network-manager, wpasupplicant, openssh-server, avahi-daemon,
-iputils-ping, curl, ca-certificates
-```
-
-Desktop:
-
-```
-ubuntu-desktop-minimal, gdm3, gnome-shell, gnome-control-center,
-gnome-session, mutter, xdg-desktop-portal-gnome, gnome-snapshot,
-mesa-vulkan-drivers, mesa-utils, libgl1-mesa-dri, vulkan-tools,
-pipewire, pipewire-pulse, wireplumber, pipewire-audio-client-libraries,
-libspa-0.2-bluetooth, gstreamer1.0-gl, bluez, alsa-ucm-conf, alsa-utils,
-iio-sensor-proxy, upower, power-profiles-daemon
-```
-
-Diagnostics during bring-up:
-
-```
-gdb, strace, evtest, i2c-tools, v4l-utils, usbutils, pciutils, ethtool, tree,
-libdrm-tests, drm-info, edid-decode
-```
+The authoritative package set is `base_packages` and `desktop_packages` in
+`scripts/build-ubuntu-rootfs.sh`; it is not repeated here, because it keeps
+changing. `ubuntu-desktop-minimal`, GDM3, GNOME Shell, Mesa, PipeWire with
+WirePlumber, BlueZ, `iio-sensor-proxy` and the bring-up tools (`strace`,
+`evtest`, `i2c-tools`, `v4l-utils`, `usbutils`, `pciutils`, `ethtool`,
+`libdrm-tests`, `edid-decode`) are all in it. `linux-firmware` is not
+installed: every blob comes from the staged firmware overlay.
 
 `v4l-utils` is still the CAMSS diagnostic tool, but the normal path no longer
 ends at RAW10. `scripts/build-camera-packages.sh` pins and packages
@@ -107,7 +86,11 @@ pinned, signed `v4l2loopback` to create four capture nodes, and
 `v4l2-relayd-gts9u` feeds them on demand from the PipeWire sources. The desktop
 image includes GNOME Camera and `gstreamer1.0-gl`. A clean build therefore
 offers the four named cameras to browsers and V4L2 applications with no scenes
-and no per-user setup.
+and no per-user setup. That is the SM-X910: the camera table is per board
+(`ubuntu-gts9u-camera-profile`). The SM-X710 gets a node only for a sensor
+that is actually bound, and its two HI1337 cameras are off by default, opt-in
+through `/etc/ubuntu-gts9u/cameras`, and untested on hardware
+([`gts9wifi-cameras.md`](gts9wifi-cameras.md)).
 
 **OBS Studio is no longer shipped.** It travelled along as a camera
 verification tool, together with `obs-v4l2-gts9u`; with that work closed, both
@@ -164,8 +147,12 @@ What does **not** translate and has to be repackaged as `.deb`:
 ## Root filesystem structure
 
 Since v0.18 the root is **a single ext4 filesystem inside a partition** on the
-internal UFS, labelled `UBTS9U_UFS`. That partition is `linuxroot` when the
-disk has been split and `userdata` when it has not. The image the ZIP ships has
+internal UFS, labelled `$DEVICE_LABEL` from `scripts/lib/device.sh`:
+`UBTS9U_UFS` on the SM-X910, `UBTS9_UFS` on the SM-X710. `vendor_boot`'s
+`root=LABEL=` is set to the same label, so a kernel and a root built for
+different tablets refuse to mount instead of half-booting. That partition is
+`linuxroot` when the disk has been split (SM-X910 only) and `userdata` when it
+has not. The image the ZIP ships has
 no partition table: it is the filesystem alone, because it is written inside a
 partition that already exists.
 
@@ -239,6 +226,9 @@ Validated after an unattended reboot: both units active, the swapfile reused
 rather than recreated, and a test that reserves 11 GiB without a single OOM
 kill.
 
+Both sizes are fixed, the same on the SM-X710. With its 8 or 12 GB of RAM,
+8 GiB of zram is more than half of it there; that has not been revisited.
+
 ## Ubuntu's own initramfs
 
 **The postmarketOS initramfs is not reused.** Ubuntu generates its own with
@@ -246,7 +236,8 @@ kill.
 default:
 
 1. **Find the root without device numbers.** The root is given as
-   `root=LABEL=UBTS9U_UFS`, never `sda34` or `mmcblk1p2`. The enumeration order
+   `root=LABEL=UBTS9U_UFS` (`UBTS9_UFS` on the SM-X710), never `sda34` or
+   `mmcblk1p2`. The enumeration order
    of the UFS LUNs and of `sdhc_2` is not guaranteed, and the label is also
    what separates the internal installation from an old microSD.
 2. **Wait for the device to appear.** `rootwait` is already in `vendor_boot`'s
@@ -258,37 +249,49 @@ default:
    "invalid magic at start of compressed archive" even though the Android image
    is valid. `initramfs-tools` is configured with `COMPRESS=lz4` and the
    packager checks for the `02 21 4c 18` magic.
-4. **Fit in 8 MiB minus the AVB footer.** `MODULES=dep`, not `most`. Since this
-   port's critical providers are built in, the initramfs needs no large module
-   tree; if it still does not fit, the answer is to move modules to
-   `initramfs-extra` on the boot partition, not to cut needed drivers.
+4. **Fit in 8 MiB minus the AVB footer.** `MODULES=most`, never `dep`: `dep`
+   inspects the build host's root device and fails with "failed to determine
+   device for /". `make-initramfs.sh` enforces the 8388608 − 8192 byte
+   budget. Since this port's critical providers are built in, the initramfs
+   needs no large module tree; if it still does not fit, prune what it
+   carries (the device package's `zz-gts9u-prune` hook) rather than cut needed
+   drivers. There is no separate boot partition on the UFS install.
 
 The validation script checks all four against the generated image, flashing
 nothing.
 
 ## Firmware
 
-The repository contains no blobs. The `scripts/stage-stock-*.sh` helpers are
-adapted from the pmOS port, keeping its pinned hashes and changing only the
-destination, which in Ubuntu is the Debian hierarchy:
+The repository contains no blobs. `scripts/stage-firmware.py` stages them from
+the owner's stock Samsung package against a per-revision manifest in
+`configs/firmware/` and writes a verified directory plus `PROVENANCE.json`;
+the build reads it through `FIRMWARE_DIR` (see
+[`configs/firmware/README.md`](../configs/firmware/README.md)).
+`build-rootfs-overlay.sh` installs it into the Debian hierarchy:
 
 | Contents | Path in the Ubuntu root filesystem |
 |---|---|
 | Adreno 740 GPU (`a740_*`, `gmu_gen70200.bin`) | `/lib/firmware/qcom/` |
 | Samsung ADSP (`adsp*.mdt`, `adsp*.bNN`, `*.jsn`) | `/lib/firmware/qcom/sm8550/` |
-| AudioReach topology | `/lib/firmware/qcom/sm8550/Samsung-Galaxy-Tab-S9-Ultra-tplg.bin` |
-| WCN7850 Wi-Fi (official amss + QRD BDF in ELF) | `/lib/firmware/ath12k/WCN7850/hw2.0/` |
-| Bluetooth (`hmtbtfw20.tlv`, `hmtnv20.b21`) | `/lib/firmware/qca/` |
-| CS35L45 (protection, not loaded yet) | `/lib/firmware/` |
-| Sensors' HexagonFS tree | `/usr/share/qcom/sm8550/Samsung/gts9uwifi/` |
+| AudioReach topology | `/lib/firmware/qcom/sm8550/Samsung-Galaxy-Tab-S9-Ultra-tplg.bin` (SM-X910), `Samsung-Galaxy-Tab-S9-tplg.bin` (SM-X710) |
+| SM-X910 Wi-Fi, WCN7850 (official amss + QRD BDF in ELF) | `/lib/firmware/ath12k/WCN7850/hw2.0/` |
+| SM-X710 Wi-Fi, WCN6855/QCA6490 (linux-firmware amss and m3 for hw2.0, the IOE 04866.5 build for hw2.1, Samsung's board data by default; `GTS9WIFI_ATH11K_BOARD` and `GTS9WIFI_ATH11K_REGDB` switch it) | `/lib/firmware/ath11k/WCN6855/hw2.0/` and `hw2.1/` |
+| Bluetooth: `hmtbtfw20.tlv`, `hmtnv20.b21` (SM-X910); `hpbtfw21.tlv` and the `hpnv21[g].*` set (SM-X710) | `/lib/firmware/qca/` |
+| CS35L45 (protection, not loaded yet; only if staged by hand) | `/lib/firmware/` |
+| Keyboard cover MCU (`stm32_gts9family.bin`, both tablets) | `/lib/firmware/keyboard_stm/` |
+| Sensors' HexagonFS tree | `/usr/share/qcom/sm8550/Samsung/gts9uwifi/` (SM-X910), `.../Samsung/gts9wifi/` (SM-X710) |
 
 In Ubuntu `/lib` is a symlink to `/usr/lib`, as it is in the postmarketOS
 initramfs. This is the same trap that broke v0.69 of that port: the overlay
 must be written into `/usr/lib/firmware/...`, never creating a `/lib` directory
 over the symlink.
 
-`hmtbtfw20.tlv` and `hmtnv20.b21` must **also** go in `vendor_boot`'s vendor
-fragment, because `hci_qca` is built in and probes before the root is mounted.
+Every Bluetooth file of the board (`DEVICE_BT_FW` in `scripts/lib/device.sh`)
+must **also** go in `vendor_boot`'s vendor fragment, because `hci_qca` is built
+in and probes before the root is mounted. On the SM-X710 the five WCN6855
+hw2.1 files go there too, for the same reason: ath11k is built in and probes
+at about 11.7 s, before the root is mounted
+([`gts9wifi-wifi.md`](gts9wifi-wifi.md)).
 
 ## User, locale and input
 
@@ -308,7 +311,9 @@ fragment, because `hci_qca` is built in and probes before the root is mounted.
 
   One consequence worth knowing when reaching a tablet over SSH: the account's
   name and password are whatever was typed in that wizard, and they change with
-  every reinstall. The host keys do not — they travel inside the image.
+  every reinstall. So do the host keys: `build-release.sh` removes the build's
+  keys and the tablet generates its own on first boot
+  (`ubuntu-gts9u-ssh-host-keys.service`).
 - Nothing in the port may name a specific user any more. The flashlight
   extension is enabled through a gschema override, and
   `ubuntu-gts9u-desktop-user` resolves the ordinary account on every boot,
@@ -319,32 +324,197 @@ fragment, because `hci_qca` is built in and probes before the root is mounted.
 - A hostname different from postmarketOS's, so two systems on the same LAN
   cannot be confused.
 - 200 % scaling by default: 2960×1848 on 14.6" is unusable at 100 %.
-- SSH enabled with a key; the user's password stays out of the repository.
+- SSH is enabled, with password authentication on and root login off. A key
+  is added only when a development build sets `GTS9U_AUTHORIZED_KEYS=<file>`:
+  it goes into `/etc/skel/.ssh`, so the wizard's account inherits it (or into
+  the `GTS9U_USER` home when `GTS9U_PW` is set). No password lives in the
+  repository. `build-release.sh` refuses a root with either, through
+  `sanitize-release-rootfs.py`.
 
 ## Build pipeline
 
-Everything runs as root inside `wsl.exe -d Ubuntu-24.04`, based in
-`/root/ubuntu-gts9u`. No script accepts a block device or writes to a
-partition.
+Any x86-64 Linux host works, native or WSL: the author builds inside
+`wsl.exe -d Ubuntu-24.04`, and the SM-X710 was built natively. Everything is
+based in `UBUNTU_WORKDIR` (default `/root/ubuntu-gts9u`), which must be a path
+without spaces. No script accepts a block device or writes to a partition.
+
+### Prerequisites
+
+- **The repository with its full history:** `git clone
+  https://github.com/agcarbajo/ubuntu-galaxy-tab-s9-ultra.git`, not
+  `--depth 1` and not a ZIP download. SM-X910 builds read pinned files (the
+  ABL-facing DTS, the panel driver) out of commit `5046f92f`.
+- **Host tools.** `sudo bash scripts/install-build-deps.sh` installs the
+  rootfs, image and packaging tools only. The kernel and the firmware staging
+  need more:
+
+  ```sh
+  sudo apt install clang lld llvm make bc flex bison libssl-dev libelf-dev \
+      dwarves git kmod openssl patch mtools erofs-utils file gcc libjson-c-dev \
+      android-sdk-libsparse-utils
+  ```
+
+  Linux 7.2 needs Clang 17 or newer; `/usr/lib/llvm-22` is used when it is
+  installed. Without `dwarves` (pahole) `olddefconfig` silently drops
+  `CONFIG_DEBUG_INFO_BTF`, which the released kernels have.
+  `scripts/check-build-deps.sh` checks only what `install-build-deps.sh`
+  installs, and it always exits 0: read its output.
+- **The Android boot tools.** `scripts/stage-android-tools.sh` copies them
+  from a postmarketOS chroot (`PMOS_ROOTFS_CHROOT`) and fails without one.
+  Otherwise copy `mkbootimg.py` **with its `gki/` directory** from
+  https://android.googlesource.com/platform/system/tools/mkbootimg, and
+  `avbtool.py` from https://android.googlesource.com/platform/external/avb,
+  into `$UBUNTU_WORKDIR/tools`, or point `ANDROID_TOOLS` at them. The bundle
+  uses only those two.
+- **The staged firmware** for the tablet's model and bootloader revision:
+  [`configs/firmware/README.md`](../configs/firmware/README.md).
+- **Network access** throughout: kernel.org, GitHub (raw.githubusercontent.com
+  too), gitlab.freedesktop.org, git.libcamera.org, git.launchpad.net,
+  codeberg.org and the Ubuntu archives.
+- **Disk:** the kernel worktree and object tree (`KERNEL_WORKTREE` and
+  `KERNEL_BUILD_DIR` can put them on another disk), `$UBUNTU_WORKDIR/buildroot`
+  (the arm64 chroot the package builders use), a ~4 GiB rootfs tree, the UFS
+  image (4.0 GiB for the SM-X710 v1.2.0, capped by `UFS_IMAGE_MAX_MB`) and a
+  ~1.1 GB ZIP.
+
+### Who needs root
+
+`stage-firmware.py`, `fetch-mainline.sh`, `stage-android-tools.sh` and
+`build-mainline-kernel.sh` run unprivileged: build the kernel as your own
+user. `build-release.sh` needs root for the rest (mmdebstrap and the package
+builders' chroots, loop and bind mounts, `chown root:root` in the package
+builders). `sudo` resets the environment, and every variable then falls back
+to the Ultra and `/root` defaults: `DEVICE` becomes `gts9uwifi`,
+`UBUNTU_WORKDIR` becomes `/root/ubuntu-gts9u`, `FIRMWARE_DIR` points at a path
+that does not exist, and without `SKIP_KERNEL=1` the kernel is rebuilt as root.
+So `export DEVICE=gts9wifi; sudo bash scripts/build-release.sh` builds the
+Ultra. Pass every variable on the sudo command line with `sudo env`.
+
+### Building a release
+
+```sh
+export W=$HOME/ubuntu-gts9u              # UBUNTU_WORKDIR, no spaces
+UBUNTU_WORKDIR=$W bash scripts/fetch-mainline.sh
+UBUNTU_WORKDIR=$W bash scripts/stage-android-tools.sh   # or stage them by hand, above
+# firmware into $W/firmware/x710-bl5: configs/firmware/README.md
+
+# kernel: unprivileged; KERNEL_CLEAN=1 for anything you publish
+UBUNTU_WORKDIR=$W DEVICE=gts9wifi KERNEL_CLEAN=1 bash scripts/build-mainline-kernel.sh
+
+# everything else as root, every variable passed explicitly
+sudo env UBUNTU_WORKDIR=$W DEVICE=gts9wifi FIRMWARE_DIR=$W/firmware/x710-bl5 \
+    SKIP_KERNEL=1 GTS9U_INCLUDE_NPU=0 bash scripts/build-release.sh
+```
+
+For the SM-X910 use `DEVICE=gts9uwifi` (the default) and
+`FIRMWARE_DIR=$W/firmware/x910-bl<rev>`. Keep `GTS9U_INCLUDE_NPU=0` unless the
+NPU inputs are staged in `$W/npu-release-inputs` and `$W/npu-release-firmware`;
+they exist only for the SM-X910. If the kernel was built with
+`KERNEL_WORKTREE=` and `KERNEL_BUILD_DIR=` (on another disk, for example), pass
+the same two values to `build-release.sh` and keep that disk mounted: the
+rootfs stage builds the SPSS IRQ module, the device package and the NPU
+package against that object tree, and checks its signing certificate and
+`.config`.
+
+The result is `artifacts/ubuntu-24.04-<sm-x910|sm-x710>-bl<rev>-v<version>.zip`
+in the repository (`ARTIFACTS_DIR`), with
+`MANIFEST-<sm-x910|sm-x710>-bl<rev>-v<version>.txt`
+beside it; without a firmware staging both names lose `-bl<rev>`. The
+version comes from `VERSION` unless `RELEASE_VERSION` is set. Flashing it is
+in [`boot-strategy.md`](boot-strategy.md#exact-installation-procedure).
+
+Things that bite:
+
+- **`KERNEL_CLEAN=1`.** `build-release.sh` does not set it; pass it to the
+  kernel run, standalone as above or through `build-release.sh` without
+  `SKIP_KERNEL`. It also recreates `KERNEL_WORKTREE` from the pinned HEAD and
+  mints a new signing key, so the modules and `boot.img` of that run are one
+  set and must ship together.
+- **Output paths.** With `build-release.sh`, leave `KERNEL_OUT_DIR`,
+  `BUNDLE_OUT_DIR`, `OVERLAY_OUT_DIR` and `INITRAMFS_OVERLAY_OUT_DIR` unset:
+  it reads and zips the default `$UBUNTU_WORKDIR/out` paths, so an override
+  ships a stale or missing bundle.
+- **Both tablets from one `UBUNTU_WORKDIR`.** Only the kernel paths are
+  per device. Set `ROOTFS_DIR=$W/rootfs-$DEVICE` (it has to be inside
+  `UBUNTU_WORKDIR`) and a separate `ARTIFACTS_DIR` per device: the manifest's
+  name carries no model and its header says SM-X910 for every build, so two
+  builds at the same revision and version overwrite each other's manifest.
+  Use `SKIP_ROOTFS=1` only when that rootfs was built for the same `DEVICE`
+  and kernel: it is reused as it is and only stamped with the current
+  `DEVICE`.
+- **Development switches.** `build-release.sh` passes the root through
+  `sanitize-release-rootfs.py`, which refuses an account, a password or an
+  SSH key in it, so `GTS9U_PW` and `GTS9U_AUTHORIZED_KEYS` cannot produce a
+  release.
+
+### Environment
+
+| Variable | Default | Use |
+|---|---|---|
+| `DEVICE` | `gts9uwifi` | `gts9uwifi` (SM-X910) or `gts9wifi` (SM-X710); unset keeps the SM-X910 build byte for byte |
+| `UBUNTU_WORKDIR` | `/root/ubuntu-gts9u` | the build base |
+| `FIRMWARE_DIR` | the author's old Windows path | the `stage-firmware.py` staging; required |
+| `SKIP_KERNEL`, `SKIP_ROOTFS` | `0` | `1` reuses `out/kernel-$DEVICE` or the rootfs |
+| `KERNEL_CLEAN` | `0` | `1` builds the kernel from scratch; required for anything published |
+| `KERNEL_SRC`, `KERNEL_WORKTREE`, `KERNEL_BUILD_DIR` | `$W/linux-mainline`, `$W/build/linux-src-$DEVICE`, `$W/build/linux-$DEVICE` | pinned checkout, disposable worktree, object tree |
+| `GTS9U_INCLUDE_NPU` | `1` | `0` unless the NPU inputs are staged; always `0` on the SM-X710 |
+| `ROOTFS_DIR` | `$W/rootfs` | inside `UBUNTU_WORKDIR` |
+| `ARTIFACTS_DIR` | `artifacts/` in the repository | where the ZIP and manifest go |
+| `RELEASE_VERSION` | `VERSION` | the release version |
+| `GTS9U_PROFILE` | `desktop` | or `minimal` |
+| `UFS_IMAGE_MAX_MB`, `ROOT_SLACK_MB` | `8192`, `1152` | image budget and slack, below |
+| `GTS9U_FINGERPRINT_FIRMWARE_DIR` | unset | SM-X910 only: opt in to the proprietary fingerprint TA |
+
+Development only, never in a release: `GTS9U_PW` and `GTS9U_AUTHORIZED_KEYS`
+(see above); `GTS9U_USB_GADGET=1` (an NCM network at 10.42.0.2 and an ACM
+console on the Type-C port) and `GTS9U_BRINGUP_SDLOG=1` (kernel logs written
+to the microSD card on every boot); `GTS9U_EXTRA_CMDLINE` and
+`GTS9U_DROP_CMDLINE` (`vendor_boot` only); `GTS9WIFI_ATH11K_BOARD` and
+`GTS9WIFI_ATH11K_REGDB` (SM-X710 Wi-Fi data experiments);
+`BUILD_WIFI_MODULES=0` (ships no modules at all); `ENABLE_RUNTIME_DTBO=1`
+(does not boot).
+
+### The stages
 
 | Step | Script | Produces |
 |---|---|---|
-| 0 | `install-build-deps.sh` / `check-build-deps.sh` | a checked build environment |
-| 0 | `fetch-mainline.sh` | checkout pinned at `a13c140c` (7.2-rc3) |
-| 0 | `stage-android-tools.sh` | `mkbootimg`, `mkdtboimg`, `avbtool` |
-| 0 | `import-kernel-sources.sh` | reimports DTS, drivers and patches with a source hash |
-| 1 | `build-mainline-kernel.sh` | `Image.gz`, DTB, config, and the ath12k plus signed `v4l2loopback` modules |
-| 1b | `build-camera-packages.sh` | `libcamera-gts9u` and the libcamera SPA for PipeWire |
-| 1c | `build-extra-packages.sh` | Fastfetch and the V4L2 relay |
-| 2 | `build-ubuntu-rootfs.sh` | the Ubuntu arm64 root filesystem, with `mmdebstrap` |
-| 3 | `build-rootfs-overlay.sh` | the module and firmware overlay |
-| 4 | `build-ufs-image.sh` | Ubuntu's initramfs and the root's ext4 image, with no partition table |
-| 5 | `build-android-v4-bundle.sh` | `boot`, `init_boot`, `vendor_boot`, `dtbo`, `vbmeta` |
-| 6 | `make-twrp-zip.py` | a deterministic TWRP ZIP with the root inside |
-| 7 | `validate-bundle.sh` | static validation, flashing nothing |
+| 0 | `install-build-deps.sh` (root) / `check-build-deps.sh` | the rootfs, image and packaging host tools; the kernel and staging tools are above |
+| 0 | `fetch-mainline.sh` | `$W/linux-mainline`, pinned at `a13c140c` (7.2-rc3) |
+| 0 | `stage-android-tools.sh` | `mkbootimg.py` with `gki/`, `mkdtboimg.py` and `avbtool.py` in `$W/tools` |
+| 0 | `stage-firmware.py stage` | the verified `FIRMWARE_DIR` and its `PROVENANCE.json` |
+| 1 | `build-mainline-kernel.sh` (no root) | in `$W/out/kernel-$DEVICE`: `Image.gz`, `sm8550-samsung-$DEVICE.dtb`, `config`, `kernel.release`, `SHA256SUMS`, `fingerprint.layers`, and `modules-root/` (about 60 signed modules: ath12k, qcomtee, snvm, the SPSS stack, netfilter, `v4l2loopback`, and `icc-bwmon` on the SM-X710) |
+| 2 | `build-ubuntu-rootfs.sh` (root) | builds or reuses every local `.deb` (companion, device, libfprint, gnome-settings-daemon, fingerprint owner, SPSS IRQ module, NPU, fprintd, sensors, camera, extras, PipeWire AAC) into `$W/out/packages`, then runs `mmdebstrap` into the rootfs |
+| 2 | `sanitize-release-rootfs.py` | refuses personal data in the rootfs and removes the build's SSH host keys |
+| 3 | `build-rootfs-overlay.sh` | the module and firmware overlay `$W/out/rootfs-overlay`, and `$W/out/initramfs-overlay` for the `vendor_boot` fragment |
+| 4 | `build-ufs-image.sh` (root) | Ubuntu's initramfs and the root's ext4 image `$W/out/ubuntu-$DEVICE[-bl<rev>]-v<version>-ufs.img`, with no partition table |
+| 5 | `build-android-v4-bundle.sh` | `boot`, `init_boot`, `vendor_boot`, `dtbo`, `vbmeta` in `$W/out/bundle` |
+| 6 | `build-update-payload.py` + `make-twrp-zip.py` | the update payload, and a deterministic TWRP ZIP with the root inside |
+| 7 | `validate-bundle.sh` + `validate-update-zip.py` | static validation, flashing nothing |
 | — | `make-initramfs.sh` | a checked legacy-LZ4 initramfs; both image builders use it |
-| — | `build-sd-image.sh` | the two-partition microSD image, how installing worked up to v0.17 |
-| — | `build-release.sh` | chains 1–7 and writes the manifest |
+| — | `build-sd-image.sh` | the two-partition microSD image, how installing worked up to v0.17; legacy, kept for reference: a current bundle boots `root=LABEL=UBTS9U_UFS` or `UBTS9_UFS`, so an SD image built today does not boot without a matching cmdline |
+| — | `build-release.sh` (root) | chains 1–7 and writes the manifest |
+
+`import-kernel-sources.sh` is not a build step. It re-imports from the frozen
+postmarketOS v1.71 port and overwrites the versioned `kernel/` and `configs/`
+sources; a builder never runs it, because it would discard this repository's
+own changes, the SM-X710 support included.
+
+To re-check a ZIP outside `build-release.sh`, run `DEVICE=<board>
+UBUNTU_WORKDIR=$W bash scripts/validate-bundle.sh <zip>` and `DEVICE=<board>
+python3 scripts/validate-update-zip.py <zip>` with the `DEVICE` the ZIP was
+built for; without it both judge the ZIP as an SM-X910 one.
+`validate-bundle.sh` also reads `$W/out/bundle` and the kernel outputs.
+
+To rebuild a package on its own: `build-device-package.sh` and
+`build-companion-package.sh` call `chown root:root`, so run them as root or
+under `fakeroot`, with `UBUNTU_WORKDIR` set; the `.deb`s land in
+`$UBUNTU_WORKDIR/out/packages` (`DEB_OUT_DIR`). The device package also
+needs the board's `DEVICE` (without `DEVICE=gts9wifi` the SM-X710 gets the
+Ultra's sensor-registry path and camera labels, and rotation and the light
+sensor fail), the outputs of `build-fingerprint-secure-owner.sh` and
+`build-spss-irq-module.sh` (one full release run leaves both behind), and the
+same `KERNEL_BUILD_DIR` and `KERNEL_OUT_DIR` as the kernel build, or it
+refuses on a signing-key or `.config` mismatch.
 
 `make-initramfs.sh` fails the build if the initramfs is not legacy LZ4 or does
 not fit in `init_boot`. Those two errors are found here rather than on the
@@ -352,10 +522,11 @@ tablet, and they live in one place so the UFS image and the microSD one cannot
 diverge on exactly that.
 
 `build-ufs-image.sh` produces the filesystem alone: no GPT, with `/boot`
-inside, with the firmware overlay already integrated, labelled `UBTS9U_UFS`,
-and reserving enough descriptor blocks (`-E resize=`) for the first boot to
-grow online to 1 TiB. It refuses to write to a block device and aborts if the
-image exceeds its size budget, because it travels whole inside the ZIP.
+inside, with the firmware overlay already integrated, labelled
+`$DEVICE_LABEL` (`UBTS9U_UFS` or `UBTS9_UFS`), and reserving enough descriptor
+blocks (`-E resize=`) for the first boot to grow online to 1 TiB. It refuses
+to write to a block device and aborts if the image exceeds its size budget,
+because it travels whole inside the ZIP.
 
 Two numbers in that script are deliberate and connected:
 
@@ -364,8 +535,10 @@ Two numbers in that script are deliberate and connected:
   root grows into would be tens of gigabytes the owner never gets back.
 - **The slack, and the budget it needs.** The installer seeds two boot sets of
   216 MiB each into this filesystem before it grows, so it must have room for
-  both. The budget was raised from 4096 to 4608 MiB deliberately for that; empty
-  space costs almost nothing in the ZIP, where 256 MiB of slack measured 784 KB.
+  both. The budget (`UFS_IMAGE_MAX_MB`) is now 8192 MiB: first raised from
+  4096 for those two boot sets, then again for the NPU runtime. The slack is
+  `ROOT_SLACK_MB`, 1152 MiB by default; empty space costs almost nothing in
+  the ZIP, where 256 MiB of slack measured 784 KB.
 
 ## Validation order
 

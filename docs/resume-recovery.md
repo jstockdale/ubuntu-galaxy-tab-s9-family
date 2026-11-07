@@ -1,9 +1,20 @@
 # Resume failure and recovery, 2026-09-09
 
+> **Status, 2026-11-07: superseded.** This is the SM-X910 record of
+> 2026-09-09. The UFS fixes are in the default kernel: the baseline SERDES
+> patch, and since the kernel #11 validation the PCS-reset change described
+> below (see [NPU status](npu-status.md)). The sleep-disable file described
+> below was removed after the kernel #10 normal-root cycles
+> ([RAM-root diagnostic](ramroot-diagnostic.md)). If an old test tablet still
+> has `/etc/systemd/sleep.conf.d/90-gts9u-ufs-recovery.conf`, delete it to
+> re-enable suspend. The SM-X710 gets the SERDES change but not the PCS-reset
+> assertion (see [SM-X710](#sm-x710-gts9wifi) at the end).
+
 Automatic brightness was validated by changing the room lighting, and the
 owner confirmed that it still worked after a power-button suspend. That
 cycle nevertheless exposed an intermittent **storage resume failure**.
-Deep suspend must not be described as reliable on this build.
+Deep suspend must not be described as reliable on that build (build 8,
+`7.2.0-rc3-dirty #8`); later kernels carry the board UFS fixes.
 
 ## Captured failure
 
@@ -20,8 +31,10 @@ The running kernel was `7.2.0-rc3-dirty`, build 8. Kernel timestamps:
 | 1072.956 | Wi-Fi reassociates |
 
 SSH returned, but root was `rw,noatime,emergency_ro`; uncached reads and
-writes failed. The root filesystem is internal UFS `/dev/sda35`, partition
-label `linuxroot`, ext4 label `UBTS9U_UFS`, not the microSD. Memory pressure
+writes failed. On this split test SM-X910 the root filesystem is internal UFS
+`/dev/sda35`, partition label `linuxroot`, ext4 label `UBTS9U_UFS`, not the
+microSD. A whole-tablet install has its root in `userdata`; the SM-X710
+always does, with ext4 label `UBTS9_UFS`. Memory pressure
 was not the cause. The owner also reports occasional black-screen resumes
 after idle or lid closure while charger sounds still work. That symptom
 has not yet been proven to share the same cause.
@@ -36,6 +49,32 @@ orphan inodes; full preen corrected free-space counters. A final read-only
 five-pass check reported no remaining consistency errors. No Android
 userdata or partition-table changes were made.
 
+The same procedure, for any install (it is also what a TWRP update ZIP means
+by "Run e2fsck manually from TWRP before flashing again"). From the PC, with
+the tablet in TWRP, run `adb shell` and then:
+
+```sh
+P=/dev/block/by-name/linuxroot     # split SM-X910
+P=/dev/block/by-name/userdata      # whole-tablet install (every SM-X710)
+blkid "$P"                         # LABEL="UBTS9U_UFS" (X910) or "UBTS9_UFS" (X710)
+grep "$(readlink -f "$P")" /proc/mounts   # must print nothing
+e2fsck -n "$P"                     # read-only first look
+dd if="$P" of=/tmp/root-head.img bs=1M count=2
+# on the PC, in a second terminal: adb pull /tmp/root-head.img
+e2fsck -p -E journal_only "$P"     # replay the journal
+e2fsck -fp "$P"                    # full preen
+e2fsck -fn "$P"                    # read-only re-check: must be clean
+```
+
+Set only the `P=` line that matches the install. TWRP mounts `userdata` as
+Internal Storage, so on a whole-tablet install the `grep` usually lists
+`/data` (and `/sdcard`): unmount each listed mount point (`umount /sdcard`,
+`umount /data`) before going on. Pull the 2 MiB backup to the PC before the
+first writing step; TWRP's `/tmp` does not survive a reboot. If
+`e2fsck -fp` reports an unexpected inconsistency and asks for a manual run,
+run `e2fsck -f "$P"` and answer its questions, then repeat the final
+read-only check.
+
 The original Ubuntu boot set remains installed, including boot SHA-256
 `a48a7d1b81e27641683fc930b5f9c712990e3748121b09b1cc82bd33e5d9ac8f`.
 After reboot, root was writable, a 4 MiB fsync/readback check passed,
@@ -43,7 +82,8 @@ Wi-Fi connected, HTTPS returned 204 with successful TLS verification,
 and libssc again delivered light samples. Sensor packages remain
 `libssc 0.4.4-gts9u3` and `iio-sensor-proxy 3.9-gts9u3`.
 
-The test tablet has a **temporary local** file
+The test tablet then had a **temporary local** file (since removed; see the
+status note at the top)
 `/etc/systemd/sleep.conf.d/90-gts9u-ufs-recovery.conf` setting all four
 `AllowSuspend`, `AllowHibernation`, `AllowSuspendThenHibernate`, and
 `AllowHybridSleep` options to `no`. Logind reports `CanSuspend=no`.
@@ -117,18 +157,24 @@ that write before table programming. No PHY tables, polling timeouts, UFS
 power levels, device tree, wake sources or other drivers are changed.
 The missing assertion is a hypothesis, **not proof of the failure's cause**.
 
-The build recipe enables this only with `UFS_PCS_RESET_EXPERIMENTAL=1`.
-Default builds do not gain an unvalidated storage change. Reusing a tree
-containing the candidate without opting in fails instead of silently keeping
-it. For an already prepared kernel tree, stage it with:
+When this was written the build recipe enabled it only with
+`UFS_PCS_RESET_EXPERIMENTAL=1`. Since the kernel #11 validation it is on by
+default: `build-mainline-kernel.sh` applies the baseline
+`qmp-ufs-reset-serdes-before-power-down-gts9u.patch` and then stages this
+change on every build. Set `UFS_PCS_RESET_EXPERIMENTAL=0` with a fresh
+`KERNEL_WORKTREE` to build without it; a tree that already contains it is
+refused when the variable is 0. Running the stage script by hand is needed
+only for a tree prepared outside `build-mainline-kernel.sh`, and that tree
+must already carry the baseline SERDES patch:
 
 ```sh
-UFS_PCS_RESET_EXPERIMENTAL=1 bash scripts/stage-ufs-resume-experiment.sh /path/to/kernel-tree
+bash scripts/stage-ufs-resume-experiment.sh /path/to/kernel-tree
 ```
 
 `scripts/test-ufs-resume-experiment.py PRISTINE_QMP_UFS_C` applies both patches
-with zero fuzz, checks default/no-op and repeated staging, rejects a stale
-experimental tree, and compiles the actual calibration function with mocked
+with zero fuzz, checks that `UFS_PCS_RESET_EXPERIMENTAL=0` is a no-op, that the
+default applies the change idempotently, and that 0 or invalid values are
+rejected on a tree already carrying it, and compiles the actual calibration function with mocked
 MMIO. It checks reset-before-tables ordering, platform isolation, repeated
 calibration and error propagation. These tests passed against the pinned
 `a13c140cc289c0b7b3770bce5b3ad42ab35074aa` source; they cannot validate physical
@@ -142,7 +188,8 @@ the owner's currently inserted WINPE microSD or use it as a disposable root.
 Before enabling normal suspend, validate repeated real deep cycles and UFS
 reads, then normal-root filesystem writes and existing hardware functions
 under supervision. A platform PM test alone is insufficient. The local sleep
-safeguard remains in place and no reboot is implied by staging or building.
+safeguard remained in place then (it has since been removed) and no reboot
+is implied by staging or building.
 
 ### Build-only result on PC-ARTURO
 
@@ -182,3 +229,28 @@ normal desktop validation. See [RAM-root results](ramroot-diagnostic.md);
 long-duration and lid/idle acceptance remain pending. See
 [GPU recovery](gpu-recovery.md) for the traces, tests, hashes, preserved #9
 backup and remaining requirements for a combined physical test session.
+
+## SM-X710 (gts9wifi)
+
+The baseline SERDES patch has no board check: it applies to every SM8550 UFS
+PHY, so SM-X710 kernels carry it. The PCS-reset assertion is gated on
+`samsung,gts9uwifi` (the `of_machine_is_compatible()` check in
+`qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch`), so SM-X710
+kernels do not get it.
+
+That is deliberate for now. A widened gate (`samsung,gts9wifi` as well) was
+in X710 build 5, which hung before userspace, and was reverted in build 6 as
+a precaution. It matches stock: Samsung's own X710 kernel asserts
+`UFS_PHY_SW_RESET` before its calibration tables, the X710 uses the same
+`sm8550_ufsphy_cfg`, and its early bring-up recorded a resume `PCS_READY`
+timeout (-110). Both the boot-time panel cycle and a real s2idle power the
+UFS PHY down and recalibrate it. Widen the gate only if UFS resume errors
+appear once X710 suspend is enabled, in a build that changes nothing else,
+with the previous boot and vendor_boot images ready to restore from TWRP.
+After boot and after every sleep, `findmnt -no OPTIONS /` must show `rw` and
+`journalctl -k -b | grep -iE 'phy initialization timed-out|ufshcd.*(error|fail)'`
+must print nothing.
+
+X710 suspend has so far passed one real deep and one real s2idle cycle
+(2026-11-06, baseline kernel) and stays off by default; see the
+[display notes](gts9wifi-display.md) and `scripts/diagnostics/suspend/`.

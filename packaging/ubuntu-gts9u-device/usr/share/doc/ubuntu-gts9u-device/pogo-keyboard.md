@@ -55,18 +55,49 @@ by root and the `input` group alone.
 ## EF-DX920 firmware background
 
 The Book Cover Keyboard Slim talks to an STM32G0 that lives **in the tablet**,
-on I2C6 at address `0x2a`, not in the cover.  That controller runs one of two
-applications, and only one of them works here:
+on its own I2C bus (QUP SE15, `&i2c15` in both board DTS files; Linux assigns
+the adapter number at boot, and early images showed `6-002a`) at address
+`0x2a`, not in the cover.  That controller runs one of two applications, and
+only one of them works here:
 
 | Version | Under Ubuntu | Under One UI |
 |---|---|---|
-| **V37** (Samsung's X910 blob) | works | works |
+| **V37** (Samsung's `stm32_gts9family.bin`, byte-identical in the X910 and X710 stock firmware) | works | works |
 | V34 (older application) | announces no protocol ID; cover is dead | works |
 
 The mainline driver reproduces Samsung's V37 start-up sequence.  V34 speaks a
 different one: the controller boots fine, pulses the connection line every
 ~2.1 s and never sends `0xd6`.  That is the whole failure, and it looks exactly
 like a wiring or timing problem, which is why it cost several sessions.
+
+## SM-X710 (Galaxy Tab S9)
+
+On the SM-X710 the driver follows Samsung's X710 table: `0xfd` EF-DX715,
+`0x02` EF-DX710, `0xd1` EF-DX725, `0x03` EF-DX720 and `0x51` Neos.  Any other
+protocol id gets no input device, as on the stock kernel.  The EF-DX715 and
+EF-DX725 touchpads use 1560x820.
+
+The cover's hall states go out on a separate switch-only input device,
+`Samsung Book Cover Switch`, and the keyboard device carries keys only:
+
+| Posture | `SW_LID` | `SW_TABLET_MODE` | GNOME |
+|---|---|---|---|
+| typing | 0 | 0 | laptop mode, no rotation |
+| closed over the screen | 1 | 0 | lid closed (locks while suspend is off) |
+| folded behind the tablet | 0 | 1 | touch mode: on-screen keyboard, rotation |
+| detached | 0 | 1 | touch mode |
+
+Tab Companion never grabs the switch device, so logind, UPower and mutter
+read it directly.  The keyboard's data-ready line is wake-capable but
+disabled by default; `echo enabled | sudo tee
+/sys/bus/i2c/drivers/samsung-gts9u-stm32-pogo/*-002a/power/wakeup` lets the
+keys wake the tablet from suspend.
+
+Tested on 2026-11-07 with an EF-DX720: it enumerates as a keyboard (keys
+only), the switch device appears, and detaching the cover gives touch mode
+and rotation.  Not yet confirmed: the folded-back and closed-over-screen
+postures with this cover, and its special-key codes, which are still the
+EF-DX920 values (record them with "Save keyboard cover logs").
 
 ## Checking
 
@@ -93,8 +124,11 @@ The cover used to be required, on the assumption that the controller shared the
 accessory's power rail.  Measured with the cover detached and `pogo_vddo`
 disabled, the ROM bootloader still answered with its product id and flash
 version: the rail that gets cut feeds the keyboard, while the controller sits on
-the tablet's own I2C6.  So a controller found on V34 is repaired on the first
-boot after an install whether or not the cover is anywhere near the tablet.
+the tablet's own I2C bus (QUP SE15).  So a controller found on V34 is repaired
+on the first boot after an install whether or not the cover is anywhere near
+the tablet.  The service has no board condition, so it runs on the SM-X710 as
+well.  Since device package 2.56 it runs after the cold-boot panel cycle, so
+a needed flash (about 15 s) no longer keeps the panel dark.
 
 The only remaining condition is 15 % battery, and that is not protecting the
 flash: the STM32 ROM bootloader cannot be erased, it answers on every boot, and
@@ -119,4 +153,7 @@ sudo systemctl mask ubuntu-gts9u-pogo-firmware.service
 Nothing in this port ships a V34 image, so the downgrade does not come from
 here.  The likely source is Samsung's own `stm32_pogo_v3` driver with its
 vendor blobs, under One UI or under the Ubuntu Touch port.  If the cover stops
-working after booting one of those, check `flash_version` first.
+working after booting one of those, check `flash_version` first.  On the
+SM-X710 test unit the controller is found on V34 again on the first boot after
+every TWRP session, so the Samsung kernel that TWRP runs appears to do it
+there; the restore service puts V37 back on that boot.

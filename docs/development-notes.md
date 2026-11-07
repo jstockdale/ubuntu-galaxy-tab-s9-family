@@ -40,14 +40,22 @@ does not intrude into it.
 - **mmdebstrap, not a manual installation.** Every definitive change lives in
   the repository as configuration, a package, a driver, a patch or a script.
   Fixes applied only to the live installation are not accepted.
-- **New partition labels** (`UBTS9U_BOOT`/`UBTS9U_ROOT`) so that a postmarketOS
-  initramfs and an Ubuntu one do not compete for the same card.
+- **Own root labels**: `UBTS9U_UFS` (SM-X910) and `UBTS9_UFS` (SM-X710) on
+  the internal UFS, scoped per board so a mismatched kernel and root fail at
+  mount. `UBTS9U_BOOT`/`UBTS9U_ROOT` were the microSD pair up to v0.17, kept
+  distinct from `pmOS_boot`/`pmOS_root` so that a postmarketOS initramfs and
+  an Ubuntu one do not compete for the same card.
 
 ## Working environment
 
 - The Ubuntu build base is `wsl.exe -d Ubuntu-24.04 -u root`, directory
   `/root/ubuntu-gts9u`. The pmOS base is `/root/pmos-gts9u` and the two are not
-  mixed.
+  mixed. WSL is the author's environment, not a requirement: any x86-64 Linux
+  host works with `UBUNTU_WORKDIR` set to a path without spaces (the SM-X710
+  was built natively). `DEVICE=gts9wifi` selects the SM-X710; leaving it unset
+  keeps the SM-X910 build byte for byte. The kernel stage runs unprivileged;
+  the rootfs, image and release stages need root, with the same environment
+  passed through `sudo env` ([`ubuntu-userspace.md`](ubuntu-userspace.md#building-a-release)).
 - The WSL distribution called simply `Ubuntu` is a different environment and
   does **not** contain the right toolchain.
 - Heavy builds run on a Linux filesystem and in a path without spaces. Versioned
@@ -110,9 +118,10 @@ Two things that log makes clear, which save experiments:
 
 - **The ABL accepts an unsigned `vbmeta`**: it says `(Booting) AUTHENTICATE
   fail but allow Vbmeta binary: vbmeta` and carries on. The correct vbmeta is
-  an empty one made with `avbtool make_vbmeta_image --flags 2` — 4096 bytes,
-  authentication and auxiliary blocks zeroed — like
-  `port/sources/samsung-gts9u/vbmeta.img`.
+  an empty one made with `avbtool make_vbmeta_image --flags 2`,
+  authentication and auxiliary blocks zeroed, like the bundle's own
+  `vbmeta.img` (`build-android-v4-bundle.sh` pads it with `--padding_size
+  131072`, the partition's size; the pmOS reference used a 4096-byte image).
 - **Patching a signed `vbmeta` byte by byte does not work here.** Putting `02`
   at offset 120 of Samsung's image leaves a broken signature. That is what
   AnyKernel's `patch_vbmeta_flag` does, and it only works on ABLs that do not
@@ -120,6 +129,9 @@ Two things that log makes clear, which save experiments:
 
 **`vbmeta` is read-only to the kernel** (`sde15`, a different LUN, `blockdev
 --getro` = 1), so it is only ever written by Odin or heimdall, never from TWRP.
+The SM-X710's TWRP cannot write it either. The installer would still write its
+`vbmeta.img` if a recovery ever showed the partition writable (`getro` = 0),
+so "never" holds only as long as that stays true.
 
 ## `param` can leave the device stuck in recovery
 
@@ -169,7 +181,9 @@ firmware does happen, verified — and leaves the device worse than it was.
   of compressed archive" even though the Android image is valid.
 - **[pmOS]** `APPEND_DTB_TO_KERNEL=1` and `DISABLE_RUNTIME_DTBO=1` are the only
   safe values. The opposites return ABL to its `ufdt` fork, which rejects the
-  base DTB and enters Odin.
+  base DTB and enters Odin. In this repository the equivalent is built in:
+  `build-android-v4-bundle.sh` always appends the DTB, and
+  `ENABLE_RUNTIME_DTBO` must stay `0`.
 - **[pmOS]** The early overlay goes in `/usr/lib/firmware/...`. In the
   initramfs `lib` is a symlink to `usr/lib`; creating a `/lib` directory over it
   caused a reset before journald (pmOS v0.69).
@@ -254,18 +268,23 @@ ioctl, answers in ~3 ms and cannot block.
 
 ## A symbol at `=m` is absent, not degraded
 
-This port installs no module tree: only the two signed ath12k ones. Therefore
-**any `CONFIG_*=m` is equivalent to the feature not existing**. It is the
-single cause of three failures that looked unrelated:
+This port installs no module tree: only the isolated, signed modules in the
+kernel build's `modules-root`. Therefore **any other `CONFIG_*=m` is
+equivalent to the feature not existing**. It is the single cause of failures
+that looked unrelated:
 
 | Symbol | Visible symptom |
 |---|---|
 | `SQUASHFS=m` | `apt install firefox` and `chromium` fail: in Ubuntu they are transitional packages that install a snap, and a snap is a squashfs image |
 | `BINFMT_MISC=m` | `systemd-binfmt.service` and `proc-sys-fs-binfmt_misc.mount` fail on every boot and the system stays `degraded` |
 | `OVERLAY_FS=m`, `FUSE_FS=m` | snapd cannot overlay writable data on top of the snap |
+| `SM_VIDEOCC_8550=m` (SM-X710) | rpmhpd never reached `sync_state()`, every RPMh rail it had enabled stayed clamped at its maximum corner, and the GPU lost writes (the lattice specks, [`gts9wifi-display.md`](gts9wifi-display.md)) |
 
 Before accepting a desktop feature as working, check that its symbols are `=y`,
-not `=m`.
+not `=m`. `build-mainline-kernel.sh` now fails when a board fragment asks for
+`=m` on an in-tree option the build does not ship; the one it builds on purpose
+is the SM-X710's `QCOM_ICC_BWMON`, signed into `modules-root` and blacklisted
+([`gts9wifi-interconnect.md`](gts9wifi-interconnect.md)).
 
 ## Do not trust `Recommends` for anything that matters
 
@@ -1279,8 +1298,8 @@ registering anything. Decoding that property by phandle gives three providers:
 | `0x9` | `epss-l3` | **none** |
 
 The third is handled by `INTERCONNECT_QCOM_OSM_L3`, which the inherited config
-left at `=m`. Since this port installs no module tree — there are only three
-`.ko`s on the tablet — that module did not exist, `17d90000.interconnect` was
+left at `=m`. Since this port installs no module tree — there were only three
+`.ko`s on the tablet then — that module did not exist, `17d90000.interconnect` was
 left with no driver, one path did not resolve, and the probe was deferred
 forever. It is exactly the trap `config-ubuntu-desktop.fragment`'s own header
 warns about, again.
@@ -1470,8 +1489,11 @@ refused request, leaves nothing pending at all.
 
 ### One switch for every way to suspend
 
-The SM-X710 cannot come back from deep suspend yet, and gating the power key
-alone left every other way in open: the cover (gpio-keys `SW_LID` and the
+Suspend on the SM-X710 is not proven reliable yet: an early build never came
+back from deep suspend, and although one real s2idle and one real deep cycle
+did resume on the 2026-11-06 kernel, the repeated runs are still to come
+(`scripts/diagnostics/suspend/`). Gating the power key alone left every other
+way in open: the cover (gpio-keys `SW_LID` and the
 keyboard's), GNOME's fifteen-minute idle timeout on battery, the Suspend entry
 in the menus and on the login screen, a keyboard's sleep key, and anyone's
 `systemctl suspend`. All of them end up as a request to logind and then to
@@ -1480,9 +1502,15 @@ systemd-sleep, so that is where the decision now lives.
 `ubuntu-gts9u-suspend-mode.service` runs before logind on every boot and
 picks one of three modes: `off`, `s2idle` or `deep`. The board decides the
 default — `off` on `samsung,gts9wifi`, `deep` (nothing written, the stock
-policy) everywhere else — and `/etc/ubuntu-gts9u/suspend-mode` or, for one
-boot only, `/run/ubuntu-gts9u/suspend-mode` override it. A forced restart after
-a sleep that does not come back therefore always returns to the safe default.
+policy) everywhere else — and `/run/ubuntu-gts9u/suspend-mode` (this boot
+only) or `/etc/ubuntu-gts9u/suspend-mode` override it, in that order. A forced
+restart drops a `/run` choice and so returns to the board default; a mode
+saved in `/etc` persists. Each file holds one word: `off`, `s2idle`, `deep` or
+`auto`. Apply a change with `systemctl restart
+ubuntu-gts9u-suspend-mode.service` and check it with
+`/usr/libexec/ubuntu-gts9u-suspend-mode status`. A masked `sleep.target` or
+`suspend.target` overrides every mode; unmask it before trying `s2idle` or
+`deep`.
 
 `off` writes `AllowSuspend=no` into `/run/systemd/sleep.conf.d`. logind then
 refuses every suspend and answers `CanSuspend` with `no`, which also takes
@@ -1592,6 +1620,10 @@ pressed the button, `wakeup_count` unmoved and `pm_wakeup_irq=21`.
 
 The properly correct fix is `no_wakeup_source` in the driver's
 `power_supply_desc`, but that needs a kernel; the rule needs a reboot at most.
+Since 2026-11-07 the driver also notifies the pen's power supply only when the
+charge state or direction changes, and stops its 30 s garage poll across
+suspend; the rule stays, because a real change still counts as a wakeup
+event.
 Careful if this is ever revisited: the device's other `power_supply` objects
 (`sm5714-battery`, `sm5714-usb`, `tcpm-source-psy-8-0033`) are wakeup sources
 for the same reason, and in 40 s of idle they emitted nothing, so they are left
@@ -1615,6 +1647,12 @@ is pinned. It was the build directory's previous state.
 but **a release must be built that way**: without it, comparing hashes between
 two builds means nothing and there is no way to demonstrate that what the
 device boots came from the tree the manifest names.
+
+`build-release.sh` does not set it. Pass `KERNEL_CLEAN=1` in the environment
+of the kernel run, either standalone or through `build-release.sh` without
+`SKIP_KERNEL`. It also recreates `KERNEL_WORKTREE` from the pinned HEAD and
+mints a new signing key, so the modules and `boot.img` of that run are one
+set and must ship together.
 
 ## The keyboard's V34 is real content, not a marginal read
 
@@ -1947,7 +1985,8 @@ reference too.
 
 Throughout the port it was assumed that moving the root onto the UFS meant
 repartitioning or rebuilding `super`, which is why it was postponed. That was
-not true. This device's `userdata` partition is 939 GiB, already exists, and
+not true. This device's `userdata` partition (939 GiB on the 1 TB SM-X910)
+already exists, and
 nothing else is needed: an ext4 filesystem is written inside it with `dd` and
 resized with `resize2fs` on the first boot. Samsung's GPT stays intact, which
 is exactly what keeps the way back to a single Odin flash.
@@ -1974,7 +2013,8 @@ Three details that are not obvious until it is implemented:
 - **The label has to change.** `root=LABEL=` resolves to the first match it
   finds. With `UBTS9U_ROOT` in both places, an old microSD in the slot would
   boot instead of the internal installation, and the symptom would be "the
-  flash did nothing". The internal root is `UBTS9U_UFS`.
+  flash did nothing". The internal root is `UBTS9U_UFS` on the SM-X910 and
+  `UBTS9_UFS` on the SM-X710.
 - **The write order matters.** The root first, the boot images after. The other
   way round, a failure half way leaves a new kernel with no system to boot;
   this way it leaves the device where it was, one retry away.
@@ -2134,7 +2174,8 @@ GNOME needs its `language-pack-XX`.
 A wrong decision was taken here and then corrected: including them all was
 rejected for weighing close to 1 GiB. The criterion was badly calibrated. This
 device has 256 GB in its smallest version and the root occupies the whole
-939 GiB partition; the gigabyte is not the scarce resource. What does grate is
+`userdata` partition (939 GiB on the 1 TB SM-X910); the gigabyte is not the
+scarce resource. What does grate is
 a tablet that offers you Japanese in the wizard and then speaks to you in
 English. Since v0.21 every language pack travels.
 

@@ -16,6 +16,14 @@ storage and downloads any APT dependencies while the normal network is still
 available. Installation runs outside the graphical session and restarts back
 into Ubuntu when it finishes.
 
+SM-X710: the GitHub check, the hidden repair action below and
+`scripts/update-to-latest.py` only know SM-X910 release ZIPs. On an SM-X710
+they find the Ultra's ZIP and the X710 refuses it ("Unsupported update format,
+device or Ubuntu release"), after the download. Update an SM-X710 with a ZIP
+built for the same model and bootloader revision: choose it in Updates, or run
+`sudo gts9u-update --zip ubuntu-24.04-sm-x710-bl5-vX.X.X.zip`. A local-ZIP
+update has not yet been tried on an SM-X710.
+
 Companion 1.3.1 shows release notes, the download size and a visual progress
 bar. Transfer percentage, speed and estimated time use measured bytes; stages
 without a known total use an activity indicator. Download, verification,
@@ -98,13 +106,30 @@ another update; the updater does not silently discard that failure.
 
 ## Building and publishing
 
-`build-release.sh` produces the installation ZIP and a local validation
-manifest. Publish only the installation ZIP, the dual-boot APK and the split
+`build-release.sh`, run with `DEVICE=gts9uwifi` (the default) or
+`DEVICE=gts9wifi` and, for revision-matched firmware, `FIRMWARE_DIR`, produces
+`artifacts/ubuntu-24.04-<sm-x910|sm-x710>[-bl<rev>]-v<version>.zip` and a local
+validation manifest, `artifacts/MANIFEST-<sm-x910|sm-x710>[-bl<rev>]-v<version>.txt`. The
+`-bl<rev>` part appears whenever `FIRMWARE_DIR` holds a staged
+`PROVENANCE.json`.
+
+The SM-X910 dual-boot artifacts are built separately:
+`python3 scripts/make-repartition-zip.py artifacts/gts9u-split.zip --android-percent 50`
+for the split ZIP, and the APK from `android/bootswitcher` with a system Gradle
+and Android SDK 35 (there is no Gradle wrapper). Neither applies to the
+SM-X710.
+
+Publish only the installation ZIP, the dual-boot APK and the split
 ZIP. Put their SHA-256 checksums in the release notes, together with the hidden
 compatibility marker `<!-- gts9u-update-format: 1 -->`. The updater script lives
 in `scripts/update-to-latest.py`. Do not routinely replace published builds;
-use a new version when distributing subsequent changes. The app selects the latest non-prerelease GitHub
-release, selects only the SM-X910 ZIP, and validates GitHub's SHA-256 digest.
+use a new version when distributing subsequent changes. The app selects the
+latest non-prerelease GitHub release and in it only the asset named exactly
+`ubuntu-24.04-sm-x910-v<version>.zip`, one per release; it validates GitHub's
+SHA-256 digest and refuses a payload built for another device or another
+bootloader revision than the installed one. Publish an SM-X910 build under that
+name, renaming a `-bl<rev>` build, or the online check finds nothing. Do not
+attach SM-X710 ZIPs expecting the updater to offer them.
 For local ZIPs, internal hashes detect corruption, not an untrusted author:
 local packages must come from a trusted build of this port.
 

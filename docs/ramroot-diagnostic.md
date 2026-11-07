@@ -41,8 +41,19 @@ No Android userdata, vendor_boot, DTBO or microSD partition is written.
 ## Inputs and implementation
 
 - `scripts/diagnostics/kernel10-ramroot-test`: actual early-init diagnostic.
+  It hardcodes `/dev/sda21` (boot), `/dev/sda22` (init_boot), `/dev/sda35`
+  (linuxroot) and the boot and init_boot SHA-256 values of one split SM-X910.
+  It is not portable: never pack or flash it for another unit, for a
+  whole-tablet install, or for an SM-X710.
 - `scripts/diagnostics/prepare-kernel10-ramroot.py`: packs and verifies the
   original init_boot header and unsigned AVB footer; it never flashes.
+  Invocation (all four options are required):
+  `python3 scripts/diagnostics/prepare-kernel10-ramroot.py --baseline
+  original-init_boot.img --ramdisk diagnostic-ramdisk.lz4 --output
+  init_boot-kernel10-ramroot-test.img --avbtool /path/to/avbtool.py`. It
+  accepts only the audited init_boot (SHA-256 `7881d585...`, below), a
+  legacy-LZ4 ramdisk whose init execs `/gts9u-ramroot-test`, the pinned
+  `avbtool.py`, and an output path that does not exist yet.
 - Diagnostic init_boot SHA-256:
   `3c019939c5af32efb4377ce03a539d422cdf754bf8141b892624b8da82bc21dd`.
 - Original init_boot SHA-256:
@@ -98,10 +109,13 @@ from `00 00 00` to `80 00 04`, GDM restarted, Wi-Fi and HTTPS returned, and
 root remained writable. This isolates the boot-time concurrency as a suspect,
 without proving that it explains all earlier GPU/UFS failures.
 
-The panel unit now explicitly pulls in and orders itself after
-`ubuntu-gts9u-pogo-firmware.service`, so it cannot freeze userspace or suspend
-the controller during that service's firmware write. systemd-analyze verify
-accepted the installed unit and its dependency graph. The ordinary deep-sleep
+The panel unit then pulled in and ordered itself after
+`ubuntu-gts9u-pogo-firmware.service`, so it could not freeze userspace or
+suspend the controller during that service's firmware write. systemd-analyze
+verify accepted the installed unit and its dependency graph. (Since device
+package 2.56 the order is reversed: the pogo firmware service orders itself
+after the panel cycle, so a needed flash no longer keeps the panel dark for
+its ~15 s; the two still never overlap.) The ordinary deep-sleep
 safeguard remains enabled; kernel #10 acceptance is still pending.
 
 The subsequent normal reboot passed on kernel #8: the pogo unit finished
@@ -171,7 +185,9 @@ was removed after these checks; login1 now reports `CanSuspend=yes`.
 This is an installed experimental kernel, not a new release or evidence of
 long-term reliability. Physical lid/button and extended idle coverage, plus
 actual GPU fault recovery, remain separate acceptance work. Build experiment
-flags remain opt-in.
+flags were still opt-in then; since the kernel #11 validation
+`UFS_PCS_RESET_EXPERIMENTAL` and `GPU_FAULT_WAIT_EXPERIMENTAL` both default to
+1 (see [GPU recovery](gpu-recovery.md)).
 
 ## Keyboard-folio opening wake-up (kernel #11)
 

@@ -42,6 +42,12 @@ fprintd D-Bus API and encrypted storage as Ubuntu Settings, GDM and the lock
 screen. No separate biometric store, privileged helper or PAM policy is added.
 An inline link opens `gnome-control-center system users`.
 
+Fingerprint is not supported on the SM-X710 yet: the fingerprint-area
+interface of its FTS1BA90A touchscreen, which the EL721 stack needs, is not
+ported. The device package masks `fprintd` for the boot on every board but
+the Ultra (`ubuntu-gts9u-fingerprint-gate`), so the tab has no reader there
+and login falls back to the password at once.
+
 Enrollment shows secure aggregate coverage, actual accepted samples, estimated
 remaining placements and quality guidance. The EL721 currently usually needs
 17 accepted placements. This is an estimate, not fprintd's 18 processing stages:
@@ -146,8 +152,10 @@ signal is handled directly: when the adapter comes back, the interface and the
 service immediately recover the stored value. If it was off it stays off; if it
 was on it comes back on.
 
-"Ignore finger touches while hovering" shares Wacom proximity with the Goodix
-controller. The moment `BTN_TOOL_PEN` arrives, the touchscreen releases its
+"Ignore finger touches while hovering" shares Wacom proximity with the touch
+controller: the Goodix GT9916 on the SM-X910, the STMicroelectronics FTS1BA90A
+on the SM-X710 (both through `samsung_wacom_should_suppress_touch()`). The
+moment `BTN_TOOL_PEN` arrives, the touchscreen releases its
 active contacts and publishes no fingers until the pen leaves range. "Disable
 the digitizer while docked" keeps the dock, charging and BLE alive but discards
 the EMR coordinate packets. The physical IRQ is not disabled, because it also
@@ -353,7 +361,18 @@ One validation reboot stopped before Tab Companion started, in the
 `pm_test=platform` cycle the port uses to recover the panel after a cold boot.
 The next boot completed the cycle and every check. If the tablet freezes during
 boot again, that panel recovery is the first thing to look at; no relationship
-with the Wacom/Goodix policies was observed.
+with the Wacom/Goodix policies was observed. On the SM-X710 the same cycle
+hung, with a watchdog reset and a boot loop, every time the interconnect
+reached sync_state before it (Stage 3 and 3b, 2026-11-07); the X710 image
+keeps `icc_bwmon` blacklisted and releases the interconnect only after the
+cycle (see [the interconnect notes](gts9wifi-interconnect.md)).
+
+On the SM-X710 (2026-11-07) the digitiser binds, the pen charges in its
+garage, docking and undocking are detected, the pairing service and the
+hardware service run, and the EF-DX720 cover enumerates with its switches on
+the separate device. Not yet confirmed there: pressure, hover and side
+button, coordinate mapping in landscape and portrait, finger rejection while
+hovering, and the haptic motor.
 
 Still pending: feeling the motor physically, calibrating the pointer with real
 use, testing EF-DX900/910/915/925 and verifying their touchpads. BLE recovery

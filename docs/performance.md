@@ -57,9 +57,11 @@ that build. An additional physical check confirmed that changing only the DTB
 appended to `boot` leaves the live DT unchanged: ABL uses `vendor_boot` here.
 The appended-only test was rolled back to the original boot image.
 
-`kernel/dts/gts9-performance.dtso` adds only the prime-CPU OPP node and
-`kernel/dts/gts9u-performance.dtso` only the GPU OPP node.
-`scripts/stage-performance-overlay.sh` embeds them in a small built-in board
+`kernel/dts/gts9-performance.dtso` adds only the prime-CPU OPP node,
+`kernel/dts/gts9u-performance.dtso` only the GPU OPP node, and
+`kernel/dts/gts9-family.dtso` only `wakeup-source` on `/soc@0/usb@a600000`
+(both boards). `scripts/stage-performance-overlay.sh` embeds all three,
+8-byte aligned, in a small built-in board
 helper. Its `core_initcall` applies the overlays to Linux's live tree, after
 OF initialization and before cpufreq and DRM can consume their OPP tables.
 The CPU overlay runs for `samsung,gts9uwifi` and `samsung,gts9wifi`, the GPU
@@ -130,6 +132,16 @@ the rev-04 board overlay's `cpufreq_limit` node is identical to the Ultra's
 (silver-cluster tables only), and the vendor perf HAL's `targetconfig.xml`
 sets no prime `MaxFrequency`.
 
+With the overlay applied on both boards, the X710 registers the boost OPP: on
+2026-11-07 policy7 showed `scaling_boost_frequencies` 3360000, boost=1 and
+`cpuinfo_max_freq` 3360000. Kernels built before the alignment fix in
+`scripts/stage-performance-overlay.sh` (`__aligned(8)` on the embedded blobs)
+logged `OF: overlay: Invalid overlay_fdt header` and `gts9u-performance:
+cannot apply the Galaxy CPU OPP overlay: -22`, and stayed at 2.9568 GHz.
+libfdt rejects an unaligned blob, so the Ultra's earlier builds worked only
+because of where the linker happened to place the array; check its next
+build's log for both `registered Galaxy ... OPP` lines.
+
 The OPP comes from the runtime overlay rather than the X710 board DTS. This
 board's first image bootlooped in ABL with the Ultra's board-id and 41
 Ultra-inherited extra nodes, the CPU and GPU OPPs among them; since then its
@@ -137,10 +149,16 @@ DTS keeps the node set of a known-booting mainline tree, and the overlay
 leaves that ABL-facing DTB untouched. The 3.36 GHz OPP places the same
 LLCC/DDR/L3 votes as 2.9568 GHz, so it adds no new memory-bus state.
 
-Thermal protection is the Ultra's: the same tsens zones and trips (CPU passive
-90/95 C, critical 110 C, GPU cooling map at 85 C), identical thermal zones in
-both Samsung board overlays, and LMh hardware limiting reported to the
-scheduler through `dcvsh-irq-7`. The 11-inch chassis has less sustained
+Thermal protection starts from the Ultra's: the same tsens zones and trips
+(CPU passive 90/95 C, critical 110 C, GPU cooling map at 85 C), identical
+thermal zones in both Samsung board overlays, and LMh hardware limiting
+reported to the scheduler through `dcvsh-irq-7`. The X710 DTS adds three
+things the Ultra does not have yet (its board DTS is pinned): the CDSP zones
+move to tsens1 sensors 4-7 as in Qualcomm's kalama DT, so the gpuss zones
+that `sm8550.dtsi` shadowed register and can throttle the GPU; each CPU
+zone's 95 C trip is bound to its cluster's cpufreq cooling device as a
+backstop behind LMh; and the crystal and AP-area thermistors are exposed as
+ADC channels for logging only. The 11-inch chassis has less sustained
 headroom; LMh answers that with a lower prime clock. LMh and tsens follow die
 temperature only: neither board runs Android's skin-temperature policy
 (`thermal-engine-v2`'s built-in rules, Samsung's thermal HAL), so a warm back
@@ -159,9 +177,10 @@ before extending the GPU overlay:
 sudo cat /sys/kernel/debug/qcom_socinfo/feature_code /sys/kernel/debug/qcom_socinfo/pcode
 ```
 
-A feature code of 3 or 6 is bin 0. The X710 also has an open GPU
-write-integrity investigation ([display notes](gts9wifi-display.md)); a new
-GPU clock should not be added while it is open.
+A feature code of 3 or 6 is bin 0. The X710's GPU write-loss defect is
+resolved: rpmhpd now reaches sync_state at boot (see the
+[display notes](gts9wifi-display.md)), so it no longer blocks a GPU clock
+change. The bin still has to be read first.
 
 ## Reproduce the checks
 
@@ -278,9 +297,12 @@ bash scripts/test-performance-overlay.sh /path/to/validated-base.dtb
 ```
 
 This checks OPP properties, repeat application and staging, and that every
-other node/property is unchanged. No device is written by that test.
+other node/property is unchanged by the OPP overlays. The family overlay
+(`gts9-family.dtso`, USB `wakeup-source`) is not exercised by this test. No
+device is written by that test.
 
-On the tablet:
+On the tablet (the audit script is not packaged; copy
+`scripts/gts9u-frequency-audit.py` over first):
 
 ```sh
 python3 scripts/gts9u-frequency-audit.py
@@ -297,7 +319,8 @@ adds bounded SHA-256 CPU workloads without writing sysfs. It pins each core,
 then exercises all eight, sampling requested and hardware-reported policy
 frequencies and temperatures. It cools between runs, stops at 75 C by default,
 and cleans up its workers. `--require-galaxy-max` checks that the target OPPs
-are registered and allowed. For the stricter, workload-dependent requirement
+(CPU 3.36 GHz on both boards; GPU 719 MHz on the SM-X910, 680 MHz on the
+SM-X710) are registered and allowed. For the stricter, workload-dependent requirement
 that every core reports its target in its own run, add `--require-observed-max`.
 That check may fail legitimately under hardware thermal/current limiting,
 even when the requested clock and permitted maximum are correct.
@@ -318,7 +341,8 @@ has disappeared. Check `scaling_boost_frequencies`, the global `boost` switch,
 `cpuinfo_max_freq`, `scaling_max_freq` and `powerprofilesctl get` together.
 
 When a validated kernel was written directly to the active `boot` partition,
-also refresh the Ubuntu image used by the dual-boot switch. Otherwise a later
+also refresh the Ubuntu image used by the dual-boot switch (SM-X910 split
+installs only; the SM-X710 has no dual-boot switch). Otherwise a later
 Android → Ubuntu switch can restore the older kernel even though ordinary
 restarts keep the validated one. The refresh helper refuses to proceed unless
 the candidate and active partition have the same caller-supplied SHA-256, and

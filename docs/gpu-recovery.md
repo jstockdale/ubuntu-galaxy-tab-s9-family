@@ -49,11 +49,19 @@ the recovery code. Repeated faults cannot restart the wait indefinitely.
 This bounds the demonstrated deadlock path; **hardware recovery and the
 initial GPU fault remain unvalidated**. It does not disable acceleration,
 change Mesa, alter clock tables, or claim to eliminate all GPU hangs.
+Kernel #11's hardware validation made the patch the default: kernels #10 and
+#11 carried it through the RAM-root and normal-root suspend cycles, normal
+desktop use and the lid-wake test ([RAM-root diagnostic](ramroot-diagnostic.md)).
+None of those runs hit a GPU fault, so the recovery path itself is still
+unexercised on hardware. The patch has no board check, so SM-X710
+(gts9wifi) kernels carry it as well.
 
-Default builds do not enable the candidate. Use
-`GPU_FAULT_WAIT_EXPERIMENTAL=1` to opt in through the kernel build recipe or
-`scripts/stage-gpu-recovery-experiment.sh`. Default staging rejects a tree
-with the candidate already present. Repeated opt-in verifies the complete
+Default builds enable the candidate: since kernel #11,
+`GPU_FAULT_WAIT_EXPERIMENTAL` defaults to 1, and `build-mainline-kernel.sh`
+stages the patch through `scripts/stage-gpu-recovery-experiment.sh` for every
+`DEVICE`. To build without it, set `GPU_FAULT_WAIT_EXPERIMENTAL=0` with a
+fresh `KERNEL_WORKTREE`; staging with 0 refuses a tree that already contains
+the candidate. Repeated staging verifies the complete
 two-file patch; partial application is rejected. Reverse verification uses
 `patch --force` so GNU patch cannot silently change direction on one file.
 
@@ -71,8 +79,9 @@ The three incoming commits through `66c832a` were fast-forwarded into the
 local repository. The earlier kernel #9 UFS candidate and its #8 backup
 were found and their recorded hashes verified before building on that work.
 
-The new #10 combines **only the two-file GPU patch and the existing opt-in
-UFS PCS reset candidate**, on the existing #8 performance/fingerprint base.
+The new #10 combines **only the two-file GPU patch and the UFS PCS reset
+candidate**, on the existing #8 performance/fingerprint base. That candidate
+was opt-in then; since kernel #11, `UFS_PCS_RESET_EXPERIMENTAL` defaults to 1.
 Source and objects are still at
 `/root/ubuntu-gts9u/build/linux-src-performance-20260908` and
 `/root/ubuntu-gts9u/build/linux-performance-20260908` in WSL Ubuntu.
@@ -124,3 +133,18 @@ stuck runtime-PM transitions or uninterruptible workers. A controlled GPU
 fault-recovery test must show that recovery returns, not merely that an idle
 desktop boots. The initial GMU timeout may need a further fix even if the
 permanent deadlock is eliminated.
+
+## SM-X710 (gts9wifi): a different GPU defect
+
+The SM-X710's lost GPU writes (single pixels on a fixed lattice, WebGL
+damage) were not a recovery problem and are fixed. Their cause was that
+rpmhpd never reached sync_state(), which clamps every RPMh rail it has
+enabled at its maximum corner; the X710 kernel now builds the video clock
+controller in (`CONFIG_SM_VIDEOCC_8550=y`), so rpmhpd syncs at boot and the
+write-check battery loses 0 of 296 frames (168 to 197 with rpmhpd held). The
+root cause, the fix and the check are in the
+[X710 display notes](gts9wifi-display.md). The Ultra has the same
+sync_state blockers but shows no loss; porting the fix there is queued. Late
+GMU `GX_BW_PERF_VOTE` answers like the ones above were also seen on the X710
+while rpmhpd was held; whether they persist with it synced is not checked
+yet.

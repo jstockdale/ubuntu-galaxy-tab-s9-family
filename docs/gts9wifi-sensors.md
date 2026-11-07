@@ -7,6 +7,19 @@ serves the sensor protection domain its HexagonFS tree, `libssc` talks to SSC
 over QRTR, and `iio-sensor-proxy` hands rotation and light to GNOME.  Only the
 HexagonFS tree, which carries Samsung's sensor registry, is per board.
 
+Status (2026-11-07): SSC comes up on the first attempt, iio-sensor-proxy
+reports `HasAccelerometer` and `HasAmbientLight`, and auto-rotation works with
+the keyboard cover detached.  The only recorded light level, 0 lux, was read
+at night; whether lux follows room light is still to be checked
+(`ssccli --sensor light --timeout 8` below).
+
+For builders: the tree is a generated manifest entry, so staging
+`configs/firmware/x710-bl5-X710XXS5CYG1.toml` needs `--sscregistrygen`:
+`python3 scripts/stage-firmware.py stage --manifest
+configs/firmware/x710-bl5-X710XXS5CYG1.toml ... --sscregistrygen PATH --out
+<dir>`, with `PATH` the `tools/sscregistrygen` of sensh v2.0.0 (see
+`configs/firmware/README.md`).  Without it `stage` refuses to run.
+
 ## What the first X710 images got wrong
 
 Every boot logged `ubuntu-gts9u-sensors-resume: SSC did not become ready;
@@ -45,10 +58,11 @@ Compared with the Ultra's tree:
 | magnetometer | AK0991x, different orientation and correction matrices | AK0991x |
 | DSP skeletons | byte-identical to the X910 bl5 set | |
 
-The registry configs of the accelerometer are identical on both boards, so
-the X910's mount-matrix rule (`61-gts9u-sensor-mount-matrix.rules`) should
-apply to the X710 too; the Fedora X710 port uses the same matrix.  Confirm it
-by eye with `monitor-sensor --accel`.  The light stream is libssc's standard
+The accelerometer's registry configs are identical on both boards.  The
+X910's mount-matrix rule (`61-gts9u-sensor-mount-matrix.rules`) matches
+fastrpc-adsp on any board, so it applies to the X710 as well, and the Fedora
+X710 port uses the same matrix.  Auto-rotation was confirmed by eye on
+2026-11-07 with the keyboard detached.  The light stream is libssc's standard
 `ambient_light` on the X710: `use-samsung-auto-brightness.patch` switches to
 Samsung's `auto_brightness` only for `samsung,gts9uwifi`, where the
 STK31610's physical stream delivers nothing.  The two other X710 ports report
@@ -81,9 +95,16 @@ systemctl status hexagonrpcd-adsp-sensorspd ubuntu-gts9u-sensors-resume
 ssccli --sensor accelerometer --timeout 4
 ssccli --sensor magnetometer --timeout 4  # uT samples; see the corr_mat note
 ssccli --sensor light --timeout 8      # cover the sensor: lux must change
-monitor-sensor --accel --light          # Ctrl-C to stop
+monitor-sensor --accel --light          # in the tablet's own session; Ctrl-C to stop
+# over SSH polkit refuses monitor-sensor's claim; read the properties instead:
+gdbus introspect --system --dest net.hadess.SensorProxy \
+	--object-path /net/hadess/SensorProxy --only-properties
 ```
 
 `ubuntu-gts9u-sensors-resume` should log `SSC ready after attempt N`.  GNOME
-only rotates in touch mode; while the keyboard cover is attached and counted
-as a pointer, Mutter reports `PanelOrientationManaged=false`.
+only rotates in touch mode.  On the X710 the cover's `Samsung Book Cover
+Switch` device reports `SW_TABLET_MODE=0` in typing posture and when closed,
+so GNOME stays in laptop mode and does not rotate.  Detaching the cover sets
+`SW_TABLET_MODE=1` and gives rotation (confirmed); folding it behind the
+tablet should do the same, but that posture is not confirmed on the EF-DX720
+yet.
