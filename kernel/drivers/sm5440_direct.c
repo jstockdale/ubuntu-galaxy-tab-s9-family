@@ -53,6 +53,20 @@
 #define SM5440_INITIAL_IBUS_MA		3000
 
 /*
+ * A start that fails against the same source is retried at 30 s, then 1, 2, 4
+ * and 8 minutes.  Every attempt opens the SM5714's Q4 and soft-resets this
+ * chip, so a source that keeps refusing must not be asked twice a minute for
+ * the whole charge.  A detach ends the streak.
+ */
+#define SM5440_BACKOFF_MAX_SHIFT	4
+
+/*
+ * After TCPM announces a change (attach, a new contract, PPS appearing) look
+ * again this soon, instead of at the next 30 s poll.
+ */
+#define SM5440_SETTLE_MS		1000
+
+/*
  * What the loop aims for at the pump's input; the pack gets about twice this.
  * The chip's own limit above is the hard ceiling and stays well clear of it.
  */
@@ -207,12 +221,20 @@ struct sm5440_direct {
 	struct power_supply *tcpm;
 	struct power_supply *battery;
 	struct delayed_work work;
+	struct notifier_block psy_nb;
 	int target_mv;
 	int target_ma;
 	unsigned int pps_ticks;
 	unsigned int refresh_misses;
 	int last_start_err;
+	/* Consecutive failed starts against the attached source. */
+	unsigned int start_failures;
+	/* No start attempt before this (backoff, or the pause after a stop). */
+	unsigned long retry_at;
+	/* TCPM USB type last reported as having no PPS; -1 after a detach. */
+	int noted_usb_type;
 	bool active;
+	bool suspended;
 };
 
 static int sm5440_update_bits(struct sm5440_direct *sm, u8 reg, u8 mask,
@@ -359,7 +381,14 @@ static void sm5440_restore_switching(struct sm5440_direct *sm)
 	sm5440_psy_set(sm->tcpm, POWER_SUPPLY_PROP_ONLINE, 1);
 	sm5714_battery_set_direct_charge(false);
 	sm->pps_ticks = 0;
-	sm->active = false;
+	/*
+	 * Going back to the fixed contract makes TCPM announce a change, which
+	 * kicks the work early (sm5440_psy_notify()).  Hold the next start to
+	 * the usual 30 s pause after any stop, so a cause that is still there
+	 * cannot turn into a stop/start cycle once a second.
+	 */
+	sm->retry_at = jiffies + msecs_to_jiffies(SM5440_RETRY_MS);
+	WRITE_ONCE(sm->active, false);
 }
 
 static void sm5440_put_power_supply(void *data)
@@ -516,7 +545,7 @@ static int sm5440_start(struct sm5440_direct *sm)
 		goto restore;
 	}
 
-	sm->active = true;
+	WRITE_ONCE(sm->active, true);
 	sm->target_mv = target_mv;
 	sm->target_ma = target_ma;
 	sm->pps_ticks = 0;
@@ -530,18 +559,119 @@ restore:
 	return ret;
 }
 
-static bool sm5440_eligible(struct sm5440_direct *sm)
-{
-	int capacity, online, temp, voltage;
+enum sm5440_source {
+	SM5440_SOURCE_NONE,
+	SM5440_SOURCE_NO_PPS,
+	SM5440_SOURCE_PPS,
+};
 
-	online = sm5440_psy_get(sm->tcpm, POWER_SUPPLY_PROP_ONLINE);
+/*
+ * What is on the port, from TCPM's own state: no I2C, so it is cheap enough
+ * to ask after every TCPM change.
+ *
+ * Only a source that advertised a PPS APDO can feed the pump.  Anything else
+ * -- a PC port, a Type-C or BC1.2 charger, fixed-only USB-PD -- makes TCPM
+ * refuse the PPS request with -EOPNOTSUPP, and asking anyway is not free: by
+ * then sm5440_start() has opened the SM5714's Q4 and soft-reset this chip,
+ * and sm5440_restore_switching() closes Q4 again.  On the X710, charging from
+ * a PC, that cycle ran every 30.72 s (the 30 s retry, rounded up by the timer
+ * wheel at HZ=250) for the whole uptime: one "direct-charge start failed: -95"
+ * per boot and one SM5714 "enabled charging" line per retry.
+ */
+static enum sm5440_source sm5440_source(struct sm5440_direct *sm,
+					 int *usb_type)
+{
+	int online = sm5440_psy_get(sm->tcpm, POWER_SUPPLY_PROP_ONLINE);
+
+	*usb_type = sm5440_psy_get(sm->tcpm, POWER_SUPPLY_PROP_USB_TYPE);
+	if (online <= 0)
+		return SM5440_SOURCE_NONE;
+
+	switch (*usb_type) {
+	case POWER_SUPPLY_USB_TYPE_PD_PPS:
+	case POWER_SUPPLY_USB_TYPE_PD_PPS_SPR_AVS:
+		return SM5440_SOURCE_PPS;
+	default:
+		return SM5440_SOURCE_NO_PPS;
+	}
+}
+
+static bool sm5440_battery_eligible(struct sm5440_direct *sm)
+{
+	int capacity, temp, voltage;
+
 	capacity = sm5440_psy_get(sm->battery, POWER_SUPPLY_PROP_CAPACITY);
 	temp = sm5440_psy_get(sm->battery, POWER_SUPPLY_PROP_TEMP);
 	voltage = sm5440_psy_get(sm->battery, POWER_SUPPLY_PROP_VOLTAGE_NOW);
 
-	return online > 0 && capacity >= 5 && capacity < 90 &&
+	return capacity >= 5 && capacity < 90 &&
 	       temp >= 100 && temp < 420 &&
 	       voltage >= 3500000 && voltage < 4350000;
+}
+
+static unsigned long sm5440_backoff(unsigned int failures)
+{
+	unsigned int shift = min(failures ? failures - 1 : 0,
+				 (unsigned int)SM5440_BACKOFF_MAX_SHIFT);
+
+	return msecs_to_jiffies(SM5440_RETRY_MS << shift);
+}
+
+/* Decide whether to start; returns the delay before the next look. */
+static unsigned long sm5440_idle_work(struct sm5440_direct *sm)
+{
+	unsigned long retry = msecs_to_jiffies(SM5440_RETRY_MS);
+	int usb_type;
+	int ret;
+
+	switch (sm5440_source(sm, &usb_type)) {
+	case SM5440_SOURCE_NONE:
+		/* A detach ends any failure streak: the next source starts fresh. */
+		sm->start_failures = 0;
+		sm->last_start_err = 0;
+		sm->retry_at = jiffies;
+		sm->noted_usb_type = -1;
+		return retry;
+	case SM5440_SOURCE_NO_PPS:
+		if (usb_type != sm->noted_usb_type) {
+			sm->noted_usb_type = usb_type;
+			if (usb_type == POWER_SUPPLY_USB_TYPE_PD)
+				dev_info(sm->dev,
+					 "USB-PD source has no PPS profile; direct charging stays off\n");
+			else
+				dev_dbg(sm->dev,
+					"no USB-PD PPS source (TCPM USB type %d); direct charging stays off\n",
+					usb_type);
+		}
+		return retry;
+	case SM5440_SOURCE_PPS:
+		break;
+	}
+
+	if (time_before(jiffies, sm->retry_at))
+		return sm->retry_at - jiffies;
+
+	if (!sm5440_battery_eligible(sm))
+		return retry;
+
+	ret = sm5440_start(sm);
+	if (!ret) {
+		sm->last_start_err = 0;
+		sm->start_failures = 0;
+		return msecs_to_jiffies(SM5440_POLL_MS);
+	}
+
+	/*
+	 * One line per failure streak: an adapter that cannot serve the direct
+	 * charger at all turns the retries into permanent log spam otherwise.
+	 */
+	if (ret != sm->last_start_err)
+		dev_warn(sm->dev, "direct-charge start failed: %d\n", ret);
+	sm->last_start_err = ret;
+	sm->start_failures++;
+	retry = sm5440_backoff(sm->start_failures);
+	sm->retry_at = jiffies + retry;
+	return retry;
 }
 
 static void sm5440_work(struct work_struct *work)
@@ -553,27 +683,15 @@ static void sm5440_work(struct work_struct *work)
 	int vbat, vbus;
 	int ret;
 
+	/*
+	 * The TCPM notifier can queue this while the system is suspending; the
+	 * I2C bus may already be gone.  Resume schedules the next look.
+	 */
+	if (READ_ONCE(sm->suspended))
+		return;
+
 	if (!sm->active) {
-		if (!sm5440_eligible(sm)) {
-			delay = msecs_to_jiffies(SM5440_RETRY_MS);
-			goto out;
-		}
-		ret = sm5440_start(sm);
-		if (ret) {
-			/*
-			 * One line per failure streak: an adapter that cannot
-			 * serve the direct charger at all turns the 30-second
-			 * retry into permanent log spam otherwise.
-			 */
-			if (ret != sm->last_start_err)
-				dev_warn(sm->dev,
-					 "direct-charge start failed: %d\n",
-					 ret);
-			sm->last_start_err = ret;
-			delay = msecs_to_jiffies(SM5440_RETRY_MS);
-		} else {
-			sm->last_start_err = 0;
-		}
+		delay = sm5440_idle_work(sm);
 		goto out;
 	}
 
@@ -737,6 +855,36 @@ static void sm5440_cancel_work(void *data)
 		sm5440_restore_switching(sm);
 }
 
+/*
+ * TCPM calls power_supply_changed() on attach, detach and every contract
+ * change, including the moment a source's PPS APDO becomes known.  Look again
+ * shortly after, so a PPS adapter starts the pump within about a second of
+ * its contract rather than at the next 30 s poll, and a detach ends a backoff
+ * streak at once.  An active session polls every second on its own.
+ */
+static int sm5440_psy_notify(struct notifier_block *nb, unsigned long event,
+			     void *data)
+{
+	struct sm5440_direct *sm = container_of(nb, struct sm5440_direct,
+						psy_nb);
+
+	if (event != PSY_EVENT_PROP_CHANGED || data != sm->tcpm)
+		return NOTIFY_DONE;
+	if (READ_ONCE(sm->suspended) || READ_ONCE(sm->active))
+		return NOTIFY_OK;
+
+	mod_delayed_work(system_percpu_wq, &sm->work,
+			 msecs_to_jiffies(SM5440_SETTLE_MS));
+	return NOTIFY_OK;
+}
+
+static void sm5440_unreg_notifier(void *data)
+{
+	struct sm5440_direct *sm = data;
+
+	power_supply_unreg_notifier(&sm->psy_nb);
+}
+
 static int sm5440_probe(struct i2c_client *client)
 {
 	struct sm5440_direct *sm;
@@ -779,11 +927,24 @@ static int sm5440_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
+	sm->noted_usb_type = -1;
+	/* Keep the first start 10 s after probe even if TCPM kicks earlier. */
+	sm->retry_at = jiffies + msecs_to_jiffies(10000);
 	INIT_DELAYED_WORK(&sm->work, sm5440_work);
 	ret = devm_add_action_or_reset(sm->dev, sm5440_cancel_work, sm);
 	if (ret)
 		return ret;
 	schedule_delayed_work(&sm->work, msecs_to_jiffies(10000));
+
+	/* Registered after the cancel action, so devm removes it first. */
+	sm->psy_nb.notifier_call = sm5440_psy_notify;
+	ret = power_supply_reg_notifier(&sm->psy_nb);
+	if (ret)
+		return dev_err_probe(sm->dev, ret,
+				     "cannot watch the TCPM power supply\n");
+	ret = devm_add_action_or_reset(sm->dev, sm5440_unreg_notifier, sm);
+	if (ret)
+		return ret;
 
 	dev_info(sm->dev, "SM5440 direct charger device ID %#x\n", id);
 	return 0;
@@ -807,10 +968,15 @@ static int sm5440_suspend(struct device *dev)
 	 * anyway once nothing services it, and coming back through the normal
 	 * eligibility check on resume is cheaper than trying to prove what the
 	 * hardware did while nobody was watching.
+	 *
+	 * Stop the work first, then hand back: the restore must not run beside
+	 * a poll or a start that is still talking to the chip, and nothing may
+	 * queue the work again once the flag is set (sm5440_psy_notify()).
 	 */
+	WRITE_ONCE(sm->suspended, true);
+	cancel_delayed_work_sync(&sm->work);
 	if (sm->active)
 		sm5440_restore_switching(sm);
-	cancel_delayed_work_sync(&sm->work);
 
 	return 0;
 }
@@ -819,6 +985,7 @@ static int sm5440_resume(struct device *dev)
 {
 	struct sm5440_direct *sm = dev_get_drvdata(dev);
 
+	WRITE_ONCE(sm->suspended, false);
 	schedule_delayed_work(&sm->work, msecs_to_jiffies(SM5440_RETRY_MS));
 
 	return 0;

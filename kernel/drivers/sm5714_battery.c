@@ -98,6 +98,17 @@
 #define SM5714_POLL_INTERVAL_MS		1000
 #define SM5714_CAPACITY_POLL_DIVIDER	10
 
+/*
+ * Net-drain detection while the charger is on (see sm5714_update_net_drain()).
+ * The fuel gauge's average current is sampled with the capacity, every ten
+ * polls.  Two samples in a row at or below -100 mA mean the source cannot
+ * carry the load; two at or above 0 mA end it.  Between the two thresholds
+ * the state holds, so a load hovering at the input limit does not flap.
+ */
+#define SM5714_DRAIN_ENTER_UA		(-100000)
+#define SM5714_DRAIN_EXIT_UA		0
+#define SM5714_DRAIN_SAMPLES		2
+
 enum sm5714_charge_thermal_state {
 	SM5714_THERMAL_NORMAL,
 	SM5714_THERMAL_REDUCED,
@@ -128,6 +139,15 @@ struct sm5714_battery {
 	enum sm5714_charge_thermal_state thermal_state;
 	bool direct_charging;
 	bool otg_active;
+	/* What the last "enabled charging" line said; see configure_charging. */
+	int logged_usb_type;
+	unsigned int logged_mv;
+	unsigned int logged_input_ma;
+	unsigned int logged_fast_ma;
+	/* Net drain while charging; see sm5714_update_net_drain(). */
+	u8 drain_samples;
+	u8 gain_samples;
+	bool net_draining;
 };
 
 static DEFINE_MUTEX(sm5714_global_lock);
@@ -161,6 +181,24 @@ static unsigned int otg_ma = 3;
 module_param(otg_ma, uint, 0644);
 MODULE_PARM_DESC(otg_ma,
 		 "OTG current limit: 0=500mA, 1=900mA (vendor), 2=1200mA, 3=1500mA (default)");
+
+/*
+ * STATUS2.CHG_ON only says the switching charger is running.  Behind a source
+ * that cannot carry the load -- a 500 mA PC port with the panel on, or a 15 W
+ * fixed contract under a game -- the pack still loses charge, and reporting
+ * "Charging" then misleads twice: UPower shows a time to full while the
+ * percentage falls, and because it believes the battery is charging it never
+ * raises the low and critical warnings or takes the critical action, so the
+ * tablet runs down to a brown-out instead of a clean shutdown.
+ *
+ * Report "Discharging" in that case instead, like the mainline bq27xxx and
+ * sbs-battery gauges, which take the status from the sign of the current.
+ * Set report_net_drain=0 to report the charger state alone again.
+ */
+static bool report_net_drain = true;
+module_param(report_net_drain, bool, 0644);
+MODULE_PARM_DESC(report_net_drain,
+		 "report Discharging while charging if the pack still loses charge (default on)");
 
 int sm5714_battery_set_pd_contract(unsigned int mv, unsigned int ma);
 int sm5714_battery_set_direct_charge(bool active);
@@ -334,12 +372,27 @@ static int sm5714_configure_charging(struct sm5714_battery *sm)
 	unsigned int input_ma, fast_ma;
 	unsigned int typec_mv, typec_ma;
 	enum sm5714_charge_thermal_state thermal_state;
+	bool q4_was_open;
 	int usb_type;
+	int cntl1;
 	int temp;
 	int ret;
 
 	mutex_lock(&sm->chg_lock);
 	if (READ_ONCE(sm->otg_active)) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	/*
+	 * The SM5440 owns the battery path while it direct-charges, and closing
+	 * Q4 behind it would run both chargers at once.  The callers' own checks
+	 * of this flag are made without chg_lock: the poll could read it clear,
+	 * lose the CPU to sm5714_battery_set_direct_charge(true), and then close
+	 * Q4 here just after the pump took over.  Checking again under the lock
+	 * closes that window; the release path clears the flag before it calls.
+	 */
+	if (READ_ONCE(sm->direct_charging)) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
@@ -406,6 +459,13 @@ static int sm5714_configure_charging(struct sm5714_battery *sm)
 		fast_ma = min(fast_ma, 2100U);
 	}
 
+	cntl1 = i2c_smbus_read_byte_data(sm->chg, SM5714_CHG_REG_CNTL1);
+	if (cntl1 < 0) {
+		ret = cntl1;
+		goto out_unlock;
+	}
+	q4_was_open = !(cntl1 & SM5714_CHG_CNTL1_ENQ4FET);
+
 	/*
 	 * Match chg_set_enq4fet(): lower the input limit before closing Q4,
 	 * then restore the limit advertised by the MUIC classification.
@@ -432,11 +492,30 @@ static int sm5714_configure_charging(struct sm5714_battery *sm)
 
 	ret = i2c_smbus_write_byte_data(sm->chg, SM5714_CHG_REG_VBUSCNTL,
 					sm5714_input_current_reg(input_ma));
-	if (!ret)
+	if (ret)
+		goto out_unlock;
+
+	/*
+	 * TCPM repeats the same contract several times while a port settles,
+	 * and each repeat lands here.  Say so when something changed: new limits,
+	 * or Q4 found open, which is the event worth seeing (a cable insertion,
+	 * a direct-charge hand-back, or anything else that opened it).  A
+	 * repeat that changed nothing is debug noise.
+	 */
+	if (q4_was_open || usb_type != sm->logged_usb_type ||
+	    (typec_mv ?: 5000) != sm->logged_mv ||
+	    input_ma != sm->logged_input_ma || fast_ma != sm->logged_fast_ma)
 		dev_info(sm->dev,
 			 "enabled charging for USB type %d at %u mV "
-			 "(%u mA input, %u mA fast)\n",
-			 usb_type, typec_mv ?: 5000, input_ma, fast_ma);
+			 "(%u mA input, %u mA fast)%s\n",
+			 usb_type, typec_mv ?: 5000, input_ma, fast_ma,
+			 q4_was_open ? "" : ", Q4 already closed");
+	else
+		dev_dbg(sm->dev, "charging limits unchanged\n");
+	sm->logged_usb_type = usb_type;
+	sm->logged_mv = typec_mv ?: 5000;
+	sm->logged_input_ma = input_ma;
+	sm->logged_fast_ma = fast_ma;
 
 out_unlock:
 	mutex_unlock(&sm->chg_lock);
@@ -826,6 +905,56 @@ static int sm5714_get_status(struct sm5714_battery *sm)
 	return POWER_SUPPLY_STATUS_DISCHARGING;
 }
 
+/*
+ * Track whether the pack loses charge although the charger is on.  Called
+ * from the poll with the charger state it just read: anything but CHARGING
+ * starts over, so plugging in always shows "Charging" first and only a drain
+ * that lasts two samples (10-20 s) turns it into "Discharging".
+ */
+static void sm5714_update_net_drain(struct sm5714_battery *sm, int status,
+				    bool sample)
+{
+	int ua;
+
+	if (status != POWER_SUPPLY_STATUS_CHARGING) {
+		sm->drain_samples = 0;
+		sm->gain_samples = 0;
+		WRITE_ONCE(sm->net_draining, false);
+		return;
+	}
+
+	if (!sample || sm5714_get_current(sm, SM5714_FG_SRAM_CURRENT_AVG, &ua))
+		return;
+
+	if (ua <= SM5714_DRAIN_ENTER_UA) {
+		sm->gain_samples = 0;
+		if (sm->drain_samples < SM5714_DRAIN_SAMPLES)
+			sm->drain_samples++;
+	} else if (ua >= SM5714_DRAIN_EXIT_UA) {
+		sm->drain_samples = 0;
+		if (sm->gain_samples < SM5714_DRAIN_SAMPLES)
+			sm->gain_samples++;
+	}
+
+	if (!sm->net_draining && sm->drain_samples >= SM5714_DRAIN_SAMPLES) {
+		WRITE_ONCE(sm->net_draining, true);
+		dev_dbg(sm->dev, "net drain while charging: %d uA average\n", ua);
+	} else if (sm->net_draining && sm->gain_samples >= SM5714_DRAIN_SAMPLES) {
+		WRITE_ONCE(sm->net_draining, false);
+		dev_dbg(sm->dev, "net charge again: %d uA average\n", ua);
+	}
+}
+
+/* The status user space sees: the charger state, corrected for net drain. */
+static int sm5714_reported_status(struct sm5714_battery *sm, int status)
+{
+	if (status == POWER_SUPPLY_STATUS_CHARGING &&
+	    READ_ONCE(report_net_drain) && READ_ONCE(sm->net_draining))
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+
+	return status;
+}
+
 static int sm5714_bat_get_property(struct power_supply *psy,
 				   enum power_supply_property psp,
 				   union power_supply_propval *val)
@@ -838,7 +967,7 @@ static int sm5714_bat_get_property(struct power_supply *psy,
 		ret = sm5714_get_status(sm);
 		if (ret < 0)
 			return ret;
-		val->intval = ret;
+		val->intval = sm5714_reported_status(sm, ret);
 		return 0;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = 1;
@@ -989,11 +1118,13 @@ static void sm5714_poll_work(struct work_struct *work)
 	int usb_type = sm5714_get_usb_type(sm);
 	int capacity = sm->last_capacity;
 	enum sm5714_charge_thermal_state old_thermal_state;
+	bool slow_sample;
+	int reported;
 	int temp;
 	int cntl1;
 
-	if (sm->poll_count++ % SM5714_CAPACITY_POLL_DIVIDER == 0 &&
-	    sm5714_get_capacity(sm, &capacity))
+	slow_sample = sm->poll_count++ % SM5714_CAPACITY_POLL_DIVIDER == 0;
+	if (slow_sample && sm5714_get_capacity(sm, &capacity))
 		capacity = sm->last_capacity;
 
 	old_thermal_state = sm->thermal_state;
@@ -1021,9 +1152,16 @@ static void sm5714_poll_work(struct work_struct *work)
 			status = sm5714_get_status(sm);
 	}
 
-	if (status >= 0 &&
-	    (status != sm->last_status || capacity != sm->last_capacity)) {
-		sm->last_status = status;
+	/*
+	 * Compare what user space sees, so UPower hears about a switch between
+	 * "Charging" and a net drain as well as about charger state changes.
+	 */
+	if (status >= 0)
+		sm5714_update_net_drain(sm, status, slow_sample);
+	reported = status >= 0 ? sm5714_reported_status(sm, status) : status;
+	if (reported >= 0 &&
+	    (reported != sm->last_status || capacity != sm->last_capacity)) {
+		sm->last_status = reported;
 		sm->last_capacity = capacity;
 		power_supply_changed(sm->psy_bat);
 	}
