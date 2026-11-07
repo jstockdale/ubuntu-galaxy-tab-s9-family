@@ -1,0 +1,20 @@
+[Unit]
+Description=Enable the SM-X710 cameras chosen in /etc/ubuntu-gts9u/cameras
+# The SM-X710 device tree keeps its camera nodes disabled, so nothing camera-
+# related probes during boot.  This asks the kernel's gts9wifi_camera switch
+# for the cameras named in /etc/ubuntu-gts9u/cameras (rear, front or both),
+# after the panel's boot-time suspend cycle, and before the loopback loader
+# builds the camera table.  Without that file nothing happens: off by default.
+ConditionPathExists=/etc/ubuntu-gts9u/cameras
+ConditionPathExists=/sys/module/gts9wifi_camera/parameters/enable
+After=ubuntu-gts9u-panel-coldboot-recover.service
+Before=ubuntu-gts9u-camera-loopback.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/ubuntu-gts9u-camera-enable
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

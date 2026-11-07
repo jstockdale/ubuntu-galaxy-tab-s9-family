@@ -59,6 +59,23 @@ if [ "$DEVICE_SENSOR_DIR" != gts9uwifi ] &&
 	exit 1
 fi
 
+# --- per-device camera labels ------------------------------------------------
+# The SM-X710's two cameras have the same libcamera node names as two of the
+# SM-X910's four, and WirePlumber's config sandbox cannot read the device tree,
+# so the PipeWire labels are chosen here by board.  Everything else in the
+# camera stack (loopback nodes, relays, udev aliases) decides at runtime.
+camera_lua=usr/share/wireplumber/main.lua.d/51-gts9u-camera-backends.lua
+grep -qx 'local gts9u_board = "gts9uwifi"' "$staging/$camera_lua" || {
+	echo "$camera_lua no longer carries its board token" >&2
+	exit 1
+}
+sed -i "s/^local gts9u_board = \"gts9uwifi\"\$/local gts9u_board = \"$DEVICE\"/" \
+	"$staging/$camera_lua"
+grep -q "^  $DEVICE = {\$" "$staging/$camera_lua" || {
+	echo "$camera_lua has no camera labels for $DEVICE" >&2
+	exit 1
+}
+
 # Boot-lifetime native secure owner and the matching signed IRQ module are
 # built separately. No proprietary runtime/firmware bytes enter this package.
 owner=$base/out/fingerprint-secure/ubuntu-gts9u-fingerprint-secure-owner

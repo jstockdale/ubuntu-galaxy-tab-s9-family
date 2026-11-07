@@ -57,6 +57,9 @@ CONFIG_SM_CAMCC_8550=y
 CONFIG_VIDEO_HI847=y
 CONFIG_VIDEO_HI1337_GTS9U=y
 CONFIG_VIDEO_DW9808_VCM=y
+# The X710 camera nodes stay disabled at boot; this switch enables them on
+# request (gts9wifi_camera.enable=rear|front|both, docs/gts9wifi-cameras.md).
+CONFIG_VIDEO_GTS9WIFI_CAMERA=y
 CONFIG_USB_NET_AX8817X=y
 CONFIG_USB_NET_AX88179_178A=y
 CONFIG_USB_NET_CDCETHER=y

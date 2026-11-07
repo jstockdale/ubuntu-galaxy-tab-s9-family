@@ -1,28 +1,49 @@
 -- Snapshot consumes the native PipeWire/libcamera nodes, while browsers and
--- OBS consume the V4L2 relays. Give both layers the same four stable names so
+-- OBS consume the V4L2 relays. Give both layers the same stable names so
 -- every application presents the same camera list. WirePlumber must expose
 -- these nodes as Video/Source for Snapshot; the direct GStreamer provider is
 -- omitted from libcamera-gts9u so this does not create a second camera layer.
-local gts9u_cameras = {
-  {
-    name = "libcamera_input._base_soc_0_geniqup_8c0000_i2c_884000_camera_21",
-    description = "GTS9U Front Ultra-Wide",
+--
+-- The SM-X710's front and rear sit on the same buses and addresses as the
+-- SM-X910's front-main and rear-main, so their libcamera nodes have the same
+-- names; only the board can tell which labels apply.  WirePlumber's config
+-- sandbox cannot read the device tree, so scripts/build-device-package.sh
+-- rewrites this one word for the board the package is built for, the same
+-- way it points the sensor registry at that board's tree.
+local gts9u_board = "gts9uwifi"
+
+local gts9u_board_cameras = {
+  gts9uwifi = {
+    {
+      name = "libcamera_input._base_soc_0_geniqup_8c0000_i2c_884000_camera_21",
+      description = "GTS9U Front Ultra-Wide",
+    },
+    {
+      name = "libcamera_input._base_soc_0_cci_ac16000_i2c-bus_1_camera_20",
+      description = "GTS9U Front Main",
+    },
+    {
+      name = "libcamera_input._base_soc_0_cci_ac15000_i2c-bus_1_camera_21",
+      description = "GTS9U Rear Main",
+    },
+    {
+      name = "libcamera_input._base_soc_0_cci_ac15000_i2c-bus_0_camera_21",
+      description = "GTS9U Rear Ultra-Wide",
+    },
   },
-  {
-    name = "libcamera_input._base_soc_0_cci_ac16000_i2c-bus_1_camera_20",
-    description = "GTS9U Front Main",
-  },
-  {
-    name = "libcamera_input._base_soc_0_cci_ac15000_i2c-bus_1_camera_21",
-    description = "GTS9U Rear Main",
-  },
-  {
-    name = "libcamera_input._base_soc_0_cci_ac15000_i2c-bus_0_camera_21",
-    description = "GTS9U Rear Ultra-Wide",
+  gts9wifi = {
+    {
+      name = "libcamera_input._base_soc_0_cci_ac16000_i2c-bus_1_camera_20",
+      description = "GTS9 Front",
+    },
+    {
+      name = "libcamera_input._base_soc_0_cci_ac15000_i2c-bus_1_camera_21",
+      description = "GTS9 Rear",
+    },
   },
 }
 
-for _, camera in ipairs(gts9u_cameras) do
+for _, camera in ipairs(gts9u_board_cameras[gts9u_board] or {}) do
   table.insert(libcamera_monitor.rules, {
     matches = {
       {
