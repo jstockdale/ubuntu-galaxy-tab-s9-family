@@ -34,6 +34,18 @@ disp_cc_mdss_rscc_vsync_clk
 disp_cc_sleep_clk
 gcc_boot_rom_ahb_clk
 gcc_pcie_1_phy_rchng_clk'
+# clk_disable_unused() emits the clk_disable trace event for every clock whose
+# .is_enabled reads "on", before it looks for a .disable op.  These six are
+# enabled-with-count-0 too but have no .disable (RCGs with clk_rcg2_ops,
+# branches with clk_branch2_aon_ops): they show up in the trace and stay on.
+# disp_cc_sleep_clk_src may read off by then, since its only branch
+# (disp_cc_sleep_clk) is gated just before it.
+trace_only_clk='disp_cc_sleep_clk_src
+disp_cc_xo_clk_src
+gcc_ddrss_gpu_axi_clk
+gpu_cc_cx_gmu_clk
+gpu_cc_hub_aon_clk
+gpu_cc_hub_cx_int_clk'
 
 boot=$(cut -c1-8 /proc/sys/kernel/random/boot_id)
 top=/var/log/gts9u-flags
@@ -75,7 +87,10 @@ find /sys/devices -maxdepth 6 -name state_synced 2>/dev/null | while read -r f; 
 	echo "${f%/state_synced} $(cat "$f")"
 done | sort > "$out/state_synced.txt"
 trace_on=$(cat "$tracefs/events/clk/clk_disable/enable" 2>/dev/null || echo 0)
-[ "$trace_on" = 1 ] && cp "$tracefs/trace" "$out/trace.txt"
+# The event stays on after boot and records all runtime clock gating (UFS,
+# QUP, GPU), so a full 8 x 8 MiB buffer would be a ~130 MB text file.  The
+# boot-time pass is near the start of the time-ordered output: keep the head.
+[ "$trace_on" = 1 ] && head -n 400000 "$tracefs/trace" > "$out/trace.txt"
 
 # Enabled in hardware with enable count 0, from clk_summary: the input of
 # clk_disable_unused() (it acts only on those whose ops can disable them).
@@ -150,16 +165,36 @@ if [ "$want_clk" = 0 ]; then
 			ck "the ring buffer overwrote $(( ${hd#* } - ${hd% *} )) events: if they include the cleanup, the list below is incomplete"
 		fi
 		sed 's/^/  info   /' "$out/clk-disabled-at-boot.txt"
+		# A clk_disable event means the pass found the clock on; it gated it
+		# only if the ops have a .disable.  Sort the events into the six
+		# predicted gates, the known no-op ones, and the rest; for the rest,
+		# a clock that still reads enabled-with-count-0 now was not gated.
 		got=$(awk '$2 == "clk_disable" {print $1}' "$out/clk-disabled-at-boot.txt" | sort -u)
 		want=$(printf '%s\n' "$expected_clk" | sort)
-		extra=$(printf '%s\n' "$got" | grep -vxF -e "$want" | grep . || true)
+		noop=$(printf '%s\n' "$got" | grep -xF -e "$trace_only_clk" | grep . || true)
+		extra=$(printf '%s\n' "$got" | grep -vxF -e "$want" | grep -vxF -e "$trace_only_clk" | grep . || true)
 		missing=$(printf '%s\n' "$want" | grep -vxF -e "$got" | grep . || true)
-		if [ -z "$extra" ] && [ -z "$missing" ]; then
-			ok 'exactly the six clocks the analysis predicted'
+		stillon= offnow=
+		for c in $extra; do
+			if grep -qxF "$c" "$out/clk-enabled-count0.txt" 2>/dev/null; then
+				stillon="$stillon $c"
+			else
+				offnow="$offnow $c"
+			fi
+		done
+		[ -z "$noop" ] || inf "found on but not gated (no .disable op, as predicted): $(echo $noop)"
+		[ -z "$stillon" ] || inf "found on, not predicted, still enabled-with-count-0 now, so not gated: $(echo $stillon)"
+		if [ -z "$offnow" ] && [ -z "$missing" ]; then
+			ok 'gated exactly the six clocks the analysis predicted'
 		else
-			[ -z "$extra" ] || ck "switched off beyond the prediction: $(echo $extra)"
+			[ -z "$offnow" ] || ck "switched off beyond the prediction (no longer enabled-with-count-0): $(echo $offnow)"
 			[ -z "$missing" ] || inf "predicted but not switched off (off already at 13.7 s?): $(echo $missing)"
 		fi
+		for c in $expected_clk; do
+			printf '%s\n' "$got" | grep -qxF "$c" || continue
+			grep -qxF "$c" "$out/clk-enabled-count0.txt" 2>/dev/null &&
+				ck "$c was switched off at boot but reads enabled-with-count-0 again now"
+		done
 	fi
 fi
 

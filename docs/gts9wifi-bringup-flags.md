@@ -92,7 +92,19 @@ TrustZone does not depend on an HLOS vote (the same finding as the X910's in
 Caveat: the snapshot is from 145 s.  A clock that was on at 13.66 s and taken
 by a driver later is not in it.  The `flags-noclk` image therefore also
 traces every `clk_disable`/`clk_unprepare`, and `flags-check.sh` lists what
-PID 1 switched off in the two seconds after "clk: Disabling unused clocks".
+PID 1 traced in the two seconds after "clk: Disabling unused clocks".
+
+The trace is a list of clocks the pass found on, not of clocks it gated:
+`clk_disable_unused_subtree()` emits the `clk_disable` event for every clock
+whose `.is_enabled` reads on, then calls `.disable` only if the ops have one.
+So the two RCGs (`disp_cc_xo_clk_src`, and `disp_cc_sleep_clk_src` unless it
+reads off once its branch is gated) and the four always-on branches of the
+table above also appear in the trace and stay on.  `flags-check.sh` knows
+those six; for any other traced clock it looks at the clk_summary of the same
+boot: still enabled with count 0 means the pass could not gate it (info), not
+enabled-with-count-0 any more means it was gated or a driver took it later
+(CHECK).  (`.unprepare` events need an `.is_prepared` op, which no SM8550
+clock-controller clock has.)
 
 ## `pd_ignore_unused`: nothing expected
 
@@ -154,7 +166,7 @@ image, each required to be a whole word of it (a typo fails the build;
 |---|---|---|---|
 | `flags-nopd` | `pd_ignore_unused` | - | "genpd: Disabling unused power domains"; same domain states as fix2-s2 |
 | `flags-noreg` | `regulator_ignore_unused` | - | no "regulator: Not disabling" line and no "`<rail>: disabling`" line |
-| `flags-noclk` | `clk_ignore_unused` | `trace_event=clk:clk_disable,clk:clk_unprepare trace_buf_size=8M` | exactly the six clocks above; panel unaffected |
+| `flags-noclk` | `clk_ignore_unused` | `trace_event=clk:clk_disable,clk:clk_unprepare trace_buf_size=8M` | the six clocks above gated (the RCGs and always-on branches are traced too but stay on); panel unaffected |
 | `flags-none` | all three | the same trace | only after the three above pass |
 
 Order: `pd`, then `regulator`, then `clk` (lowest expected change first), then

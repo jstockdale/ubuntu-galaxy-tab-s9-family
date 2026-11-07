@@ -15,9 +15,13 @@ off six clocks that no device-tree node uses.
 | `flags-noclk` | `clk_ignore_unused` | `trace_event=clk:clk_disable,clk:clk_unprepare trace_buf_size=8M` | `37141280deaa…` |
 | `flags-none` | all three | the same trace | `c90a49b630d7…` |
 
-The trace tokens only record clock switch-offs in the ftrace ring buffer
-(64 MiB RAM in total), so `flags-check.sh` can list exactly what the kernel
-switched off at 13.7 s.
+The trace tokens only record, in the ftrace ring buffer (64 MiB RAM in
+total), every clock the boot-time pass finds on at 13.7 s (and, after that,
+ordinary runtime clock gating), so `flags-check.sh` can tell exactly what the
+kernel switched off.  The pass traces a clock before it checks for a `.disable`
+op, so six clocks without one (two RCGs, four always-on branches) appear in the
+trace and stay on; the check knows them.  Run the check soon after boot: the
+buffer wraps after a few hours of runtime gating, and the check says so.
 
 Files:
 
@@ -162,17 +166,24 @@ sh ~/fix1/verify.sh --gpu
 
 Expected:
 - `clk_ignore_unused absent`; info `clk: Disabling unused clocks`;
-- under `clocks switched off by clk_disable_unused()`: six `info` lines
+- under `clocks switched off by clk_disable_unused()`: about twelve `info`
+  lines `<clock> clk_disable <time>`, the six predicted gates
   (`disp_cc_mdss_ahb1_clk`, `disp_cc_mdss_rscc_ahb_clk`,
   `disp_cc_mdss_rscc_vsync_clk`, `disp_cc_sleep_clk`, `gcc_boot_rom_ahb_clk`,
-  `gcc_pcie_1_phy_rchng_clk`), then `ok     exactly the six clocks the analysis predicted`;
+  `gcc_pcie_1_phy_rchng_clk`) and the clocks the pass found on but cannot gate;
+- `info   found on but not gated (no .disable op, as predicted): disp_cc_sleep_clk_src disp_cc_xo_clk_src gcc_ddrss_gpu_axi_clk gpu_cc_cx_gmu_clk gpu_cc_hub_aon_clk gpu_cc_hub_cx_int_clk`
+  (some may be missing: harmless);
+- `ok     gated exactly the six clocks the analysis predicted`;
 - `info   enabled-with-count-0 in the control, now off:` the same six;
 - no new `CHECK` in health; no `more known-pattern splats ... than the control`.
 
-`CHECK  switched off beyond the prediction: ...` is a finding (a clock that
-was on at 13.7 s and that a driver took later): note the names.
-`info   predicted but not switched off` is harmless.  Manual checks as in
-step 3, plus WebGL in Chrome and 60 Hz mode.
+`CHECK  switched off beyond the prediction (no longer enabled-with-count-0): ...`
+is a finding (a clock that was on at 13.7 s and that the pass gated, or that a
+driver took later): note the names.  `info   found on, not predicted, still
+enabled-with-count-0 now, so not gated` and `info   predicted but not switched
+off` are harmless.  A `CHECK  the ring buffer overwrote ...` line means the run
+came too late after boot; the clk_summary diff still holds.  Manual checks as
+in step 3, plus WebGL in Chrome and 60 Hz mode.
 
 ### 6. Optional: all three dropped (tablet, sudo)
 
