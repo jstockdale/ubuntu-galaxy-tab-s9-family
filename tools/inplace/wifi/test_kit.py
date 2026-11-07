@@ -268,6 +268,19 @@ class KitTest(unittest.TestCase):
         self.assertTrue(self.exists("usr/libexec/ubuntu-gts9u-wlan-address"))
         self.assertTrue(self.exists("var/backups/ubuntu-gts9u-wifi/complete"))
 
+    def test_rollback_keeps_a_vendor_boot_another_kit_wrote(self):
+        self.run_kit("install")
+        later = os.urandom(SIZE)  # e.g. a cmdline-flags kit flashed afterwards
+        self.part.write_bytes(later)
+        out = self.run_kit("rollback", expect=1)
+        self.assertIn("neither the backup nor this kit's Wi-Fi variant", out)
+        self.assertEqual(self.partition(), later)
+        self.assertTrue(self.exists("usr/libexec/ubuntu-gts9u-wlan-address"))
+        self.assertTrue(self.exists("var/backups/ubuntu-gts9u-wifi/complete"))
+        out = self.run_kit("rollback", "--images-only", "--force")
+        self.assertIn("--force: replacing vendor_boot", out)
+        self.assertEqual(self.partition(), self.base)
+
     def test_rollback_refuses_a_damaged_backup(self):
         self.run_kit("install")
         with open(self.root / "var/backups/ubuntu-gts9u-wifi/vendor_boot.img", "r+b") as f:

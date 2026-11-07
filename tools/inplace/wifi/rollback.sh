@@ -5,6 +5,8 @@
 #
 #   sudo sh ~/wifi-kit/rollback.sh
 #   sudo sh ~/wifi-kit/rollback.sh --images-only    only vendor_boot
+#   ... --force    restore the vendor_boot backup even though another kit has
+#                  written vendor_boot since install.sh (that kit's change is lost)
 #
 # From TWRP, when the tablet no longer boots (the Ubuntu root is userdata):
 #   [ -d /data/var ] || mount -t ext4 /dev/block/by-name/userdata /data
@@ -13,6 +15,7 @@
 # then reboot and run this script for the rest.
 set -eu
 
+kit=$(cd "$(dirname "$0")" && pwd)
 backup=/var/backups/ubuntu-gts9u-wifi
 log=/var/log/gts9u-wifi-kit.log
 part=/dev/disk/by-partlabel/vendor_boot
@@ -34,11 +37,14 @@ partition_sha() {
 packaged() { dpkg -S "$1" >/dev/null 2>&1; }
 
 images_only=0
-case "${1:-}" in
-'') ;;
---images-only) images_only=1 ;;
-*) echo 'usage: rollback.sh [--images-only]' >&2; exit 2 ;;
-esac
+force=0
+for arg; do
+	case "$arg" in
+	--images-only) images_only=1 ;;
+	--force) force=1 ;;
+	*) echo 'usage: rollback.sh [--images-only] [--force]' >&2; exit 2 ;;
+	esac
+done
 [ "$(id -u)" = 0 ] || { echo 'run with sudo' >&2; exit 1; }
 exec 9> /run/gts9u-wifi-kit.lock
 flock -n 9 || { echo 'install.sh or rollback.sh is already running: tail -f /var/log/gts9u-wifi-kit.log' >&2; exit 1; }
@@ -55,9 +61,23 @@ want=$(cut -d' ' -f1 "$backup/vendor_boot.sha256")
 
 # --- vendor_boot ---------------------------------------------------------------
 trap '' INT TERM
-if [ "$(partition_sha)" = "$want" ]; then
+current=$(partition_sha)
+# This kit's Wi-Fi variants, from the IMAGES list next to this script.
+ours=0
+if [ -r "$kit/IMAGES" ]; then
+	while read -r base variant file; do
+		case "$base" in ''|'#'*) continue ;; esac
+		[ "$current" = "$variant" ] && ours=1
+	done < "$kit/IMAGES"
+fi
+if [ "$current" = "$want" ]; then
 	say 'vendor_boot already holds the backed-up image'
+elif [ "$ours" = 0 ] && [ "$force" = 0 ]; then
+	# Another kit (flags, panel, icc...) wrote vendor_boot after install.sh.
+	# Putting this backup back would silently undo that kit's image too.
+	die "vendor_boot holds $(echo "$current" | cut -c1-12), which is neither the backup nor this kit's Wi-Fi variant: another kit wrote it after install.sh.  Roll that kit back first, or run rollback.sh --force to put the backup ($(echo "$want" | cut -c1-12)) back anyway; nothing was changed"
 else
+	[ "$ours" = 1 ] || say "--force: replacing vendor_boot $(echo "$current" | cut -c1-12), which this kit did not write"
 	say 'writing vendor_boot <- the backup (a few seconds; do not interrupt)'
 	dd if="$backup/vendor_boot.img" of="$part" bs=4M conv=fsync status=none ||
 		die 'writing vendor_boot failed: do NOT reboot; run rollback.sh --images-only again, or dd from TWRP (header)'
