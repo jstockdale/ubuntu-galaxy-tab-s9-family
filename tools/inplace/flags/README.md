@@ -190,9 +190,11 @@ Expected:
 
 `CHECK  switched off beyond the prediction (no longer enabled-with-count-0): ...`
 is a finding (a clock that was on at 13.7 s and that the pass gated, or that a
-driver took later): note the names.  `info   found on, not predicted, still
-enabled-with-count-0 now, so not gated` and `info   predicted but not switched
-off` are harmless.  A `CHECK  the ring buffer overwrote ...` line means the run
+driver took later): note the names.  It does not fail the step by itself; the
+health lines, `verify.sh` and the manual checks decide that.  `info   found
+on, not predicted, still enabled-with-count-0 now, so not gated`, `info   GPU
+clocks gated at boot ...` and `info   predicted but not switched off` are
+harmless.  A `CHECK  the ring buffer overwrote ...` line means the run
 came too late after boot; the clk_summary diff still holds.  Manual checks as
 in step 3, plus WebGL in Chrome and 60 Hz mode.
 

@@ -174,16 +174,21 @@ if [ "$want_clk" = 0 ]; then
 		noop=$(printf '%s\n' "$got" | grep -xF -e "$trace_only_clk" | grep . || true)
 		extra=$(printf '%s\n' "$got" | grep -vxF -e "$want" | grep -vxF -e "$trace_only_clk" | grep . || true)
 		missing=$(printf '%s\n' "$want" | grep -vxF -e "$got" | grep . || true)
-		stillon= offnow=
+		stillon= offnow= gpuoff=
 		for c in $extra; do
 			if grep -qxF "$c" "$out/clk-enabled-count0.txt" 2>/dev/null; then
 				stillon="$stillon $c"
+			elif echo "$c" | grep -qE '^(gpu_cc_|gcc_gpu_|gcc_ddrss_gpu_)'; then
+				# The GPU is first powered after the pass (by the compositor)
+				# and its driver switches these on and off with rendering.
+				gpuoff="$gpuoff $c"
 			else
 				offnow="$offnow $c"
 			fi
 		done
 		[ -z "$noop" ] || inf "found on but not gated (no .disable op, as predicted): $(echo $noop)"
 		[ -z "$stillon" ] || inf "found on, not predicted, still enabled-with-count-0 now, so not gated: $(echo $stillon)"
+		[ -z "$gpuoff" ] || inf "GPU clocks gated at boot and run by the GPU driver since (see the --gpu check): $(echo $gpuoff)"
 		if [ -z "$offnow" ] && [ -z "$missing" ]; then
 			ok 'gated exactly the six clocks the analysis predicted'
 		else
