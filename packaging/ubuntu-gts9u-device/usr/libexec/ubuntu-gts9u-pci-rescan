@@ -29,12 +29,26 @@
 #   off             disable in every case (the escape hatch if a board's link
 #                   misbehaves in L1.2: AER errors, Wi-Fi stalls)
 #
+# Enabling needs two steps.  A write of 1 to link/l1_*_aspm only takes the state
+# out of the link's aspm_disable mask; the states actually enabled are still
+# capped by the ASPM policy, and the default policy means link->aspm_default.
+# pcie-qcom raises that to every state (pci_enable_link_state_locked(ALL)) only
+# for the devices present at host init; a device created by a rescan keeps the
+# core's devicetree default of L0s and L1, so for it the writes change nothing
+# (aspm_attr_store_common -> policy_to_aspm_state, drivers/pci/pcie/aspm.c).
+# When the substates still read 0 after the writes, the global policy is set to
+# powersupersave, which enables every supported state on every link: on both
+# boards that is this one link (pcie0 is the only PCIe controller enabled), and
+# it is what host init gives a boot-time endpoint.  The per-link aspm_disable
+# mask stays in force under every policy, so `off` keeps working afterwards.
+#
 # The outcome is also left in /run/ubuntu-gts9u/pci-rescan (key=value), so it
 # can be checked without the journal, which may not hold the early boot.
 set -u
 
 ep=/sys/bus/pci/devices/0000:01:00.0
 rp=/sys/bus/pci/devices/0000:00:00.0
+aspm_policy=/sys/module/pcie_aspm/parameters/policy
 policy_file=/etc/ubuntu-gts9u/pcie-l1ss
 state=/run/ubuntu-gts9u/pci-rescan
 
@@ -46,6 +60,20 @@ link_states() {
 	for a in l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
 		[ -r "$ep/link/$a" ] && printf '%s=%s ' "$a" "$(cat "$ep/link/$a")"
 	done
+}
+# Every L1 substate the link offers reads 1.  (The kernel hides the attribute
+# of a state the link does not support.)
+substates_on() {
+	for a in l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
+		[ -e "$ep/link/$a" ] || continue
+		[ "$(cat "$ep/link/$a" 2>/dev/null)" = 1 ] || return 1
+	done
+	return 0
+}
+# The active ASPM policy: the bracketed word of "[default] performance ...".
+aspm_policy_now() {
+	p=$(cat "$aspm_policy" 2>/dev/null) || return 0
+	case "$p" in *\[*\]*) p=${p#*\[}; echo "${p%%\]*}" ;; esac
 }
 
 policy=auto
@@ -136,8 +164,27 @@ if [ -n "$want" ] && [ -d "$ep/link" ]; then
 		echo "$want" > "$ep/link/$a" 2>/dev/null ||
 			log "writing $want to link/$a failed"
 	done
-	log "L1 substates set to $want (policy $policy)"
-	record l1ss "$want"
+	if [ "$want" = 1 ] && ! substates_on; then
+		# The writes only lifted aspm_disable; aspm_default (a re-created
+		# device: L0s L1) still caps them.  See the header.
+		was=$(aspm_policy_now)
+		if [ "$was" = powersupersave ]; then
+			log 'L1 substates still off under the powersupersave ASPM policy'
+		elif echo powersupersave > "$aspm_policy" 2>/dev/null; then
+			log "ASPM policy ${was:-?} -> powersupersave, so the L1 substates can be enabled"
+			record aspm_policy "powersupersave (was ${was:-unknown})"
+		else
+			log "could not set the ASPM policy to powersupersave; the L1 substates stay off"
+			record aspm_policy "set-failed (${was:-unknown})"
+		fi
+	fi
+	if [ "$want" = 1 ] && ! substates_on; then
+		log "L1 substates requested but still not all on (policy $policy)"
+		record l1ss "1-requested-not-on"
+	else
+		log "L1 substates set to $want (policy $policy)"
+		record l1ss "$want"
+	fi
 fi
 log "link: $(link_states)"
 record link "$(link_states)"

@@ -1,7 +1,15 @@
 """Run ubuntu-gts9u-pci-rescan against a fake PCI sysfs.  Writes to the fake
 remove/rescan/drivers_probe files only take effect when the script sleeps: the
 `sleep` stub plays the kernel, so each scenario decides what a re-probe or a
-rescan achieves.  Nothing on the host is touched."""
+rescan achieves.  Nothing on the host is touched.
+
+The ASPM link attributes follow the kernel's rule (drivers/pci/pcie/aspm.c):
+a write of 1 to link/l1_* only lifts the state out of aspm_disable, and what is
+enabled stays capped by the policy, under "default" link->aspm_default.  An
+endpoint the fake rescan creates carries the marker `default-l0s-l1` (the
+core's devicetree default; pcie-qcom raised the boot-time one to every state),
+and the `cat` stub reports its L1 substates as 0 unless the fake
+/sys/module/pcie_aspm/parameters/policy says powersupersave."""
 import os
 import pathlib
 import re
@@ -32,6 +40,7 @@ echo "sleep $1" >> "$r/calls.log"
 endpoint() {  # create the endpoint as a fresh enumeration does
 	mkdir -p "$ep/link" "$ep/net"
 	: > "$ep/remove"
+	: > "$ep/default-l0s-l1"
 	for a in l0s_aspm l1_aspm; do echo 1 > "$ep/link/$a"; done
 	for a in l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do echo 0 > "$ep/link/$a"; done
 	if [ -e "$r/rescan-binds" ]; then
@@ -67,7 +76,31 @@ fi
 exit 0
 """
 
+# What the script reads back from the ASPM files, as the kernel would show it.
+STUB_CAT = r"""#!/bin/sh
+PATH=/usr/bin:/bin
+r=$FAKE_ROOT
+ep=$r/sys/bus/pci/devices/0000:01:00.0
+policy=$r/sys/module/pcie_aspm/parameters/policy
+[ $# = 1 ] || exec cat "$@"
+case "$1" in
+"$policy")
+	# The script writes a bare word; the kernel shows the list, bracketed.
+	p=$(cat "$1") || exit 1
+	case "$p" in *"["*) echo "$p" ;; *) echo "[$p]" ;; esac ;;
+"$ep"/link/l1_*)
+	v=$(cat "$1") || exit 1
+	if [ "$v" = 1 ] && [ -e "$ep/default-l0s-l1" ] &&
+		! grep -qE '^powersupersave$|\[powersupersave\]' "$policy" 2>/dev/null; then
+		v=0
+	fi
+	echo "$v" ;;
+*) exec cat "$1" ;;
+esac
+"""
+
 TOOLS = ("cat", "tr", "ls", "readlink", "basename", "mkdir")
+POLICY = "sys/module/pcie_aspm/parameters/policy"
 
 
 class PciRescanTest(unittest.TestCase):
@@ -75,16 +108,18 @@ class PciRescanTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name)
         for directory in ("bin", "tools", "etc/ubuntu-gts9u", RP,
-                          "sys/bus/pci/drivers/ath11k_pci"):
+                          "sys/bus/pci/drivers/ath11k_pci", "sys/module/pcie_aspm/parameters"):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
         for name in ("sys/bus/pci/rescan", "sys/bus/pci/drivers_probe",
                      RP + "/remove", RP + "/rescan"):
             (self.root / name).write_text("")
+        (self.root / POLICY).write_text("[default] performance powersave powersupersave \n")
         for tool in TOOLS:
             os.symlink(shutil.which(tool), self.root / "tools" / tool)
-        path = self.root / "bin/sleep"
-        path.write_text(STUB_SLEEP)
-        path.chmod(0o755)
+        for name, body in (("sleep", STUB_SLEEP), ("cat", STUB_CAT)):
+            path = self.root / "bin" / name
+            path.write_text(body)
+            path.chmod(0o755)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -110,7 +145,7 @@ class PciRescanTest(unittest.TestCase):
         (self.root / "etc/ubuntu-gts9u/pcie-l1ss").write_text(text)
 
     def run_script(self):
-        text = re.sub(r"/sys/bus/pci|/etc/ubuntu-gts9u|/run/ubuntu-gts9u",
+        text = re.sub(r"/sys/bus/pci|/sys/module/pcie_aspm|/etc/ubuntu-gts9u|/run/ubuntu-gts9u",
                       lambda match: str(self.root) + match.group(0), SCRIPT.read_text())
         env = dict(os.environ, FAKE_ROOT=str(self.root),
                    PATH="%s:%s" % (self.root / "bin", self.root / "tools"))
@@ -123,8 +158,20 @@ class PciRescanTest(unittest.TestCase):
         log = self.root / "calls.log"
         return log.read_text().splitlines() if log.exists() else []
 
+    def aspm_policy(self):
+        path = self.root / POLICY
+        return path.read_text().strip() if path.is_file() else ""
+
     def substates(self):
-        return {a: (self.root / EP / "link" / a).read_text().strip() for a in SUBSTATES}
+        """The substates as the kernel would report them (see STUB_CAT)."""
+        ep = self.root / EP
+        capped = ((ep / "default-l0s-l1").exists()
+                  and not re.search(r"^powersupersave$|\[powersupersave\]", self.aspm_policy()))
+        states = {}
+        for a in SUBSTATES:
+            value = (ep / "link" / a).read_text().strip()
+            states[a] = "0" if capped else value
+        return states
 
     def state(self):
         path = self.root / "run/ubuntu-gts9u/pci-rescan"
@@ -162,6 +209,7 @@ class PciRescanTest(unittest.TestCase):
         self.assertNotIn("L1 substates set", result.stderr)
         self.assertEqual(self.state()["outcome"], "reprobed")
         self.assertNotIn("l1ss", self.state())
+        self.assertTrue(self.aspm_policy().startswith("[default]"))
 
     # --- re-probe fails: re-create, then re-enable the substates ------------------
     def test_recreated_endpoint_gets_its_substates_back(self):
@@ -173,10 +221,28 @@ class PciRescanTest(unittest.TestCase):
         self.assertLess(calls.index("remove-ep"), calls.index("remove-rp"))
         self.assertLess(calls.index("remove-rp"), calls.index("bus-rescan"))
         self.assertIn("endpoint bound to ath11k_pci after a rescan", result.stderr)
+        # Writing 1 to link/l1_* alone leaves a re-created device at L0s L1
+        # (aspm_default); the policy has to allow the substates too.
+        self.assertEqual(self.aspm_policy(), "powersupersave")
+        self.assertIn("ASPM policy default -> powersupersave", result.stderr)
+        self.assertEqual(self.state()["aspm_policy"], "powersupersave (was default)")
         self.assertEqual(set(self.substates().values()), {"1"})
         self.assertIn("L1 substates set to 1 (policy auto)", result.stderr)
         self.assertEqual(self.state()["outcome"], "rescanned")
         self.assertEqual(self.state()["l1ss"], "1")
+        self.assertIn("l1_1_aspm=1 l1_2_aspm=1 l1_1_pcipm=1 l1_2_pcipm=1", self.state()["link"])
+
+    def test_recreated_endpoint_when_the_policy_cannot_be_set(self):
+        (self.root / POLICY).unlink()
+        (self.root / POLICY).mkdir()  # every write to it fails
+        self.endpoint(bound=False)
+        self.scenario("rescan-binds")
+        result = self.run_script()
+        self.assertIn("could not set the ASPM policy", result.stderr)
+        self.assertEqual(set(self.substates().values()), {"0"})
+        self.assertEqual(self.state()["aspm_policy"], "set-failed (unknown)")
+        self.assertEqual(self.state()["l1ss"], "1-requested-not-on")
+        self.assertNotIn("L1 substates set to 1", result.stderr)
 
     def test_late_link_rescans_the_root_port(self):
         self.scenario("rescan-binds")
@@ -185,6 +251,7 @@ class PciRescanTest(unittest.TestCase):
         self.assertIn("rp-rescan", self.calls())
         self.assertIn("no endpoint; rescanning the root port", result.stderr)
         self.assertEqual(set(self.substates().values()), {"1"})
+        self.assertEqual(self.aspm_policy(), "powersupersave")
 
     def test_root_port_gone_falls_back_to_the_bus_rescan(self):
         shutil.rmtree(self.root / RP)
@@ -214,12 +281,23 @@ class PciRescanTest(unittest.TestCase):
         self.policy("off")
         self.run_script()
         self.assertEqual(set(self.substates().values()), {"0"})
+        self.assertTrue(self.aspm_policy().startswith("[default]"))
 
     def test_policy_on_enables_at_boot(self):
         self.endpoint(bound=True, substates="0")
         self.policy(" on \n")
         self.run_script()
         self.assertEqual(set(self.substates().values()), {"1"})
+        # A boot-time endpoint has every state in aspm_default already.
+        self.assertTrue(self.aspm_policy().startswith("[default]"))
+
+    def test_policy_on_after_a_rescan(self):
+        self.endpoint(bound=False)
+        self.scenario("rescan-binds")
+        self.policy("on")
+        self.run_script()
+        self.assertEqual(set(self.substates().values()), {"1"})
+        self.assertEqual(self.aspm_policy(), "powersupersave")
 
     def test_unknown_policy_is_auto(self):
         self.endpoint(bound=True, substates="0")

@@ -109,12 +109,24 @@ so it replaces the copy older overlays generated) and runs
    through `/sys/bus/pci/drivers_probe`, which keeps the device and its L1
    substates;
 3. otherwise the old re-creation (root-port rescan, or remove and rescan the
-   host bridge), after which it re-enables the four L1 substate controls once
-   the interface is up (ath11k keeps ASPM off while its firmware boots).
+   host bridge), after which it re-enables the L1 substates once the
+   interface is up (ath11k keeps ASPM off while its firmware boots).
+
+Re-enabling takes more than writing 1 to `link/l1_*_aspm`: those attributes
+only lift a state out of the link's `aspm_disable` mask, and with the
+`default` ASPM policy what is enabled stays capped by `link->aspm_default`,
+which for a re-created device is the core's L0s+L1
+(`aspm_attr_store_common()` -> `policy_to_aspm_state()`).  So when the
+substates still read 0 after the writes, the helper sets
+`/sys/module/pcie_aspm/parameters/policy` to `powersupersave` (every
+supported state on every link; pcie0 is the only PCIe controller enabled on
+either board, so this is the state host init gives a boot-time endpoint).  The
+`aspm_disable` mask, and with it `off` below, is honoured under every policy.
 
 `/etc/ubuntu-gts9u/pcie-l1ss` overrides step 3's choice: `auto` (default),
 `on` (always enable), `off` (always disable, the escape hatch if a link
-misbehaves in L1.2).  The outcome is left in `/run/ubuntu-gts9u/pci-rescan`.
+misbehaves in L1.2).  The outcome is left in `/run/ubuntu-gts9u/pci-rescan`
+(`aspm_policy=` when the policy had to change).
 
 ## Userspace
 

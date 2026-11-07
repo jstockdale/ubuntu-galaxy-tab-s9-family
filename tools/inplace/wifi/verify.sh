@@ -87,6 +87,8 @@ case "$states" in
 *) bad "link: $states (L1.1/L1.2 not all on)" ;;
 esac
 [ -r /etc/ubuntu-gts9u/pcie-l1ss ] && info "L1SS policy override: $(cat /etc/ubuntu-gts9u/pcie-l1ss)"
+ap=$(kv aspm_policy /run/ubuntu-gts9u/pci-rescan)
+info "PCIe ASPM policy: $(cat /sys/module/pcie_aspm/parameters/policy 2>/dev/null)${ap:+ (gts9u-pci-rescan: $ap)}"
 aer() { for k in correctable nonfatal fatal; do printf '%s:%s ' "$k" "$(awk '/^TOTAL/ { print $2 }' "$ep/aer_dev_$k" 2>/dev/null)"; done; }
 info "AER totals: $(aer)"
 info "'msdu_done' warnings this boot (journal): $(journalctl -k -b --no-pager 2>/dev/null | grep -c 'msdu_done bit in attention')"

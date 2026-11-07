@@ -8,7 +8,7 @@ vendor_boot carry (`docs/gts9wifi-wifi.md`):
 | --- | --- | --- |
 | `wlp1s0` has a Qualcomm default address (`00:03:7f:12:…`) that changes every boot, so the DHCP lease moves | `ubuntu-gts9u-wlan-address.service` reads `/efs/wifi/.mac.info` (EFS mounted `ro,noload`) and applies it before NetworkManager | userspace |
 | ath11k's first probe fails at ~11.7 s (`amss.bin` -2, then -110) because the firmware is only on the rootfs | the WCN6855 hw2.1 set goes into the vendor_boot ramdisk, next to the Bluetooth set | vendor_boot |
-| `gts9u-pci-rescan` brings Wi-Fi up ~22 s by re-creating the endpoint, which loses the L1.1/L1.2 substates | the rescan helper re-probes in place first, and re-enables the substates after a re-creation; `/etc/ubuntu-gts9u/pcie-l1ss` (`auto`/`on`/`off`) overrides | userspace |
+| `gts9u-pci-rescan` brings Wi-Fi up ~22 s by re-creating the endpoint, which loses the L1.1/L1.2 substates | the rescan helper re-probes in place first, and re-enables the substates after a re-creation (through the `powersupersave` ASPM policy: a re-created device's `link/l1_*` writes alone are capped at L0s+L1); `/etc/ubuntu-gts9u/pcie-l1ss` (`auto`/`on`/`off`) overrides | userspace |
 
 Measured on the Stage 2 boot before the kit (`verify.sh`, boot `df92b567`):
 address `00:03:7f:12:09:4b`, udev initialised `wlp1s0` at 22 s,
@@ -121,7 +121,10 @@ address.
   is removed.
 * **Address or rescan helpers misbehave:** `sudo sh ~/wifi-kit/rollback.sh`
   undoes everything (vendor_boot from the backup, units removed or restored),
-  then `sudo reboot`.
+  then `sudo reboot`. If another kit wrote vendor_boot after this one,
+  rollback stops before changing anything (`neither the backup nor this kit's
+  Wi-Fi variant`): roll that kit back first, or add `--force` to put the
+  fix2-s2 backup back anyway (that kit's vendor_boot change is then lost).
 * **Only the vendor_boot change is suspect:** `sudo sh ~/wifi-kit/rollback.sh --images-only`,
   `sudo reboot`. The userspace part works without it (the rescan helper then
   re-probes in place and the address helper uses its `.link`).
