@@ -1,0 +1,198 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Safety net for the Wi-Fi endpoint on PCIe0 (0000:01:00.0), run once per boot
+# by gts9u-pci-rescan.service.  A no-op when the endpoint has its driver.
+#
+# Three ways the endpoint can be left without one:
+#  1. The driver probed before its firmware was reachable.  ath11k is built
+#     into the X710 kernel and probes at ~11.7 s, before the root filesystem;
+#     an image whose vendor_boot ramdisk lacks the WCN6855 hw2.1 set fails
+#     with -110.  The device itself is enumerated and sized correctly, so the
+#     driver is simply probed again in place.  That keeps the PCI device, and
+#     with it the L1 substates pcie-qcom enabled for it at host init.
+#  2. The link trained after the host's scan (builds 7-8, before the WCN6855
+#     cold reset): no endpoint at all, so the root port is rescanned.  Its own
+#     rescan (pci_rescan_bus_bridge_resize) sizes its windows for the
+#     endpoint; the global /sys/bus/pci/rescan does not.
+#  3. A hot-added endpoint behind windows carved for an empty slot ("can't
+#     assign; no space"): even the root port's rescan does not grow them, so
+#     the endpoint and the root port are removed and the host bridge rescanned,
+#     which sizes the windows for what is present.
+#
+# Re-created devices get only the PCI core's default ASPM states (L0s L1); the
+# L1.1/L1.2 substates pcie-qcom enables at host init are lost.  After 2 or 3,
+# this re-enables them once the interface is up (ath11k disables ASPM while its
+# firmware boots).  /etc/ubuntu-gts9u/pcie-l1ss overrides that:
+#   auto (default)  enable after a rescan, leave a boot-time endpoint alone
+#   on              enable in every case
+#   off             disable in every case (the escape hatch if a board's link
+#                   misbehaves in L1.2: AER errors, Wi-Fi stalls)
+#
+# Enabling needs two steps.  A write of 1 to link/l1_*_aspm only takes the state
+# out of the link's aspm_disable mask; the states actually enabled are still
+# capped by the ASPM policy, and the default policy means link->aspm_default.
+# pcie-qcom raises that to every state (pci_enable_link_state_locked(ALL)) only
+# for the devices present at host init; a device created by a rescan keeps the
+# core's devicetree default of L0s and L1, so for it the writes change nothing
+# (aspm_attr_store_common -> policy_to_aspm_state, drivers/pci/pcie/aspm.c).
+# When the substates still read 0 after the writes, the global policy is set
+# from default to powersupersave, which enables every supported state on every
+# link: on both boards that is this one link (pcie0 is the only PCIe
+# controller enabled), and it is what host init gives a boot-time endpoint.  A
+# policy someone chose (performance, powersave) is left alone.  The per-link
+# aspm_disable mask stays in force under every policy, so `off` keeps working.
+#
+# The outcome is also left in /run/ubuntu-gts9u/pci-rescan (key=value), so it
+# can be checked without the journal, which may not hold the early boot.
+set -u
+
+ep=/sys/bus/pci/devices/0000:01:00.0
+rp=/sys/bus/pci/devices/0000:00:00.0
+aspm_policy=/sys/module/pcie_aspm/parameters/policy
+policy_file=/etc/ubuntu-gts9u/pcie-l1ss
+state=/run/ubuntu-gts9u/pci-rescan
+
+log() { echo "gts9u-pci-rescan: $*" >&2; }
+record() { echo "$1=$2" >> "$state" 2>/dev/null || :; }
+bound() { [ -e "$ep/driver" ]; }
+driver() { basename "$(readlink -f "$ep/driver")"; }
+link_states() {
+	for a in l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
+		[ -r "$ep/link/$a" ] && printf '%s=%s ' "$a" "$(cat "$ep/link/$a")"
+	done
+}
+# Every L1 substate the link offers reads 1.  (The kernel hides the attribute
+# of a state the link does not support.)
+substates_on() {
+	for a in l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
+		[ -e "$ep/link/$a" ] || continue
+		[ "$(cat "$ep/link/$a" 2>/dev/null)" = 1 ] || return 1
+	done
+	return 0
+}
+# The active ASPM policy: the bracketed word of "[default] performance ...".
+aspm_policy_now() {
+	p=$(cat "$aspm_policy" 2>/dev/null) || return 0
+	case "$p" in *\[*\]*) p=${p#*\[}; echo "${p%%\]*}" ;; esac
+}
+
+policy=auto
+if [ -r "$policy_file" ]; then
+	policy=$(tr -d '[:space:]' < "$policy_file")
+	case "$policy" in
+	auto|on|off) ;;
+	*) log "ignoring '$policy' in $policy_file (expected auto, on or off)"; policy=auto ;;
+	esac
+fi
+
+mkdir -p "${state%/*}" 2>/dev/null && : > "$state" 2>/dev/null
+record policy "$policy"
+rescanned=0
+if bound; then
+	log "endpoint bound to $(driver) at boot; nothing to rescan"
+	record outcome bound-at-boot
+else
+	# --- 1. probe again in place -------------------------------------------
+	if [ -e "$ep" ]; then
+		log 'endpoint present without a driver; probing it again in place'
+		echo 0000:01:00.0 > /sys/bus/pci/drivers_probe 2>/dev/null || true
+		i=0
+		while [ "$i" -lt 10 ] && ! bound; do
+			sleep 1
+			i=$((i + 1))
+		done
+		if bound; then
+			log "re-probe bound $(driver)"
+			record outcome reprobed
+		fi
+	fi
+	# --- 2./3. re-create -----------------------------------------------------
+	attempt=1
+	while ! bound && [ "$attempt" -le 4 ]; do
+		rescanned=1
+		if [ -e "$ep" ]; then
+			log "attempt $attempt: re-creating the root port and the endpoint"
+			echo 1 > "$ep/remove"
+			sleep 1
+			[ -e "$rp" ] && echo 1 > "$rp/remove"
+			sleep 2
+			echo 1 > /sys/bus/pci/rescan
+		else
+			log "attempt $attempt: no endpoint; rescanning the root port"
+			sleep 3
+			if [ -e "$rp/rescan" ]; then
+				echo 1 > "$rp/rescan"
+			else
+				echo 1 > /sys/bus/pci/rescan
+			fi
+		fi
+		sleep 6
+		attempt=$((attempt + 1))
+	done
+	if ! bound; then
+		log 'no driver-bound PCIe endpoint after rescans'
+		record outcome unbound
+		exit 0
+	fi
+	if [ "$rescanned" = 1 ]; then
+		log "endpoint bound to $(driver) after a rescan"
+		record outcome rescanned
+	fi
+fi
+record driver "$(driver)"
+
+# --- L1 substates ------------------------------------------------------------------
+want=
+case "$policy:$rescanned" in
+off:*) want=0 ;;
+on:*|auto:1) want=1 ;;
+esac
+if [ -n "$want" ] && [ -d "$ep/link" ]; then
+	if [ "$want" = 1 ]; then
+		# The driver keeps ASPM off until its firmware is up; its network
+		# interface appearing is the sign that it has restored it.
+		i=0
+		while [ "$i" -lt 30 ] && [ -z "$(ls "$ep/net" 2>/dev/null)" ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		[ -n "$(ls "$ep/net" 2>/dev/null)" ] ||
+			log 'no network interface after 30 s; enabling the L1 substates anyway'
+	fi
+	for a in l1_1_pcipm l1_2_pcipm l1_1_aspm l1_2_aspm; do
+		[ -w "$ep/link/$a" ] || continue
+		echo "$want" > "$ep/link/$a" 2>/dev/null ||
+			log "writing $want to link/$a failed"
+	done
+	if [ "$want" = 1 ] && ! substates_on; then
+		# The writes only lifted aspm_disable; aspm_default (a re-created
+		# device: L0s L1) still caps them.  See the header.
+		was=$(aspm_policy_now)
+		if [ "$was" = powersupersave ]; then
+			log 'L1 substates still off under the powersupersave ASPM policy'
+		elif [ -n "$was" ] && [ "$was" != default ]; then
+			# performance or powersave was chosen on purpose (for example
+			# pcie_aspm.policy= on the kernel command line, the early way to
+			# keep L1.x off from host init on); do not override it.
+			log "ASPM policy is $was, not default; leaving it, the L1 substates stay off"
+			record aspm_policy "left-$was"
+		elif echo powersupersave > "$aspm_policy" 2>/dev/null; then
+			log "ASPM policy ${was:-?} -> powersupersave, so the L1 substates can be enabled"
+			record aspm_policy "powersupersave (was ${was:-unknown})"
+		else
+			log "could not set the ASPM policy to powersupersave; the L1 substates stay off"
+			record aspm_policy "set-failed (${was:-unknown})"
+		fi
+	fi
+	if [ "$want" = 1 ] && ! substates_on; then
+		log "L1 substates requested but still not all on (policy $policy)"
+		record l1ss "1-requested-not-on"
+	else
+		log "L1 substates set to $want (policy $policy)"
+		record l1ss "$want"
+	fi
+fi
+log "link: $(link_states)"
+record link "$(link_states)"
+exit 0

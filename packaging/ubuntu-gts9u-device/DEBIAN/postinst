@@ -23,6 +23,8 @@ ubuntu-gts9u-speaker-cal.service:multi-user.target
 ubuntu-gts9u-sensor-registry.service:multi-user.target
 ubuntu-gts9u-powerkey.service:multi-user.target
 ubuntu-gts9u-bluetooth-address.service:multi-user.target
+ubuntu-gts9u-wlan-address.service:multi-user.target
+gts9u-pci-rescan.service:multi-user.target
 ubuntu-gts9u-sensors-resume.service:multi-user.target
 ubuntu-gts9u-pogo-firmware.service:multi-user.target
 ubuntu-gts9u-desktop-user.service:multi-user.target
