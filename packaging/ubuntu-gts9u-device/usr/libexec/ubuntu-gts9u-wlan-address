@@ -1,0 +1,183 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Give the Wi-Fi interface the tablet's own address.
+#
+# The SM-X710's WCN6855 has no address in OTP and Samsung's board data carries
+# none either, so ath11k registers wlp1s0 with a Qualcomm default from the
+# 00:03:7f prefix whose low bytes change on every boot: the DHCP lease moves,
+# router reservations never match and SSH by address breaks.  Stock Android
+# reads the real address from the EFS partition, /efs/wifi/.mac.info (17 bytes,
+# "68:DF:E4:..", written at the factory; Bluetooth's bt_addr is the same value
+# minus one).  EFS is mounted read-only with noload -- never written, never
+# journalled -- just long enough to read it, as ubuntu-gts9u-bluetooth-address
+# does, but on a mount point of its own so the two can never unmount each
+# other.
+#
+# The address is applied in two ways, both before NetworkManager starts:
+#  * a systemd .link file in /run/systemd/network, which udev applies every
+#    time the interface is created: a late PCIe rescan or a driver re-bind gets
+#    the address before NetworkManager is told the device exists;
+#  * `ip link set address` for an interface that already exists because
+#    ath11k came up in the initramfs.  It is still down at this point, the only
+#    state in which mac80211 accepts a new address.
+# NetworkManager's default (cloned-mac-address "preserve") keeps it from then
+# on; its idle scans still use random addresses as before.
+#
+# Nothing persists: the .link lives in /run and is derived from EFS on every
+# boot, so a missing or malformed EFS file leaves the driver's own behaviour.
+#
+#   ubuntu-gts9u-wlan-address           apply (the service)
+#   ubuntu-gts9u-wlan-address --check   read and validate EFS, change nothing
+set -u
+
+efs=/dev/disk/by-partlabel/efs
+mountpoint=/run/ubuntu-gts9u-wlan-efs
+link_dir=/run/systemd/network
+# 05-: a matching .link replaces every later one for that interface, and
+# netplan writes its per-connection files as 10-netplan-*.link.
+link_file=$link_dir/05-ubuntu-gts9u-wlan.link
+# Interfaces of these drivers get the address.  The X710 only for now (the unit
+# is gated on samsung,gts9wifi); the Ultra's WCN7850 would add ath12k_pci once
+# its EFS layout and runtime address have been checked.
+drivers=ath11k_pci
+
+check=0
+case "${1:-}" in
+'') ;;
+--check) check=1 ;;
+*) echo 'usage: ubuntu-gts9u-wlan-address [--check]' >&2; exit 2 ;;
+esac
+
+log() { echo "ubuntu-gts9u-wlan-address: $*" >&2; }
+
+# --- find the EFS partition ------------------------------------------------
+# The udev symlink first; if udev has not linked it yet, the partition name in
+# sysfs, whose device node devtmpfs created long before udev ran.
+find_efs() {
+	if [ -b "$efs" ]; then
+		echo "$efs"
+		return 0
+	fi
+	for uevent in /sys/class/block/*/uevent; do
+		[ -r "$uevent" ] || continue
+		if grep -qx 'PARTNAME=efs' "$uevent"; then
+			name=$(sed -n 's/^DEVNAME=//p' "$uevent")
+			[ -n "$name" ] && [ -b "/dev/$name" ] && { echo "/dev/$name"; return 0; }
+		fi
+	done
+	return 1
+}
+
+dev=
+i=0
+while [ "$i" -lt 15 ]; do
+	dev=$(find_efs) && break
+	sleep 1
+	i=$((i + 1))
+done
+if [ -z "$dev" ]; then
+	log 'EFS partition not found; the interface keeps the driver address'
+	exit 0
+fi
+
+# --- read the native address --------------------------------------------------
+mkdir -p "$mountpoint"
+cleanup() {
+	if grep -q " $mountpoint " /proc/mounts; then
+		umount "$mountpoint" || true
+	fi
+}
+trap cleanup EXIT
+# ro,noload is mandatory: EFS holds per-device calibration and must never be
+# written, and noload stops the kernel replaying its journal.
+if ! mount -t ext4 -o ro,noload "$dev" "$mountpoint"; then
+	log "could not mount EFS ($dev) read-only; the interface keeps the driver address"
+	exit 0
+fi
+raw=$(head -c 64 "$mountpoint/wifi/.mac.info" 2>/dev/null | tr -d '\r\n[:space:]')
+cleanup
+trap - EXIT
+rmdir "$mountpoint" 2>/dev/null || true
+
+address=$(printf '%s' "$raw" | tr 'A-F' 'a-f')
+case "$address" in
+	[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+	*) log 'EFS has no valid wifi/.mac.info; the interface keeps the driver address'; exit 0 ;;
+esac
+first=$(printf '%d' "0x${address%%:*}")
+if [ $((first & 1)) -ne 0 ] || [ "$address" = 00:00:00:00:00:00 ]; then
+	log "EFS address $address is not a unicast address; ignoring it"
+	exit 0
+fi
+
+# Interfaces of $drivers that exist right now.
+current_interfaces() {
+	for net in /sys/class/net/*; do
+		[ -e "$net/device/driver" ] || continue
+		[ -d "$net/phy80211" ] || continue
+		driver=$(basename "$(readlink -f "$net/device/driver")")
+		for d in $drivers; do
+			[ "$driver" = "$d" ] && echo "${net##*/}"
+		done
+	done
+}
+
+if [ "$check" = 1 ]; then
+	echo "EFS ($dev) wifi/.mac.info: $address"
+	for ifname in $(current_interfaces); do
+		echo "$ifname: $(cat "/sys/class/net/$ifname/address") now"
+	done
+	[ -f "$link_file" ] && echo "$link_file: $(sed -n 's/^MACAddress=//p' "$link_file")"
+	exit 0
+fi
+
+# --- 1. future interfaces: a .link that udev applies on "add" ----------------
+# A matching .link replaces 99-default.link for the interface altogether, so it
+# repeats that file's naming policies: without them the interface would keep
+# the kernel's wlan0 name.
+mkdir -p "$link_dir"
+tmp=$link_file.$$
+{
+	echo '# Written at boot by ubuntu-gts9u-wlan-address from the Samsung EFS.'
+	echo '[Match]'
+	echo "Driver=$drivers"
+	echo 'Type=wlan'
+	echo
+	echo '[Link]'
+	echo 'NamePolicy=keep kernel database onboard slot path'
+	echo 'AlternativeNamesPolicy=database onboard slot path'
+	echo "MACAddress=$address"
+} > "$tmp" && mv -f "$tmp" "$link_file" || {
+	rm -f "$tmp"
+	log "could not write $link_file"
+}
+# udevd re-reads .link files when their directories change, but say so
+# explicitly: the next "add" may come within a second (a PCIe rescan).
+udevadm control --reload >/dev/null 2>&1 || true
+
+# --- 2. an interface ath11k already created ---------------------------------------
+found=0
+for ifname in $(current_interfaces); do
+	found=1
+	now=$(cat "/sys/class/net/$ifname/address")
+	if [ "$now" = "$address" ]; then
+		log "$ifname already has the native address $address"
+		continue
+	fi
+	flags=$(cat "/sys/class/net/$ifname/flags")
+	if [ $((flags & 1)) -ne 0 ]; then
+		# Up already, so something configured it before this ran.  Changing the
+		# address now would drop that connection; the .link applies it the next
+		# time the interface is created (at the latest, the next boot).
+		log "$ifname is already up with $now; the native address $address applies from the next boot"
+		continue
+	fi
+	if ip link set dev "$ifname" address "$address"; then
+		log "$ifname: $now -> $address (EFS)"
+	else
+		log "$ifname: setting $address failed; it keeps $now"
+	fi
+done
+[ "$found" = 1 ] || log "no Wi-Fi interface yet; $link_file gives it $address when it appears"
+exit 0

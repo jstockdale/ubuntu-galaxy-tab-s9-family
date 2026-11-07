@@ -1,0 +1,126 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Safety net for the Wi-Fi endpoint on PCIe0 (0000:01:00.0), run once per boot
+# by gts9u-pci-rescan.service.  A no-op when the endpoint has its driver.
+#
+# Three ways the endpoint can be left without one:
+#  1. The driver probed before its firmware was reachable.  ath11k is built
+#     into the X710 kernel and probes at ~11.7 s, before the root filesystem;
+#     an image whose vendor_boot ramdisk lacks the WCN6855 hw2.1 set fails
+#     with -110.  The device itself is enumerated and sized correctly, so the
+#     driver is simply probed again in place.  That keeps the PCI device, and
+#     with it the L1 substates pcie-qcom enabled for it at host init.
+#  2. The link trained after the host's scan (builds 7-8, before the WCN6855
+#     cold reset): no endpoint at all, so the root port is rescanned.  Its own
+#     rescan (pci_rescan_bus_bridge_resize) sizes its windows for the
+#     endpoint; the global /sys/bus/pci/rescan does not.
+#  3. A hot-added endpoint behind windows carved for an empty slot ("can't
+#     assign; no space"): even the root port's rescan does not grow them, so
+#     the endpoint and the root port are removed and the host bridge rescanned,
+#     which sizes the windows for what is present.
+#
+# Re-created devices get only the PCI core's default ASPM states (L0s L1); the
+# L1.1/L1.2 substates pcie-qcom enables at host init are lost.  After 2 or 3,
+# this re-enables them once the interface is up (ath11k disables ASPM while its
+# firmware boots).  /etc/ubuntu-gts9u/pcie-l1ss overrides that:
+#   auto (default)  enable after a rescan, leave a boot-time endpoint alone
+#   on              enable in every case
+#   off             disable in every case (the escape hatch if a board's link
+#                   misbehaves in L1.2: AER errors, Wi-Fi stalls)
+set -u
+
+ep=/sys/bus/pci/devices/0000:01:00.0
+rp=/sys/bus/pci/devices/0000:00:00.0
+policy_file=/etc/ubuntu-gts9u/pcie-l1ss
+
+log() { echo "gts9u-pci-rescan: $*" >&2; }
+bound() { [ -e "$ep/driver" ]; }
+driver() { basename "$(readlink -f "$ep/driver")"; }
+link_states() {
+	for a in l0s_aspm l1_aspm l1_1_aspm l1_2_aspm l1_1_pcipm l1_2_pcipm; do
+		[ -r "$ep/link/$a" ] && printf '%s=%s ' "$a" "$(cat "$ep/link/$a")"
+	done
+}
+
+policy=auto
+if [ -r "$policy_file" ]; then
+	policy=$(tr -d '[:space:]' < "$policy_file")
+	case "$policy" in
+	auto|on|off) ;;
+	*) log "ignoring '$policy' in $policy_file (expected auto, on or off)"; policy=auto ;;
+	esac
+fi
+
+rescanned=0
+if bound; then
+	log "endpoint bound to $(driver) at boot; nothing to rescan"
+else
+	# --- 1. probe again in place -------------------------------------------
+	if [ -e "$ep" ]; then
+		log 'endpoint present without a driver; probing it again in place'
+		echo 0000:01:00.0 > /sys/bus/pci/drivers_probe 2>/dev/null || true
+		i=0
+		while [ "$i" -lt 10 ] && ! bound; do
+			sleep 1
+			i=$((i + 1))
+		done
+		bound && log "re-probe bound $(driver)"
+	fi
+	# --- 2./3. re-create -----------------------------------------------------
+	attempt=1
+	while ! bound && [ "$attempt" -le 4 ]; do
+		rescanned=1
+		if [ -e "$ep" ]; then
+			log "attempt $attempt: re-creating the root port and the endpoint"
+			echo 1 > "$ep/remove"
+			sleep 1
+			[ -e "$rp" ] && echo 1 > "$rp/remove"
+			sleep 2
+			echo 1 > /sys/bus/pci/rescan
+		else
+			log "attempt $attempt: no endpoint; rescanning the root port"
+			sleep 3
+			if [ -e "$rp/rescan" ]; then
+				echo 1 > "$rp/rescan"
+			else
+				echo 1 > /sys/bus/pci/rescan
+			fi
+		fi
+		sleep 6
+		attempt=$((attempt + 1))
+	done
+	if ! bound; then
+		log 'no driver-bound PCIe endpoint after rescans'
+		exit 0
+	fi
+	[ "$rescanned" = 1 ] && log "endpoint bound to $(driver) after a rescan"
+fi
+
+# --- L1 substates ------------------------------------------------------------------
+want=
+case "$policy:$rescanned" in
+off:*) want=0 ;;
+on:*|auto:1) want=1 ;;
+esac
+if [ -n "$want" ] && [ -d "$ep/link" ]; then
+	if [ "$want" = 1 ]; then
+		# The driver keeps ASPM off until its firmware is up; its network
+		# interface appearing is the sign that it has restored it.
+		i=0
+		while [ "$i" -lt 30 ] && [ -z "$(ls "$ep/net" 2>/dev/null)" ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		[ -n "$(ls "$ep/net" 2>/dev/null)" ] ||
+			log 'no network interface after 30 s; enabling the L1 substates anyway'
+	fi
+	for a in l1_1_pcipm l1_2_pcipm l1_1_aspm l1_2_aspm; do
+		[ -w "$ep/link/$a" ] || continue
+		echo "$want" > "$ep/link/$a" 2>/dev/null ||
+			log "writing $want to link/$a failed"
+	done
+	log "L1 substates set to $want (policy $policy)"
+fi
+log "link: $(link_states)"
+exit 0

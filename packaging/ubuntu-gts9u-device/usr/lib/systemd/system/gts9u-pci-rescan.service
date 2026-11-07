@@ -1,0 +1,15 @@
+[Unit]
+Description=Rescan the PCIe bus if the Wi-Fi endpoint has no driver
+# Same name as the unit the rootfs overlay used to generate, so a package
+# upgrade replaces that file instead of running two rescans side by side.
+After=basic.target
+ConditionPathExists=/sys/bus/pci/rescan
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/ubuntu-gts9u-pci-rescan
+# Worst case: a 10 s re-probe, four 9 s re-creations, 30 s for the interface.
+TimeoutStartSec=150
+
+[Install]
+WantedBy=multi-user.target

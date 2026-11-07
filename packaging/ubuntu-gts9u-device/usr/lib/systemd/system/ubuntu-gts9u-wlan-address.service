@@ -1,0 +1,24 @@
+[Unit]
+Description=Apply the native Samsung Wi-Fi address from EFS
+# The X710 (WCN6855, ath11k) comes up with a Qualcomm default address that
+# changes on every boot.  The Ultra is left alone until its WCN7850 has been
+# checked the same way; adding it is a second ConditionFirmware=| line here and
+# ath12k_pci in the helper's driver list.
+ConditionFirmware=device-tree-compatible(samsung,gts9wifi)
+# After udev's coldplug, so an interface ath11k already created in the
+# initramfs exists (still down) and can take the address directly; before
+# NetworkManager, which keeps whatever address the interface has when it first
+# sees it.  An interface created later gets it from the .link file this
+# writes.
+After=systemd-udev-trigger.service local-fs.target
+Before=NetworkManager.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/ubuntu-gts9u-wlan-address
+RemainAfterExit=yes
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

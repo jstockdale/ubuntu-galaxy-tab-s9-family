@@ -195,13 +195,29 @@ ath11k)
 	# and crashes into RDDM on this silicon (confirmed on hardware); the
 	# IOE build 04866.5 from the ath11k-firmware repository, which the
 	# Fedora gts9wifi port runs, is what works here.
-	hw21=$overlay/usr/lib/firmware/ath11k/WCN6855/hw2.1
-	mkdir -p "$hw21"
-	install -m 0644 "$firmware/wcn6855-hw21-amss.bin" "$hw21/amss.bin"
-	install -m 0644 "$firmware/wcn6855-hw21-m3.bin" "$hw21/m3.bin"
-	install -m 0644 "$regdb_src" "$hw21/regdb.bin"
-	install -m 0644 "$board2_src" "$hw21/board-2.bin"
-	install -m 0644 "$firmware/bdwlan.elf" "$hw21/board.bin"
+	#
+	# ath11k is built in and probes at ~11.7 s, before /init mounts the root
+	# filesystem (13.5 s): with the set only on the rootfs, the first probe
+	# failed with -110 on every boot and gts9u-pci-rescan had to re-create the
+	# endpoint ~10 s later, which also lost the L1.1/L1.2 substates pcie-qcom
+	# enables at host init.  So the same five files also go into the
+	# vendor_boot ramdisk fragment, like the Bluetooth set below.  That
+	# fragment lives in vendor_boot (96 MiB; stock X710 puts 13.4 MB of
+	# vendor ramdisk there), not in init_boot, so it costs nothing of the
+	# 8 MiB init_boot budget: 5.5 MB uncompressed, +2.8 MB of LZ4 (the
+	# fragment grows from 0.15 to 2.9 MB), unpacked into the initramfs and
+	# freed at switch_root.  After that the rootfs copies serve every later
+	# load (resume power-ups, firmware recovery); both come from the same
+	# staged files, so they cannot differ.
+	for hw21 in "$overlay/usr/lib/firmware/ath11k/WCN6855/hw2.1" \
+		"$initramfs_overlay/usr/lib/firmware/ath11k/WCN6855/hw2.1"; do
+		mkdir -p "$hw21"
+		install -m 0644 "$firmware/wcn6855-hw21-amss.bin" "$hw21/amss.bin"
+		install -m 0644 "$firmware/wcn6855-hw21-m3.bin" "$hw21/m3.bin"
+		install -m 0644 "$regdb_src" "$hw21/regdb.bin"
+		install -m 0644 "$board2_src" "$hw21/board-2.bin"
+		install -m 0644 "$firmware/bdwlan.elf" "$hw21/board.bin"
+	done
 	;;
 esac
 
@@ -453,36 +469,11 @@ EOF
 fi
 
 # --- late PCIe endpoint rescan -------------------------------------------
-# Mainline's DesignWare host waits ~1 s for link training and never rescans a
-# link that trains later; the X710's QCA6490 needs longer after WLAN_EN.  The
-# kernel wait is extended for gts9wifi, and this unit is the safety net: if
-# no endpoint sits behind the root port once userspace is up, rescan.  It is a
-# no-op on boards whose Wi-Fi enumerated at boot.
-mkdir -p "$overlay/usr/lib/systemd/system" \
-	"$overlay/etc/systemd/system/multi-user.target.wants"
-cat > "$overlay/usr/lib/systemd/system/gts9u-pci-rescan.service" <<'EOF'
-[Unit]
-Description=Rescan the PCIe bus if the Wi-Fi endpoint trained its link late
-After=basic.target
-ConditionPathExists=/sys/bus/pci/rescan
-
-[Service]
-Type=oneshot
-# The root port's own rescan (pci_rescan_bus_bridge_resize) re-sizes its
-# windows for a late endpoint; the global /sys/bus/pci/rescan does not and
-# leaves a 2 MiB BAR with "can't assign; no space".  An endpoint found without a
-# driver bound is dropped first so its BARs are re-read.
-# A hot-added endpoint behind windows that were carved for an empty slot gets
-# "can't assign; no space" and even the root port's own rescan does not grow
-# them, so after a failed attempt re-create the root port: remove 00:00.0 and
-# rescan the host bridge, which sizes the windows for the endpoint present.
-ExecStart=/bin/sh -c 'for i in 1 2 3 4; do ep=/sys/bus/pci/devices/0000:01:00.0; if [ -e "$ep/driver" ]; then exit 0; fi; if [ -e "$ep" ]; then echo 1 > "$ep/remove"; sleep 1; echo 1 > /sys/bus/pci/devices/0000:00:00.0/remove; sleep 2; echo 1 > /sys/bus/pci/rescan; else sleep 3; echo 1 > /sys/bus/pci/devices/0000:00:00.0/rescan; fi; sleep 6; done; [ -e /sys/bus/pci/devices/0000:01:00.0/driver ] || echo "gts9u-pci-rescan: no driver-bound PCIe endpoint after rescans"'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-ln -sf /usr/lib/systemd/system/gts9u-pci-rescan.service \
-	"$overlay/etc/systemd/system/multi-user.target.wants/gts9u-pci-rescan.service"
+# gts9u-pci-rescan.service, the safety net for a Wi-Fi endpoint left without a
+# driver, ships in the ubuntu-gts9u-device package (same unit name, so the
+# package replaces the copy earlier overlays installed), together with the
+# L1-substate handling that a re-created endpoint needs.  With the ath11k
+# hw2.1 set in the vendor_boot ramdisk (above) it is a no-op on gts9wifi too.
 
 # --- staged-firmware provenance -------------------------------------------
 # A staging produced by scripts/stage-firmware.py records which stock package
