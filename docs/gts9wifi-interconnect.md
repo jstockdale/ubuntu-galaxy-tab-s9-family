@@ -68,8 +68,10 @@ hang.
   everywhere and the cluster's idle states never let DDR or CX go.
 * But not during a pm_test cycle: from `dpm_prepare()` to `dpm_complete()`
   genpd refuses to power a domain off while `prepared_count > 0`
-  (`genpd_power_off()`), and the cluster domain holds the RSC itself and the
-  CPUs' genpd devices.  The platform level's 5 s wait is `msleep(1000)` five
+  (`genpd_power_off()`), and the RSC device itself sits in the cluster domain,
+  so the cluster stays up whatever the CPUs do (a real s2idle goes around this
+  with `dev_pm_genpd_suspend()`; a pm_test cycle never gets there).  The
+  platform level's 5 s wait is `msleep(1000)` five
   times (`suspend_test()`, level > TEST_CORE), so CPU0 does idle, but only in
   CPU-level states.  During the cycle AOP never gets the sleep set; what
   changes is the active set, one `icc_disable()`/`icc_set_bw(0)` at a time as
@@ -112,9 +114,10 @@ others (0x50020, 0x50044) now toggle to zero (0x40000000).
   right after "Suspending console(s)".  That line is the Stage 1 sequence
   (24.21 s, inside a cycle that passed).  Treat the hang point as unknown.
 * Between the early sync (13.3 s) and the cycle (24 s) the boot ran normally
-  with the floor gone: rootfs, systemd, the PCI rescan and the WCN6855 probe
-  (about 21.5 s), Bluetooth firmware, the USB gadget, the microSD logger at
-  18 s.  The floor being gone is not the problem by itself; the cycle is.
+  with the floor gone (3b's kern.log): rootfs, systemd, Bluetooth firmware,
+  the PCI rescan and the WCN6855 probe 2 s before the cycle, the microSD
+  logger at 18 s.  The floor being gone is not the problem by itself; the
+  cycle is.
 * ramoops reports a header error on every boot ("ramoops: error in header"),
   so pstore has not yet carried a console across a reset on this unit.  TWRP's
   `/proc/last_kmsg` (the sec_log ring) is the other channel; its retention
@@ -130,7 +133,7 @@ others (0x50020, 0x50044) now toggle to zero (0x40000000).
 | Wi-Fi | WCN6855 probed 1 to 2 s before, after the PCI rescan; MSIs through the GIC ITS | long running |
 | USB | cable to the PC, VBUS present, UDC not bound yet (`gts9u-usb-gadget` is ordered after the cycle); dwc3-qcom still logs "HS-PHY not in L2" and drops its clocks and paths | NCM gadget bound and carrying the SSH session |
 | deferred | LPI pinctrl, VA codec, sound card, aux_bridge still deferred; deferred-probe timeout 0.5 s before | all bound |
-| floor dropped | 13.3 s, in the initramfs, before Wi-Fi and the USB gadget came up | minutes after boot |
+| floor dropped | 13.3 s, in the initramfs, before Wi-Fi and Bluetooth came up | minutes after boot |
 | kernel | fix2/fix3 (videocc =y, aligned 3.36 GHz OPP overlay, bwmon =y on fix2-s3, RTC/qcom_stats/temp-alarm =y) | baseline |
 | mem_sleep | deep (pinned by the helper) | deep (run-level.sh) |
 
@@ -169,8 +172,9 @@ synced too (Stage 2 and 3) CX and MX can fall to whatever those leave, under
 something still running.  Predicts: W1 hangs.
 
 **H3, initialisation under real votes.**  Drivers that came up after 13.3 s
-(the WCN6855 after the rescan, the USB gadget, Bluetooth) set up differently
-when the floor is already gone.  Predicts: W2 passes, W3 hangs.
+(the WCN6855 after the rescan, Bluetooth, everything userspace started) set
+up differently when the floor is already gone.  Predicts: W2 passes, W3
+hangs.
 
 Out: bwmon (3b hangs without it), the sleep mode (deep in both), the release
 itself (the same writes passed at runtime), and the sleep set (not reachable
