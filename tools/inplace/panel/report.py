@@ -256,10 +256,14 @@ def main():
     for _i, t, _kind, text in rows:
         out.append("%s  %s" % (fmt_t(t), text))
 
-    ids = [PANEL_ID.search(text).groups() for _i, _t, kind, text in rows if kind == "id"]
+    id_rows = [(i, PANEL_ID.search(text).groups()) for i, _t, kind, text in rows if kind == "id"]
+    ids = [answer for _i, answer in id_rows]
     suspended = any(kind == "suspend" and "entry" in text for _i, _t, kind, text in rows)
-    handoff = [text for _i, _t, kind, text in rows if kind == "handoff"]
-    cycle = [text for _i, _t, kind, text in rows if kind == "cycle"]
+    handoff = [(i, text) for i, _t, kind, text in rows if kind == "handoff"]
+    cycle = [(i, text) for i, _t, kind, text in rows if kind == "cycle"]
+
+    def first_answer_after(index):
+        return next((answer for i, answer in id_rows if i > index), None)
     errors = [text for _i, _t, kind, text in rows if kind == "error"]
     good_id = ("80", "00", "04")
     dead_id = ("00", "00", "00")
@@ -271,13 +275,15 @@ def main():
         first = ids[0]
         out.append("first answer: %s; answers in order: %s" % (
             " ".join(first), ", ".join(" ".join(i) for i in ids)))
+        # The switch must have done its job and the next power-on answered.
         if handoff:
-            ok = "power-cycled" in handoff[0] and first == good_id
-            out.append("E1 (GDSC cycle at probe): %s - %s" % ("PASS" if ok else "FAIL", handoff[0]))
+            index, text = handoff[0]
+            ok = "power-cycled" in text and first_answer_after(index) == good_id
+            out.append("E1 (GDSC cycle at probe): %s - %s" % ("PASS" if ok else "FAIL", text))
         if cycle:
-            later = ids[1] if len(ids) > 1 else None
-            ok = "power-cycled" in cycle[0] and later == good_id
-            out.append("E2 (display-only boot cycle): %s - %s" % ("PASS" if ok else "FAIL", cycle[0]))
+            index, text = cycle[0]
+            ok = "power-cycled" in text and first_answer_after(index) == good_id
+            out.append("E2 (display-only boot cycle): %s - %s" % ("PASS" if ok else "FAIL", text))
         if first == dead_id and good_id in ids and not handoff and not cycle:
             how = ("after a system suspend cycle (the boot-time pm_test cycle or a manual one)"
                    if suspended else "WITHOUT any system suspend (a blank/unblank: E3 PASS)")

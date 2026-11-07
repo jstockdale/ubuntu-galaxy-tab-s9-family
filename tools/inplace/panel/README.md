@@ -72,7 +72,7 @@ come back hangs the boot: recovery below).
     git -C ~/projects/ubuntu-galaxy-tab-s9-ultra archive overnight/panel tools/inplace/panel |
       ssh jstockdale@10.42.0.2 'rm -rf ~/panel && mkdir ~/panel && tar -x --strip-components=3 -C ~/panel'
     # the four images (96 MiB each, mostly zeros)
-    scp -r "$S"/images/panel-ref "$S"/images/panel-e0 "$S"/images/panel-e1 "$S"/images/panel-e2 \
+    scp -C -r "$S"/images/panel-ref "$S"/images/panel-e0 "$S"/images/panel-e1 "$S"/images/panel-e2 \
       jstockdale@10.42.0.2:display-exp/
     ssh jstockdale@10.42.0.2 'cd ~/panel && sha256sum -c SHA256SUMS && cd ~/display-exp && sha256sum -c ~/panel/IMAGES.sha256'
     # a host copy of the rollback image, for TWRP (the scratchpad lives in /tmp)
@@ -129,7 +129,7 @@ Do not plug in a DisplayPort monitor during the masked boots (see Couplings).
 3. **panel-e1**:
 
         sudo sh ~/panel/apply.sh panel-e1 && sudo reboot
-        # PASS: the login screen appears ~15-20 s after power-on, with no blank/wake
+        # PASS: the login screen appears ~20 s after power-on, with no blank/wake
         sudo sh ~/panel/collect.sh e1
 
    PASS: `E1 (GDSC cycle at probe): PASS - bootloader hand-off: MDSS GDSC
@@ -201,7 +201,8 @@ adm, so the reports can be read back without sudo:
 
 ## Recovery if a variant does not boot
 
-From TWRP (USB to the host):
+Force a restart and boot TWRP as for the Stage 3 recovery, then (USB to
+the host):
 
     adb push ~/ubuntu-gts9u/fix2-s2-vendor_boot.img /tmp/vb.img
     adb shell 'dd if=/tmp/vb.img of=/dev/block/by-name/vendor_boot bs=4M && sync && sha256sum /dev/block/by-name/vendor_boot'
