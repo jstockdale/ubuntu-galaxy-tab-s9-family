@@ -92,7 +92,9 @@ cmdline=${cmdline/root=LABEL=UBTS9U_UFS/root=LABEL=$DEVICE_LABEL}
 # share.  Each token has to be a whole word of cmdline.txt: a typo fails the
 # build instead of packaging the unchanged cmdline.  root= is never dropped.
 if [ -n "${GTS9U_DROP_CMDLINE:-}" ]; then
-	read -r -a drop_tokens <<< "$GTS9U_DROP_CMDLINE"
+	# -d '': split every line, not only the first, so a multi-line value
+	# cannot silently keep a token (read returns 1 at end of input).
+	read -r -d '' -a drop_tokens <<< "$GTS9U_DROP_CMDLINE" || true
 	for token in "${drop_tokens[@]}"; do
 		case "$token" in
 			root=*) echo "GTS9U_DROP_CMDLINE: refusing to drop $token" >&2; exit 1 ;;
@@ -108,7 +110,7 @@ if [ -n "${GTS9U_DROP_CMDLINE:-}" ]; then
 		cmdline=${padded# }
 		cmdline=${cmdline% }
 	done
-	echo "vendor_boot cmdline drop: ${GTS9U_DROP_CMDLINE}"
+	echo "vendor_boot cmdline drop: ${drop_tokens[*]}"
 fi
 # Extra tokens for bring-up experiments (module parameters of built-in
 # drivers, initcall_blacklist=...).  Only vendor_boot.img carries them, so an
