@@ -1115,6 +1115,227 @@
 			qcom,hw-settle-time = <200>;
 			qcom,avg-samples = <4>;
 		};
+
+		/*
+		 * Two more board thermistors, as the stock X710 overlay defines
+		 * them: the crystal (PMK8550 AMUX1, "pmk8550_xo_therm") and the
+		 * AP area (PM8550 AMUX5, "ap_therm", Samsung's
+		 * sec-ap-thermistor).  The same 100 kOhm pull-up channel type as
+		 * the battery thermistor, so the driver's standard NTC curve
+		 * applies; Samsung's own adc_array calibration is not ported.
+		 *
+		 * Nothing acts on them: they are here so the board and skin side
+		 * can be logged without root (iio:device0 in_temp68_input and
+		 * in_temp328_input, millidegrees) before a skin policy is chosen.
+		 * Conversions run only when read.
+		 */
+		channel@44 {
+			reg = <0x44>;
+			label = "xo-thermistor";
+			qcom,pre-scaling = <1 1>;
+			qcom,ratiometric;
+			qcom,hw-settle-time = <200>;
+			qcom,avg-samples = <4>;
+		};
+
+		channel@148 {
+			reg = <0x148>;
+			label = "ap-thermistor";
+			qcom,pre-scaling = <1 1>;
+			qcom,ratiometric;
+			qcom,hw-settle-time = <200>;
+			qcom,avg-samples = <4>;
+		};
+	};
+};
+
+/*
+ * sm8550.dtsi points cdsp0-3 at tsens2 sensors 4-7, which are GPU sensors.
+ * Qualcomm's own kalama DT (the stock base DTB in vendor_boot) names tsens2
+ * 1-8 gpuss-0..7 and puts nspss-0..3 on tsens1 4-7, sensors nothing upstream
+ * uses.  A tsens sensor backs one zone only, so the CDSP zones claimed 4-7
+ * and gpuss-3..6, each carrying an 85 C map to the GPU's devfreq cooling
+ * device, never registered: half the GPU sensors could not throttle it.
+ */
+&{/thermal-zones/cdsp0-thermal} {
+	thermal-sensors = <&tsens1 4>;
+};
+
+&{/thermal-zones/cdsp1-thermal} {
+	thermal-sensors = <&tsens1 5>;
+};
+
+&{/thermal-zones/cdsp2-thermal} {
+	thermal-sensors = <&tsens1 6>;
+};
+
+&{/thermal-zones/cdsp3-thermal} {
+	thermal-sensors = <&tsens1 7>;
+};
+
+/*
+ * CPU frequency throttling is LMh's job: the dcvsh interrupts that cpufreq-hw
+ * turns into thermal pressure.  Stock does the same and adds only CPU pause
+ * at 108/110 C in the kernel DT.  The upstream CPU zones carry passive trips
+ * at 90 and 95 C with no cooling maps, so if LMh ever let a core run past its
+ * own limit, nothing in Linux would act before the 110 C critical shutdown.
+ *
+ * Bind the 95 C trip to the cluster's cpufreq cooling device as a backstop.
+ * While LMh holds the cores below it, it never engages; the 90 C trip stays
+ * unbound, so sustained clocks remain LMh's decision.  Passive polling (100
+ * ms) runs only while a zone is above 90 C.
+ */
+&{/thermal-zones/cpu0-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu0_alert1>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu1-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu1_alert1>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu2-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu2_alert1>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu3-top-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu3_top_alert1>;
+			cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu3-bottom-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu3_bottom_alert1>;
+			cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu4-top-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu4_top_alert1>;
+			cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu4-bottom-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu4_bottom_alert1>;
+			cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu5-top-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu5_top_alert1>;
+			cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu5-bottom-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu5_bottom_alert1>;
+			cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu6-top-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu6_top_alert1>;
+			cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu6-bottom-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu6_bottom_alert1>;
+			cooling-device = <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu7-top-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu7_top_alert1>;
+			cooling-device = <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu7-middle-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu7_middle_alert1>;
+			cooling-device = <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu7-bottom-thermal} {
+	polling-delay-passive = <100>;
+
+	cooling-maps {
+		map0 {
+			trip = <&cpu7_bottom_alert1>;
+			cooling-device = <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
 	};
 };
 
