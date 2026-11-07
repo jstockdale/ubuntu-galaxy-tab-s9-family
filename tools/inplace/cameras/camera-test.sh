@@ -104,8 +104,10 @@ for c in $cams; do
 	rm -rf "$tmp"; mkdir -p "$tmp"
 	inf "camera $c: $(sed -n "s/^$c: //p" "$out/cam-list.txt")"
 	cam -c "$c" -p > "$out/cam-$c-properties.txt" 2>&1
-	if timeout 60 cam -c "$c" -C60 -s width=640,height=480,pixelformat=BGR888 \
-		-F "$tmp/frame-#.ppm" > "$out/cam-$c-capture.txt" 2>&1; then
+	# --capture and --file take optional arguments: they must be attached.
+	if timeout 60 cam --camera="$c" --capture=60 \
+		--stream=width=640,height=480,pixelformat=BGR888 \
+		--file="$tmp/frame-#.ppm" > "$out/cam-$c-capture.txt" 2>&1; then
 		last=$(ls "$tmp"/*.ppm 2>/dev/null | sort | tail -n 1)
 		frames=$(ls "$tmp"/*.ppm 2>/dev/null | wc -l)
 		if [ -n "$last" ]; then
