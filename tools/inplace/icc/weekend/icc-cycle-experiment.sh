@@ -6,7 +6,7 @@
 #
 # Runtime rungs (on the normal Stage 2 boot, after the boot cycle; a hang
 # costs one watchdog reset and the next boot is a normal one):
-#   systemd-run --unit=gts9u-icc-exp --collect sh $0 runtime [options]
+#   sudo systemd-run --unit=gts9u-icc-exp --collect sh $0 runtime [options]
 #       --level devices|platform   pm_test level (default platform)
 #       --stop-adsp                stop the ADSP first, as at the boot cycle
 #                                  (audio and sensors may need a reboot after)
@@ -256,9 +256,8 @@ boot_gate() {
 	[ -e "$state/fired" ] || exit 0
 	[ "$(field mode "$state/fired")" = kernel-early ] || exit 0
 	grep -q '^returned=' "$state/fired" && exit 0
-	grep -q '^gated=' "$state/fired" && exit 0
-	# Only while still on a Stage 3 cmdline (no bwmon hold): back on Stage 2,
-	# the cycle is safe again.
+	# For as long as this is still a Stage 3 cmdline (no bwmon hold), every
+	# boot skips the cycle: back on Stage 2 the cycle is safe again.
 	case " $(cat /proc/cmdline) " in
 	*' initcall_blacklist='*bwmon_driver_init*) exit 0 ;;
 	esac

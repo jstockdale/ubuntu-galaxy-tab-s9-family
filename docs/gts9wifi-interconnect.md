@@ -214,7 +214,10 @@ and the same for `interconnect-1` (not `echo`).  `sudo grep -c 2147483647
 ## Weekend experiment
 
 `tools/inplace/icc/weekend/icc-cycle-experiment.sh` (in the kit as
-`~/icc/weekend/`), root.  Every rung logs to
+`~/icc/weekend/`), as root: `sudo sh ~/icc/weekend/icc-cycle-experiment.sh
+<rung>`, and the runtime rungs through `sudo systemd-run
+--unit=gts9u-icc-exp --collect sh ~/icc/weekend/icc-cycle-experiment.sh
+runtime ...` so that a dropped SSH session cannot cut them.  Every rung logs to
 `/var/log/gts9u-icc-exp/experiment.log` (group adm) line by line with a sync,
 and marks the kernel log.  A runtime rung that hangs costs one watchdog reset
 and comes back on a normal Stage 2 boot.  A boot rung disarms itself before
@@ -234,9 +237,9 @@ callback reaches the ramoops and sec_log consoles while it runs.
    did on the baseline kernel.  If it hangs on the fix kernel, the release
    is unsafe for any later cycle or suspend: `sudo touch
    /etc/ubuntu-gts9u/icc-hold` and the rest of this list runs at runtime.
-2. **W1**: `systemd-run --unit=gts9u-icc-exp --collect sh
-   ~/icc/weekend/icc-cycle-experiment.sh runtime --stop-adsp --trace`.  The
-   boot cycle's lone voter, recreated at runtime.  Hang: H2; go to W1b.
+2. **W1**: `runtime --stop-adsp --trace` (USB SSH; follow it with
+   `sh ~/icc/weekend/icc-cycle-experiment.sh status`).  The boot cycle's
+   lone voter, recreated at runtime.  Hang: H2; go to W1b.
    Pass: H1 or H3; go to W2.
 3. **W1b** (only if W1 hung): the same with `--level devices`.  Pass: the
    culprit is in the late or noirq phase (or the 5 s wait); hang: in an
@@ -252,11 +255,15 @@ callback reaches the ramoops and sec_log consoles while it runs.
    after it (still fix2-s3) skips the panel cycle: panel dark, SSH works.
    `collect`, `sudo sh ~/display-exp/apply.sh fix2-s2`, `disarm`, reboot.
 
-Reading a trace: the last `PM: calling <device> ...` line without its
-`returned` names the callback that hung; `PM: suspend debug: Waiting for 5
+Reading a trace: with `pm_print_times` each device callback is a pair of
+lines, `<drv> <dev>: calling <callback> @ <pid>, parent: <parent>` and
+`<drv> <dev>: <callback> returned <err> after <n> usecs`.  Callbacks run
+asynchronously, so look for the `calling` lines that never got their
+`returned`, not just the last line.  `PM: suspend debug: Waiting for 5
 second(s)` with nothing after it points at the wait (a timer, a work item or
 an interrupt touching something already off); resume lines point at a resume
-callback (`dispcc`/MDSS, `qcom-pcie`, `ath11k_pci` first).
+callback (MDSS/DSI/DP and the display clock controller, `qcom-pcie`,
+`ath11k_pci`, `dwc3-qcom` first).
 
 What each outcome would mean for the fix:
 
