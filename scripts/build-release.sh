@@ -44,6 +44,7 @@ initramfs_overlay=$base/out/initramfs-overlay
 bundle=$base/out/bundle
 image=$base/out/ubuntu-$DEVICE${fw_blrev:+-bl$fw_blrev}-v$version-ufs.img
 zip=$artifacts/ubuntu-24.04-$DEVICE_SLUG${fw_blrev:+-bl$fw_blrev}-v$version.zip
+manifest=$artifacts/MANIFEST-$DEVICE_SLUG${fw_blrev:+-bl$fw_blrev}-v$version.txt
 
 # No secret is needed to build a shipping image any more: it has no account,
 # and the owner creates theirs in the first-boot wizard.  GTS9U_PW is only for
@@ -117,7 +118,7 @@ bash "$repo/scripts/validate-bundle.sh" "$zip"
 python3 "$repo/scripts/validate-update-zip.py" "$zip"
 
 {
-	printf 'Ubuntu 24.04 LTS for Samsung Galaxy Tab S9 Ultra Wi-Fi (SM-X910)\n'
+	printf 'Ubuntu 24.04 LTS for %s (%s)\n' "$DEVICE_NAME" "$DEVICE_MODEL"
 	printf 'release: v%s (%s profile)\n' "$version" "$profile"
 	printf 'generated: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	printf 'kernel_release: %s\n' "$kernel_release"
@@ -137,8 +138,8 @@ python3 "$repo/scripts/validate-update-zip.py" "$zip"
 	( cd "$artifacts" && sha256sum "${zip##*/}" )
 	printf '\n'
 	cat "$bundle/SHA256SUMS"
-} > "$artifacts/MANIFEST${fw_blrev:+-bl$fw_blrev}-v$version.txt"
+} > "$manifest"
 
 printf '\n=== release v%s ===\n' "$version"
-cat "$artifacts/MANIFEST${fw_blrev:+-bl$fw_blrev}-v$version.txt"
+cat "$manifest"
 printf '\nNothing was flashed. Flash the ZIP from TWRP, from external media.\n'

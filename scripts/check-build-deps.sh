@@ -1,6 +1,7 @@
 #!/bin/bash
 # Report which host tools the Ubuntu image pipeline needs and which are
-# missing.  Read-only: it installs nothing and touches no device.
+# missing.  Read-only: it installs nothing and touches no device.  Exits 1 when
+# anything is missing.
 set -uo pipefail
 
 missing=0
@@ -54,5 +55,5 @@ if [ "$missing" -eq 0 ]; then
 	echo 'All build dependencies are present.'
 else
 	echo "$missing dependency/dependencies missing."
+	exit 1
 fi
-exit 0

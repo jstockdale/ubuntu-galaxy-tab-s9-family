@@ -73,12 +73,12 @@ class Sources:
 
     def _odin_bl_member(self, name: str) -> Path:
         """Stream one lz4 member out of the Odin package's BL tar."""
+        if self.odin is None:
+            flag = name.split('.')[0].lower().replace('-', '')
+            raise SystemExit(f"{name} is needed; pass --{flag} or --odin ZIP")
         out = self.cache / f"odin-{self.odin.stem}-{name}"
         if out.is_file():
             return out
-        if self.odin is None:
-            raise SystemExit(f"{name} is needed; pass --{name.split('.')[0].lower()} "
-                             "or --odin ZIP")
         listing = run(["unzip", "-Z1", str(self.odin)]).stdout.decode()
         member = next((l for l in listing.splitlines() if l.startswith("BL_")), None)
         if member is None:

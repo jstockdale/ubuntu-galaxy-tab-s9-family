@@ -7,6 +7,7 @@
 #
 #   DEVICE            Ubuntu/pmOS codename: gts9uwifi (SM-X910), gts9wifi (SM-X710)
 #   DEVICE_MODEL      Samsung model as the bootloader and installer report it
+#   DEVICE_NAME       product name for human-readable titles
 #   DEVICE_SLUG       artifact file-name slug
 #   DEVICE_LABEL      root filesystem label (scoped per device: a mismatched
 #                     kernel/rootfs pairing must fail loudly at mount, never
@@ -23,6 +24,7 @@ DEVICE=${DEVICE:-gts9uwifi}
 case "$DEVICE" in
 gts9uwifi)
 	DEVICE_MODEL=SM-X910
+	DEVICE_NAME="Samsung Galaxy Tab S9 Ultra Wi-Fi"
 	DEVICE_SLUG=sm-x910
 	DEVICE_LABEL=UBTS9U_UFS
 	DEVICE_CARD=Samsung-Galaxy-Tab-S9-Ultra
@@ -33,6 +35,7 @@ gts9uwifi)
 	;;
 gts9wifi)
 	DEVICE_MODEL=SM-X710
+	DEVICE_NAME="Samsung Galaxy Tab S9 Wi-Fi"
 	DEVICE_SLUG=sm-x710
 	DEVICE_LABEL=UBTS9_UFS
 	DEVICE_CARD=Samsung-Galaxy-Tab-S9
