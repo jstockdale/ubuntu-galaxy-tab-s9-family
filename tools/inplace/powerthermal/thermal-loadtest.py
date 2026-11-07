@@ -17,7 +17,14 @@ Phases (each logged once a second to CSV):
 Abort (the workers are killed at once, the cool-down is still logged): any CPU
 zone >= --abort-cpu-c (default 100 C, 10 C under the 110 C critical trip),
 battery >= --abort-battery-c (default 45 C), the AP thermistor (if the new DT
-exposes it) >= --abort-ap-c (default 60 C), or Ctrl-C.
+exposes it) >= --abort-ap-c (default 60 C), Ctrl-C, or a hangup (terminal
+closed, SSH dropped).
+
+The workers can never outlive this script: they stay in its process group, so
+the terminal's Ctrl-C, Ctrl-Z and hangup reach them too, and each one is
+SIGKILLed by the kernel the moment this script dies for any reason
+(PR_SET_PDEATHSIG), even a kill -9.  An unwatched load on the prime core is
+exactly what this test must not leave behind.
 
 Every sample has: cpu7 requested (scaling_cur_freq) and delivered
 (cpuinfo_avg_freq) clocks, all thermal zones, the cpufreq/GPU cooling-device
@@ -26,6 +33,7 @@ thermistors when iio:device0 has them.  A summary is printed and saved.
 """
 
 import argparse
+import ctypes
 import csv
 import datetime as dt
 import glob
@@ -107,21 +115,49 @@ def time_in_state(policy):
     return out
 
 
+PR_SET_PDEATHSIG = 1
+_libc = ctypes.CDLL(None, use_errno=True)
+
+
+def _die_with(parent):
+    def setup():
+        # Runs in the child between fork and exec.  taskset then execs
+        # sha256sum in the same process, and the death signal survives that
+        # exec, so the worker itself is what the kernel kills when this
+        # script goes away.
+        if _libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+            os._exit(127)
+        # The parent may already have died between fork and prctl.
+        if os.getppid() != parent:
+            os._exit(127)
+    return setup
+
+
+def say(*args):
+    # A hung-up terminal turns print() into EIO; the log must still be written.
+    try:
+        print(*args, flush=True)
+    except OSError:
+        pass
+
+
 class Load:
     def __init__(self):
         self.procs = []
 
     def start(self, cpus):
         for c in cpus:
+            # Same process group as this script on purpose: Ctrl-C, Ctrl-Z
+            # and a terminal hangup stop the load as well as the guard.
             self.procs.append(subprocess.Popen(
                 ["taskset", "-c", str(c), "sha256sum", "/dev/zero"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True))
+                preexec_fn=_die_with(os.getpid())))
 
     def stop(self):
         for p in self.procs:
             try:
-                os.killpg(p.pid, signal.SIGKILL)
+                p.kill()
             except ProcessLookupError:
                 pass
         for p in self.procs:
@@ -147,12 +183,12 @@ def main():
     if os.geteuid() == 0:
         sys.exit("run this as the desktop user, not root")
     if read(f"{CPU}/policy7/scaling_governor") != "schedutil":
-        print("note: policy7 governor is", read(f"{CPU}/policy7/scaling_governor"))
+        say("note: policy7 governor is", read(f"{CPU}/policy7/scaling_governor"))
     boost = read(f"{CPU}/boost")
     maxf = read_int(f"{CPU}/policy7/scaling_max_freq")
-    print(f"boost={boost} policy7 scaling_max_freq={maxf}")
+    say(f"boost={boost} policy7 scaling_max_freq={maxf}")
     if maxf != BOOST_KHZ:
-        print("WARNING: policy7 cannot reach 3.36 GHz right now (boost off or "
+        say("WARNING: policy7 cannot reach 3.36 GHz right now (boost off or "
               "capped); the run still measures what it gets")
 
     os.makedirs(a.outdir, exist_ok=True)
@@ -175,11 +211,20 @@ def main():
     load = Load()
     stop = {"why": None}
 
+    hung_up = {"yes": False}
+
     def on_signal(signum, frame):
-        stop["why"] = "interrupted"
+        if signum == signal.SIGHUP:
+            # Nobody is watching any more: stop, skip the cool-down, write
+            # the summary.
+            hung_up["yes"] = True
+            stop["why"] = "hangup (terminal closed)"
+        else:
+            stop["why"] = "interrupted"
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
 
     peaks = {}
     lmh0 = dcvsh_counts()
@@ -243,10 +288,10 @@ def main():
         def run_phase(phase, seconds, cpus):
             if seconds <= 0 or stop["why"]:
                 return
-            print(f"{phase}: {seconds} s on cpus {cpus or '-'}", flush=True)
-            if cpus:
-                load.start(cpus)
+            say(f"{phase}: {seconds} s on cpus {cpus or '-'}")
             try:
+                if cpus:
+                    load.start(cpus)
                 end = time.monotonic() + seconds
                 while time.monotonic() < end and not stop["why"]:
                     temps, iio = sample(phase, len(cpus))
@@ -275,10 +320,10 @@ def main():
         run_phase("prime", a.prime_s, [7])
         run_phase("big", a.big_s, [3, 4, 5, 6, 7])
         aborted = stop["why"]
-        if ran_load:
+        if ran_load and not hung_up["yes"]:
             if aborted:
-                print(f"{aborted}; load stopped, logging the cool-down "
-                      "(Ctrl-C again to skip it)", flush=True)
+                say(f"{aborted}; load stopped, logging the cool-down "
+                    "(Ctrl-C again to skip it)")
             stop["why"] = None
             run_phase("cooldown", a.cooldown_s, [])
 
@@ -308,9 +353,9 @@ def main():
     lines.append("peak temperatures (C): " + ", ".join(
         f"{k} {v / 1000:.1f}" for k, v in hot[:16]))
     text = "\n".join(lines) + "\n"
-    print(text)
     with open(sum_path, "w") as f:
         f.write(text)
+    say(text)
     return 1 if aborted and aborted.startswith("ABORT") else 0
 
 
