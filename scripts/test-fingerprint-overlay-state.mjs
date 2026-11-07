@@ -3,6 +3,8 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {isTypingKeyboard} from '../packaging/ubuntu-gts9u-device/usr/share/gnome-shell/extensions/gts9u-fingerprint-overlay@agcarbajo/authKeyboard.js';
+import {recoverClosedCancellation} from '../packaging/ubuntu-gts9u-device/usr/share/gnome-shell/extensions/gts9u-fingerprint-overlay@agcarbajo/authRecovery.js';
+import {KeyboardEventGuard} from '../packaging/ubuntu-gts9u-device/usr/share/gnome-shell/extensions/gts9u-fingerprint-overlay@agcarbajo/keyboardEvents.js';
 const source = readFileSync(new URL('../packaging/ubuntu-gts9u-device/usr/share/gnome-shell/extensions/gts9u-fingerprint-overlay@agcarbajo/extension.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '')
     .replace('export default class', 'return class');
@@ -194,27 +196,49 @@ assert.equal(scanner._scanPhysicalKeyboards(), true); // Unknown: conservative u
 assert.equal(closes, 5);
 console.log('PASS: 5 actual sysfs inventory/hotplug paths with closed enumeration handles');
 
-// Off the Ultra the extension stays inert: no prototype patch, actors, poll or
-// bus name.  Main is empty and ShellUserVerifier is not defined here, so any
-// real enable step throws; an unreadable device tree counts as another board.
+// Off the Ultra the fingerprint part stays inert: no actors, poll, bus name or
+// broker pulses.  The two GNOME 46 guards (closed-connection cancel recovery,
+// targetless keyboard events) go on and off on every board.  Main has only the
+// keyboard here and Gio no Cancellable, so a real fingerprint enable step
+// throws; an unreadable device tree counts as another board.
 const boardGLib = compatible => ({...GLib, file_get_contents(path) {
     assert.equal(path, '/proc/device-tree/compatible');
     if (compatible === null)
         throw new Error('No such file or directory');
     return [true, new TextEncoder().encode(compatible)];
 }});
+const board = compatible => {
+    const nativeCancel = function () { return 'native cancel'; };
+    const nativeHandle = function () { return 'native handle'; };
+    const verifier = {prototype: {cancel: nativeCancel}};
+    const keyboard = {maybeHandleEvent: nativeHandle};
+    const BoardType = new Function('Extension', 'GLib', 'Gio', 'Main', 'global',
+        'ShellUserVerifier', 'recoverClosedCancellation', 'KeyboardEventGuard', source)(
+        class {}, boardGLib(compatible), {IOErrorEnum: {CLOSED: 18}}, {keyboard},
+        {stage: {get_event_actor: () => null}}, verifier, recoverClosedCancellation,
+        KeyboardEventGuard);
+    return {BoardType, verifier, keyboard, nativeCancel, nativeHandle};
+};
 const x710 = 'qcom,kalama-mtp\0qcom,kalama\0qcom,mtp\0samsung,gts9wifi\0qcom,sm8550\0';
 const x910 = 'qcom,kalama-mtp\0qcom,kalama\0qcom,mtp\0samsung,gts9uwifi\0qcom,sm8550\0';
 for (const compatible of [x710, null]) {
-    const InertType = new Function('Extension', 'GLib', 'Main', source)(class {}, boardGLib(compatible), {});
-    const inert = new InertType();
+    const b = board(compatible);
+    const inert = new b.BoardType();
     inert.enable();
     assert.equal(inert._inert, true);
+    assert.notEqual(b.verifier.prototype.cancel, b.nativeCancel);
+    assert.equal(b.verifier.prototype.cancel.call({}), 'native cancel');
+    assert.notEqual(b.keyboard.maybeHandleEvent, b.nativeHandle);
     assert.equal(inert._panelPollId, undefined);
     assert.equal(inert._busId, undefined);
+    assert.equal(inert._authKeyboard, undefined);
+    assert.equal(inert._displayCancellable, undefined);
     inert.disable();
     assert.equal(inert._inert, false);
+    assert.equal(b.verifier.prototype.cancel, b.nativeCancel);
+    assert.equal(b.keyboard.maybeHandleEvent, b.nativeHandle);
 }
-const UltraType = new Function('Extension', 'GLib', 'Main', source)(class {}, boardGLib(x910), {});
-assert.throws(() => new UltraType().enable(), /ShellUserVerifier/);
-console.log('PASS: inert on the X710 and without a device tree, active on the X910');
+const ultra = board(x910);
+assert.throws(() => new ultra.BoardType().enable(), /Cancellable/);
+assert.notEqual(ultra.verifier.prototype.cancel, ultra.nativeCancel);
+console.log('PASS: guards on every board; fingerprint part inert on the X710 and without a device tree, active on the X910');
