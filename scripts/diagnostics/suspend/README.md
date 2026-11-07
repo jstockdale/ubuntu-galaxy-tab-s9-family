@@ -95,6 +95,16 @@ Stage 2 held a 10-minute watch, but an interconnect synced before the boot-time
 released yet. Expect a possible wedge: hold Power and Volume Down until the
 tablet restarts; it comes back on plain Stage 2.
 
+## Likely first findings, and what they point at
+
+| Result | Points at | Next step |
+|---|---|---|
+| s2idle woken by `q6v5 ready`, `smp2p-adsp`, `ipcc_0` or `glink-smem` | ADSP traffic as wake noise: `q6v5 ready` fires about 5 times a second on Stage 2, where once per DSP boot is expected | `run --s2idle 10 --deep 0 --keep-going` to count it; deep is not affected by non-PDC IRQs |
+| woken by a `dwc3`/USB IRQ | the USB gadget link | repeat with the cable out, over Wi-Fi SSH |
+| deep returns within milliseconds, `wake=none` | the IPCC bounce the X710 IPCC patch addresses, or another pending IRQ | compare `grep -E "ipcc_0\|smp2p" /proc/interrupts` around a cycle |
+| `Wi-Fi is '...'` after resume | ath11k resume | ladder `s2idle nowifi nobt` to confirm; then try one cycle with `echo enabled > /sys/bus/pci/devices/0000:01:00.0/power/wakeup` (keeps the WCN6855 link and power up through suspend) |
+| root `ro`, UFS lines | UFS resume | stop; TWRP and fsck as in `docs/resume-recovery.md` |
+
 ## A cycle that does not come back
 
 The log is synced line by line and the cycle's name is written to `IN-CYCLE`
