@@ -13,6 +13,14 @@ from pathlib import Path
 REPOSITORY = "agcarbajo/ubuntu-galaxy-tab-s9-ultra"
 API = "https://api.github.com/repos/" + REPOSITORY + "/releases"
 IDENTITY = Path("/usr/lib/gts9u-release.json")
+MODEL = Path("/proc/device-tree/model")
+# Device-tree model -> (codename, Samsung model, root filesystem label).  The
+# label is scoped per device so a kernel paired with the other tablet's root
+# fails at mount instead of half-booting; see scripts/lib/device.sh.
+DEVICES = {
+    b"Samsung Galaxy Tab S9 Ultra Wi-Fi": ("gts9uwifi", "SM-X910", "UBTS9U_UFS"),
+    b"Samsung Galaxy Tab S9 Wi-Fi": ("gts9wifi", "SM-X710", "UBTS9_UFS"),
+}
 MANIFEST = "UPDATE/manifest.json"
 PARTITIONS = {"boot": 100663296, "init_boot": 8388608,
               "vendor_boot": 100663296, "dtbo": 16777216}
@@ -29,10 +37,24 @@ def sha256(path):
     return h.hexdigest()
 
 
+def device():
+    """The running tablet's codename, or None on a model this port does not know.
+
+    Without a device tree, as on a build host, the Ultra is assumed: that is
+    what every caller did before the family split.
+    """
+    try:
+        model = MODEL.read_bytes().rstrip(b"\0")
+    except OSError:
+        return "gts9uwifi"
+    entry = DEVICES.get(model)
+    return entry[0] if entry else None
+
+
 def current():
     try:
         value = json.loads(IDENTITY.read_text())
-        return value if value.get("device") == "gts9uwifi" else {}
+        return value if value.get("device") == device() else {}
     except (OSError, ValueError):
         return {}
 
@@ -119,9 +141,29 @@ def inspect(path):
         if archive.getinfo(MANIFEST).file_size > 1024**2:
             raise ValueError("Oversized update manifest")
         manifest = json.loads(archive.read(MANIFEST))
-        if (manifest.get("format") != 1 or manifest.get("device") != "gts9uwifi"
+        if (manifest.get("format") != 1 or manifest.get("device") != device()
                 or manifest.get("architecture") != "arm64" or manifest.get("suite") != "noble"):
             raise ValueError("Unsupported update format, device or Ubuntu release")
+        # Builds staged from a specific stock package declare its bootloader
+        # revision.  The proprietary ADSP/zap/TrustZone blobs are authenticated
+        # against the tablet's fused rollback state, so a payload matched to a
+        # different revision is refused.  Either side lacking the field means
+        # a build from before revision tracking, which stays accepted.
+        offered = manifest.get("firmware")
+        if offered is not None:
+            if (not isinstance(offered, dict)
+                    or not isinstance(offered.get("bl_rev"), int)
+                    or not isinstance(offered.get("build_id"), str)
+                    or not TOKEN.fullmatch(offered["build_id"])):
+                raise ValueError("Invalid firmware identity in the update")
+            installed = current().get("firmware")
+            if (isinstance(installed, dict) and "bl_rev" in installed
+                    and installed["bl_rev"] != offered["bl_rev"]):
+                raise ValueError(
+                    "This update carries firmware for bootloader revision "
+                    f"{offered['bl_rev']}, but this tablet's installation is "
+                    f"matched to revision {installed['bl_rev']}. Build the "
+                    "update from the matching stock package.")
         for field in ("version", "tag", "kernel_release"):
             if not isinstance(manifest.get(field), str) or not TOKEN.fullmatch(manifest[field]):
                 raise ValueError("Invalid " + field)

@@ -6,6 +6,7 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 src=$repo/packaging/ubuntu-gts9u-device
 out=${DEB_OUT_DIR:-$base/out/packages}
@@ -33,11 +34,11 @@ test -x "$owner" || { echo 'Run scripts/build-fingerprint-secure-owner.sh first'
 test -f "$irq" || { echo 'Run scripts/build-spss-irq-module.sh first' >&2; exit 1; }
 release=$(modinfo -F vermagic "$irq" | cut -d' ' -f1)
 irq_sig_key=$(modinfo -F sig_key "$irq")
-build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-gts9uwifi}
-kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-gts9uwifi}
-test -f "$build_dir/certs/signing_key.x509"
-test -f "$kernel_out/config"
-test -f "$kernel_out/kernel.release"
+build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-$DEVICE}
+kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-$DEVICE}
+for f in "$build_dir/certs/signing_key.x509" "$kernel_out/config" "$kernel_out/kernel.release"; do
+	test -f "$f" || { echo "missing $f (kernel build directory not mounted or kernel not built?)" >&2; exit 1; }
+done
 cert_serial=$(openssl x509 -inform DER -in "$build_dir/certs/signing_key.x509" \
 	-noout -serial | sed 's/^serial=//' | tr '[:lower:]' '[:upper:]')
 module_serial=$(printf '%s' "$irq_sig_key" | tr -d ':' | tr '[:lower:]' '[:upper:]')

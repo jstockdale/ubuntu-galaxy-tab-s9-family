@@ -210,6 +210,8 @@ struct sm5440_direct {
 	int target_mv;
 	int target_ma;
 	unsigned int pps_ticks;
+	unsigned int refresh_misses;
+	int last_start_err;
 	bool active;
 };
 
@@ -287,15 +289,40 @@ static int sm5440_psy_set(struct power_supply *psy,
 	return power_supply_set_property(psy, prop, &val);
 }
 
-static int sm5440_request_pps(struct sm5440_direct *sm, int mv, int ma)
+static int sm5440_request_pps(struct sm5440_direct *sm, int mv, int *ma)
 {
-	int ret;
+	int floor_ma = DIV_ROUND_UP(DIV_ROUND_UP(15000000, mv), 50) * 50;
+	int limit, ret;
 
 	ret = sm5440_psy_set(sm->tcpm, POWER_SUPPLY_PROP_ONLINE, 2);
 	if (ret)
 		return ret;
+
+	/*
+	 * The operating current has to fit the APDO tcpm selected.  Sources
+	 * cap their programmable profiles -- 3 A is the norm for 45 W-class
+	 * adapters and for any lead without an e-marker -- and a Request
+	 * above the cap is refused as invalid, which used to park the tablet
+	 * on the 15 W fixed fallback for the whole charge, retrying and being
+	 * refused every 30 seconds.  Ask for the configured current or the
+	 * source's limit, whichever is lower; a source whose limit cannot
+	 * even carry the 15 W floor is not worth leaving the fixed contract
+	 * for.
+	 */
+	limit = sm5440_psy_get(sm->tcpm, POWER_SUPPLY_PROP_CURRENT_MAX);
+	if (limit > 0 && limit / 1000 < *ma) {
+		if (limit / 1000 < floor_ma) {
+			ret = -ERANGE;
+			goto fixed;
+		}
+		dev_info(sm->dev,
+			 "PPS source allows %d mA; clamping the %d mA request\n",
+			 limit / 1000, *ma);
+		*ma = limit / 1000;
+	}
+
 	ret = sm5440_psy_set(sm->tcpm, POWER_SUPPLY_PROP_CURRENT_NOW,
-			      ma * 1000);
+			      *ma * 1000);
 	if (ret)
 		goto fixed;
 	ret = sm5440_psy_set(sm->tcpm, POWER_SUPPLY_PROP_VOLTAGE_NOW,
@@ -439,7 +466,7 @@ static int sm5440_start(struct sm5440_direct *sm)
 	if (ret)
 		goto restore;
 
-	ret = sm5440_request_pps(sm, target_mv, target_ma);
+	ret = sm5440_request_pps(sm, target_mv, &target_ma);
 	if (ret)
 		goto restore;
 
@@ -493,6 +520,7 @@ static int sm5440_start(struct sm5440_direct *sm)
 	sm->target_mv = target_mv;
 	sm->target_ma = target_ma;
 	sm->pps_ticks = 0;
+	sm->refresh_misses = 0;
 	dev_info(sm->dev, "direct charge started: PPS %d mV/%d mA\n",
 		 target_mv, target_ma);
 	return 0;
@@ -532,8 +560,19 @@ static void sm5440_work(struct work_struct *work)
 		}
 		ret = sm5440_start(sm);
 		if (ret) {
-			dev_warn(sm->dev, "direct-charge start failed: %d\n", ret);
+			/*
+			 * One line per failure streak: an adapter that cannot
+			 * serve the direct charger at all turns the 30-second
+			 * retry into permanent log spam otherwise.
+			 */
+			if (ret != sm->last_start_err)
+				dev_warn(sm->dev,
+					 "direct-charge start failed: %d\n",
+					 ret);
+			sm->last_start_err = ret;
 			delay = msecs_to_jiffies(SM5440_RETRY_MS);
+		} else {
+			sm->last_start_err = 0;
 		}
 		goto out;
 	}
@@ -601,11 +640,27 @@ static void sm5440_work(struct work_struct *work)
 		}
 
 		ret = sm5440_refresh_pps(sm);
-		if (ret) {
+		if (ret == -EAGAIN && sm->refresh_misses < 3) {
+			/*
+			 * tcpm answers -EAGAIN when the port is mid-exchange
+			 * at the moment the refresh lands; the programmable
+			 * contract survives a missed 2.5 s refresh easily
+			 * (sources allow about ten).  Tearing down on the
+			 * first miss made the session restart every minute
+			 * against adapters with chatty PD stacks, cycling
+			 * the whole charge path audibly.  Let the next tick
+			 * retry; three consecutive misses (7.5 s) still stay
+			 * inside the source's window and anything beyond
+			 * that is a real failure.
+			 */
+			sm->refresh_misses++;
+		} else if (ret) {
 			dev_warn(sm->dev, "failed to refresh PPS: %d\n", ret);
 			sm5440_restore_switching(sm);
 			delay = msecs_to_jiffies(SM5440_RETRY_MS);
 			goto out;
+		} else {
+			sm->refresh_misses = 0;
 		}
 	}
 

@@ -2,9 +2,10 @@
 # Experimental SM-X910 session helpers. Does not install or flash anything.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
-kernel_tree=${KERNEL_WORKTREE:-$base/build/linux-src-gts9uwifi}
-build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-gts9uwifi}
+kernel_tree=${KERNEL_WORKTREE:-$base/build/linux-src-$DEVICE}
+build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-$DEVICE}
 module_dir=$base/build/npu-session-module
 out=${NPU_SESSION_OUT:-$base/out/npu-session}
 if [ -z "${NPU_POWER_KEEPER:-}" ]; then

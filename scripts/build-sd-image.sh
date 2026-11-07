@@ -7,10 +7,11 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 rootfs=${ROOTFS_DIR:-$base/rootfs}
-out=${IMAGE_OUT:-$base/out/ubuntu-gts9uwifi.img}
-kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-gts9uwifi}
+out=${IMAGE_OUT:-$base/out/ubuntu-$DEVICE.img}
+kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-$DEVICE}
 kernel_release=${KERNEL_RELEASE:-$(cat "$kernel_out/kernel.release" 2>/dev/null || echo 7.2.0-rc3)}
 boot_mb=${BOOT_PART_MB:-256}
 slack_mb=${ROOT_SLACK_MB:-1536}
@@ -138,14 +139,14 @@ tar -C "$rootfs" --numeric-owner --acls \
 mkdir -p "$base/mnt/boot"
 cp -a "$base/mnt/root/boot/." "$base/mnt/boot/"
 rm -rf "$base/mnt/root/boot"/*
-install -m 0644 "$kernel_out/sm8550-samsung-gts9uwifi.dtb" \
-	"$base/mnt/boot/sm8550-samsung-gts9uwifi.dtb"
+install -m 0644 "$kernel_out/$DEVICE_DTS.dtb" \
+	"$base/mnt/boot/$DEVICE_DTS.dtb"
 {
 	printf 'kernel_release=%s\n' "$kernel_release"
 	printf 'kernel_image_sha256=%s\n' \
 		"$(sha256sum "$kernel_out/Image.gz" | cut -d' ' -f1)"
 	printf 'kernel_dtb_sha256=%s\n' \
-		"$(sha256sum "$kernel_out/sm8550-samsung-gts9uwifi.dtb" | cut -d' ' -f1)"
+		"$(sha256sum "$kernel_out/$DEVICE_DTS.dtb" | cut -d' ' -f1)"
 	printf 'initramfs_sha256=%s\n' "$(sha256sum "$initramfs" | cut -d' ' -f1)"
 	printf 'built=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$base/mnt/boot/BUILD-METADATA.txt"

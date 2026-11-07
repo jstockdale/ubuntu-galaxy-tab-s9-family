@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build a reproducible Ubuntu 24.04 LTS arm64 root filesystem for the Samsung
-# Galaxy Tab S9 Ultra Wi-Fi (SM-X910).
+# Galaxy Tab S9 family (SM-X910 Ultra, SM-X710).
 #
 # The result is a directory tree, not an image; scripts/build-sd-image.sh turns
 # it into the two-partition microSD image.  Nothing here writes to a device.
@@ -11,6 +11,7 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 rootfs=${ROOTFS_DIR:-$base/rootfs}
 profile=${GTS9U_PROFILE:-desktop}
@@ -75,7 +76,7 @@ sudo,locales,tzdata,console-setup,keyboard-configuration,
 cloud-guest-utils,
 apparmor,apparmor-utils,
 snapd,squashfs-tools,
-netplan.io,network-manager,wpasupplicant,
+netplan.io,network-manager,wpasupplicant,wireless-regdb,iw,
 openssh-server,avahi-daemon,
 protection-domain-mapper,qrtr-tools,
 iputils-ping,curl,wget,ca-certificates,
@@ -284,7 +285,7 @@ if [ "${GTS9U_INCLUDE_NPU:-1}" = 1 ]; then
         --runtime "${NPU_RUNTIME_DIR:-$base/npu-release-inputs}" \
         --firmware "${NPU_FIRMWARE_DIR:-$base/npu-release-firmware}" \
         --session "$base/out/npu-session" \
-        --kernel-build "${KERNEL_BUILD_DIR:-$base/build/linux-gts9uwifi}" \
+        --kernel-build "${KERNEL_BUILD_DIR:-$base/build/linux-$DEVICE}" \
         --output "$base/out/packages"
     npu_package=ubuntu-gts9u-npu
 fi
@@ -386,6 +387,20 @@ if [ "$extra_missing" = 1 ] || [ "$extra_cached" != "$extra_fingerprint" ]; then
 	printf '%s\n' "$extra_fingerprint" > "$extra_stamp"
 fi
 
+# PipeWire rebuilt with the Bluetooth AAC codec (fdk-aac, multiverse).  Ubuntu's
+# own libspa-0.2-bluetooth cannot negotiate AAC, so A2DP sinks fall back to
+# SBC.  The whole binary set from the one source build is installed so the
+# versions stay consistent with the archive packages they replace.
+pipewire_aac_version=${PIPEWIRE_VERSION:-1.0.5-1ubuntu3.3}${PIPEWIRE_AAC_SUFFIX:-+gts9u1}
+pipewire_aac_stamp=$base/out/packages/.gts9u-pipewire-aac-inputs.sha256
+pipewire_aac_fingerprint=$(sha256sum "$repo/scripts/build-pipewire-aac.sh" | awk '{print $1}')
+if [ ! -f "$base/out/packages/libspa-0.2-bluetooth_${pipewire_aac_version}_arm64.deb" ] || \
+   [ "$(cat "$pipewire_aac_stamp" 2>/dev/null || true)" != "$pipewire_aac_fingerprint" ]; then
+	echo 'PipeWire AAC package inputs changed or packages are missing; rebuilding them'
+	bash "$repo/scripts/build-pipewire-aac.sh" >/dev/null
+	printf '%s\n' "$pipewire_aac_fingerprint" > "$pipewire_aac_stamp"
+fi
+
 # Newest build of each, so repeated builds do not accumulate stale versions.
 stage_debs=$base/out/local-debs
 rm -rf -- "$stage_debs"
@@ -394,7 +409,10 @@ for pkg in libssc hexagonrpcd iio-sensor-proxy \
 	libfprint-2-2 $fingerprint_firmware_package \
 	libcamera-gts9u libspa-0.2-libcamera-gts9u \
 	ubuntu-gts9u-device ubuntu-gts9u-companion fastfetch v4l2-relayd-gts9u \
-    gnome-settings-daemon gnome-settings-daemon-common $npu_package; do
+    gnome-settings-daemon gnome-settings-daemon-common $npu_package \
+    pipewire pipewire-bin pipewire-audio pipewire-pulse pipewire-alsa \
+    libpipewire-0.3-0t64 libpipewire-0.3-modules libspa-0.2-modules \
+    libspa-0.2-bluetooth gstreamer1.0-pipewire; do
 	deb=$(ls -t "$base"/out/packages/${pkg}_*.deb 2>/dev/null | head -1 || true)
 	if [ -z "$deb" ]; then
 		echo "missing local package: $pkg" >&2
@@ -564,6 +582,24 @@ else
 		"deb $mirror $suite-security main restricted universe multiverse"
 fi
 
+# mmdebstrap's cleanup can lose its unmount race against a process the hooks
+# leave running for a few more seconds; it then only warns and leaves /proc
+# (or /sys, /dev) mounted inside the rootfs.  Everything downstream assumes a
+# plain directory tree -- the summary du dies racing live procfs churn, and
+# stage 4's tar would image a mounted /proc wholesale -- so settle the mounts
+# here and refuse to continue if one will not go.
+for sub in proc sys dev/pts dev; do
+	mountpoint -q "$rootfs/$sub" 2>/dev/null || continue
+	for attempt in 1 2 3 4 5; do
+		umount "$rootfs/$sub" 2>/dev/null && break
+		sleep 2
+	done
+	if mountpoint -q "$rootfs/$sub" 2>/dev/null; then
+		echo "refusing to continue: $rootfs/$sub is still mounted" >&2
+		exit 1
+	fi
+done
+
 # ---------------------------------------------------------------------------
 # Kernel modules and optional development key
 # ---------------------------------------------------------------------------
@@ -608,6 +644,8 @@ echo '=== rootfs summary ==='
 # Keep it outside /etc: this is release metadata, not a user preference.
 printf '%s' "$packages" | tr ',[:space:]' '\n' | sed '/^$/d' | sort -u \
 	> "$rootfs/usr/lib/gts9u-required-packages.txt"
-du -sh "$rootfs"
+# Cosmetic only: never let a size printout kill a finished thirty-minute
+# build (racy or unreadable entries make du exit nonzero under set -e).
+du -sh --one-file-system "$rootfs" || echo 'rootfs size unavailable'
 chroot "$rootfs" dpkg-query -f '${binary:Package}\n' -W | wc -l | \
 	sed 's/^/packages installed: /'

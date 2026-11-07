@@ -2,6 +2,12 @@
 Description=Tab Companion docked S Pen pairing
 After=bluetooth.service
 Wants=bluetooth.service
+# The daemon's D-Bus proxies bind to one bluetoothd instance; when bluez is
+# restarted (every bluez package update does this from its postinst), the old
+# proxies answer ServiceUnknown forever and the S Pen BLE features silently
+# die while the unit still reports active. Restart alongside bluetoothd
+# instead of trying to outlive it.
+PartOf=bluetooth.service
 
 [Service]
 Type=simple

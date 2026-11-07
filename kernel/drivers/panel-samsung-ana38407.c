@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/workqueue.h>
 
@@ -26,6 +27,22 @@
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
+
+/*
+ * Boot-time switches for the display experiments, so a change of DSI timing
+ * or clock mode is a vendor_boot repack rather than a kernel rebuild.  The
+ * driver is built in, so they are set on the kernel command line as
+ * panel_samsung_ana38407.<name>=.  -1 keeps the per-glass default.
+ */
+static int param_continuous_clock = -1;
+module_param_named(continuous_clock, param_continuous_clock, int, 0444);
+MODULE_PARM_DESC(continuous_clock,
+		 "keep the DSI clock lane in HS between frames (-1 per-glass default, 0 no, 1 yes)");
+
+static int param_hback_porch = -1;
+module_param_named(hback_porch, param_hback_porch, int, 0444);
+MODULE_PARM_DESC(hback_porch,
+		 "override the horizontal back porch of every declared mode, recomputing its clock (-1 keeps the table)");
 
 /*
  * DCS 0x51 carries 11 significant bits on this DDIC, not 12: Samsung's own
@@ -44,6 +61,37 @@
 
 /* Revision D, as read back by the bootloader (lcd_id=0x800004). */
 static const u8 ana38407_expected_id[3] = { 0x80, 0x00, 0x04 };
+
+/*
+ * One driver serves the ANA38407 across the Tab S9 family; the glass differs.
+ * A variant carries its modes, physical size, DSC geometry and, once read on
+ * hardware, the expected panel id (NULL skips the comparison and the prepare
+ * path just logs what the DDIC answered).
+ */
+struct ana38407;
+
+struct ana38407_desc {
+	/* The DDIC's vendor power-on sequence differs per glass. */
+	int (*on)(struct ana38407 *ctx);
+	/* Lowest 0x51 level the glass renders cleanly; 0 passes GNOME's fade through. */
+	u16 min_brightness;
+	const struct drm_display_mode *modes;
+	unsigned int num_modes;
+	u16 width_mm;
+	u16 height_mm;
+	u16 pic_width;
+	u16 pic_height;
+	u16 slice_width;
+	u16 slice_height;
+	const u8 *expected_id;
+	/*
+	 * Keep the DSI clock lane in HS between command-mode frames.  The
+	 * 11" glass shows intermittent speckle on frames written after an idle
+	 * gap (never during continuous updates), the signature of a marginal
+	 * LP->HS re-entry at 1.524 Gbps with mainline's generic PHY timings.
+	 */
+	bool continuous_clock;
+};
 
 /*
  * On a cold boot the DDIC answers 00:00:00 and emits black, even though the
@@ -75,6 +123,7 @@ struct ana38407 {
 	bool fod_circle;
 	u8 id[3];
 	char cell_id[23];
+	const struct ana38407_desc *desc;
 };
 
 /*
@@ -425,6 +474,191 @@ static int ana38407_on(struct ana38407 *ctx)
 	return dsi_ctx.accum_err;
 }
 
+/*
+ * AMSA10FA01 (SM-X710), panel revision D (id 0x80 0x00 0x04): Samsung's
+ * POWER_ON_PRE_SETTING for GTS9_ANA38407_AMSA10FA01, transcribed macro by
+ * macro from the panel data file in the X710 open-source kernel.  It shares
+ * MX_IP_ENABLE, TCON_INTR_SETTING, TE_ON, DSC, DIA, brightness and SP_SETTING
+ * with the Ultra glass, but brackets them with slew boosting and uses its own
+ * display-on-delay and TSP sync registers; the Ultra's VBP_SETTING_FOR_SDC_IP
+ * writes a vertical porch for the 1848-line panel and must not be sent here.
+ */
+/* GLUT pages cleared at 120 Hz: DCS register followed by the zero payload. */
+static const u8 ana38407_glut_zero_eb[1 + 110] = { 0xeb };
+static const u8 ana38407_glut_zero_ec[1 + 82] = { 0xec };
+
+static int ana38407_amsa10fa01_on(struct ana38407 *ctx)
+{
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	struct drm_dsc_picture_parameter_set pps;
+	static const u8 slew_regs[] = { 0x4f, 0x62, 0x75, 0x88 };
+	u8 module_info[11] = {};
+	u8 id[3] = {};
+	ssize_t module_info_len;
+	unsigned int i;
+
+	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+
+	/* SLEW_BOOSTING_OFF */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0x5a, 0x5a);
+	for (i = 0; i < ARRAY_SIZE(slew_regs); i++) {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x2a);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+		mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xc0, 0x0f, 0x00, 0x00,
+						 0x00, 0x13, slew_regs[i], 0x81);
+	}
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
+
+	/* PM_EN_DISP_ON_DELAY */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x14, 0x35, 0x81);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x23);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x01, 0x04, 0x81);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
+
+	/* Sleep out.  Samsung waits 50 ms; the DCS minimum of 120 ms costs nothing. */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x11);
+	mipi_dsi_msleep(&dsi_ctx, 120);
+
+	mipi_dsi_dcs_read(ctx->dsi, 0xda, &id[0], 1);
+	mipi_dsi_dcs_read(ctx->dsi, 0xdb, &id[1], 1);
+	mipi_dsi_dcs_read(ctx->dsi, 0xdc, &id[2], 1);
+	memcpy(ctx->id, id, sizeof(ctx->id));
+	dev_info(&ctx->dsi->dev, "ana38407 panel id: %02x %02x %02x\n",
+		 id[0], id[1], id[2]);
+
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	module_info_len = mipi_dsi_dcs_read(ctx->dsi, 0xa1, module_info,
+					    sizeof(module_info));
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	if (module_info_len == (ssize_t)sizeof(module_info)) {
+		snprintf(ctx->cell_id, sizeof(ctx->cell_id),
+			 "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+			 module_info[4], module_info[5], module_info[6],
+			 module_info[7], module_info[8], module_info[9],
+			 module_info[10], module_info[0], module_info[1],
+			 module_info[2], module_info[3]);
+		dev_info(&ctx->dsi->dev, "ana38407 cell id: %s\n", ctx->cell_id);
+	} else {
+		ctx->cell_id[0] = '\0';
+		dev_warn(&ctx->dsi->dev,
+			 "failed to read panel cell id: %zd\n", module_info_len);
+	}
+
+	/* MX_IP_ENABLE */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x23);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x09, 0xb2, 0x81);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
+
+	/* TCON_INTR_SETTING */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x02);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x14, 0x46, 0x81);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x13);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x08, 0xcf, 0x81);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x05);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x09, 0xcd, 0x81);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
+
+	/* Revision D: neither SSCG block applies (B and C only). */
+
+	/* TE_ON */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x35, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+
+	/* TSP_SYNC_SETTING (revision C+): no 0x0e/0xb9 pair on this glass. */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0b, 0xb9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0xcc);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+
+	/* DSC_SETTING: compression on, PPS from drm_dsc_config (2 x 1280 x 100). */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_compression_mode_multi(&dsi_ctx, true);
+	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+
+	/* DIA_SETTING */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x91, 0x02);
+
+	/*
+	 * GLUT_SETTING, 120 Hz branch: Samsung clears both gamma LUT pages
+	 * (110 + 82 bytes at 0xEB/0xEC via index 0x91) and then selects
+	 * them.  The 60/30 Hz branch loads a per-panel LUT and is not sent.
+	 */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x91, 0xeb);
+	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, ana38407_glut_zero_eb,
+					sizeof(ana38407_glut_zero_eb));
+	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, ana38407_glut_zero_ec,
+					sizeof(ana38407_glut_zero_ec));
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xeb, 0x02);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x26, 0x93);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x93, 0x20);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+
+	/* BRIGHTNESS_DIMMING_SETTING: normal mode plus a real level. */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x28);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0x51,
+					 ctx->user_brightness >> 8,
+					 ctx->user_brightness & 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+
+	/* SP_SETTING */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc3, 0x02);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+
+	mipi_dsi_msleep(&dsi_ctx, 20);
+
+	/* SLEW_BOOSTING_ON */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0x5a, 0x5a);
+	for (i = 0; i < ARRAY_SIZE(slew_regs); i++) {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc1, 0x2e);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+		mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xc0, 0x0f, 0x00, 0x00,
+						 0x00, 0x13, slew_regs[i], 0x81);
+	}
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
+
+	/* VRR_SETTING, 120 Hz, revision C+ variant. */
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x13, 0xdd);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xdd, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x10, 0xb9);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x80, 0x00, 0x00, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
+
+	/* Display-on (0x29) stays in enable(), once the DPU streams. */
+	mipi_dsi_msleep(&dsi_ctx, 100);
+
+	return dsi_ctx.accum_err;
+}
+
 static int ana38407_enable(struct drm_panel *panel)
 {
 	struct ana38407 *ctx = to_ana38407(panel);
@@ -505,7 +739,7 @@ static int ana38407_prepare(struct drm_panel *panel)
 
 	ana38407_reset(ctx);
 
-	ret = ana38407_on(ctx);
+	ret = ctx->desc->on(ctx);
 	if (ret) {
 		gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 		regulator_bulk_disable(ARRAY_SIZE(ana38407_supplies), ctx->supplies);
@@ -513,12 +747,16 @@ static int ana38407_prepare(struct drm_panel *panel)
 	}
 	ctx->prepared = true;
 
-	if (memcmp(ctx->id, ana38407_expected_id, sizeof(ctx->id)))
+	if (!ctx->desc->expected_id)
+		dev_info(&ctx->dsi->dev,
+			 "panel id %02x %02x %02x (no expected id pinned for this glass yet)\n",
+			 ctx->id[0], ctx->id[1], ctx->id[2]);
+	else if (memcmp(ctx->id, ctx->desc->expected_id, sizeof(ctx->id)))
 		dev_warn(&ctx->dsi->dev,
 			 "panel id %02x %02x %02x, expected %02x %02x %02x: the panel will stay dark until a suspend/resume re-initialises the DSI host\n",
 			 ctx->id[0], ctx->id[1], ctx->id[2],
-			 ana38407_expected_id[0], ana38407_expected_id[1],
-			 ana38407_expected_id[2]);
+			 ctx->desc->expected_id[0], ctx->desc->expected_id[1],
+			 ctx->desc->expected_id[2]);
 
 out_unlock:
 	mutex_unlock(&ctx->lock);
@@ -564,37 +802,101 @@ static const struct drm_display_mode ana38407_modes[] = {
 		.vdisplay = 1848, .vsync_start = 1848 + 127, .vsync_end = 1848 + 127 + 256,
 		.vtotal = 1848 + 127 + 256 + 137,
 	},
-	{	/* 30 Hz */
-		.clock = (2960 + 512 + 208 + 256) * (1848 + 512 + 512 + 512) * 30 / 1000,
-		.hdisplay = 2960, .hsync_start = 2960 + 512, .hsync_end = 2960 + 512 + 208,
-		.htotal = 2960 + 512 + 208 + 256,
-		.vdisplay = 1848, .vsync_start = 1848 + 512, .vsync_end = 1848 + 512 + 512,
-		.vtotal = 1848 + 512 + 512 + 512,
+};
+
+/*
+ * Tab S9 11" (gts9wifi): AMSA10FA01 glass, 2560x1600, command mode.  The
+ * vertical porches are the stock r04 timings (42/64/32).  The horizontal
+ * blanking is not transmitted in command mode; it only sets the DSI byte
+ * clock: msm's dsi_adjust_pclk_for_compression() shrinks hdisplay to
+ * DIV_ROUND_UP(2560 * 8 / 24) = 854 columns, keeps the blanking, and the lane
+ * rate is six times that pixel clock.  With the stock porches (34/64/34) that
+ * is (854 + 132) * 1738 * 120 = 205.7 MHz, i.e. 1.234 Gbps per lane: the
+ * configuration that is known to light the glass (builds 8 and 9).  Stock
+ * Android drives 1.524 Gbps (qcom,mdss-dsi-panel-clockrate, 7533 us frame
+ * transfer), which a 266-pixel back porch reproduces here ((854 + 364) * 1738
+ * * 120 = 254 MHz); build 10 shipped that together with a continuous DSI
+ * clock and the panel stayed black although the DDIC answered and the DPU ran,
+ * so both are now boot-time experiments (panel_samsung_ana38407.hback_porch=266,
+ * panel_samsung_ana38407.continuous_clock=1) rather than defaults.  Only the
+ * 120 Hz mode is declared until the 60 Hz VRR path is wired.
+ */
+static const struct drm_display_mode ana38407_amsa10fa01_modes[] = {
+	{	/* 120 Hz, 1.234 Gbps per lane */
+		.clock = (2560 + 34 + 64 + 34) * (1600 + 42 + 64 + 32) * 120 / 1000,
+		.hdisplay = 2560, .hsync_start = 2560 + 34, .hsync_end = 2560 + 34 + 64,
+		.htotal = 2560 + 34 + 64 + 34,
+		.vdisplay = 1600, .vsync_start = 1600 + 42, .vsync_end = 1600 + 42 + 64,
+		.vtotal = 1600 + 42 + 64 + 32,
 	},
+};
+
+static const struct ana38407_desc ana38407_amsa46as02_desc = {
+	.on = ana38407_on,
+	.modes = ana38407_modes,
+	.num_modes = ARRAY_SIZE(ana38407_modes),
+	.width_mm = 313,
+	.height_mm = 196,
+	.pic_width = 2960,
+	.pic_height = 1848,
+	.slice_width = 1480,
+	.slice_height = 77,
+	.expected_id = ana38407_expected_id,
+};
+
+static const struct ana38407_desc ana38407_amsa10fa01_desc = {
+	.on = ana38407_amsa10fa01_on,
+	/* Samsung's platform scale never goes below 10/2047 (about 2 nits). */
+	.min_brightness = 10,
+	.modes = ana38407_amsa10fa01_modes,
+	.num_modes = ARRAY_SIZE(ana38407_amsa10fa01_modes),
+	/* Stock r04 physical dimensions: 236 x 148 mm. */
+	.width_mm = 236,
+	.height_mm = 148,
+	.pic_width = 2560,
+	.pic_height = 1600,
+	/* Stock r04 DSC geometry: two 1280 x 100 slices, 8 bpc / 8 bpp. */
+	.slice_width = 1280,
+	.slice_height = 100,
+	/* Off: the build-9 configuration; 1 via the module parameter to test. */
+	.continuous_clock = false,
+	/* Read on first hardware boot, then pin it here. */
+	.expected_id = NULL,
 };
 
 static int ana38407_get_modes(struct drm_panel *panel,
 			      struct drm_connector *connector)
 {
+	struct ana38407 *ctx = to_ana38407(panel);
+	const struct ana38407_desc *desc = ctx->desc;
 	struct drm_display_mode *mode;
 	int i, count = 0;
 
-	for (i = 0; i < ARRAY_SIZE(ana38407_modes); i++) {
-		mode = drm_mode_duplicate(connector->dev, &ana38407_modes[i]);
+	for (i = 0; i < desc->num_modes; i++) {
+		mode = drm_mode_duplicate(connector->dev, &desc->modes[i]);
 		if (!mode)
 			continue;
+		if (param_hback_porch >= 0) {
+			int vrefresh = drm_mode_vrefresh(&desc->modes[i]);
+
+			mode->htotal = mode->hsync_end + param_hback_porch;
+			mode->clock = DIV_ROUND_CLOSEST(mode->htotal * mode->vtotal *
+							vrefresh, 1000);
+			dev_info(panel->dev, "mode %d: back porch %d, clock %d kHz (boot parameter)\n",
+				 i, param_hback_porch, mode->clock);
+		}
 		mode->type = DRM_MODE_TYPE_DRIVER;
 		if (i == 0)
 			mode->type |= DRM_MODE_TYPE_PREFERRED;
-		mode->width_mm = 313;
-		mode->height_mm = 196;
+		mode->width_mm = desc->width_mm;
+		mode->height_mm = desc->height_mm;
 		drm_mode_set_name(mode);
 		drm_mode_probed_add(connector, mode);
 		count++;
 	}
 
-	connector->display_info.width_mm = 313;
-	connector->display_info.height_mm = 196;
+	connector->display_info.width_mm = desc->width_mm;
+	connector->display_info.height_mm = desc->height_mm;
 
 	return count;
 }
@@ -614,6 +916,8 @@ static int ana38407_bl_update(struct backlight_device *bl)
 			       ANA38407_MAX_BRIGHTNESS);
 	int ret = 0;
 
+	if (brightness && brightness < ctx->desc->min_brightness)
+		brightness = ctx->desc->min_brightness;
 	mutex_lock(&ctx->lock);
 	ctx->user_brightness = brightness;
 	if (ctx->prepared && !ctx->fod_mode)
@@ -868,12 +1172,17 @@ static const struct drm_dsc_config ana38407_dsc_template = {
 static void ana38407_dsc_config(struct ana38407 *ctx)
 {
 	ctx->dsc = ana38407_dsc_template;
+	ctx->dsc.pic_width = ctx->desc->pic_width;
+	ctx->dsc.pic_height = ctx->desc->pic_height;
+	ctx->dsc.slice_width = ctx->desc->slice_width;
+	ctx->dsc.slice_height = ctx->desc->slice_height;
 }
 
 static int ana38407_probe(struct mipi_dsi_device *dsi)
 {
 	struct device *dev = &dsi->dev;
 	struct ana38407 *ctx;
+	bool continuous_clock;
 	int ret;
 
 	ctx = devm_drm_panel_alloc(dev, struct ana38407, panel,
@@ -881,6 +1190,10 @@ static int ana38407_probe(struct mipi_dsi_device *dsi)
 				   DRM_MODE_CONNECTOR_DSI);
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
+
+	ctx->desc = of_device_get_match_data(dev);
+	if (!ctx->desc)
+		ctx->desc = &ana38407_amsa46as02_desc;
 
 	ret = devm_regulator_bulk_get_const(dev, ARRAY_SIZE(ana38407_supplies),
 					    ana38407_supplies, &ctx->supplies);
@@ -900,7 +1213,15 @@ static int ana38407_probe(struct mipi_dsi_device *dsi)
 
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;
-	dsi->mode_flags = MIPI_DSI_MODE_LPM | MIPI_DSI_CLOCK_NON_CONTINUOUS;
+	dsi->mode_flags = MIPI_DSI_MODE_LPM;
+	continuous_clock = ctx->desc->continuous_clock;
+	if (param_continuous_clock >= 0)
+		continuous_clock = param_continuous_clock;
+	if (!continuous_clock)
+		dsi->mode_flags |= MIPI_DSI_CLOCK_NON_CONTINUOUS;
+	dev_info(dev, "DSI clock %s between frames%s\n",
+		 continuous_clock ? "continuous" : "non-continuous",
+		 param_continuous_clock >= 0 ? " (boot parameter)" : "");
 
 	ctx->panel.prepare_prev_first = true;
 
@@ -952,7 +1273,10 @@ static void ana38407_remove(struct mipi_dsi_device *dsi)
 }
 
 static const struct of_device_id ana38407_of_match[] = {
-	{ .compatible = "samsung,ana38407-amsa46as02" },
+	{ .compatible = "samsung,ana38407-amsa46as02",
+	  .data = &ana38407_amsa46as02_desc },
+	{ .compatible = "samsung,ana38407-amsa10fa01",
+	  .data = &ana38407_amsa10fa01_desc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ana38407_of_match);

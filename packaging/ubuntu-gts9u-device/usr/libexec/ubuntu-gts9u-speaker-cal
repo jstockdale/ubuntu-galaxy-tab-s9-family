@@ -1,0 +1,28 @@
+#!/bin/sh
+# Write Samsung's no-factory-EFS speaker calibration into the four protection
+# DSPs.  These are firmware-created controls: they exist only after the first
+# preload has parsed the wmfw, which happens asynchronously after WirePlumber's
+# UCM EnableSequence flips the preload switch - too late for any UCM sequence
+# to write them.  This oneshot waits for the controls and writes the values;
+# it touches no routing and no card acquisition, so it cannot interfere with
+# WirePlumber.  CAL_R 8580 is Cirrus' CIRRUS_CAL_RDC_DEFAULT, ambient 23 C,
+# checksum = status + rdc, exactly what stock writes on a unit with no
+# calibration in EFS.
+set -eu
+for attempt in $(seq 1 60); do
+	if amixer -q -c 0 cget name='Front Left DSP1 Protection cd CAL_R' >/dev/null 2>&1; then
+		break
+	fi
+	[ "$attempt" = 60 ] && {
+		echo 'speaker DSP controls never appeared; calibration not written' >&2
+		exit 1
+	}
+	sleep 2
+done
+for amp in 'Front Left' 'Front Right' 'Rear Left' 'Rear Right'; do
+	amixer -q -c 0 cset name="$amp DSP1 Protection cd CAL_STATUS"   '0x00,0x00,0x00,0x01'
+	amixer -q -c 0 cset name="$amp DSP1 Protection cd CAL_R"        '0x00,0x00,0x21,0x84'
+	amixer -q -c 0 cset name="$amp DSP1 Protection cd CAL_AMBIENT"  '0x00,0x00,0x00,0x17'
+	amixer -q -c 0 cset name="$amp DSP1 Protection cd CAL_CHECKSUM" '0x00,0x00,0x21,0x85'
+done
+echo 'speaker calibration written to all four protection DSPs'

@@ -18,14 +18,15 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 rootfs=${ROOTFS_DIR:-$base/rootfs}
 overlay=${OVERLAY_OUT_DIR:-$base/out/rootfs-overlay}
-out=${IMAGE_OUT:-$base/out/ubuntu-gts9uwifi-ufs.img}
-kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-gts9uwifi}
+out=${IMAGE_OUT:-$base/out/ubuntu-$DEVICE-ufs.img}
+kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-$DEVICE}
 kernel_release=${KERNEL_RELEASE:-$(cat "$kernel_out/kernel.release" 2>/dev/null || echo 7.2.0-rc3)}
 slack_mb=${ROOT_SLACK_MB:-1152}
-root_label=${ROOT_LABEL:-UBTS9U_UFS}
+root_label=${ROOT_LABEL:-$DEVICE_LABEL}
 # The whole image travels inside the ZIP, and the owner has to download it and
 # write it through TWRP's unzip.  Keeping it small is what makes that bearable:
 # the filesystem is grown to the full partition on first boot anyway.
@@ -125,8 +126,23 @@ tar -C "$rootfs" --numeric-owner --acls \
 # is built in one place, so the card's "incomplete until step 2" state simply
 # does not exist any more.
 echo 'merging the firmware and module overlay'
-tar -C "$overlay" --numeric-owner -cf - . \
+# Everything in the overlay belongs to root on the tablet.  The kernel stage
+# may have run as an ordinary user, and cp -a carried that uid into
+# modules-root; the stream fixes the owner rather than trusting the staging.
+tar -C "$overlay" --owner=0 --group=0 --numeric-owner -cf - . \
 	| tar -C "$mnt" --numeric-owner -xf -
+
+# Both tar streams end by applying their "./" entry's attributes to the
+# extraction directory, which here is the filesystem root: the image's /
+# silently inherits the owner and mode of whatever directory staged the
+# rootfs on the build host.  Built under /root that was invisibly correct;
+# built from a tree a regular user created, the image shipped / owned by
+# that user -- and systemd treats a non-root-owned / as an unsafe path
+# transition, so tmpfiles never creates /tmp/.X11-unix, logind never
+# populates /run/systemd/seats, and GNOME Shell dies on a console cursor.
+# Pin the root inode explicitly; never inherit it from the build host.
+chown 0:0 "$mnt"
+chmod 0755 "$mnt"
 
 # /boot is part of the root filesystem here, so the fstab entry for the
 # microSD boot partition would fail at every boot.  The root entry has to name
@@ -140,8 +156,8 @@ grep -q "LABEL=$root_label[[:space:]]\+/[[:space:]]" "$fstab" || {
 	exit 1
 }
 
-install -m 0644 "$kernel_out/sm8550-samsung-gts9uwifi.dtb" \
-	"$mnt/boot/sm8550-samsung-gts9uwifi.dtb"
+install -m 0644 "$kernel_out/$DEVICE_DTS.dtb" \
+	"$mnt/boot/$DEVICE_DTS.dtb"
 {
 	printf 'kernel_release=%s\n' "$kernel_release"
 	printf 'root_label=%s\n' "$root_label"
@@ -149,7 +165,7 @@ install -m 0644 "$kernel_out/sm8550-samsung-gts9uwifi.dtb" \
 	printf 'kernel_image_sha256=%s\n' \
 		"$(sha256sum "$kernel_out/Image.gz" | cut -d' ' -f1)"
 	printf 'kernel_dtb_sha256=%s\n' \
-		"$(sha256sum "$kernel_out/sm8550-samsung-gts9uwifi.dtb" | cut -d' ' -f1)"
+		"$(sha256sum "$kernel_out/$DEVICE_DTS.dtb" | cut -d' ' -f1)"
 	printf 'initramfs_sha256=%s\n' "$(sha256sum "$initramfs" | cut -d' ' -f1)"
 	printf 'built=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$mnt/boot/BUILD-METADATA.txt"
@@ -164,6 +180,20 @@ e2fsck -fp "$out" || {
 	rc=$?
 	[ "$rc" -le 1 ] || { echo "e2fsck rejected the finished image ($rc)" >&2; exit 1; }
 }
+
+# The defect above is invisible to every other validator, so prove the fix
+# on the finished image: debugfs reads the root inode without mounting.
+root_inode=$(debugfs -R 'stat <2>' "$out" 2>/dev/null)
+printf '%s' "$root_inode" | grep -q 'User:     0   Group:     0' || {
+	echo 'the image root directory is not owned by root:root' >&2
+	printf '%s\n' "$root_inode" | head -4 >&2
+	exit 1
+}
+printf '%s' "$root_inode" | grep -q 'Mode:  0755' || {
+	echo 'the image root directory is not mode 0755' >&2
+	exit 1
+}
+echo 'root inode: 0:0 mode 0755'
 
 echo '=== image ==='
 stat -c '%n %s bytes' "$out"

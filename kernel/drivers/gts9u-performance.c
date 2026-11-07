@@ -8,23 +8,42 @@
 #include <linux/init.h>
 #include <linux/of.h>
 #include <linux/printk.h>
+#include <linux/types.h>
 
 #include "gts9u-performance-overlay.h"
 
-static int __init gts9u_performance_init(void)
+static int __init gts9u_apply(const unsigned char *fdt, u32 size,
+			      const char *what)
 {
 	int overlay_id, ret;
 
-	if (!of_machine_is_compatible("samsung,gts9uwifi"))
+	ret = of_overlay_fdt_apply(fdt, size, &overlay_id, NULL);
+	if (ret)
+		pr_err("gts9u-performance: cannot apply the %s overlay: %d\n",
+		       what, ret);
+	return ret;
+}
+
+static int __init gts9u_performance_init(void)
+{
+	bool ultra = of_machine_is_compatible("samsung,gts9uwifi");
+	int ret;
+
+	if (!ultra && !of_machine_is_compatible("samsung,gts9wifi"))
 		return 0;
 
-	ret = of_overlay_fdt_apply(gts9u_performance_overlay,
-				  sizeof(gts9u_performance_overlay),
-				  &overlay_id, NULL);
-	if (ret) {
-		pr_err("gts9u-performance: cannot add Galaxy OPPs: %d\n", ret);
+	ret = gts9u_apply(gts9_family_overlay, sizeof(gts9_family_overlay),
+			  "family");
+	if (ret)
 		return ret;
-	}
+
+	/* The OPP values were read from the X910's tables; no other board's yet. */
+	if (!ultra)
+		return 0;
+	ret = gts9u_apply(gts9u_performance_overlay,
+			  sizeof(gts9u_performance_overlay), "Galaxy OPP");
+	if (ret)
+		return ret;
 
 	pr_info("gts9u-performance: registered Galaxy 3.36 GHz CPU and 719 MHz GPU OPPs\n");
 	return 0;

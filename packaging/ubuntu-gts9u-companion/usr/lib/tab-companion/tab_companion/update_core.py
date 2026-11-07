@@ -79,19 +79,20 @@ def set_status(state, **extra):
 
 
 def device_check():
-    model = Path("/proc/device-tree/model").read_bytes().rstrip(b"\0")
-    if model != b"Samsung Galaxy Tab S9 Ultra Wi-Fi":
-        raise ValueError("Updates are only supported on the SM-X910")
+    model = bundle.MODEL.read_bytes().rstrip(b"\0")
+    if model not in bundle.DEVICES:
+        raise ValueError("Updates are only supported on the SM-X910 and SM-X710")
+    label = bundle.DEVICES[model][2]
     if run(["dpkg", "--print-architecture"], True) != "arm64":
         raise ValueError("Expected arm64 Ubuntu")
     release = Path("/etc/os-release").read_text()
     if '\nID=ubuntu\n' not in '\n' + release or 'VERSION_ID="24.04"' not in release:
         raise ValueError("Only Ubuntu 24.04 is supported")
-    if run(["findmnt", "-n", "-o", "LABEL", "/"], True) != "UBTS9U_UFS":
+    if run(["findmnt", "-n", "-o", "LABEL", "/"], True) != label:
         raise ValueError("The installed root filesystem is not this port's UFS installation")
     # Do not overwrite a saved switch to Android while Linux is still running.
     with partitions()["vendor_boot"].open("rb") as source:
-        if b"root=LABEL=UBTS9U_UFS" not in source.read(4096):
+        if ("root=LABEL=" + label).encode() not in source.read(4096):
             raise ValueError("Boot partitions are not set to Ubuntu; switch back before updating")
 
 

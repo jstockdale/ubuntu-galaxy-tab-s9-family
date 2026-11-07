@@ -592,11 +592,14 @@ static int samsung_pogo_enable_power(struct samsung_pogo *pogo)
 	pogo->powered = true;
 
 	/* Exact order and values used by Samsung before accepting STM32 data. */
-	ret = samsung_pogo_booster_write(pogo, MAX77816_CONFIG2,
-					 MAX77816_OUTPUT_ENABLE);
-	if (!ret)
-		ret = samsung_pogo_booster_write(pogo, MAX77816_CONFIG1,
-					     MAX77816_LIMIT_3P1A);
+	ret = 0;
+	if (pogo->booster) {
+		ret = samsung_pogo_booster_write(pogo, MAX77816_CONFIG2,
+						 MAX77816_OUTPUT_ENABLE);
+		if (!ret)
+			ret = samsung_pogo_booster_write(pogo, MAX77816_CONFIG1,
+						     MAX77816_LIMIT_3P1A);
+	}
 	if (ret) {
 		samsung_pogo_power_off_locked(pogo);
 		goto out_unlock;
@@ -1387,18 +1390,28 @@ static int samsung_pogo_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
+	/*
+	 * The MAX77816 buck-boost exists on the Ultra's board only; the 11"
+	 * keyboard covers (EF-DX710/715) run from the logic rail alone, and
+	 * Samsung's X710 tree carries no booster at all.
+	 */
 	booster_np = of_parse_phandle(dev->of_node, "booster", 0);
-	if (!booster_np)
-		return dev_err_probe(dev, -EINVAL, "missing MAX77816 phandle\n");
-	pogo->booster = of_find_i2c_device_by_node(booster_np);
-	of_node_put(booster_np);
-	if (!pogo->booster)
-		return dev_err_probe(dev, -EPROBE_DEFER, "MAX77816 is not ready\n");
-	ret = devm_add_action_or_reset(dev, samsung_pogo_put_booster,
-				       &pogo->booster->dev);
+	if (booster_np) {
+		pogo->booster = of_find_i2c_device_by_node(booster_np);
+		of_node_put(booster_np);
+		if (!pogo->booster)
+			return dev_err_probe(dev, -EPROBE_DEFER,
+					     "MAX77816 is not ready\n");
+		ret = devm_add_action_or_reset(dev, samsung_pogo_put_booster,
+					       &pogo->booster->dev);
+	} else {
+		pogo->booster = NULL;
+		ret = 0;
+	}
 	if (ret)
 		return ret;
-	if (!i2c_check_functionality(pogo->booster->adapter, I2C_FUNC_I2C))
+	if (pogo->booster &&
+	    !i2c_check_functionality(pogo->booster->adapter, I2C_FUNC_I2C))
 		return dev_err_probe(dev, -EOPNOTSUPP,
 				     "MAX77816 adapter lacks raw I2C\n");
 

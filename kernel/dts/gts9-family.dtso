@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/dts-v1/;
+/plugin/;
+
+/*
+ * Board additions every Galaxy Tab S9 family member needs.  Applied by Linux
+ * before the consumers probe, never by Samsung ABL; the Ultra-only OPP
+ * additions stay in gts9u-performance.dtso.
+ */
+/ {
+	fragment@0 {
+		/*
+		 * Deep suspend with an active USB host session needs dwc3-qcom's
+		 * wakeup path: without it the glue drops clocks and interconnect
+		 * without arming the power-event interrupts or recording per-port
+		 * speeds, and the xHC resumes dead - a pm_test ladder with a dock
+		 * attached measured a 180-second resume of command timeouts, and a
+		 * real suspend in that state never comes back.  The property lives
+		 * here rather than in the board DTS because the ABL-facing DTB is
+		 * pinned; dwc3-qcom reads it at probe, long after this overlay.
+		 */
+		target-path = "/soc@0/usb@a600000";
+		__overlay__ {
+			wakeup-source;
+		};
+	};
+};

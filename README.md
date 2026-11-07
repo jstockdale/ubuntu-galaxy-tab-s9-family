@@ -151,7 +151,8 @@ EF-DX925 are untested as I don't have them, so they might not work.
 kernel/       Device tree, drivers, patches and kernel configuration
 packaging/    Debian packages installed in the Ubuntu image
 android/      The Dualboot app, which switches systems from the Android side
-configs/      System configuration, service overlays and the TWRP installers
+configs/      System configuration, service overlays, the TWRP installers and
+              per-revision firmware manifests (configs/firmware/README.md)
 scripts/      Reproducible build and validation tools
 docs/         Detailed documentation and engineering history
 artifacts/    Generated release files; not versioned

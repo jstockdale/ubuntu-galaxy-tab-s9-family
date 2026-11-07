@@ -54,29 +54,64 @@ abort() {
 }
 
 BUNDLE_LABEL="$(unzip -p "$ZIPFILE" BUNDLE-LABEL 2>/dev/null)"
-[ -n "$BUNDLE_LABEL" ] || BUNDLE_LABEL="unnamed SM-X910 boot bundle"
+
+# Which family member this ZIP was built for.  make-twrp-zip.py writes the
+# member from scripts/lib/device.sh; a ZIP without it predates the family
+# split and is an Ultra ZIP.
+DEVICE_IDENTITY="$(unzip -p "$ZIPFILE" DEVICE-IDENTITY 2>/dev/null)"
+ident() { printf '%s\n' "$DEVICE_IDENTITY" | sed -n "s/^$1=//p" | head -1; }
+TARGET_MODEL="$(ident model)"
+[ -n "$TARGET_MODEL" ] || TARGET_MODEL=SM-X910
+TARGET_BL_PREFIX="$(ident bootloader_prefix)"
+[ -n "$TARGET_BL_PREFIX" ] || TARGET_BL_PREFIX=X910
+TARGET_CODENAMES="$(ident codenames)"
+[ -n "$TARGET_CODENAMES" ] || TARGET_CODENAMES="gts9u gts9uwifi"
+IDENT_LABEL="$(ident rootfs_label)"
+[ -z "$IDENT_LABEL" ] || ROOTFS_LABEL=$IDENT_LABEL
+
+[ -n "$BUNDLE_LABEL" ] || BUNDLE_LABEL="unnamed $TARGET_MODEL boot bundle"
 ui_print "---------------------------------------"
 ui_print " $BUNDLE_LABEL"
 ui_print "---------------------------------------"
 
+# The bootloader puts the model and its own build id on the kernel command
+# line.  Recovery's properties and device tree describe the TWRP image that is
+# running, and a family TWRP carries another board's DTB, so the command line
+# is the identity and the properties only a fallback.
+cmdline_value() {
+    value="$(tr ' ' '\n' < /proc/cmdline | sed -n "s/^androidboot\.$1=//p" | head -1)"
+    # Newer bootloaders hand the androidboot.* parameters over in bootconfig.
+    [ -n "$value" ] || value="$(sed -n "s/^androidboot\.$1 = \"\(.*\)\"\$/\1/p" \
+        /proc/bootconfig 2>/dev/null | head -1)"
+    echo "$value"
+}
+EM_MODEL="$(cmdline_value em.model)"
+[ -n "$EM_MODEL" ] || EM_MODEL="$(getprop ro.boot.em.model)"
+BOOTLOADER="$(cmdline_value bootloader)"
+[ -n "$BOOTLOADER" ] || BOOTLOADER="$(getprop ro.bootloader)"
 DEVICE_CODENAME="$(getprop ro.product.device)"
-EM_MODEL="$(getprop ro.boot.em.model)"
-BOOTLOADER="$(getprop ro.bootloader)"
 
-case "$DEVICE_CODENAME" in
-    gts9u|gts9uwifi) ;;
-    *) abort "Expected gts9u/gts9uwifi; got '$DEVICE_CODENAME'" ;;
-esac
-
-if [ -n "$EM_MODEL" ] && [ "$EM_MODEL" != "SM-X910" ]; then
-    abort "Expected SM-X910; got '$EM_MODEL'"
+if [ -n "$EM_MODEL" ] && [ "$EM_MODEL" != "$TARGET_MODEL" ]; then
+    abort "This ZIP is for the $TARGET_MODEL; this tablet reports $EM_MODEL"
 fi
 if [ -z "$EM_MODEL" ]; then
     case "$BOOTLOADER" in
-        X910*) ui_print "em.model empty; X910 bootloader accepted" ;;
-        *) abort "Cannot positively identify SM-X910" ;;
+        "$TARGET_BL_PREFIX"*) ui_print "em.model empty; $TARGET_BL_PREFIX bootloader accepted" ;;
+        *) abort "Cannot positively identify the $TARGET_MODEL" ;;
     esac
 fi
+
+# Within the family the recovery codename is a cross-check, not a gate.
+case " $TARGET_CODENAMES " in
+    *" $DEVICE_CODENAME "*) ;;
+    *)
+        case "$DEVICE_CODENAME" in
+            gts9u|gts9uwifi|gts9|gts9wifi|gts9p|gts9pwifi)
+                ui_print "Recovery calls itself '$DEVICE_CODENAME'; the $TARGET_MODEL check above is what counts" ;;
+            *) abort "Expected a Galaxy Tab S9 family recovery; got '$DEVICE_CODENAME'" ;;
+        esac
+        ;;
+esac
 
 BB=/dev/block/by-name
 SLOT="$(getprop ro.boot.slot_suffix)"
@@ -117,6 +152,46 @@ zip_has() {
 for file in boot.img init_boot.img vendor_boot.img dtbo.img vbmeta.img; do
     zip_has "$file" || abort "ZIP is missing $file"
 done
+
+# The staged vendor firmware in this ZIP was matched to one bootloader
+# revision at build time: character 8 of Samsung's build id, the value the
+# anti-rollback fuses track.  The ADSP images, the GPU zap shader and the
+# TrustZone apps are authenticated against that fused state, so a mismatched
+# pairing is refused here rather than left to fail halfway into first boot.
+# A deliberate cross-flash stays possible: add an empty ALLOW-FIRMWARE-MISMATCH
+# member to the ZIP, the same way ANDROID-PERCENT is edited in the split ZIP.
+# ZIPs without FIRMWARE-IDENTITY predate revision tracking and are accepted;
+# a tablet whose bootloader string cannot be parsed gets a warning, because
+# some recovery builds report unreliable identity strings.
+if zip_has FIRMWARE-IDENTITY; then
+    ZIP_FW_REV="$(unzip -p "$ZIPFILE" FIRMWARE-IDENTITY 2>/dev/null | \
+        awk 'NR == 1 { print substr($2, 3) }')"
+    ZIP_FW_BUILD="$(unzip -p "$ZIPFILE" FIRMWARE-IDENTITY 2>/dev/null | \
+        awk 'NR == 1 { print $3 }')"
+    ZIP_FW_DEVICE="$(unzip -p "$ZIPFILE" FIRMWARE-IDENTITY 2>/dev/null | \
+        awk 'NR == 1 { print $1 }')"
+    case " $TARGET_CODENAMES " in
+        *" $ZIP_FW_DEVICE "*) ;;
+        *) abort "ZIP firmware was staged for '$ZIP_FW_DEVICE' but the ZIP targets the $TARGET_MODEL" ;;
+    esac
+    DEVICE_FW_REV="$(echo "$BOOTLOADER" | \
+        awk -v prefix="$TARGET_BL_PREFIX" 'index($0, prefix) == 1 { print substr($0, 8, 1) }')"
+    case "$DEVICE_FW_REV" in
+        [0-9])
+            ui_print "Firmware: ZIP staged from $ZIP_FW_BUILD (bl$ZIP_FW_REV); device bootloader is rev $DEVICE_FW_REV"
+            if [ "$DEVICE_FW_REV" != "$ZIP_FW_REV" ]; then
+                if zip_has ALLOW-FIRMWARE-MISMATCH; then
+                    ui_print "WARNING: firmware revision mismatch overridden by ALLOW-FIRMWARE-MISMATCH"
+                else
+                    abort "This ZIP carries bl$ZIP_FW_REV firmware but the tablet's bootloader is rev $DEVICE_FW_REV. Build against the matching stock package, or add an ALLOW-FIRMWARE-MISMATCH member to override."
+                fi
+            fi
+            ;;
+        *)
+            ui_print "WARNING: cannot read a bootloader revision from '$BOOTLOADER'; firmware match not verified"
+            ;;
+    esac
+fi
 
 BOOT_SETS_DIR=/var/lib/gts9u-boot-sets
 SUPER_MOUNT=/tmp/gts9u-super
@@ -515,16 +590,46 @@ if [ "$HAS_ROOTFS_IMAGE" -eq 1 ] && [ "$ROOT_PART" = linuxroot ]; then
     seed_boot_sets
 fi
 
-for part in boot init_boot vendor_boot dtbo; do
-    target="$(resolve_part "$part")" || abort "partition disappeared: $part"
+# Boot images are verified the way the root filesystem is: by reading the
+# partition back and hashing it against the ZIP's own SHA256SUMS.  The
+# pipeline's status alone is dd's, so a member that ziptool cannot read, or a
+# ZIP truncated in transfer, would otherwise stream nothing, exit zero and
+# leave a partly written kernel behind a "success" banner.  Every image is
+# built to exactly its partition's size, so the read-back covers the whole
+# partition; the counts stay in MiB-sized units for mksh's 32-bit arithmetic.
+IMAGE_SHA_LIST=/tmp/gts9u-image-sha
+unzip -p "$ZIPFILE" SHA256SUMS > "$IMAGE_SHA_LIST" 2>/dev/null \
+    || abort "cannot read SHA256SUMS from the ZIP"
+
+image_readback() {
+    case "$1" in
+        boot|vendor_boot) dd if="$2" bs=4M count=24 2>/dev/null ;;
+        init_boot)        dd if="$2" bs=4M count=2 2>/dev/null ;;
+        dtbo)             dd if="$2" bs=4M count=4 2>/dev/null ;;
+        vbmeta)           dd if="$2" bs=131072 count=1 2>/dev/null ;;
+    esac
+}
+
+write_image() {
+    part=$1
+    target=$2
+    expected="$(awk -v name="$part.img" '$2 == name { print $1 }' "$IMAGE_SHA_LIST")"
+    [ -n "$expected" ] || abort "SHA256SUMS carries no hash for $part.img"
     ui_print "Writing $part..."
     unzip -p "$ZIPFILE" "$part.img" | \
-        dd of="$target" bs=4M || abort "failed to write $part"
+        dd of="$target" bs=4M conv=fsync || abort "failed to write $part"
+    written="$(image_readback "$part" "$target" | sha256sum | cut -d' ' -f1)"
+    [ "$written" = "$expected" ] || \
+        abort "$part read back with SHA-256 $written, expected $expected"
+}
+
+for part in boot init_boot vendor_boot dtbo; do
+    target="$(resolve_part "$part")" || abort "partition disappeared: $part"
+    write_image "$part" "$target"
 done
 
 if [ "$SKIP_VBMETA" -eq 0 ]; then
-    unzip -p "$ZIPFILE" vbmeta.img | \
-        dd of="$VBMETA_TARGET" bs=4M || abort "failed to write vbmeta"
+    write_image vbmeta "$VBMETA_TARGET"
 fi
 
 if [ "$HAS_ROOTFS_OVERLAY" -eq 1 ]; then

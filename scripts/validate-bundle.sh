@@ -7,11 +7,12 @@
 set -uo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 bundle=${BUNDLE_OUT_DIR:-$base/out/bundle}
 zip=${1:-}
-kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-gts9uwifi}
-dtb=${KERNEL_DTB:-$kernel_out/sm8550-samsung-gts9uwifi.dtb}
+kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-$DEVICE}
+dtb=${KERNEL_DTB:-$kernel_out/$DEVICE_DTS.dtb}
 runtime_dtbo=$(sed -n 's/^runtime_dtbo=//p' "$bundle/BUILD-METADATA.txt" 2>/dev/null)
 runtime_dtbo=${runtime_dtbo:-0}
 tmp=$(mktemp -d)
@@ -95,7 +96,9 @@ PY
 		fail 'dtbo.img is not the expected two-entry Android DT table'
 	fi
 	base_sha=$(sha256sum "$dtb" | cut -d' ' -f1)
-	if [ "$base_sha" = 613b3bb7729d55d1c60aaeda348a098163b79aed1efbf24cdcc582ff0d58ccc4 ]; then
+	if [ "$DEVICE" != gts9uwifi ]; then
+		info "no physically booted baseline exists for $DEVICE yet (base DTB SHA-256 $base_sha)"
+	elif [ "$base_sha" = 613b3bb7729d55d1c60aaeda348a098163b79aed1efbf24cdcc582ff0d58ccc4 ]; then
 		pass 'the base DTB is byte-identical to the physically booted tree'
 	else
 		fail "the base DTB changed (SHA-256 $base_sha); ABL rejects structural mutations"
@@ -151,10 +154,11 @@ echo
 echo '=== vendor_boot.img: DTB, cmdline and bootconfig ==='
 python3 - "$bundle/vendor_boot.img" "$repo/configs/vendor_boot/cmdline.txt" \
 	"$repo/configs/vendor_boot/bootconfig.txt" \
-	"$dtb" <<'PY'
+	"$dtb" "$DEVICE_LABEL" <<'PY'
 import hashlib, pathlib, struct, sys
 
 img, cmdline_src, bootconfig_src, dtb_src = (pathlib.Path(p) for p in sys.argv[1:5])
+root_label = sys.argv[5]
 data = img.read_bytes()
 if data[:8] != b"VNDRBOOT":
     print("FAIL  vendor_boot magic is missing")
@@ -177,9 +181,12 @@ bootconfig = data[p:p + bootconfig_size].split(b"\0", 1)[0].decode()
 ok = True
 print(f"info  header version {hdrv}, page size {pagesize}")
 
+# The repository cmdline names the Ultra's root label; the bundle script
+# retargets that one token per device and nothing else.
 want_cmdline = " ".join(cmdline_src.read_text().split())
+want_cmdline = want_cmdline.replace("root=LABEL=UBTS9U_UFS", "root=LABEL=" + root_label)
 if cmdline.strip() == want_cmdline:
-    print("PASS  vendor cmdline matches configs/vendor_boot/cmdline.txt")
+    print("PASS  vendor cmdline matches configs/vendor_boot/cmdline.txt for " + root_label)
 else:
     print("FAIL  vendor cmdline differs from the repository source")
     ok = False
@@ -190,7 +197,7 @@ else:
 # left over from an older release cannot win the lookup against the copy
 # installed on the internal storage. rootwait matters because neither the UFS
 # nor a card is necessarily enumerated when the kernel goes looking.
-for token in ("root=LABEL=UBTS9U_UFS", "rootwait", "msm.separate_gpu_kms=1"):
+for token in ("root=LABEL=" + root_label, "rootwait", "msm.separate_gpu_kms=1"):
     if token in cmdline:
         print(f"PASS  cmdline keeps {token}")
     else:
@@ -284,6 +291,49 @@ if [ -n "$zip" ] && [ -f "$zip" ]; then
 	else
 		info 'no rootfs.img: this is an update ZIP, not a full installation'
 	fi
+	fw_identity=$(unzip -p "$zip" FIRMWARE-IDENTITY 2>/dev/null | head -1)
+	if [ -n "$fw_identity" ]; then
+		fw_device=${fw_identity%% *}
+		fw_rest=${fw_identity#* }
+		fw_bl=${fw_rest%% *}
+		fw_build=${fw_rest#* }
+		fw_char8=$(printf '%s' "$fw_build" | cut -c8)
+		if [ "$fw_device" = "$DEVICE" ] && [ "${fw_bl#bl}" != "$fw_bl" ] &&
+			[ "${fw_bl#bl}" = "$fw_char8" ]; then
+			pass "FIRMWARE-IDENTITY is coherent: $fw_identity"
+		else
+			fail "FIRMWARE-IDENTITY is malformed: '$fw_identity'"
+		fi
+		if unzip -l "$zip" | awk '$NF == "ALLOW-FIRMWARE-MISMATCH" { found = 1 } END { exit !found }'; then
+			fail 'a built ZIP must not ship the ALLOW-FIRMWARE-MISMATCH override'
+		else
+			pass 'no ALLOW-FIRMWARE-MISMATCH override is packaged'
+		fi
+	else
+		info 'no FIRMWARE-IDENTITY: this ZIP predates firmware revision tracking'
+	fi
+	# The on-device updater matches this manifest's device against the
+	# tablet it runs on; a payload stamped for the other family member would
+	# be refused there, or worse, accepted by an older updater.
+	if unzip -l "$zip" | awk '$NF == "UPDATE/manifest.json" { found = 1 } END { exit !found }'; then
+		manifest_device=$(unzip -p "$zip" UPDATE/manifest.json 2>/dev/null | \
+			python3 -c 'import json, sys; print(json.load(sys.stdin).get("device", ""))' 2>/dev/null)
+		if [ "$manifest_device" = "$DEVICE" ]; then
+			pass "UPDATE/manifest.json is stamped for $DEVICE"
+		else
+			fail "UPDATE/manifest.json is stamped for '$manifest_device', not $DEVICE"
+		fi
+	fi
+	# The installer takes its model, bootloader prefix, codenames and root
+	# label from this member; without it, it assumes the Ultra.
+	dev_identity=$(unzip -p "$zip" DEVICE-IDENTITY 2>/dev/null)
+	dev_model=$(printf '%s\n' "$dev_identity" | sed -n 's/^model=//p')
+	dev_label=$(printf '%s\n' "$dev_identity" | sed -n 's/^rootfs_label=//p')
+	if [ "$dev_model" = "$DEVICE_MODEL" ] && [ "$dev_label" = "$DEVICE_LABEL" ]; then
+		pass "DEVICE-IDENTITY targets $dev_model with root label $dev_label"
+	else
+		fail "DEVICE-IDENTITY ('$dev_model', '$dev_label') does not name $DEVICE_MODEL / $DEVICE_LABEL"
+	fi
 	installer=$(unzip -p "$zip" META-INF/com/google/android/update-binary 2>/dev/null)
 	if [ -z "$installer" ]; then
 		fail 'the packaged installer could not be read'
@@ -303,6 +353,11 @@ if [ -n "$zip" ] && [ -f "$zip" ]; then
 			pass 'the installer hashes back the root filesystem it wrote'
 		else
 			fail 'the installer does not verify the root filesystem it writes'
+		fi
+		if printf '%s\n' "$installer" | grep -q 'read back with SHA-256'; then
+			pass 'the installer hashes back every boot image it writes'
+		else
+			fail 'the installer does not verify the boot images it writes'
 		fi
 		if printf '%s\n' "$installer" | grep -q 'the ZIP is stored on the installation target'; then
 			pass 'the installer refuses to run from the partition it overwrites'

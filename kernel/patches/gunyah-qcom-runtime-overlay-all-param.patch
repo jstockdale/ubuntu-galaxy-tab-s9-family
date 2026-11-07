@@ -1,0 +1,23 @@
+--- a/drivers/virt/gunyah/qcom_bootinfo.c	2026-11-06 16:06:30.678038333 -0800
++++ b/drivers/virt/gunyah/qcom_bootinfo.c	2026-11-06 16:06:30.692042971 -0800
+@@ -16,6 +16,11 @@
+ #include <linux/libfdt.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
++#include <linux/moduleparam.h>
++
++/* Bring-up switch: gunyah.qcom_overlay_all=1 tries the overlay on any machine */
++static bool qcom_overlay_all;
++module_param(qcom_overlay_all, bool, 0444);
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ 
+@@ -153,7 +158,7 @@
+ 	 * unconditional SMC may trap in generic guests (for example QEMU virt).
+ 	 * Do not probe unrelated machines with a vendor-private call.
+ 	 */
+-	if (!of_machine_is_compatible("samsung,gts9uwifi"))
++	if (!qcom_overlay_all && !of_machine_is_compatible("samsung,gts9uwifi"))
+ 		return 0;
+ 
+ 	hypervisor = of_find_node_by_path("/hypervisor");

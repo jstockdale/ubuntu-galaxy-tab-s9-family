@@ -1,0 +1,12 @@
+[Unit]
+Description=Write speaker protection calibration once the DSP controls exist
+After=multi-user.target
+ConditionPathExists=/usr/lib/firmware/cs35l45-dsp1-spk-prot.wmfw
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/ubuntu-gts9u-speaker-cal
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

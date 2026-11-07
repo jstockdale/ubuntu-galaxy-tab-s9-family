@@ -1,5 +1,5 @@
 [Unit]
-Description=Power button: short press suspends, long press confirms shutdown
+Description=Power button: short press suspends (locks on boards without resume), long press confirms shutdown
 Documentation=file:///usr/libexec/ubuntu-gts9u-powerkey
 After=systemd-logind.service
 Wants=systemd-logind.service

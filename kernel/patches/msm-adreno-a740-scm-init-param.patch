@@ -1,0 +1,37 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 15:34:10.976257413 -0800
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 15:34:11.001258763 -0800
+@@ -63,6 +63,17 @@
+ MODULE_PARM_DESC(a7xx_ccu_inval, "A7xx end-of-submit CCU handling: 0=none, 1=invalidate (default), 2=clean+idle then invalidate");
+ module_param(a7xx_ccu_inval, int, 0444);
+ 
++/*
++ * Bring-up switch: mainline no longer asks the secure world to initialise
++ * GPU registers on the A740 (the call fails on the HDK8550).  On devices
++ * whose firmware honours it, msm.gpu_scm_init=<request bits> issues
++ * qcom_scm_gpu_init_regs() with those bits before the GMU starts
++ * (1 = ALWAYS_EN, 8 = TSENSE_EN, 9 = both).  0 (default) keeps mainline.
++ */
++int gpu_scm_init;
++MODULE_PARM_DESC(gpu_scm_init, "A740: secure-world GPU init request bits to issue (0 = none, default)");
++module_param(gpu_scm_init, int, 0444);
++
+ extern const struct adreno_gpulist a2xx_gpulist;
+ extern const struct adreno_gpulist a3xx_gpulist;
+ extern const struct adreno_gpulist a4xx_gpulist;
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c	2026-11-06 15:34:10.982523737 -0800
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c	2026-11-06 15:34:11.003063396 -0800
+@@ -1248,6 +1248,14 @@
+ 		adreno_gpu->has_ray_tracing =
+ 			!!(fuse_val & A7XX_CX_MISC_SW_FUSE_VALUE_RAYTRACING);
+ 	} else if (adreno_is_a740(adreno_gpu)) {
++		extern int gpu_scm_init;
++
++		if (gpu_scm_init && qcom_scm_is_available()) {
++			ret = qcom_scm_gpu_init_regs(gpu_scm_init);
++			dev_info(gpu->dev->dev,
++				 "secure-world GPU init request 0x%x returned %d (msm.gpu_scm_init)\n",
++				 gpu_scm_init, ret);
++		}
+ 		/* Raytracing is always enabled on a740 */
+ 		adreno_gpu->has_ray_tracing = true;
+ 	}

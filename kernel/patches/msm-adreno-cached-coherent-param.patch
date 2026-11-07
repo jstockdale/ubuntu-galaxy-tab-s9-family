@@ -1,0 +1,33 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 10:15:25.053802696 -0800
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 10:15:25.183809570 -0800
+@@ -28,6 +28,17 @@
+ MODULE_PARM_DESC(no_gpu, "Disable GPU driver register (0=enable GPU driver register (default), 1=skip GPU driver register");
+ module_param(skip_gpu, bool, 0400);
+ 
++/*
++ * Bring-up switch: the catalog marks the A7xx as able to use CPU-cached,
++ * IO-coherent buffers (ADRENO_QUIRK_HAS_CACHED_COHERENT) from the chip id
++ * alone.  msm.cached_coherent=0 withholds that from userspace so Mesa falls
++ * back to write-combined memory, to test whether this board's SMMU path is
++ * really coherent.
++ */
++static bool cached_coherent = true;
++MODULE_PARM_DESC(cached_coherent, "Advertise cached-coherent GEM buffers when the GPU supports them (default true)");
++module_param(cached_coherent, bool, 0444);
++
+ extern const struct adreno_gpulist a2xx_gpulist;
+ extern const struct adreno_gpulist a3xx_gpulist;
+ extern const struct adreno_gpulist a4xx_gpulist;
+@@ -234,8 +245,11 @@
+ 	DBG("Found GPU: %"ADRENO_CHIPID_FMT, ADRENO_CHIPID_ARGS(config.chip_id));
+ 
+ 	priv->is_a2xx = info->family < ADRENO_3XX;
+-	priv->has_cached_coherent =
++	priv->has_cached_coherent = cached_coherent &&
+ 		!!(info->quirks & ADRENO_QUIRK_HAS_CACHED_COHERENT);
++	if (!priv->has_cached_coherent)
++		DRM_DEV_INFO(dev, "cached-coherent GEM buffers %s\n",
++			     cached_coherent ? "not supported by this GPU" : "disabled by msm.cached_coherent=0");
+ 
+ 	gpu = info->funcs->init(drm);
+ 	if (IS_ERR(gpu)) {

@@ -14,6 +14,7 @@ ubuntu-gts9u-swapfile.service:multi-user.target
 ubuntu-gts9u-cpu-boost.service:graphical.target
 ubuntu-gts9u-panel-coldboot-recover.service:multi-user.target
 ubuntu-gts9u-adsp-boot.service:multi-user.target
+ubuntu-gts9u-speaker-cal.service:multi-user.target
 ubuntu-gts9u-sensor-registry.service:multi-user.target
 ubuntu-gts9u-powerkey.service:multi-user.target
 ubuntu-gts9u-bluetooth-address.service:multi-user.target

@@ -160,8 +160,17 @@ class PairingService(dbus.service.Object):
             print("S Pen Bluetooth remote features disabled", flush=True)
         else:
             print("S Pen Bluetooth remote features enabled", flush=True)
-            GLib.idle_add(self.tick)
+            GLib.idle_add(self.tick_once)
         return True
+
+    def tick_once(self):
+        # tick() answers GLib.SOURCE_CONTINUE to stay on its 2 s timer.
+        # Handed to idle_add unwrapped, that return value keeps the idle
+        # source alive and tick() runs back to back at main-loop speed from
+        # the first re-enable until the service restarts.  One catch-up
+        # pass, then drop the idle source; the timer carries on.
+        self.tick()
+        return GLib.SOURCE_REMOVE
 
     @dbus.service.method(BUS_NAME, in_signature="", out_signature="b")
     def RecoverStaleBond(self):

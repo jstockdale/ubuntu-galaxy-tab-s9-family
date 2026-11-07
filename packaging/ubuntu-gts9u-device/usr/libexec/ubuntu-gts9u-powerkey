@@ -42,9 +42,26 @@ PM_WAKEUP_IRQ = "/sys/power/pm_wakeup_irq"
 EVENT_FORMAT = "llHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 
+# Boards that do not come back from deep suspend yet.  A short press there
+# locks the session instead of suspending: a suspend would otherwise look
+# like a dead tablet (black panel, USB gone) until a hard reset.
+NO_RESUME_COMPATIBLES = (b"samsung,gts9wifi",)
+
 
 def log(message):
     print("ubuntu-gts9u-powerkey: %s" % message, flush=True)
+
+
+def suspend_supported():
+    try:
+        with open("/proc/device-tree/compatible", "rb") as handle:
+            compatible = handle.read().split(b"\0")
+    except OSError:
+        return True
+    return not any(c in compatible for c in NO_RESUME_COMPATIBLES)
+
+
+SUSPEND_SUPPORTED = suspend_supported()
 
 
 def find_power_key():
@@ -92,6 +109,10 @@ def active_session():
 
 
 def short_press():
+    if not SUSPEND_SUPPORTED:
+        log("short press: locking sessions (this board does not resume from suspend yet)")
+        subprocess.Popen(["loginctl", "lock-sessions"])
+        return time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
     log("short press: suspending")
     subprocess.Popen(["systemctl", "suspend"])
     return time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
@@ -161,7 +182,8 @@ def main():
     if path is None:
         log("no pmic_pwrkey input device; nothing to do")
         return 1
-    log("watching %s (long press at %d ms)" % (path, LONG_PRESS_MS))
+    log("watching %s (long press at %d ms; short press %s)" %
+        (path, LONG_PRESS_MS, "suspends" if SUSPEND_SUPPORTED else "locks"))
     pwr_irq = power_key_irq()
     log("pmic power-key wake IRQ is %s" %
         (pwr_irq if pwr_irq is not None else "unknown"))

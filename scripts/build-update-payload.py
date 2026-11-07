@@ -8,15 +8,25 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import zipapp
 from pathlib import Path
 
 
 def main():
+    # zipfile stores mtimes through localtime(), so the 1980-01-01 UTC stamps
+    # below fall into 1979 on any build host west of UTC and zipapp refuses
+    # them. Pin the conversion to UTC: the archive stays deterministic and the
+    # stored timestamps no longer depend on the build machine's timezone.
+    os.environ["TZ"] = "UTC"
+    time.tzset()
     p = argparse.ArgumentParser()
     p.add_argument("--base", type=Path, required=True)
     p.add_argument("--version", required=True)
     p.add_argument("--bootstrap", type=Path, required=True)
+    p.add_argument("--rootfs", type=Path, help="root filesystem tree (default: BASE/rootfs)")
+    p.add_argument("--device", default="gts9uwifi",
+                   help="board codename: selects out/kernel-<device> and its DTB")
     a = p.parse_args()
     if not re.fullmatch(r"[0-9][A-Za-z0-9.+~]*", a.version):
         p.error("version must be a Debian-compatible release number without a leading v")
@@ -26,8 +36,8 @@ def main():
         shutil.rmtree(out)
     debs = out / "debs"
     debs.mkdir(parents=True)
-    rootfs = a.base / "rootfs"
-    kernel = a.base / "out/kernel-gts9uwifi"
+    rootfs = a.rootfs if a.rootfs is not None else a.base / "rootfs"
+    kernel = a.base / ("out/kernel-" + a.device)
     kernel_release = (kernel / "kernel.release").read_text().strip()
     # local-debs is the exact selection installed in this build, not a directory
     # of stale packages from previous releases.
@@ -47,7 +57,7 @@ def main():
         for file in (rootfs / "boot").iterdir():
             if file.is_file() and not file.is_symlink():
                 shutil.copy2(file, boot / file.name)
-        shutil.copy2(kernel / "sm8550-samsung-gts9uwifi.dtb", boot)
+        shutil.copy2(kernel / ("sm8550-samsung-" + a.device + ".dtb"), boot)
         # Fresh-image settings must use conffile semantics on existing systems.
         # Machine identity, accounts, locales, passwords and home never enter
         # this package. More port defaults belong in the device package.
@@ -64,7 +74,7 @@ def main():
         (control / "control").write_text(
             "Package: ubuntu-gts9u-hardware\nVersion: " + a.version +
             "\nArchitecture: arm64\nMaintainer: Ubuntu gts9uwifi port contributors <noreply@example.invalid>\n"
-            "Description: Firmware, modules and boot files matching the SM-X910 release\n")
+            "Description: Firmware, modules and boot files matching this release\n")
         (control / "conffiles").write_text("".join(
             "/" + f.relative_to(stage).as_posix() + "\n" for f in sorted((stage / "etc").rglob("*"))
             if f.is_file() and not f.is_symlink()))
@@ -76,8 +86,18 @@ def main():
         os.utime(stage, (0, 0))
         subprocess.run(["dpkg-deb", "--root-owner-group", "--build", str(stage),
                         str(debs / ("ubuntu-gts9u-hardware_" + a.version + "_arm64.deb"))], check=True)
-    identity = {"device": "gts9uwifi", "version": a.version, "tag": "v" + a.version,
+    identity = {"device": a.device, "version": a.version, "tag": "v" + a.version,
                 "kernel_release": kernel_release}
+    # A staging produced by stage-firmware.py names the stock package it came
+    # from; carry that through so the updater can hold a bl1 system back from
+    # a bl5 payload and vice versa.
+    provenance = os.environ.get("FIRMWARE_DIR", "")
+    if provenance:
+        provenance_file = Path(provenance) / "PROVENANCE.json"
+        if provenance_file.is_file():
+            package = json.loads(provenance_file.read_text())["package"]
+            identity["firmware"] = {"build_id": package["build_id"],
+                                    "bl_rev": package["bl_rev"]}
     (rootfs / "usr/lib/gts9u-release.json").write_text(json.dumps(identity) + "\n")
     # Generated from the same rootfs input list; do not copy dpkg's database or
     # reinstall every application the image happened to pull in as a dependency.

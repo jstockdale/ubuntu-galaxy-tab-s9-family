@@ -1,0 +1,62 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 12:53:16.010047814 -0800
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 12:53:16.034471723 -0800
+@@ -39,6 +39,20 @@
+ MODULE_PARM_DESC(cached_coherent, "Advertise cached-coherent GEM buffers when the GPU supports them (default true)");
+ module_param(cached_coherent, bool, 0444);
+ 
++/*
++ * Bring-up switches for the A740 write-back corruption (a 96-px screen-space
++ * lattice of unwritten pixels in the composited frame): msm.gpu_hwcg=0 leaves
++ * the GPU's hardware clock gating off, msm.gpu_llc=0 keeps the GPU off the
++ * system cache (LLCC) slices.  Both default to the normal behaviour.
++ */
++bool gpu_hwcg = true;
++MODULE_PARM_DESC(gpu_hwcg, "Enable GPU hardware clock gating (default true)");
++module_param(gpu_hwcg, bool, 0444);
++
++bool gpu_llc = true;
++MODULE_PARM_DESC(gpu_llc, "Let the GPU use the system cache (LLCC) slices (default true)");
++module_param(gpu_llc, bool, 0444);
++
+ extern const struct adreno_gpulist a2xx_gpulist;
+ extern const struct adreno_gpulist a3xx_gpulist;
+ extern const struct adreno_gpulist a4xx_gpulist;
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c	2026-11-06 12:53:16.013011304 -0800
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c	2026-11-06 12:53:16.034871679 -0800
+@@ -1230,8 +1230,15 @@
+ 		gpu_write(gpu, REG_A6XX_RBBM_SECVID_TSB_ADDR_MODE_CNTL, 0x1);
+ 	}
+ 
+-	/* enable hardware clockgating */
+-	a6xx_set_hwcg(gpu, true);
++	/* enable hardware clockgating (msm.gpu_hwcg=0 leaves it off) */
++	{
++		extern bool gpu_hwcg;
++
++		if (!gpu_hwcg)
++			dev_info_once(&gpu->pdev->dev,
++				      "GPU hardware clock gating disabled by msm.gpu_hwcg=0\n");
++		a6xx_set_hwcg(gpu, gpu_hwcg);
++	}
+ 
+ 	/* For gmuwrapper implementations, do the VBIF/GBIF CX configuration here */
+ 	if (adreno_is_a610_family(adreno_gpu)) {
+@@ -2061,6 +2068,18 @@
+ 	if (adreno_has_gmu_wrapper(&a6xx_gpu->base))
+ 		return;
+ 
++	{
++		extern bool gpu_llc;
++
++		if (!gpu_llc) {
++			dev_info(&pdev->dev,
++				 "GPU system cache (LLCC) use disabled by msm.gpu_llc=0\n");
++			a6xx_gpu->llc_slice = ERR_PTR(-ENODEV);
++			a6xx_gpu->htw_llc_slice = ERR_PTR(-ENODEV);
++			return;
++		}
++	}
++
+ 	a6xx_gpu->llc_slice = llcc_slice_getd(LLCC_GPU);
+ 	a6xx_gpu->htw_llc_slice = llcc_slice_getd(LLCC_GPUHTW);
+ }

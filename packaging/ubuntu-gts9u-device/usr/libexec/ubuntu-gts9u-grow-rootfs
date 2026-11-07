@@ -14,7 +14,11 @@
 set -eu
 
 marker=/var/lib/ubuntu-gts9u/rootfs-grown
-ufs_label=UBTS9U_UFS
+# The root label is scoped per family member (scripts/lib/device.sh).
+case "$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)" in
+	'Samsung Galaxy Tab S9 Wi-Fi') ufs_label=UBTS9_UFS ;;
+	*) ufs_label=UBTS9U_UFS ;;
+esac
 sd_label=UBTS9U_ROOT
 
 root_dev=$(findmnt -no SOURCE /)

@@ -134,3 +134,43 @@ CONFIG_TOUCHSCREEN_SAMSUNG_WACOM_W90XX=y
 # probe deferred for the rest of the boot.  Exactly the failure mode this
 # fragment's header warns about, one more time.
 CONFIG_INTERCONNECT_QCOM_OSM_L3=y
+
+# --- TUN/TAP and in-kernel WireGuard -----------------------------------------
+# A symbol left at =m exists on the device only if it is also in the signed
+# module payload (ath12k, the netfilter set, v4l2loopback, the IRQ bridge).
+# The inherited config leaves CONFIG_TUN=m and nothing shipped it, so
+# `modprobe tun` failed, /dev/net/tun never appeared, and anything that needs
+# it (Tailscale, OpenVPN, WireGuard userspace, QEMU user networking) could
+# not create its interface.  A VPN-capable desktop wants it unconditionally:
+# build it in, like everything else in this fragment.
+CONFIG_TUN=y
+# In-kernel WireGuard is optional for Tailscale (it falls back to userspace
+# WireGuard over /dev/net/tun), but building it in gives the faster datapath at
+# no module-tree cost, and the same reasoning applies to anything using wg
+# directly.
+CONFIG_WIREGUARD=y
+
+# --- USB serial adapters -------------------------------------------------------
+# A tablet used for hardware bring-up gets a serial console or a flashing
+# cable plugged into it eventually.  The usual adapter chips were all =m -
+# built, never shipped, absent - so a USB-UART enumerated and then did
+# nothing.  CDC-ACM covers Arduinos and native-USB microcontrollers.
+CONFIG_USB_SERIAL=y
+CONFIG_USB_SERIAL_FTDI_SIO=y
+CONFIG_USB_SERIAL_CP210X=y
+CONFIG_USB_SERIAL_CH341=y
+CONFIG_USB_SERIAL_PL2303=y
+CONFIG_USB_ACM=y
+
+# --- Tab S9 11" (gts9wifi): WLAN/BT and touch -----------------------------------
+# The 11" carries WCN6855/QCA6490 where the Ultra has WCN7850.  One kernel
+# serves the family, so both stacks are present; ath11k needs no split-build
+# module treatment (there is only one driver variant), so it is built in like
+# every other provider.
+CONFIG_ATH11K=y
+CONFIG_ATH11K_PCI=y
+# STM FingerTipS: the 11" test unit's touch controller (FTS1BA90A at i2c 0x49,
+# verified bound in TWRP).  Whether Samsung's FTS firmware speaks the vanilla
+# protocol is a first-boot experiment; Goodix berlin (other 11" units) is
+# already built in for the Ultra.
+CONFIG_TOUCHSCREEN_STMFTS=y

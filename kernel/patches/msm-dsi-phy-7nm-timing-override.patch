@@ -1,0 +1,48 @@
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c	2026-11-05 21:58:08.960542325 -0800
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c	2026-11-05 21:58:08.972225370 -0800
+@@ -8,12 +8,27 @@
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
+ #include <linux/iopoll.h>
++#include <linux/module.h>
+ 
+ #include "dsi_phy.h"
+ #include "dsi.xml.h"
+ #include "dsi_phy_7nm.xml.h"
+ 
+ /*
++ * Bring-up override for the D-PHY timing registers.  The values mainline
++ * derives from the lane rate differ from the tables vendors tune per panel;
++ * msm.dsi_phy_timings=<14 bytes> (TIMING_CTRL_0..13: 0, clk_zero,
++ * clk_prepare, clk_trail, hs_exit, hs_zero, hs_prepare, hs_trail, hs_rqst,
++ * ta_go, ta_sure, ta_get, clk_pre, clk_post) replays such a table so it can
++ * be tested without a rebuild.  Only the D-PHY path honours it.
++ */
++static unsigned char dsi_phy_timings[14];
++static int dsi_phy_timings_count;
++module_param_array(dsi_phy_timings, byte, &dsi_phy_timings_count, 0444);
++MODULE_PARM_DESC(dsi_phy_timings,
++		 "override the 14 D-PHY TIMING_CTRL registers (bring-up experiments)");
++
++/*
+  * DSI PLL 7nm - clock diagram (eg: DSI0): TODO: updated CPHY diagram
+  *
+  *           dsi0_pll_out_div_clk  dsi0_pll_bit_clk
+@@ -1174,6 +1189,17 @@
+ 		writel(timing->shared_timings.clk_post,
+ 		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_13);
+ 	}
++	if (!phy->cphy_mode &&
++	    dsi_phy_timings_count == ARRAY_SIZE(dsi_phy_timings)) {
++		int i;
++
++		for (i = 0; i < ARRAY_SIZE(dsi_phy_timings); i++)
++			writel(dsi_phy_timings[i],
++			       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0 + 4 * i);
++		DRM_DEV_INFO(&phy->pdev->dev,
++			     "D-PHY timings overridden from the command line: %14ph\n",
++			     dsi_phy_timings);
++	}
+ 
+ 	/* DSI lane settings */
+ 	dsi_phy_hw_v4_0_lane_settings(phy);

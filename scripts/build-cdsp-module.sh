@@ -2,9 +2,10 @@
 # Build and sign against the existing kernel; never rebuild or flash boot images.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
-kernel_tree=${KERNEL_WORKTREE:-$base/build/linux-src-gts9uwifi}
-build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-gts9uwifi}
+kernel_tree=${KERNEL_WORKTREE:-$base/build/linux-src-$DEVICE}
+build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-$DEVICE}
 module_dir=$base/build/cdsp-module
 out_dir=${CDSP_OUT_DIR:-$base/out/cdsp-module}
 test -f "$build_dir/Module.symvers"

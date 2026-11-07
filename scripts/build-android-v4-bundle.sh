@@ -1,6 +1,6 @@
 #!/bin/bash
 # Package the Ubuntu kernel and initramfs as the Android boot header v4 images
-# the SM-X910 boot chain expects.
+# the Galaxy Tab S9 family boot chain expects.
 #
 # Derived from scripts/build-android-v4-bundle.sh of the postmarketOS
 # gts9uwifi port (MIT), with two changes: the kernel payload comes straight
@@ -11,9 +11,10 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 tools=${ANDROID_TOOLS:-$base/tools}
-kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-gts9uwifi}
+kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-$DEVICE}
 out_dir=${BUNDLE_OUT_DIR:-$base/out/bundle}
 initramfs=${INITRAMFS:?set INITRAMFS to the Ubuntu initramfs to package}
 initramfs_overlay=${INITRAMFS_OVERLAY_DIR:-}
@@ -28,7 +29,7 @@ vbmeta_size=131072
 mkbootimg=$tools/mkbootimg.py
 avbtool=$tools/avbtool.py
 image=$kernel_out/Image.gz
-dtb=${KERNEL_DTB:-$kernel_out/sm8550-samsung-gts9uwifi.dtb}
+dtb=${KERNEL_DTB:-$kernel_out/$DEVICE_DTS.dtb}
 cmdline_file=$repo/configs/vendor_boot/cmdline.txt
 bootconfig=$repo/configs/vendor_boot/bootconfig.txt
 
@@ -77,6 +78,21 @@ add_hash_footer() {
 }
 
 cmdline=$(tr '\n' ' ' < "$cmdline_file" | sed 's/[[:space:]]*$//')
+# cmdline.txt is written for the Ultra.  The root label is the one token that
+# differs per family member, and it has to be there to be retargeted: a
+# cmdline without it would boot into the emergency shell on every board.
+case " $cmdline " in
+	*" root=LABEL=UBTS9U_UFS "*) ;;
+	*) echo "cmdline.txt carries no root=LABEL=UBTS9U_UFS token to retarget" >&2; exit 1 ;;
+esac
+cmdline=${cmdline/root=LABEL=UBTS9U_UFS/root=LABEL=$DEVICE_LABEL}
+# Extra tokens for bring-up experiments (module parameters of built-in
+# drivers, initcall_blacklist=...).  Only vendor_boot.img carries them, so an
+# experiment is a repack of that one image, not a kernel rebuild.
+if [ -n "${GTS9U_EXTRA_CMDLINE:-}" ]; then
+	cmdline="$cmdline ${GTS9U_EXTRA_CMDLINE}"
+	echo "vendor_boot cmdline extra: ${GTS9U_EXTRA_CMDLINE}"
+fi
 
 # Samsung's X910 ABL concatenates the generic init_boot ramdisk with the
 # vendor_boot fragments, and stock uses the legacy LZ4 stream format for both.
@@ -133,7 +149,7 @@ find "$tmp/vendor-ramdisk" -exec touch -h -d '@0' {} +
 (
 	cd "$tmp/vendor-ramdisk"
 	find . -print0 | LC_ALL=C sort -z \
-		| cpio --reproducible --null -o --format=newc 2>/dev/null
+		| cpio --reproducible --owner=0:0 --null -o --format=newc 2>/dev/null
 ) | lz4 -l -12 - "$tmp/vendor_ramdisk.lz4" >/dev/null
 
 python3 "$mkbootimg" \

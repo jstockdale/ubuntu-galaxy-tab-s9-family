@@ -10,11 +10,16 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 kernel_src=${KERNEL_SRC:-$base/linux-mainline}
-kernel_tree=${KERNEL_WORKTREE:-$base/build/linux-src-gts9uwifi}
-build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-gts9uwifi}
-out_dir=${KERNEL_OUT_DIR:-$base/out/kernel-gts9uwifi}
+kernel_tree=${KERNEL_WORKTREE:-$base/build/linux-src-$DEVICE}
+build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-$DEVICE}
+# Out-of-tree module scratch trees sit next to the kernel build directory and
+# are named per device: two boards must never clean each other's trees, and
+# a build run as another user must not trip over the last one's files.
+scratch=$(dirname "$build_dir")
+out_dir=${KERNEL_OUT_DIR:-$base/out/kernel-$DEVICE}
 v4l2loopback_commit=9ef83fb9bc88e8f841786753c362ac52c580defc
 fingerprint_baseline=5046f92f507d80b13d2e25c53a5d743861ba5a97
 # The complete EL721/QTEE path is physically validated for v1.2.0. Keep the
@@ -80,9 +85,9 @@ test -d "$kernel_src/.git" || {
 	echo 'run scripts/fetch-mainline.sh first' >&2
 	exit 1
 }
-test -f "$dts/sm8550-samsung-gts9uwifi.dts"
+test -f "$dts/$DEVICE_DTS.dts"
 test -f "$cfg/config-mainline.aarch64"
-test -f "$cfg/config-gts9uwifi.fragment"
+test -f "$cfg/config-$DEVICE.fragment"
 test -f "$pat/gunyah-host-vm-manager.patch"
 test -f "$pat/gunyah-qtvm-auth.patch"
 test -f "$pat/gunyah-qcom-runtime-overlay.patch"
@@ -109,7 +114,7 @@ fi
 # Board device tree
 # ---------------------------------------------------------------------------
 
-board_dts=$kernel_tree/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9uwifi.dts
+board_dts=$kernel_tree/arch/arm64/boot/dts/qcom/$DEVICE_DTS.dts
 # Keep the exact last physically booted board description for every build.
 # Adding the EL721 GPIO description to vendor_boot makes Samsung ABL reset before
 # Linux can persist a log.  The restricted EL721 compatibility device is
@@ -121,19 +126,32 @@ board_dts=$kernel_tree/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9uwifi.dts
 # byte -- one cosmetic byte of avbtool version aside -- so the packing is
 # faithful and the tree itself is what ABL rejects.  The baseline stays
 # pinned until there is a route that does not go through the DTB.
-git -C "$repo" show \
-	"$fingerprint_baseline:kernel/dts/sm8550-samsung-gts9uwifi.dts" \
-	> "$board_dts"
+if [ "$DEVICE" = gts9uwifi ]; then
+	git -C "$repo" show \
+		"$fingerprint_baseline:kernel/dts/sm8550-samsung-gts9uwifi.dts" \
+		> "$board_dts"
+else
+	# No tree has been physically booted on this board yet, so there is no
+	# baseline to pin: the working copy is the bring-up tree.
+	install -m 0644 "$repo/kernel/dts/$DEVICE_DTS.dts" "$board_dts"
+fi
 
-if ! grep -q 'sm8550-samsung-gts9uwifi.dtb' \
-	"$kernel_tree/arch/arm64/boot/dts/qcom/Makefile"; then
+dts_makefile=$kernel_tree/arch/arm64/boot/dts/qcom/Makefile
+if ! grep -q 'sm8550-samsung-gts9uwifi.dtb' "$dts_makefile"; then
 	patch -d "$kernel_tree" -p1 < "$pat/add-gts9uwifi-dtb.patch"
 fi
 # ABL's ufdt fork requires /__symbols__ in any DTB destined for vendor_boot.
-if ! grep -q '^DTC_FLAGS_sm8550-samsung-gts9uwifi := -@$' \
-	"$kernel_tree/arch/arm64/boot/dts/qcom/Makefile"; then
+if ! grep -q '^DTC_FLAGS_sm8550-samsung-gts9uwifi := -@$' "$dts_makefile"; then
 	sed -i '/sm8550-samsung-gts9uwifi\.dtb/a DTC_FLAGS_sm8550-samsung-gts9uwifi := -@' \
-		"$kernel_tree/arch/arm64/boot/dts/qcom/Makefile"
+		"$dts_makefile"
+fi
+# The other family boards hang off the Ultra's entry, with the same flag.
+if ! grep -q "$DEVICE_DTS.dtb" "$dts_makefile"; then
+	sed -i "/sm8550-samsung-gts9uwifi\.dtb/a dtb-\$(CONFIG_ARCH_QCOM) += $DEVICE_DTS.dtb" \
+		"$dts_makefile"
+fi
+if ! grep -q "^DTC_FLAGS_$DEVICE_DTS := -@\$" "$dts_makefile"; then
+	sed -i "/$DEVICE_DTS\.dtb/a DTC_FLAGS_$DEVICE_DTS := -@" "$dts_makefile"
 fi
 
 # ---------------------------------------------------------------------------
@@ -228,6 +246,9 @@ apply_unless 'PTN3222_MAX_INIT_CELLS' \
 apply_unless 'pwrseq_qcom_wcn_program_wlan_pdc' \
 	drivers/power/sequencing/pwrseq-qcom-wcn.c \
 	wcn7850-pwrseq-cold-reset-aop.patch
+apply_unless 'pwrseq_qcom_wcn6855_clk_release' \
+	drivers/power/sequencing/pwrseq-qcom-wcn.c \
+	pwrseq-wcn6855-cold-reset-hold-xo-gts9wifi.patch
 apply_unless 'default y if ARCH_QCOM' \
 	drivers/pci/pwrctrl/Kconfig build-wcn-pcie-providers-in.patch
 apply_unless 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' \
@@ -247,10 +268,49 @@ apply_unless 'bridge->of_node = msm_dp_display->pdev->dev.of_node' \
 	drivers/gpu/drm/msm/dp/dp_drm.c msm-dp-associate-bridge-of-node.patch
 apply_unless 'defer_hpd_until_resume' \
 	drivers/gpu/drm/msm/dp/dp_drm.h msm-dp-defer-oob-hpd-until-resume.patch
+# Bring-up switch: msm.dsi_phy_timings=<14 bytes> replays a vendor D-PHY
+# timing table (the X710 glass shows speckle after idle gaps with the values
+# mainline derives from the lane rate).  Inert without the parameter.
+apply_unless 'dsi_phy_timings' \
+	drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c msm-dsi-phy-7nm-timing-override.patch
+# Bring-up switch: msm.cached_coherent=0 withholds cached-coherent GEM
+# buffers from Mesa (the X710 shows a 96-px lattice of unwritten/stale
+# pixels in GPU-rendered content).  Inert without the parameter.
+apply_unless 'static bool cached_coherent' \
+	drivers/gpu/drm/msm/adreno/adreno_device.c msm-adreno-cached-coherent-param.patch
+# Bring-up switches for the same lattice: msm.gpu_hwcg=0 leaves the GPU's
+# hardware clock gating off, msm.gpu_llc=0 keeps the GPU off the system
+# cache (LLCC) slices.  Inert without the parameters.
+apply_unless 'bool gpu_hwcg' \
+	drivers/gpu/drm/msm/adreno/adreno_device.c msm-adreno-hwcg-llc-params.patch
+# Bring-up switch: msm.a7xx_ccu_inval selects what a7xx_submit() does to the
+# colour/depth caches before the completion fence (0 none, 1 invalidate as
+# mainline, 2 clean+idle then invalidate).  Inert without the parameter.
+apply_unless 'a7xx_ccu_inval' \
+	drivers/gpu/drm/msm/adreno/adreno_device.c msm-adreno-a7xx-ccu-inval-param.patch
+# Bring-up switch: msm.gpu_scm_init=<bits> re-issues the secure-world GPU
+# register init request on the A740 (mainline dropped it).  Inert at 0.
+apply_unless 'gpu_scm_init' \
+	drivers/gpu/drm/msm/adreno/adreno_device.c msm-adreno-a740-scm-init-param.patch
+# Bring-up switches: msm.gmu_hub_hz=<Hz> overrides the GPU hub clock rate;
+# gunyah.qcom_overlay_all=1 lets the Gunyah RM overlay be fetched on machines
+# other than the SM-X910.  Both inert by default.
+apply_unless 'gmu_hub_hz' \
+	drivers/gpu/drm/msm/adreno/adreno_device.c msm-adreno-gmu-hub-clk-param.patch
+apply_unless 'qcom_overlay_all' \
+	drivers/virt/gunyah/qcom_bootinfo.c gunyah-qcom-runtime-overlay-all-param.patch
 apply_unless 'adopt_retained_source_ufp' \
 	include/linux/usb/tcpm.h tcpm-adopt-retained-source-ufp-role.patch
 apply_unless 'consume_retained_sink_dfp' \
 	include/linux/usb/tcpm.h tcpm-use-retained-sink-data-role.patch
+# A dock's DisplayPort alternate mode is discovered while the tablet is still
+# UFP; typec_displayport then refuses to bind (-EPROTO) and the mode sat
+# driverless until a physical re-plug.  Impatient adapters hard-reset around
+# that window forever.  Re-probe driverless partner altmodes when the data
+# role changes.
+apply_unless 'Re-probe driverless partner alternate modes' \
+	drivers/usb/typec/class.c \
+	typec-reprobe-partner-altmodes-on-role-change.patch
 apply_unless 'disable_irq_nosync(irq)' \
 	drivers/remoteproc/qcom_q6v5.c \
 	qcom-q6v5-mask-completed-handover-irq.patch
@@ -314,6 +374,9 @@ install -m 0644 "$repo/kernel/include/linux/samsung_wacom.h" \
 apply_unless 'samsung_wacom_should_suppress_touch' \
 	drivers/input/touchscreen/goodix_berlin_core.c \
 	suppress-goodix-touch-while-spen-hovering.patch
+apply_unless 'samsung,gts9wifi' \
+	drivers/pci/controller/dwc/pcie-designware.c \
+	pcie-dwc-link-wait-longer-gts9wifi.patch
 if [ "$fingerprint_touch" = 1 ]; then
 	apply_unless 'GOODIX_BERLIN_SPONGE_FOD_RECT' \
 		drivers/input/touchscreen/goodix_berlin_core.c \
@@ -384,7 +447,8 @@ grep -q 'dw9808_vcm.o' "$camera_dir/Makefile" || \
 		>> "$camera_dir/Makefile"
 
 panel_dir=$kernel_tree/drivers/gpu/drm/panel
-if [ "$fingerprint_panel" = 1 ]; then
+# The pinned baseline driver only knows the Ultra's AMSA46AS02 glass.
+if [ "$fingerprint_panel" = 1 ] || [ "$DEVICE" != gts9uwifi ]; then
 	install -m 0644 "$drv/panel-samsung-ana38407.c" \
 		"$panel_dir/panel-samsung-ana38407.c"
 else
@@ -395,12 +459,12 @@ fi
 if ! grep -q 'DRM_PANEL_SAMSUNG_ANA38407' "$panel_dir/Kconfig"; then
 	sed -i '/^endmenu$/i \
 config DRM_PANEL_SAMSUNG_ANA38407\
-\ttristate "Samsung ANA38407 AMSA46AS02 (gts9u) DSI command-mode panel"\
+\ttristate "Samsung ANA38407 (Galaxy Tab S9 family) DSI command-mode panel"\
 \tdepends on OF\
 \tdepends on DRM_MIPI_DSI\
 \tdepends on BACKLIGHT_CLASS_DEVICE\
 \thelp\
-\t  DSC command-mode DSI panel on the Galaxy Tab S9 Ultra Wi-Fi (SM-X910).\
+\t  DSC command-mode DSI panel on the Galaxy Tab S9 Wi-Fi tablets (SM-X710, SM-X910).\
 ' "$panel_dir/Kconfig"
 fi
 grep -q 'panel-samsung-ana38407.o' "$panel_dir/Makefile" || \
@@ -512,6 +576,29 @@ EOF
 fi
 grep -q 'samsung_wacom_w90xx.o' "$touch_dir/Makefile" || \
 	printf 'obj-$(CONFIG_TOUCHSCREEN_SAMSUNG_WACOM_W90XX) += samsung_wacom_w90xx.o\n' \
+		>> "$touch_dir/Makefile"
+
+# STMicroelectronics FTS1BA90A touch controller of the 11" Galaxy Tab S9
+# (SM-X710).  Mainline stmfts speaks a different FingerTipS command set.
+install -m 0644 "$drv/samsung_fts1ba90a.c" \
+	"$touch_dir/samsung_fts1ba90a.c"
+if ! grep -q 'TOUCHSCREEN_SAMSUNG_FTS1BA90A' "$touch_dir/Kconfig"; then
+	cat >> "$touch_dir/Kconfig" <<'EOF'
+
+config TOUCHSCREEN_SAMSUNG_FTS1BA90A
+	tristate "Samsung Galaxy Tab S9 STMicroelectronics FTS1BA90A touchscreen"
+	depends on I2C
+	depends on REGULATOR
+	help
+	  Driver for the STMicroelectronics FTS1BA90A touch controller in
+	  Samsung's Galaxy Tab S9 (SM-X710) and S9+ (SM-X810).  Mainline's
+	  stmfts cannot drive it: this firmware uses 16-byte events behind
+	  opcodes 0x60/0x61 and an in-band system reset, not the FingerTipS
+	  command set.
+EOF
+fi
+grep -q 'samsung_fts1ba90a.o' "$touch_dir/Makefile" || \
+	printf 'obj-$(CONFIG_TOUCHSCREEN_SAMSUNG_FTS1BA90A) += samsung_fts1ba90a.o\n' \
 		>> "$touch_dir/Makefile"
 
 # The EL721 is permanently assigned to TrustZone on the shipping X910.  This
@@ -663,7 +750,7 @@ cp "$cfg/config-mainline.aarch64" "$build_dir/.config"
 # them separate means the inherited file stays comparable to its origin.
 # An array, not a space-separated string: this repository lives under a path
 # that contains spaces, and word splitting turned it into nonexistent files.
-fragments=("$cfg/config-gts9uwifi.fragment")
+fragments=("$cfg/config-$DEVICE.fragment")
 [ -f "$cfg/config-ubuntu-desktop.fragment" ] && \
 	fragments+=("$cfg/config-ubuntu-desktop.fragment")
 
@@ -767,7 +854,7 @@ fi
 # SOURCE_DATE_EPOCH defaults to the commit date of the pinned kernel, so it is
 # a property of the sources rather than of when we happened to build.
 export KBUILD_BUILD_USER=${KBUILD_BUILD_USER:-ubuntu}
-export KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-gts9uwifi}
+export KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-$DEVICE}
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$kernel_tree" log -1 --format=%ct)}
 export KBUILD_BUILD_TIMESTAMP=${KBUILD_BUILD_TIMESTAMP:-$(
 	LC_ALL=C date -u -d "@$SOURCE_DATE_EPOCH" 2>/dev/null
@@ -776,7 +863,7 @@ export KBUILD_BUILD_TIMESTAMP=${KBUILD_BUILD_TIMESTAMP:-$(
 printf '0\n' > "$build_dir/.version"
 
 make -C "$kernel_tree" O="$build_dir" ARCH=arm64 LLVM=1 -j"$(nproc)" \
-	Image.gz qcom/sm8550-samsung-gts9uwifi.dtb
+	Image.gz qcom/$DEVICE_DTS.dtb
 
 if [ "${BUILD_WIFI_MODULES:-1}" = 1 ]; then
 	modules_root=$out_dir/modules-root
@@ -816,6 +903,28 @@ if [ "${BUILD_WIFI_MODULES:-1}" = 1 ]; then
 	release=$(make -s -C "$kernel_tree" O="$build_dir" ARCH=arm64 LLVM=1 \
 		kernelrelease)
 	release_dir=$modules_root/lib/modules/$release
+	# Only Image.gz and the isolated M= trees are built, so an in-tree =m
+	# option is silently left out.  The gts9wifi bring-up keeps the DDR
+	# bandwidth monitor as a module (blacklisted by default, loaded by hand
+	# for display experiments), built as a single target: M=drivers/soc/qcom
+	# would also build that directory's other =m objects, and
+	# pmic_glink_altmode needs DRM bridge symbols this build never produces.
+	if grep -qx 'CONFIG_QCOM_ICC_BWMON=m' "$build_dir/.config"; then
+		make -C "$kernel_tree" O="$build_dir" ARCH=arm64 LLVM=1 -j"$(nproc)" \
+			drivers/soc/qcom/icc-bwmon.ko
+		bwmon_ko=$release_dir/kernel/drivers/soc/qcom/icc-bwmon.ko
+		install -D -m 0644 "$build_dir/drivers/soc/qcom/icc-bwmon.ko" "$bwmon_ko"
+		llvm-strip --strip-debug "$bwmon_ko"
+		sig_hash=$(sed -n 's/^CONFIG_MODULE_SIG_HASH="\(.*\)"$/\1/p' "$build_dir/.config")
+		if [ -n "$sig_hash" ] && [ -f "$build_dir/certs/signing_key.pem" ]; then
+			"$build_dir/scripts/sign-file" "$sig_hash" "$build_dir/certs/signing_key.pem" \
+				"$build_dir/certs/signing_key.x509" "$bwmon_ko"
+		fi
+		if grep -qx 'CONFIG_MODULE_COMPRESS_ZSTD=y' "$build_dir/.config"; then
+			zstd -T0 -19 -q --rm -f "$bwmon_ko"
+		fi
+		ls -la "$release_dir/kernel/drivers/soc/qcom/"
+	fi
 	# Containers need the modular NAT/filter stack too, not just ath12k.
 	# Without these modules Waydroid fails before Android starts, with
 	# "can't initialize iptables table filter" from waydroid-net.sh.
@@ -827,9 +936,9 @@ if [ "${BUILD_WIFI_MODULES:-1}" = 1 ]; then
 		# board-specific IPCC IRQ bridge.  Keep it in the same signed module
 		# set as the SPSS remoteproc/glink stack so replacing a kernel release
 		# cannot leave fprintd waiting for a module signed by the previous key.
-		spss_irq_module_dir=$base/build/spss-irq-module
+		spss_irq_module_dir=$scratch/spss-irq-module-$DEVICE
 		case "$spss_irq_module_dir" in
-			"$base"/build/spss-irq-module)
+			"$scratch"/spss-irq-module-"$DEVICE")
 				rm -rf -- "$spss_irq_module_dir"
 				;;
 			*) echo "unsafe SPSS IRQ module path: $spss_irq_module_dir" >&2; exit 1 ;;
@@ -907,9 +1016,9 @@ if [ "${BUILD_WIFI_MODULES:-1}" = 1 ]; then
 	# the exact reviewed revision against this exact kernel, then sign it with
 	# the key generated by this kernel build. A DKMS package on the tablet
 	# would be unable to reproduce that ABI or signature reliably.
-	loopback_tree=$base/build/v4l2loopback-gts9u
+	loopback_tree=$scratch/v4l2loopback-$DEVICE
 	case "$loopback_tree" in
-		"$base"/build/v4l2loopback-gts9u) rm -rf -- "$loopback_tree" ;;
+		"$scratch"/v4l2loopback-"$DEVICE") rm -rf -- "$loopback_tree" ;;
 		*) echo "unsafe v4l2loopback path: $loopback_tree" >&2; exit 1 ;;
 	esac
 	git clone --quiet https://github.com/v4l2loopback/v4l2loopback.git \
@@ -946,12 +1055,12 @@ fi
 
 install -m 0644 "$build_dir/arch/arm64/boot/Image.gz" "$out_dir/Image.gz"
 install -m 0644 \
-	"$build_dir/arch/arm64/boot/dts/qcom/sm8550-samsung-gts9uwifi.dtb" \
-	"$out_dir/sm8550-samsung-gts9uwifi.dtb"
+	"$build_dir/arch/arm64/boot/dts/qcom/$DEVICE_DTS.dtb" \
+	"$out_dir/$DEVICE_DTS.dtb"
 install -m 0644 "$build_dir/.config" "$out_dir/config"
 
 sha256sum "$out_dir/Image.gz" \
-	"$out_dir/sm8550-samsung-gts9uwifi.dtb" \
+	"$out_dir/$DEVICE_DTS.dtb" \
 	"$out_dir/config" > "$out_dir/SHA256SUMS"
 
 cat > "$out_dir/fingerprint.layers" <<EOF

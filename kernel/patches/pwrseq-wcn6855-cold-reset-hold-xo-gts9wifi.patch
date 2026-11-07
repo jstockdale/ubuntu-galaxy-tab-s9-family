@@ -1,0 +1,86 @@
+Subject: power: sequencing: qcom-wcn: cold-reset WLAN_EN and hold XO_CLK on the SM-X710 QCA6490
+
+WLAN_EN is left high by Samsung's bootloader/TWRP kernel, so request it low at
+probe (as already done for the X910's WCN7850) to give the PMU a real rising
+edge; and keep XO_CLK asserted while any target is powered, releasing it with
+the unit, since the Bluetooth ROM on this board never answers when the line is
+only strobed (the Fedora X710 port holds it in its bt-revive helper).
+
+--- a/drivers/power/sequencing/pwrseq-qcom-wcn.c	2026-11-05 15:36:39.560740661 -0800
++++ b/drivers/power/sequencing/pwrseq-qcom-wcn.c	2026-11-05 15:36:39.571664816 -0800
+@@ -153,9 +153,26 @@
+ 	return 0;
+ }
+ 
++/*
++ * Samsung SM-X710 (QCA6490): the Bluetooth ROM never answers its version
++ * read when XO_CLK is only strobed around BT_EN, while the Fedora port's
++ * bt-revive helper gets it up by holding that line.  Keep XO_CLK asserted
++ * for as long as any target is powered and release it with the unit.
++ */
++static int pwrseq_qcom_wcn6855_clk_release(struct pwrseq_device *pwrseq)
++{
++	struct pwrseq_qcom_wcn_ctx *ctx = pwrseq_device_get_drvdata(pwrseq);
++
++	if (ctx->xo_clk_gpio)
++		gpiod_set_value_cansleep(ctx->xo_clk_gpio, 0);
++
++	return 0;
++}
++
+ static const struct pwrseq_unit_data pwrseq_qcom_wcn6855_xo_clk_assert = {
+ 	.name = "xo-clk-assert",
+ 	.enable = pwrseq_qcom_wcn6855_clk_assert,
++	.disable = pwrseq_qcom_wcn6855_clk_release,
+ };
+ 
+ static const struct pwrseq_unit_data *pwrseq_qcom_wcn6855_unit_deps[] = {
+@@ -243,18 +260,6 @@
+ 	return 0;
+ }
+ 
+-static int pwrseq_qcom_wcn6855_xo_clk_deassert(struct pwrseq_device *pwrseq)
+-{
+-	struct pwrseq_qcom_wcn_ctx *ctx = pwrseq_device_get_drvdata(pwrseq);
+-
+-	if (ctx->xo_clk_gpio) {
+-		usleep_range(2000, 5000);
+-		gpiod_set_value_cansleep(ctx->xo_clk_gpio, 0);
+-	}
+-
+-	return pwrseq_qcom_wcn_pwup_delay(pwrseq);
+-}
+-
+ static const struct pwrseq_target_data pwrseq_qcom_wcn_bt_target_data = {
+ 	.name = "bluetooth",
+ 	.unit = &pwrseq_qcom_wcn_bt_unit_data,
+@@ -281,13 +286,13 @@
+ static const struct pwrseq_target_data pwrseq_qcom_wcn6855_bt_target_data = {
+ 	.name = "bluetooth",
+ 	.unit = &pwrseq_qcom_wcn6855_bt_unit_data,
+-	.post_enable = pwrseq_qcom_wcn6855_xo_clk_deassert,
++	.post_enable = pwrseq_qcom_wcn_pwup_delay,
+ };
+ 
+ static const struct pwrseq_target_data pwrseq_qcom_wcn6855_wlan_target_data = {
+ 	.name = "wlan",
+ 	.unit = &pwrseq_qcom_wcn6855_wlan_unit_data,
+-	.post_enable = pwrseq_qcom_wcn6855_xo_clk_deassert,
++	.post_enable = pwrseq_qcom_wcn_pwup_delay,
+ };
+ 
+ static const struct pwrseq_target_data *pwrseq_qcom_wcn_targets[] = {
+@@ -383,6 +388,13 @@
+ 	.num_vregs = ARRAY_SIZE(pwrseq_wcn6855_vregs),
+ 	.pwup_delay_ms = 50,
+ 	.gpio_enable_delay_ms = 5,
++	/*
++	 * Samsung SM-X710: TWRP's vendor kernel (cnss2) and ABL leave WLAN_EN
++	 * high, so an as-is request gives the QCA6490 PMU no rising edge at
++	 * power-on and the PCIe link only trains after a suspend/resume
++	 * power cycle.  Start from a known low level like the X910 does.
++	 */
++	.cold_reset_wlan = true,
+ 	.targets = pwrseq_qcom_wcn6855_targets,
+ };
+ 

@@ -1,0 +1,128 @@
+# Written by scripts/stage-firmware.py record; review before commit.
+# Format: configs/firmware/README.md
+
+[package]
+device = "gts9wifi"
+model = "SM-X710"
+bl_rev = 5
+build_id = "X710XXS5CYG1"
+odin_zip = "XAR-X710XXS5CYG1-20250728211550.zip"
+
+[files]
+"SM8550-HDK-tplg.bin" = { source = "lfw:18cf97993f06c0a28d88cee30b7b646807642acd:qcom/sm8550/SM8550-HDK-tplg.bin", sha256 = "66e01a76c413928c4e0934a6e3d993c948c4594db693b8dc0c490882e847b81b", class = "external-pinned" }
+"Samsung-Galaxy-Tab-S9-tplg.bin" = { source = "derived:tplg-sd1:SM8550-HDK-tplg.bin", sha256 = "58dda02401f4190af8d4addc33f8e7dba9f662db45a97b77c4a71cadaee48b18", class = "derived" }
+"a740_sqe.fw" = { source = "vendor:firmware/a740_sqe.fw", sha256 = "96fee336424b139100fc60b5b45a907360e4b3936d7e1d00406b9bd80ca48473", class = "loose" }
+"a740_zap.b00" = { source = "vendor:firmware/a740_zap.b00", sha256 = "2fb7b6afa4387a8ba81e1faf0c35ac1c6fd6294118426d5b45946d75f4e3e339", class = "tz-auth" }
+"a740_zap.b01" = { source = "vendor:firmware/a740_zap.b01", sha256 = "21c0afb7418fe901d688327bbc7423898cc3d6ca93d77adff8294c6fca30fbcd", class = "tz-auth" }
+"a740_zap.b02" = { source = "vendor:firmware/a740_zap.b02", sha256 = "d56baf8bc4b95b04ea2d9864a9fdfece9375037677a40c057f527f9f105b6761", class = "tz-auth" }
+"a740_zap.mdt" = { source = "vendor:firmware/a740_zap.mdt", sha256 = "675f0007a842380d760cb71dfabfd7d7fcf58981067fdc6ae0100d28fbccb711", class = "tz-auth" }
+"adsp.b00" = { source = "nonhlos:image/adsp.b00", sha256 = "6bf90d1c0331e2ef019921925f55b06b68af557e5de42d81852e2509fd3df303", class = "tz-auth" }
+"adsp.b01" = { source = "nonhlos:image/adsp.b01", sha256 = "475bd54976171eaa5ffc013f32d058e7424822b149fb8599801aa5d16cbe0c0c", class = "tz-auth" }
+"adsp.b02" = { source = "nonhlos:image/adsp.b02", sha256 = "5b4dfcb2117fe15fa25b43a4120bb66102f092c176d9cf3ae14e60977a71885f", class = "tz-auth" }
+"adsp.b03" = { source = "nonhlos:image/adsp.b03", sha256 = "6206f5f24677b86229843277045752bee86459f82c5c31cf14530b66ad97e70a", class = "tz-auth" }
+"adsp.b04" = { source = "nonhlos:image/adsp.b04", sha256 = "cfaad569845b7133cbf158d5fc362ec291e3c012d67c5a9ee3457fd5be666177", class = "tz-auth" }
+"adsp.b05" = { source = "nonhlos:image/adsp.b05", sha256 = "636a709428f1ada1a7caedf1b46b197d76741a131b344ca2fdaec88fbea64c73", class = "tz-auth" }
+"adsp.b06" = { source = "nonhlos:image/adsp.b06", sha256 = "22a2e7f471f97a0f6e395ff85258eeb9a87b58b8894412c6b4bc5b2a65a20718", class = "tz-auth" }
+"adsp.b07" = { source = "nonhlos:image/adsp.b07", sha256 = "b675b4088e13b83422ed87a124d950f82f64aa2ff4eec67b6cb771b39ec47629", class = "tz-auth" }
+"adsp.b08" = { source = "nonhlos:image/adsp.b08", sha256 = "61e09e6704fffd3e84acddd47a88463dba665e13a63c4873717146a7a65660fa", class = "tz-auth" }
+"adsp.b09" = { source = "nonhlos:image/adsp.b09", sha256 = "1ee6c7591b546122f17ca26dc509c0ec2cf1a49fb3225dced316d947de79abda", class = "tz-auth" }
+"adsp.b10" = { source = "nonhlos:image/adsp.b10", sha256 = "7653ab59c9353772ae24000e657012cc72183018e440eddecacad8d2c288cce0", class = "tz-auth" }
+"adsp.b11" = { source = "nonhlos:image/adsp.b11", sha256 = "130261d7160c2f10da37e90cef0dfd22ed3b499c566ae01252af75771fd3b9ee", class = "tz-auth" }
+"adsp.b12" = { source = "nonhlos:image/adsp.b12", sha256 = "d260f6c39a0d8b16f8a5e0ac57c534d643da838b3d144e5d9146439282b606ba", class = "tz-auth" }
+"adsp.b13" = { source = "nonhlos:image/adsp.b13", sha256 = "ca0feb7b7e278bb35537fcb209cd829211d41fbffb758bf1e6766882b8085997", class = "tz-auth" }
+"adsp.b14" = { source = "nonhlos:image/adsp.b14", sha256 = "2b746bf3c5dc76fc7f02d569840040df2f1e6f4a0275a54a133fd61a8959405f", class = "tz-auth" }
+"adsp.b15" = { source = "nonhlos:image/adsp.b15", sha256 = "268d552257767cc03eda517ebaa6f4fe168b2535ffe0af1879c5cfd02592b398", class = "tz-auth" }
+"adsp.b16" = { source = "nonhlos:image/adsp.b16", sha256 = "5c84ecea0bfdb3acf13bfced3d82e5cf291597bf9be611d1accc210a3711266f", class = "tz-auth" }
+"adsp.b17" = { source = "nonhlos:image/adsp.b17", sha256 = "19103c64e74fe4fcf0c77aa56b3c0c81ef4a722614b136439bc4271615193380", class = "tz-auth" }
+"adsp.b18" = { source = "nonhlos:image/adsp.b18", sha256 = "a28fbbcbf570b676bc26aa1ec87a78ad72a9d43dbcda3b33df761925470bf704", class = "tz-auth" }
+"adsp.b19" = { source = "nonhlos:image/adsp.b19", sha256 = "2de030c62fd2134720f15d7ed7a22dc615bd1bd36b021edc730a4cb9eaf7de51", class = "tz-auth" }
+"adsp.b20" = { source = "nonhlos:image/adsp.b20", sha256 = "b798729f54a793b8f8e2fe0bede996c26e27f76f968695657d170e9198339503", class = "tz-auth" }
+"adsp.b21" = { source = "nonhlos:image/adsp.b21", sha256 = "f1152916f96e6d0264f9ca22a6e770d5a9eee25086e6898b178c9eacc59c067c", class = "tz-auth" }
+"adsp.b22" = { source = "nonhlos:image/adsp.b22", sha256 = "b0fb1ccc88faa91d740a12c3a62aa40672eea16f955d42034d825f0f87d4d460", class = "tz-auth" }
+"adsp.b23" = { source = "nonhlos:image/adsp.b23", sha256 = "891a1d9bfbd16d2723c4e068e3035286f634cbde96c3e4cd8286601067c4338e", class = "tz-auth" }
+"adsp.b24" = { source = "nonhlos:image/adsp.b24", sha256 = "06a1c932523aab02d13ff65ab60c7cf1a6f045eb5dfd5c4a5b14f408379060b9", class = "tz-auth" }
+"adsp.b25" = { source = "nonhlos:image/adsp.b25", sha256 = "07cd292afc1486512f5124ccadc22605310bf4ba4c4d518414fdfff4470becdf", class = "tz-auth" }
+"adsp.b27" = { source = "nonhlos:image/adsp.b27", sha256 = "2edfabd9c5a31966f70173bd9d16dea1705cda3e7a93228e97f5d5bb18177447", class = "tz-auth" }
+"adsp.b28" = { source = "nonhlos:image/adsp.b28", sha256 = "88ebbb84d10984f81b1d365daf91a65b8f2b2548691f0f2f547d76222698d711", class = "tz-auth" }
+"adsp.b30" = { source = "nonhlos:image/adsp.b30", sha256 = "b6e69746be03dee832c3e1fe640d6cde9276e16159667dc410f65f4b8814b2b1", class = "tz-auth" }
+"adsp.b31" = { source = "nonhlos:image/adsp.b31", sha256 = "e7caac83ec03b02602876007e3e5b43a4615d16a87c3ce07c14f12222756ac4e", class = "tz-auth" }
+"adsp.b32" = { source = "nonhlos:image/adsp.b32", sha256 = "b6977653d9a75b59fbacd4822ff4600a443d19cc9d6a7972feb0f65a559cbce5", class = "tz-auth" }
+"adsp.b33" = { source = "nonhlos:image/adsp.b33", sha256 = "6fd7868da30a813189ab40b486bac6eba1edf10c8ab0e29031959f1e038b2a99", class = "tz-auth" }
+"adsp.b34" = { source = "nonhlos:image/adsp.b34", sha256 = "481a232de71c0a7c7d1623373049bf91cfaf09af5d600c299e645628d3d29270", class = "tz-auth" }
+"adsp.b35" = { source = "nonhlos:image/adsp.b35", sha256 = "d7efeb060c9215e008fb3351b5bec48b34689ce9f70f501b3de3878a5166b08a", class = "tz-auth" }
+"adsp.b37" = { source = "nonhlos:image/adsp.b37", sha256 = "9e2bb6a9e020c8b87dc2980b2078901c42095b4edbffdefac97706ad3b7b8772", class = "tz-auth" }
+"adsp.b38" = { source = "nonhlos:image/adsp.b38", sha256 = "81b6ae6cc0e3c0ec46ecf6c50adbf7bf1c11d77a682614be7a199f902abd20c9", class = "tz-auth" }
+"adsp.b39" = { source = "nonhlos:image/adsp.b39", sha256 = "c8ede9f410db2c6dbd44fe8dbc2245b7199ac69effb1c5635391814dda808235", class = "tz-auth" }
+"adsp.b40" = { source = "nonhlos:image/adsp.b40", sha256 = "6f70e9461bfadc063cfebc948e39ef55501d549dc53eb96c76945ac4e4d38d6c", class = "tz-auth" }
+"adsp.b41" = { source = "nonhlos:image/adsp.b41", sha256 = "b1c04902abdf0eb7636334f99178e919143adb13300a2780049b69e4241b7eab", class = "tz-auth" }
+"adsp.b42" = { source = "nonhlos:image/adsp.b42", sha256 = "6edf2719a969e905ca398cc16cd24133649e55ffa849488c42e79098abbdc4aa", class = "tz-auth" }
+"adsp.b43" = { source = "nonhlos:image/adsp.b43", sha256 = "c22fbd7689b84d3ca63d01f2bb76d1186f99932afe0a13a0941df32a8700422d", class = "tz-auth" }
+"adsp.b44" = { source = "nonhlos:image/adsp.b44", sha256 = "87193787cb8cbe3f6d3e1db445dff6bb5c96f85e7bf382842a1fb9cbf38fb3e2", class = "tz-auth" }
+"adsp.b45" = { source = "nonhlos:image/adsp.b45", sha256 = "818b6f7df8eccb392f0a67cc0ea6832a694f2d2cb3f3b984abb8dc01a7be093c", class = "tz-auth" }
+"adsp.b46" = { source = "nonhlos:image/adsp.b46", sha256 = "bfad2e7e97fac5dce69b39cc4fe0f53a726be75976090ac7c49a0f27cdb85132", class = "tz-auth" }
+"adsp.b47" = { source = "nonhlos:image/adsp.b47", sha256 = "bfa5718359647e23cb7ae6d83f3640f20ad79c45fa8d708bc222c2bbc6509b0a", class = "tz-auth" }
+"adsp.b48" = { source = "nonhlos:image/adsp.b48", sha256 = "b79c85cecb4ec57aa4ff86d8b0eeee02ed1a2f614baeb86d445a04ba1f0b44a7", class = "tz-auth" }
+"adsp.b50" = { source = "nonhlos:image/adsp.b50", sha256 = "626e5d214e55b7b81e9cd5aba50066fb1e40b114068211186fb29010cbff6f03", class = "tz-auth" }
+"adsp.mdt" = { source = "nonhlos:image/adsp.mdt", sha256 = "fc1a551b79b82dd2685a2c71cb7563708546df3394f357bb8be13233b61f6f95", class = "tz-auth" }
+"adsp_dtb.b00" = { source = "nonhlos:image/adsp_dtb.b00", sha256 = "6bf39fd29034606433776d7320ad7a12d7372319d8ec364bbeb671e82d99155c", class = "tz-auth" }
+"adsp_dtb.b01" = { source = "nonhlos:image/adsp_dtb.b01", sha256 = "006d0a6abb068e10fa6f69d53174343c7b5744e8c0be8493c70ac8d44b7cbb05", class = "tz-auth" }
+"adsp_dtb.b02" = { source = "nonhlos:image/adsp_dtb.b02", sha256 = "a37e951ed354993737196dbcd35124bc68c296c73b6026ec4b1c8eb9b59ea9da", class = "tz-auth" }
+"adsp_dtb.mdt" = { source = "nonhlos:image/adsp_dtb.mdt", sha256 = "2a5decdff13616cab9d17464e59fc1a779070724b59b2601b579ea7272ccff39", class = "tz-auth" }
+"adspr.jsn" = { source = "nonhlos:image/adspr.jsn", sha256 = "66ce8531efb7979d234e0f0eabbe18d038ac97da771a8a194f613df8f0724e81", class = "loose" }
+"adsps.jsn" = { source = "nonhlos:image/adsps.jsn", sha256 = "12ac2f3ae8ced12aa4b06b3ab3a01bc4d8efe1c92ebea503c002f209a6ec176f", class = "loose" }
+"adspua.jsn" = { source = "nonhlos:image/adspua.jsn", sha256 = "982a99853495e34726b8e44697fdfad303334de0a67cbf6cde306c8f1731000b", class = "loose" }
+"bdwlan-payload.bin" = { source = "derived:elf-payload:bdwlan.elf", sha256 = "de5a1f16093e6faa181a4f1cd6fef57a6cf62d56994f652143a0b3522263a3f7", class = "derived" }
+"bdwlan.elf" = { source = "vendor:firmware/qca6490/bdwlan.elf", sha256 = "e912793ab93c764b72a7a60f6d4cc14ddc3d534d66c74d947b87ae2b24b520ca", class = "loose" }
+"cdspr.jsn" = { source = "nonhlos:image/cdspr.jsn", sha256 = "6d01cd7dce745204d5de20efe57e2511149ca2a5b48ee562fbedefda573ca465", class = "loose" }
+"dualfp.b00" = { source = "nonhlos:image/dualfp.b00", sha256 = "98addc8b095c2bf30bb5b38845299c7376adbcc6a8cdd68d1360128d7f566937", class = "tz-auth", group = "fingerprint" }
+"dualfp.b01" = { source = "nonhlos:image/dualfp.b01", sha256 = "933a9731811f0c6f087eda102305b5d736895cdb00a625a873cd0e83d1ed3ada", class = "tz-auth", group = "fingerprint" }
+"dualfp.b02" = { source = "nonhlos:image/dualfp.b02", sha256 = "7d69b0f9e9e492d7c8eaec9657a76611e24515b5135a07f6861d7267a4b0b671", class = "tz-auth", group = "fingerprint" }
+"dualfp.b03" = { source = "nonhlos:image/dualfp.b03", sha256 = "94e8a798156100ed9d8612b9d97ba08a6280dc30c421020d29ae44913eb22c3a", class = "tz-auth", group = "fingerprint" }
+"dualfp.b04" = { source = "nonhlos:image/dualfp.b04", sha256 = "7186970eab8196f6e07c8820d832555cfd4e5f12903f7a24013477859e32d75d", class = "tz-auth", group = "fingerprint" }
+"dualfp.b05" = { source = "nonhlos:image/dualfp.b05", sha256 = "509f7f5868b132657cec8ad53a02ed85fe03269bd4a4c9d8e0950e9cd66685b2", class = "tz-auth", group = "fingerprint" }
+"dualfp.b06" = { source = "nonhlos:image/dualfp.b06", sha256 = "746b62ae00a7a927e9bdb555fb394447eb5ae6c3e291c507d83f4166cbcd5ce6", class = "tz-auth", group = "fingerprint" }
+"dualfp.b07" = { source = "nonhlos:image/dualfp.b07", sha256 = "94e8a798156100ed9d8612b9d97ba08a6280dc30c421020d29ae44913eb22c3a", class = "tz-auth", group = "fingerprint" }
+"dualfp.b08" = { source = "nonhlos:image/dualfp.b08", sha256 = "f5a7fc2220d2a6c78c073228a041c70fb666f09b110718d9b74c6b69789de2c9", class = "tz-auth", group = "fingerprint" }
+"dualfp.mdt" = { source = "nonhlos:image/dualfp.mdt", sha256 = "81f6aab9df1cf0756cbc10a8c8033b0a056c9648ec27a3729ec3859806de1566", class = "tz-auth", group = "fingerprint" }
+"gmu_gen70200.bin" = { source = "vendor:firmware/gmu_gen70200.bin", sha256 = "1a2a419c39046d3141fc5fed5aa7f971de2db40cc7a1d89693c3e26fad64dd98", class = "loose" }
+"hpbtfw21.tlv" = { source = "vendor:firmware/hpbtfw21.tlv", sha256 = "d6a195093c572a8bc14745df03bd6029c94e38bb05c68cbd0f1b0bacfe07d547", class = "loose" }
+"hpnv21.b9a" = { source = "vendor:firmware/hpnv21.b9a", sha256 = "d5e53a8676a182fa6bf6f620843acc219895ad681d1f709a5f5899c5c06b5e38", class = "loose" }
+"hpnv21.b9b" = { source = "vendor:firmware/hpnv21.b9b", sha256 = "ddc000543f25dfcdf17645409d94c33eacba762ddea5aa2c4272872af7e22440", class = "loose" }
+"hpnv21.baa" = { source = "vendor:firmware/hpnv21.baa", sha256 = "fa0713e24acaca18b18732dd55a9a5c8b50b6970e973eccbc24706525ac3d723", class = "loose" }
+"hpnv21.bb7" = { source = "vendor:firmware/hpnv21.bb7", sha256 = "669ad42f35e0c6115b223c6bf48b8b3c7fd9ddd815702766bf83cacb29832c40", class = "loose" }
+"hpnv21.bb9" = { source = "vendor:firmware/hpnv21.bb9", sha256 = "8f268a40b41c21fd387daa38a08b7b1d46a7a93b68c52ba0dc43a27c1bb94477", class = "loose" }
+"hpnv21.bin" = { source = "vendor:firmware/hpnv21.bin", sha256 = "9f90fa54f2a80dd15ec59a0c3403b6a86575812d88bc40faaf0bd9077aa69d31", class = "loose" }
+"hpnv21g.b9a" = { source = "vendor:firmware/hpnv21g.b9a", sha256 = "5bc10e0aa22af4077c897afd94de7508d9a86690af8cf358839d07efc08d0cd2", class = "loose" }
+"hpnv21g.b9b" = { source = "vendor:firmware/hpnv21g.b9b", sha256 = "ad664d96903e489a8107e21f1a88659dfb4f4753ad7445af94d2c43c6deeeffe", class = "loose" }
+"hpnv21g.baa" = { source = "vendor:firmware/hpnv21g.baa", sha256 = "ecc81b45a575c1706c2dc8663adbffbaf8507cbf5198c89477e13813094d8632", class = "loose" }
+"hpnv21g.bb7" = { source = "vendor:firmware/hpnv21g.bb7", sha256 = "7b952dec70c7532daed42be1b65db1b44e82f0bcc42b722126f967be1644b3b1", class = "loose" }
+"hpnv21g.bb9" = { source = "vendor:firmware/hpnv21g.bb9", sha256 = "5a4a568e349b7b0d2b85bad8264299929a35ccb6d92e90282229858e91e82179", class = "loose" }
+"hpnv21g.bin" = { source = "vendor:firmware/hpnv21g.bin", sha256 = "a41e2b9927b5fc009300e5e9b06bfff65ee00090693c2288fd07ce10e4937d13", class = "loose" }
+"hwvault.b00" = { source = "nonhlos:image/hwvault.b00", sha256 = "29e9f4294bdcca6f9c44e52012f8f11167e828858c3f19e86be51676c0318532", class = "tz-auth", group = "fingerprint" }
+"hwvault.b01" = { source = "nonhlos:image/hwvault.b01", sha256 = "b9843c2626cca30cec734018bc2b23736de9a5ab513031802b20fbdab6037882", class = "tz-auth", group = "fingerprint" }
+"hwvault.b02" = { source = "nonhlos:image/hwvault.b02", sha256 = "e7236a7193ee067a030c8bf953e5c6a0b22db09884b841101c73bb514a7c2ae4", class = "tz-auth", group = "fingerprint" }
+"hwvault.b03" = { source = "nonhlos:image/hwvault.b03", sha256 = "f7e08a906c7a5f58f32a7eb57a0d09ca9c6f5ac9ab4c43027e6842ee3ffe1f13", class = "tz-auth", group = "fingerprint" }
+"hwvault.b04" = { source = "nonhlos:image/hwvault.b04", sha256 = "9ce910e08284f97fe506bb4cf9aa7fe807dfa9f1626e9d78ff88d968b950e6b8", class = "tz-auth", group = "fingerprint" }
+"hwvault.b05" = { source = "nonhlos:image/hwvault.b05", sha256 = "43966540e33b85173ad2f803a2b10bf9f95f9e56b7964694a0f7796ea05620e0", class = "tz-auth", group = "fingerprint" }
+"hwvault.b06" = { source = "nonhlos:image/hwvault.b06", sha256 = "daa37e2ee37f72acb01c8412d8f3a8cfdd92868b296ba0431d0839dd3f015cf9", class = "tz-auth", group = "fingerprint" }
+"hwvault.b07" = { source = "nonhlos:image/hwvault.b07", sha256 = "f7e08a906c7a5f58f32a7eb57a0d09ca9c6f5ac9ab4c43027e6842ee3ffe1f13", class = "tz-auth", group = "fingerprint" }
+"hwvault.b08" = { source = "nonhlos:image/hwvault.b08", sha256 = "1bdeddc2ca589d74720227222fcab3dee87e41627066ac03cf37427af37ac98e", class = "tz-auth", group = "fingerprint" }
+"hwvault.mdt" = { source = "nonhlos:image/hwvault.mdt", sha256 = "97b2ffb50436966769dea2742853520483962d2a862a23d6bf50c965d34bc4a3", class = "tz-auth", group = "fingerprint" }
+"samsung-board-2.bin" = { source = "derived:board2:bdwlan.elf", sha256 = "962f7c163513584dca338930e0e5b7adcf437daa9609fe83551d8ce456df1e2c", class = "derived", board_name = "bus=pci,vendor=17cb,device=1103,subsystem-vendor=17cb,subsystem-device=0108,qmi-chip-id=2,qmi-board-id=255", driver = "ath11k" }
+"skeymast.b00" = { source = "nonhlos:image/skeymast.b00", sha256 = "afa38cb971283c4fcf6e0b925742045f868785cf169b9371cacdbb1e1b1b95f5", class = "tz-auth", group = "fingerprint" }
+"skeymast.b01" = { source = "nonhlos:image/skeymast.b01", sha256 = "ea9180f9eb7175027444f94a186ad24c82643dfdd23ec672af406ffeb22abb4c", class = "tz-auth", group = "fingerprint" }
+"skeymast.b02" = { source = "nonhlos:image/skeymast.b02", sha256 = "24c11312ce18bf58aa17388f914670cc74ac41303ffc835f3afa105eed2176a4", class = "tz-auth", group = "fingerprint" }
+"skeymast.b03" = { source = "nonhlos:image/skeymast.b03", sha256 = "e26c97f3ce7699a22d13fcdb24df63836e97a9a5c2f87e9fa0ca663f20fabad2", class = "tz-auth", group = "fingerprint" }
+"skeymast.b04" = { source = "nonhlos:image/skeymast.b04", sha256 = "8057b9b84d82ca29162d5152bbf88ca35a73bc17d4ea04b1427af973b03f03da", class = "tz-auth", group = "fingerprint" }
+"skeymast.b05" = { source = "nonhlos:image/skeymast.b05", sha256 = "601a051f5e6b352b2ad69f5ee6385487c696436e7a7757a197ef08a90c1f28fc", class = "tz-auth", group = "fingerprint" }
+"skeymast.b06" = { source = "nonhlos:image/skeymast.b06", sha256 = "c152efeef2f76772d3471bc0e77eaa339483232e0baf15d18626bc3bc3f9a255", class = "tz-auth", group = "fingerprint" }
+"skeymast.b07" = { source = "nonhlos:image/skeymast.b07", sha256 = "e26c97f3ce7699a22d13fcdb24df63836e97a9a5c2f87e9fa0ca663f20fabad2", class = "tz-auth", group = "fingerprint" }
+"skeymast.b08" = { source = "nonhlos:image/skeymast.b08", sha256 = "9aa3a6ddfcaf6050ac28fb48f8f4498e94073eca3d79ee1e53a4a23e697740a8", class = "tz-auth", group = "fingerprint" }
+"skeymast.mdt" = { source = "nonhlos:image/skeymast.mdt", sha256 = "782ce820f9cd42035ca0f8f10916d7ba3d812836212fd85e102c15d3557da083", class = "tz-auth", group = "fingerprint" }
+"stm32_gts9family.bin" = { source = "vendor:firmware/keyboard_stm/stm32_gts9family.bin", sha256 = "1b48d88c23523ae205cd960e6d42725268638a15a47d8a5e52854eb01108caa3", class = "accessory-pinned" }
+"wcn6855-hw20-amss.bin" = { source = "lfw:18cf97993f06c0a28d88cee30b7b646807642acd:ath11k/WCN6855/hw2.0/amss.bin", sha256 = "e12b23ddc4b8d2d2a10a651a5d6fdcd00f60fcae884d2cf5dad17627211fcdfd", class = "external-pinned" }
+"wcn6855-hw20-board-2.bin" = { source = "lfw:18cf97993f06c0a28d88cee30b7b646807642acd:ath11k/WCN6855/hw2.0/board-2.bin", sha256 = "9287fa8d14d915892666b03e9403135875d08371fd1438d2c6d9fe96ae71cf68", class = "external-pinned" }
+"wcn6855-hw20-m3.bin" = { source = "lfw:18cf97993f06c0a28d88cee30b7b646807642acd:ath11k/WCN6855/hw2.0/m3.bin", sha256 = "0c590881870d0e6e98fc7d393ce05690e09287933b1b535e935bf5d98b77713f", class = "external-pinned" }
+"wcn6855-hw20-regdb.bin" = { source = "lfw:18cf97993f06c0a28d88cee30b7b646807642acd:ath11k/WCN6855/hw2.0/regdb.bin", sha256 = "e1b774b1feda4cab01f5a26089124059539fc31544ac34129dce45c8ff26d645", class = "external-pinned" }
+"wcn6855-hw21-amss.bin" = { source = "url:https://raw.githubusercontent.com/CodeLinaro-mirror/ath-firmware_ath11k-firmware/main/WCN6855/hw2.0@nfa765/1.1/WLAN.HSP.1.1-04866.5-QCAHSPSWPL_V1_V2_SILICONZ_IOE-1/amss.bin", sha256 = "8cb5e63877c7cfdc5002a7d28bc5d7f7d20368183e6f93b12c977bfd0351c7b7", class = "external-pinned" }
+"wcn6855-hw21-m3.bin" = { source = "url:https://raw.githubusercontent.com/CodeLinaro-mirror/ath-firmware_ath11k-firmware/main/WCN6855/hw2.0@nfa765/1.1/WLAN.HSP.1.1-04866.5-QCAHSPSWPL_V1_V2_SILICONZ_IOE-1/m3.bin", sha256 = "d20460e104b85a7be9cdb5199c4d8b94a9787912e3f920acd845694d4d71f730", class = "external-pinned" }

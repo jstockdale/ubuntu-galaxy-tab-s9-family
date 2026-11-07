@@ -15,7 +15,12 @@ mirror=${UBUNTU_MIRROR:-http://ports.ubuntu.com/ubuntu-ports}
 libfprint_commit=bebe8565cd7e2c89c0b0c5e6ee7353b80d6a51e1
 quic_teec_commit=736419e25a2036aac3292a10a93e394a90750ca3
 qcbor_commit=4ace4620d549f22c1163c5b00d3ae0c0dae1d207
-package_version=${LIBFPRINT_EL721_VERSION:-1:1.94.7+tod1-0ubuntu5~24.04.8+gts9u47}
+# Keep the base in step with noble-updates: apt refuses the install as a
+# downgrade the moment the archive's libfprint passes this string (it did at
+# ~24.04.9, which killed two release builds on 2026-10-24). Candidate for a
+# smarter scheme: derive the base from the archive's current candidate at
+# build time and append the +gts9uN suffix, so security bumps cannot race us.
+package_version=${LIBFPRINT_EL721_VERSION:-1:1.94.7+tod1-0ubuntu5~24.04.9+gts9u48}
 
 command -v mmdebstrap >/dev/null || {
 	echo 'mmdebstrap is missing; run scripts/install-build-deps.sh' >&2

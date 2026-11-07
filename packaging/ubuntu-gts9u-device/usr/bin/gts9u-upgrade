@@ -18,7 +18,11 @@ set -euo pipefail
 
 zip=${1-}
 keep_dir=/var/lib/ubuntu-gts9u/upgrade
-label=UBTS9U_UFS
+# The root label is scoped per family member (scripts/lib/device.sh).
+case "$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)" in
+	'Samsung Galaxy Tab S9 Wi-Fi') label=UBTS9_UFS ;;
+	*) label=UBTS9U_UFS ;;
+esac
 
 die() { echo "gts9u-upgrade: $*" >&2; exit 1; }
 

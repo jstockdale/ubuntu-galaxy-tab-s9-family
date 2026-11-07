@@ -1,0 +1,40 @@
+Subject: PCI: dwc: wait longer for the QCA6490 link on the Samsung SM-X710
+
+The X710's WCN6855/QCA6490 is powered by pci-pwrctrl inside the host init
+and takes more than the 900 ms dw_pcie_wait_for_link() allows before it is
+detected; this kernel never rescans a late link, so the endpoint was only
+ever found after a suspend/resume cycle re-ran the wait. Wait 3.6 s on
+this board only.
+
+--- a/drivers/pci/controller/dwc/pcie-designware.c	2026-11-05 14:34:27.084299547 -0800
++++ b/drivers/pci/controller/dwc/pcie-designware.c	2026-11-05 14:34:27.099804720 -0800
+@@ -767,17 +767,26 @@
+ int dw_pcie_wait_for_link(struct dw_pcie *pci)
+ {
+ 	u32 offset, val, ltssm;
+-	int retries;
++	int retries, max_retries = PCIE_LINK_WAIT_MAX_RETRIES;
++
++	/*
++	 * Samsung SM-X710 (gts9wifi): the QCA6490 is powered by pci-pwrctrl
++	 * right before this wait and needs well over a second after WLAN_EN
++	 * before its receivers are detected.  Nothing rescans the bus when the
++	 * link trains late, so give it the time here instead.
++	 */
++	if (of_machine_is_compatible("samsung,gts9wifi"))
++		max_retries = 4 * PCIE_LINK_WAIT_MAX_RETRIES;
+ 
+ 	/* Check if the link is up or not */
+-	for (retries = 0; retries < PCIE_LINK_WAIT_MAX_RETRIES; retries++) {
++	for (retries = 0; retries < max_retries; retries++) {
+ 		if (dw_pcie_link_up(pci))
+ 			break;
+ 
+ 		msleep(PCIE_LINK_WAIT_SLEEP_MS);
+ 	}
+ 
+-	if (retries >= PCIE_LINK_WAIT_MAX_RETRIES) {
++	if (retries >= max_retries) {
+ 		/*
+ 		 * If the link is in Detect.Quiet or Detect.Active state, it
+ 		 * indicates that no device is detected.

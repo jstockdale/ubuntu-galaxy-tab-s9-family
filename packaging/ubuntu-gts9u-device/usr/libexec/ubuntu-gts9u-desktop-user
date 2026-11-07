@@ -136,6 +136,30 @@ if [ -d /run/systemd/system ]; then
 			attempt=$((attempt + 1))
 		done
 
+		# The control node is not the end of the story: the CS35L45 speaker
+		# amplifiers keep adding their DSP controls for up to ten seconds
+		# after the card registers (the X710 showed 36.0 s -> 44.7 s), and a
+		# WirePlumber that opens the UCM profile in that window gets no
+		# playback node and never retries.  Wait until the control count has
+		# been stable for three consecutive seconds before refreshing.
+		if [ -e /dev/snd/controlC0 ] && command -v amixer >/dev/null 2>&1; then
+			attempt=0
+			stable=0
+			last=-1
+			while [ "$attempt" -lt 30 ] && [ "$stable" -lt 3 ]; do
+				count=$(amixer -c 0 controls 2>/dev/null | wc -l)
+				if [ "$count" = "$last" ] && [ "$count" -gt 0 ]; then
+					stable=$((stable + 1))
+				else
+					stable=0
+				fi
+				last=$count
+				sleep 1
+				attempt=$((attempt + 1))
+			done
+			echo "ubuntu-gts9u: sound card settled at $last controls after ${attempt}s"
+		fi
+
 		if [ -e /dev/snd/controlC0 ]; then
 			systemctl start "user@$uid.service" || true
 			attempt=0

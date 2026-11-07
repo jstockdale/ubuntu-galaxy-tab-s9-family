@@ -3,10 +3,13 @@
 # Does not rebuild, flash, or replace a boot image.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
-kernel_tree=${KERNEL_WORKTREE:-$base/build/linux-src-gts9uwifi}
-build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-gts9uwifi}
-module_dir=$base/build/spss-irq-module
+kernel_tree=${KERNEL_WORKTREE:-$base/build/linux-src-$DEVICE}
+build_dir=${KERNEL_BUILD_DIR:-$base/build/linux-$DEVICE}
+# Not the kernel stage's tree: this helper runs from the rootfs stage, usually
+# as root, and must not leave files the next user-run kernel stage cannot clean.
+module_dir=${SPSS_IRQ_BUILD_DIR:-$(dirname "$build_dir")/spss-irq-module-$DEVICE-helper}
 out_dir=${SPSS_IRQ_OUT_DIR:-$base/out/spss-irq-module}
 test -f "$build_dir/Module.symvers"
 test -f "$build_dir/certs/signing_key.pem"

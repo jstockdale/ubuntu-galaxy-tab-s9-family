@@ -91,7 +91,47 @@ def main() -> None:
         "--label",
         default="Ubuntu 24.04 for SM-X910",
     )
+    parser.add_argument(
+        "--firmware-identity",
+        metavar="'DEVICE blREV BUILDID'",
+        help="staged-firmware identity line, e.g. 'gts9uwifi bl5 "
+        "X910XXS5CYG1'; the installer compares its revision against the "
+        "tablet's ro.bootloader and refuses a mismatch",
+    )
+    # Which family member the installer must find.  The values come from
+    # scripts/lib/device.sh; the defaults are the Ultra's so an unqualified
+    # invocation keeps producing the original ZIP.
+    parser.add_argument(
+        "--device-model",
+        default="SM-X910",
+        help="Samsung model the tablet's kernel command line must report",
+    )
+    parser.add_argument(
+        "--device-codenames",
+        default="gts9u gts9uwifi",
+        help="recovery codenames accepted for this model, space separated",
+    )
+    parser.add_argument(
+        "--rootfs-label",
+        default="UBTS9U_UFS",
+        help="ext4 label of the root filesystem this ZIP installs or updates",
+    )
     args = parser.parse_args()
+
+    if not args.device_model.startswith("SM-"):
+        raise SystemExit(f"--device-model must be a Samsung model: {args.device_model!r}")
+    if args.firmware_identity is not None:
+        fields = args.firmware_identity.split()
+        if len(fields) != 3 or not fields[1].startswith("bl") \
+                or not fields[1][2:].isdigit():
+            raise SystemExit(
+                f"malformed --firmware-identity: {args.firmware_identity!r}"
+            )
+        if fields[0] not in args.device_codenames.split():
+            raise SystemExit(
+                f"firmware staged for {fields[0]!r} but the ZIP targets "
+                f"{args.device_model} ({args.device_codenames})"
+            )
 
     for name, expected_size in IMAGES.items():
         path = args.bundle / name
@@ -129,6 +169,16 @@ def main() -> None:
         if not args.rootfs.is_file():
             raise SystemExit(f"missing root filesystem image: {args.rootfs}")
         rootfs_size = args.rootfs.stat().st_size
+        # The label the installer will look for has to be the one the image
+        # carries: ext4 keeps it at superblock offset 0x78, 16 bytes.
+        with args.rootfs.open("rb") as image:
+            image.seek(1024 + 0x78)
+            image_label = image.read(16).split(b"\0", 1)[0].decode("ascii", "replace")
+        if image_label != args.rootfs_label:
+            raise SystemExit(
+                f"rootfs image is labelled {image_label!r}; "
+                f"the ZIP targets {args.rootfs_label!r}"
+            )
         # The installer verifies the write by reading the partition back with
         # dd bs=1M, because TWRP's shell has no way to hash a byte range.  A
         # size that is not a whole number of MiB would silently hash the wrong
@@ -189,6 +239,17 @@ def main() -> None:
         )
         add_file(zf, updater_script, "META-INF/com/google/android/updater-script")
         zf.writestr(zip_info("BUNDLE-LABEL"), args.label + "\n")
+        zf.writestr(
+            zip_info("DEVICE-IDENTITY"),
+            f"model={args.device_model}\n"
+            f"bootloader_prefix={args.device_model.split('-', 1)[1]}\n"
+            f"codenames={args.device_codenames}\n"
+            f"rootfs_label={args.rootfs_label}\n",
+        )
+        if args.firmware_identity is not None:
+            zf.writestr(
+                zip_info("FIRMWARE-IDENTITY"), args.firmware_identity + "\n"
+            )
         zf.writestr(zip_info("SHA256SUMS"), manifest)
         if update_manifest:
             zf.writestr(zip_info("UPDATE/manifest.json"), json.dumps(update_manifest, sort_keys=True) + "\n")

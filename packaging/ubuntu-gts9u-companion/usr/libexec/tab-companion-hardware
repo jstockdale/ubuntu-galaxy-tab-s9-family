@@ -889,10 +889,21 @@ class HardwareService:
         self.ble_gatt_failures = 0
         self.ble_next_battery_read = 0.0
 
+    def _sample_once(self):
+        # sample() answers GLib.SOURCE_CONTINUE to stay on its 1 Hz timer.
+        # Handed to idle_add unwrapped, that same return value keeps the idle
+        # source alive, so sample() runs back to back at main-loop speed --
+        # pinning a core and flooding the system bus from the first adapter
+        # Powered change (every bluez package update restarts bluetoothd)
+        # until the service is restarted.  Run one catch-up pass, then drop
+        # the idle source; the 1 Hz timer carries on as before.
+        self.sample()
+        return GLib.SOURCE_REMOVE
+
     def _bluez_properties_changed(self, interface, changed, _invalidated, path=None):
         if interface == BLUEZ_ADAPTER and "Powered" in changed:
             self._set_bluetooth_powered(changed["Powered"])
-            GLib.idle_add(self.sample)
+            GLib.idle_add(self._sample_once)
             return
         if interface == BLUEZ_DEVICE and path == self.ble_device_path:
             if changed.get("Connected") is not None and not changed["Connected"]:

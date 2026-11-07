@@ -10,9 +10,11 @@
 # stdout.  Nothing is flashed.
 set -euo pipefail
 
+repo=$(cd "$(dirname "$0")/.." && pwd)
+. "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 rootfs=${ROOTFS_DIR:-$base/rootfs}
-kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-gts9uwifi}
+kernel_out=${KERNEL_OUT_DIR:-$base/out/kernel-$DEVICE}
 kernel_release=${KERNEL_RELEASE:-$(cat "$kernel_out/kernel.release" 2>/dev/null || echo 7.2.0-rc3)}
 
 test -d "$rootfs/etc" || { echo "missing rootfs: $rootfs" >&2; exit 1; }

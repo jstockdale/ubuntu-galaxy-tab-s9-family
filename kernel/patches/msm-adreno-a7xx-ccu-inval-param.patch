@@ -1,0 +1,54 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 13:28:37.516380074 -0800
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 13:28:37.535031217 -0800
+@@ -53,6 +53,16 @@
+ MODULE_PARM_DESC(gpu_llc, "Let the GPU use the system cache (LLCC) slices (default true)");
+ module_param(gpu_llc, bool, 0444);
+ 
++/*
++ * Bring-up switch for the A740 lost-pixel lattice: what a7xx_submit() does to
++ * the colour/depth caches (CCU) between the user's command buffers and the
++ * completion fence.  1 = mainline (invalidate), 0 = do not touch the CCU,
++ * 2 = clean (write back) and drain before invalidating.
++ */
++int a7xx_ccu_inval = 1;
++MODULE_PARM_DESC(a7xx_ccu_inval, "A7xx end-of-submit CCU handling: 0=none, 1=invalidate (default), 2=clean+idle then invalidate");
++module_param(a7xx_ccu_inval, int, 0444);
++
+ extern const struct adreno_gpulist a2xx_gpulist;
+ extern const struct adreno_gpulist a3xx_gpulist;
+ extern const struct adreno_gpulist a4xx_gpulist;
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c	2026-11-06 13:28:37.518563550 -0800
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c	2026-11-06 13:28:37.535281858 -0800
+@@ -573,11 +573,28 @@
+ 	OUT_PKT7(ring, CP_THREAD_CONTROL, 1);
+ 	OUT_RING(ring, CP_SET_THREAD_BR);
+ 
+-	OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+-	OUT_RING(ring, CCU_INVALIDATE_DEPTH);
++	{
++		extern int a7xx_ccu_inval;
+ 
+-	OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+-	OUT_RING(ring, CCU_INVALIDATE_COLOR);
++		if (a7xx_ccu_inval == 2) {
++			/* write the colour/depth caches back and let them drain first */
++			OUT_PKT7(ring, CP_EVENT_WRITE, 1);
++			OUT_RING(ring, CCU_CLEAN_DEPTH);
++
++			OUT_PKT7(ring, CP_EVENT_WRITE, 1);
++			OUT_RING(ring, CCU_CLEAN_COLOR);
++
++			OUT_PKT7(ring, CP_WAIT_FOR_IDLE, 0);
++		}
++
++		if (a7xx_ccu_inval != 0) {
++			OUT_PKT7(ring, CP_EVENT_WRITE, 1);
++			OUT_RING(ring, CCU_INVALIDATE_DEPTH);
++
++			OUT_PKT7(ring, CP_EVENT_WRITE, 1);
++			OUT_RING(ring, CCU_INVALIDATE_COLOR);
++		}
++	}
+ 
+ 	OUT_PKT7(ring, CP_THREAD_CONTROL, 1);
+ 	OUT_RING(ring, CP_SET_THREAD_BV);

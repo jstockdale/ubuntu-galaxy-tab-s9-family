@@ -1,0 +1,272 @@
+# FTS1BA90A touchscreen on the SM-X710 (gts9wifi)
+
+Status: `kernel/drivers/samsung_fts1ba90a.c` compiles cleanly against the
+X710 7.2-rc3 tree (clang 21, `W=1`, checkpatch clean) as an out-of-tree
+module; it has not yet been flashed or run on the tablet.  The 11" unit under
+test carries an STMicroelectronics FTS1BA90A at I2C 0x49 on `&i2c4` (TLMM
+GPIO 25 attention line), confirmed by TWRP's Samsung kernel binding its
+`fts_touch` driver to `39-0049` and streaming events.  Mainline `st,stmfts`
+probes but times out in `stmfts_command()`: the FingerTipS command set it
+speaks (0xA0 system reset, 0x85/0x86 event reads, 8-byte events) is not what
+this IC's Samsung firmware implements.
+
+The four integration snippets for the other session are in the section
+"Integration snippets" below; the search record and provenance follow.
+
+## Integration snippets
+
+### 1. DTS node for `kernel/dts/sm8550-samsung-gts9wifi.dts`
+
+Replaces the existing `touchscreen@49` node under `&i2c4` (currently
+`compatible = "st,stmfts"`).  The regulator labels `vreg_l14b_3p2` and
+`vreg_l12b_1p8` already exist in that file.
+
+```dts
+&i2c4 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/*
+	 * STMicroelectronics FTS1BA90A (Samsung "FingerTip S").  The stock DTS
+	 * node is compatible "stm,fts_touch" with sec,max_coords <0x640 0xa00>
+	 * (1600 x 2560), tsp_avdd_ldo = L14B 3.2 V, tsp_io_ldo = L12B 1.8 V,
+	 * sec,irq_gpio = TLMM 25, pinctrl input-enable/bias-disable.  The
+	 * downstream driver hardcodes IRQF_TRIGGER_LOW | IRQF_ONESHOT.
+	 *
+	 * Orientation: the controller's native axes are portrait (x 0..1599,
+	 * y 0..2559) while the panel is driven as 2560 x 1600 landscape.  The
+	 * swap + inverted-x pair is the one validated on an SM-X710 by the
+	 * nacht20-de Fedora port and used by the X716B port.
+	 */
+	touchscreen@49 {
+		compatible = "st,fts1ba90a";
+		reg = <0x49>;
+		interrupts-extended = <&tlmm 25 IRQ_TYPE_LEVEL_LOW>;
+		avdd-supply = <&vreg_l14b_3p2>;
+		vdd-supply = <&vreg_l12b_1p8>;
+		touchscreen-size-x = <1600>;
+		touchscreen-size-y = <2560>;
+		touchscreen-inverted-x;
+		touchscreen-swapped-x-y;
+	};
+};
+```
+
+Optional, mirroring the stock `fts1ba90a_attn_irq` pin state (the three
+sibling ports run without it, relying on the bootloader's pin setup):
+
+```dts
+&tlmm {
+	ts_int_default: ts-int-default-state {
+		pins = "gpio25";
+		function = "gpio";
+		bias-disable;
+	};
+};
+```
+
+and in the node: `pinctrl-names = "default"; pinctrl-0 = <&ts_int_default>;`.
+
+If the Goodix GT9916 node at 0x5d is kept for the other 11" units, both
+nodes can coexist on the bus: only the controller that is fitted answers, and
+the other driver fails its probe (the FTS driver with "no ready event" then
+"controller never became ready", -ETIMEDOUT, after about six seconds of
+polling; the rails are released again on that path).
+
+### 2. Install hook for `scripts/build-mainline-kernel.sh`
+
+Modeled on the `samsung_stm32_pogo` hook at lines 504-522.  Place it after
+the `samsung_wacom_w90xx` block (lines 524-543) so `touch_dir` is already
+defined; otherwise add `touch_dir=$kernel_tree/drivers/input/touchscreen`
+first.
+
+```sh
+install -m 0644 "$drv/samsung_fts1ba90a.c" \
+	"$touch_dir/samsung_fts1ba90a.c"
+if ! grep -q 'TOUCHSCREEN_SAMSUNG_FTS1BA90A' "$touch_dir/Kconfig"; then
+	cat >> "$touch_dir/Kconfig" <<'EOF'
+
+config TOUCHSCREEN_SAMSUNG_FTS1BA90A
+	tristate "Samsung Galaxy Tab S9 STMicroelectronics FTS1BA90A touchscreen"
+	depends on I2C
+	depends on REGULATOR
+	help
+	  Driver for the STMicroelectronics FTS1BA90A touch controller in
+	  Samsung's Galaxy Tab S9 (SM-X710) and S9+ (SM-X810).  Mainline's
+	  stmfts cannot drive it: this firmware uses 16-byte events behind
+	  opcodes 0x60/0x61 and an in-band system reset, not the FingerTipS
+	  command set.
+EOF
+fi
+grep -q 'samsung_fts1ba90a.o' "$touch_dir/Makefile" || \
+	printf 'obj-$(CONFIG_TOUCHSCREEN_SAMSUNG_FTS1BA90A) += samsung_fts1ba90a.o\n' \
+		>> "$touch_dir/Makefile"
+```
+
+### 3. Config line for `kernel/config/config-gts9wifi.fragment`
+
+```
+CONFIG_TOUCHSCREEN_SAMSUNG_FTS1BA90A=y
+```
+
+`CONFIG_TOUCHSCREEN_STMFTS=y` can stay or go; the two drivers match different
+compatibles and do not conflict.
+
+### 4. Provenance and protocol summary
+
+#### Where the driver came from
+
+`kernel/drivers/samsung_fts1ba90a.c` is a reuse, not a from-scratch port.
+The lineage, all GPL-2.0:
+
+| Layer | Source | License |
+|---|---|---|
+| Base file | `pmaports-overlay/device/testing/linux-postmarketos-qcom-sm8450/fts1ba90a.c` in [aaronsb/sm-x800-linux](https://github.com/aaronsb/sm-x800-linux) (Galaxy Tab S8+, SM-X800, same IC) | GPL-2.0-only (`LICENSE.md` of that repo for the kernel directory; SPDX header in the file) |
+| Fixes adopted by that file | [aaronsb/sm-x800-linux PR 14](https://github.com/aaronsb/sm-x800-linux/pull/14): chip-ID check, ready-wait requiring eid STATUS, IRQ-zero guard, `ABS_MT_PRESSURE` from byte 6; taken from `kernel/files/fts1ba90a.c` in [nacht20-de/gts9wifi-fedora](https://github.com/nacht20-de/gts9wifi-fedora) (SM-X710, hardware-validated) | GPL-2.0 (SPDX header; repo is MIT except kernel files) |
+| Protocol origin | Samsung's downstream `drivers/input/touchscreen/stm/fts1ba90a/{fts_ts.c,fts_ts.h,fts_sec.c,fts_fwu.c}` and `drivers/input/sec_input/` (SM8450/SM8550 source releases) | GPL-2.0 |
+
+Changes made here relative to aaronsb's file (every one of them):
+
+- Renamed to `samsung_fts1ba90a.c`, driver name `samsung_fts1ba90a`; header
+  comment rewritten to record the lineage above.
+- Added `samsung,fts1ba90a` to the OF match table next to `st,fts1ba90a`.
+- Chip-ID mismatch is now a warning, not `-ENODEV` (downstream behaviour);
+  device ID, firmware/config/main versions and panel geometry are logged in
+  hex.  A failed panel-info read falls back to the 12-bit range (4095) instead
+  of failing the probe; DT `touchscreen-size-x/y` override either value.
+- Power-on and the boot "ready" wait follow Samsung's order (`fts_init`,
+  `fts_reinit`): wait for the ready event after power-on, system-reset only if
+  it does not arrive.  aaronsb's file reset unconditionally after power-on and,
+  on resume, did both.
+- A missing command echo (`0x43 0x01 <cmd>`) after force-calibration,
+  clear-all-event or scan-on is a warning instead of a probe failure; the
+  write itself still takes effect.
+- Palm-type contacts (ttype 5) are reported with `MT_TOOL_PALM` so libinput
+  ignores them; `ABS_MT_TOOL_TYPE` is declared for that.  aaronsb reported
+  palms as fingers; nacht20-de dropped them.
+- A runtime "ready" status event (firmware self-reset after ESD/brown-out)
+  releases all contacts and reapplies the scan configuration from the IRQ
+  thread, as downstream `fts_reinit()` does.  Error status events are named
+  (queue full releases all contacts; ESD is logged); others go to `dev_dbg`.
+- Suspend no longer writes `SENSE_OFF` (0x11) before cutting power; it only
+  disables the IRQ, releases contacts and powers off, which is the path
+  nacht20-de validated on an SM-X710.  Resume reuses the probe start path
+  without calibration; if it fails the IRQ stays disabled and the next resume
+  retries.
+- Power-off moved to a `devm` action registered before the IRQ, with a
+  `powered` flag so suspend/remove cannot unbalance the regulators; the
+  `remove` callback is gone.  `devm_mutex_init` replaces `mutex_init`.
+- `msleep(10)` settles became `usleep_range(10000, 11000)` (checkpatch).
+
+Not carried over from the sibling ports, on purpose: nacht20-de's
+double-tap-to-wake (low-power mode with rails up, sysfs toggle, hard
+dependency on their `wacom_wez01.h` palm-suppression hook) and ygecesefa's
+fingerprint-area sysfs attributes (`fod_rect`/`fod_enable`/`fod_state`,
+patch `0017-input-fts1ba90a-fingerprint-area.patch`).  The latter mirrors the
+Ultra port's Goodix interface so the EL721 libfprint driver works unchanged;
+it is the obvious follow-up once touch itself is proven.
+
+#### Protocol summary (16-byte-event "sec_input" FTS generation)
+
+Transport: 400 kHz I2C at 0x49.  Every read is a command write followed by a
+repeated-start read.  Writes are plain.
+
+Commands used:
+
+| Opcode | Meaning | Notes |
+|---|---|---|
+| `0xFA 20 00 00 24 81` | system reset (memory-mapped register write) | 10 ms, then read `0xFA 20 00 00 78` (1 byte) for CRC status; bits [1:0] set = firmware CRC error |
+| `0x22` | read device ID, 5 bytes | bytes 2,3 = `0x39 0x36` for FTS1BA90A |
+| `0x24` | read firmware version, 9 bytes | fw BE16 at 0, config BE16 at 2, main LE16 at 4 |
+| `0x23` | read panel info, 11 bytes | max x BE16 at 0, max y BE16 at 2, tx/rx channel counts at 8/9 |
+| `0x30 <lo> <hi>` | set touch function mask | `0x61 0x00` = touch, palm, wet |
+| `0x13` | force calibration | echoed; probe only |
+| `0x62` | clear event FIFO | echoed |
+| `0xA0 00 <mode>` | set scan mode | `0x01` = mutual + self scan ("sense on"), `0x00` = off; echoed |
+| `0x60` | read one event (16 bytes) | byte 7 bits [5:0] = events still queued |
+| `0x61` | read all remaining events | `n * 16` bytes, n from the previous one-event read, FIFO depth 32 |
+
+Event layout, byte 0 bits [1:0] = event id:
+
+- `0` coordinate: bits [5:2] slot (0..9), bits [7:6] action (1 press, 2 move,
+  3 release); byte 1 = x[11:4], byte 2 = y[11:4], byte 3 = x[3:0] << 4 |
+  y[3:0]; byte 4 major, byte 5 minor; byte 6 = ttype[3:2] << 6 | z[5:0];
+  byte 7 = ttype[1:0] << 6 | left_events[5:0].  ttype 0 normal, 3 glove,
+  5 palm, 6 wet; others (hover, stylus, proximity) are ignored.
+- `1` status: bits [5:2] type (1 error, 2 info), byte 1 id.  Info/`0x00` is
+  the boot "ready" event; error `0x01` queue full, `0x02` ESD.
+- Full byte 0 `0x43` with byte 1 `0x01` is a command echo (bytes 2.. repeat
+  the command); `0xF3` is a boot error report.
+- `2` gesture and `3` vendor events are not used by this driver.
+
+Init order (downstream `fts_init`, as implemented):
+
+1. `vdd` (1.8 V IO) on, 1 ms, `avdd` (3.2 V) on, 10 ms.
+2. Poll `0x60` every 20 ms, up to 3 s, for the ready status event.  If it
+   never comes: system reset, 10 ms, CRC status, poll again.
+3. Read `0x22`, `0x24`, `0x23`; log; warn on an unexpected chip ID.
+4. `0x30 61 00`, 10 ms; `0x13` (probe only), `0x62`, `0xA0 00 01`, each
+   followed by polling `0x60` for its echo, up to 5 s.
+5. Request the level-low IRQ (trigger from DT), `IRQF_ONESHOT`.
+
+IRQ: read one event; if byte 7 says more are queued, read them all with
+`0x61`; decode; `input_mt_sync_frame` + `input_sync`.  Slots are not
+`INPUT_MT_DROP_UNUSED` because the controller reports only changed contacts.
+
+Suspend: disable IRQ, release all slots, `avdd` off, 4 ms, `vdd` off.
+Resume: steps 1, 2 and 4 (no calibration), then enable IRQ.
+
+#### What to expect on first boot
+
+```
+samsung_fts1ba90a N-0049: device id .. .. 39 36 .., fw 0x...., config 0x...., main 0x....
+samsung_fts1ba90a N-0049: panel 1600 x 2560, tx/rx channels NN/NN
+input: STMicroelectronics FTS1BA90A as /devices/.../i2c-N/N-0049/input/inputM
+```
+
+`N` is the mainline adapter number of `&i2c4`, which is dynamic without an
+alias (the nacht20-de port saw `10-0049`).
+
+Then `evtest` on that input: a finger at the panel's top-left in landscape
+should give small `ABS_MT_POSITION_X` and `ABS_MT_POSITION_Y`; if an axis is
+mirrored or the two are swapped, adjust `touchscreen-inverted-x/y` and
+`touchscreen-swapped-x-y` in the DTS node (no driver change needed).  A
+"no echo for command .." warning during probe is harmless unless touch is also
+dead; "unexpected chip id" means a different firmware revision and is worth
+recording.
+
+## Search record (step 1)
+
+Searched before writing anything, in this order.  Nothing here was executed;
+downloaded files sit under the session scratchpad only.
+
+| Where | Result |
+|---|---|
+| agcarbajo's repos ([postmarketos-galaxy-tab-s9-ultra](https://github.com/agcarbajo/postmarketos-galaxy-tab-s9-ultra), this repo; local copy `~/ubuntu-gts9u/pmos-reference`) | Ultra only; touch is Goodix GT9916 (`goodix_berlin`).  No FTS driver. |
+| Azkali: [Azkali/sm8550-mainline](https://github.com/Azkali/sm8550-mainline) branch `gts9wifi-7.0` ("Mainline kernel for Samsung Tab S9 11"", fork of map220v/sm8550-mainline), [Azkali/gts9wifi-firmware](https://github.com/Azkali/gts9wifi-firmware) | The DTS (`arch/arm64/boot/dts/qcom/sm8550-samsung-gts9wifi.dts`, BSD-3-Clause, Azkali Manad 2026) has only a `goodix,gt9916` node at 0x5d; `drivers/input/touchscreen/{Kconfig,Makefile}` on that branch have no fts1ba90a entry.  Azkali's unit is a Goodix one.  The `st,fts1ba90a` compatible seen in a "pmOS DTB" therefore comes from the nacht20-de lineage below, not from Azkali's tree.  gitlab.postmarketos.org / pmaports has no gts9 device package. |
+| Fedora effort: [nacht20-de/gts9wifi-fedora](https://github.com/nacht20-de/gts9wifi-fedora) (SM-X710) | `kernel/files/fts1ba90a.c` (GPL-2.0, 18.9 kB): compatible `st,fts1ba90a`, supplies `avdd`/`vddio`, double-tap-to-wake, palm drop, depends on their `wacom_wez01.h`.  DTS node with `interrupts-extended = <&tlmm 25 IRQ_TYPE_LEVEL_LOW>`, size 1600x2560, `touchscreen-inverted-x`, `touchscreen-swapped-x-y`, `wakeup-source`.  Config `CONFIG_TOUCHSCREEN_FTS1BA90A=y`.  Credits Azkali and agcarbajo as prior art. |
+| [kquote03/linux-gts9](https://github.com/kquote03/linux-gts9) (SM-X716B 5G) | `kernel/drivers/touchscreen-fts1ba90a-x716.c` (GPL-2.0-only, 15.8 kB): independent port with line-by-line citations into Samsung's `fts_ts.c`; compatible `stm,fts_touch`; hardcodes `IRQF_TRIGGER_LOW`; no suspend.  Also vendors nacht20-de's tree.  Confirms 1600x2560 from `sec,max_coords` of the r04 board and that r00 boards used 1752x2800. |
+| [aaronsb/sm-x800-linux](https://github.com/aaronsb/sm-x800-linux) (Tab S8+, SM8450) | `fts1ba90a.c` (GPL-2.0-only, 16.3 kB), the base chosen here (see above).  Its DTS comment documents the stmfts failure mode (-110) on this IC. |
+| [ygecesefa/gts9wifi-ubuntu-port](https://github.com/ygecesefa/gts9wifi-ubuntu-port) (SM-X710, Ubuntu 24.04, forked from this repo's Ultra port) | No driver file in-tree (it builds nacht20-de's), but two patches on it: `0006-input-fts1ba90a-read-wake-gesture-after-bus-resume.patch` and `0017-input-fts1ba90a-fingerprint-area.patch` (FOD sysfs interface for the EL721).  MIT repo; patches carry no SPDX. |
+| lore.kernel.org / linux-input | No FTS1BA90A or "new-protocol stmfts" submission found; `drivers/input/touchscreen/stmfts.c` upstream is still the 8-byte-event FingerTipS driver. |
+| Local: `/run/media/jstockdale/writable/gts9u-scratch/touch-src` | `listing.txt` names `drivers/input/touchscreen/stm/fts1ba90a/{fts_ts.c,fts_ts.h,fts_fwu.c,fts_sec.c}` but only `drivers/input/sec_input/{sec_input.h,sec_cmd.h}` were actually extracted. |
+| Local: `~/projects/ubuntu-touch-gts9` | Samsung kernel import under `devices/gts9pwifi/imports/kernel-samsung-gts9wifi` has no `drivers/input/touchscreen`; the X810 stock DTS there (`gts9pwifi_eur_open_w00_r04.dts`) gives the `stm,fts_touch` node, `fts1ba90a_attn_irq` pin states (gpio25, input-enable, bias-disable; bias-pull-down in suspend) and `sec,max_coords <0x6d8 0xaf0>` (1752x2800) for the 12.4" S9+.  No mainline-side touch work. |
+| Samsung downstream for cross-checking | `fts_ts.c`/`fts_ts.h` from the GitHub mirror [ianmacd/winnerx](https://github.com/ianmacd/winnerx) (Galaxy Fold, older 8-byte-event firmware generation): same opcodes (0x22/0x23/0x24/0x30/0x13/0x60/0x61/0x62/0xA0, 0xFA reset), same `fts_init` order and delays, same `fts_wait_for_ready` loop.  Event size differs (8 vs 16), so the 16-byte layout above is taken from the three Tab S8/S9 ports, which agree with each other and with `sec_input.h`. |
+
+## Guesses and open points
+
+- IRQ polarity is not a guess: stock pin state is input/bias-disable,
+  downstream hardcodes `IRQF_TRIGGER_LOW`, and all three sibling ports use
+  `IRQ_TYPE_LEVEL_LOW`.
+- Orientation flags are taken from the SM-X710-validated nacht20-de DTS; they
+  assume the panel is exposed as 2560x1600 landscape, which this repo's
+  `panel-samsung-ana38407.c` gts9wifi mode does (hdisplay 2560, vdisplay
+  1600).  Still confirm with `evtest` on first boot.
+- Supply voltage: the stock X710 DTS names L14B for `tsp_avdd_ldo`.  This
+  repo's `vreg_l14b_3p2` is pinned to 3.2 V (min = max = 3200000), matching
+  the stock vote the X716B port settled on after root-causing a touch crash to
+  a wrong AVDD value; nacht20-de's label says 3.3 V but the IC tolerates both.
+- Suspend/resume and the runtime self-reset path are untested on hardware.
+- The force-calibration step (0x13) on every probe is what Samsung's
+  `fts_init` does; nacht20-de's X710 driver skips it and still works, so it
+  can be dropped if it ever misbehaves.

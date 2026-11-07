@@ -1,0 +1,38 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 16:06:30.671041835 -0800
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c	2026-11-06 16:06:30.691679798 -0800
+@@ -74,6 +74,14 @@
+ MODULE_PARM_DESC(gpu_scm_init, "A740: secure-world GPU init request bits to issue (0 = none, default)");
+ module_param(gpu_scm_init, int, 0444);
+ 
++/*
++ * Bring-up switch: GPU hub clock rate in Hz (0 = driver default, 200 MHz on
++ * the A740 family).  The SM8550 hub clock also supports 300 and 400 MHz.
++ */
++unsigned int gmu_hub_hz;
++MODULE_PARM_DESC(gmu_hub_hz, "GPU hub clock rate in Hz (0 = default)");
++module_param(gmu_hub_hz, uint, 0444);
++
+ extern const struct adreno_gpulist a2xx_gpulist;
+ extern const struct adreno_gpulist a3xx_gpulist;
+ extern const struct adreno_gpulist a4xx_gpulist;
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c	2026-11-06 16:06:30.675096538 -0800
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c	2026-11-06 16:06:30.692000698 -0800
+@@ -1335,8 +1335,16 @@
+ 
+ 	/* Use a known rate to bring up the GMU */
+ 	clk_set_rate(gmu->core_clk, 200000000);
+-	clk_set_rate(gmu->hub_clk, adreno_is_a740_family(adreno_gpu) ?
+-		     200000000 : 150000000);
++	{
++		extern unsigned int gmu_hub_hz;
++		unsigned long hub = adreno_is_a740_family(adreno_gpu) ? 200000000 : 150000000;
++
++		if (gmu_hub_hz) {
++			hub = gmu_hub_hz;
++			dev_info_once(gmu->dev, "GPU hub clock requested at %lu Hz (msm.gmu_hub_hz)\n", hub);
++		}
++		clk_set_rate(gmu->hub_clk, hub);
++	}
+ 	ret = clk_bulk_prepare_enable(gmu->nr_clocks, gmu->clocks);
+ 	if (ret)
+ 		goto rpm_put;
