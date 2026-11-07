@@ -33,3 +33,21 @@ reflashea su ZIP.
 
 Si se activa el parche de consola con `APPLY_IGNORE_CONSOLE_NULL=1`, hay que
 añadir `ignore_console_null` aquí y regenerar `vendor_boot`.
+
+## Experimentos sin tocar este fichero
+
+Este `cmdline.txt` lo comparten el X910 y el X710, así que un experimento de
+un solo tablet no se hace editándolo. `scripts/build-android-v4-bundle.sh` acepta
+dos variables:
+
+- `GTS9U_EXTRA_CMDLINE`: parámetros que se añaden al final.
+- `GTS9U_DROP_CMDLINE`: parámetros de este fichero que se quitan de esa
+  imagen, por ejemplo `GTS9U_DROP_CMDLINE=pd_ignore_unused`. Cada uno tiene que
+  ser una palabra completa del fichero: una errata hace fallar la build en vez
+  de empaquetar la cmdline sin cambios. `root=` no se puede quitar.
+
+`clk_ignore_unused`, `pd_ignore_unused` y `regulator_ignore_unused` siguen
+aquí desde la puesta en marcha. Qué apaga cada uno en el X710 y las imágenes
+para probarlos de uno en uno: `docs/gts9wifi-bringup-flags.md` y
+`tools/inplace/flags/`. No se quitan de este fichero hasta probarlos en los
+dos tablets.
