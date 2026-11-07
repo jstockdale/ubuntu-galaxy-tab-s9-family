@@ -7,7 +7,7 @@ aea4987d6ed008b58190c164e8783327ee0bf41684d9bbf392168c383b266df3  files/usr/lib/
 ccc80e512f41bb2d52ecf5bce6c107ffcfff3bfe23831db59b355e7933aa9480  files/usr/lib/systemd/system/gts9u-bringup-sdlog.timer
 4b48ef11cb4f846b88059d494bda667a1c08ff417a4defdccfc455b1a84bafb2  files/usr/lib/systemd/system/ubuntu-gts9u-fingerprint-secure.service
 5e1601ffd343602e8058db5f6f9ee6310c7b3412c1408323fcb19a12a9c56d10  files/usr/lib/systemd/system/ubuntu-gts9u-fingerprint-ui.service
-ad4d0349c8a073abf239657760b0ef228537df7846a57fe5f44be8ecc9d59273  files/usr/lib/systemd/system/ubuntu-gts9u-panel-coldboot-recover.service
+c87cb9363c8f118f234466a62cc7c0e2ae388e465950c5d23311f8d4549e4266  files/usr/lib/systemd/system/ubuntu-gts9u-panel-coldboot-recover.service
 20fbdd763cec359bb46408eabe40c54901a1540b01627a64493f87253c4229f9  files/usr/lib/systemd/system/ubuntu-gts9u-pogo-firmware.service
 799b512047f6e73b5b5ae00ef082f88b47cf68dc1cb50bb1897e7d6f186cffdf  files/usr/lib/systemd/system/ubuntu-gts9u-pstore-archive.service
 babc1eb3bd978a875dd16f024b31cb03faf83dfd6c544798fcc236435187ff10  files/usr/lib/systemd/system/ubuntu-gts9u-qcomtee.service
