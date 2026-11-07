@@ -28,13 +28,18 @@
 #   on              enable in every case
 #   off             disable in every case (the escape hatch if a board's link
 #                   misbehaves in L1.2: AER errors, Wi-Fi stalls)
+#
+# The outcome is also left in /run/ubuntu-gts9u/pci-rescan (key=value), so it
+# can be checked without the journal, which may not hold the early boot.
 set -u
 
 ep=/sys/bus/pci/devices/0000:01:00.0
 rp=/sys/bus/pci/devices/0000:00:00.0
 policy_file=/etc/ubuntu-gts9u/pcie-l1ss
+state=/run/ubuntu-gts9u/pci-rescan
 
 log() { echo "gts9u-pci-rescan: $*" >&2; }
+record() { echo "$1=$2" >> "$state" 2>/dev/null || :; }
 bound() { [ -e "$ep/driver" ]; }
 driver() { basename "$(readlink -f "$ep/driver")"; }
 link_states() {
@@ -52,9 +57,12 @@ if [ -r "$policy_file" ]; then
 	esac
 fi
 
+mkdir -p "${state%/*}" 2>/dev/null && : > "$state" 2>/dev/null
+record policy "$policy"
 rescanned=0
 if bound; then
 	log "endpoint bound to $(driver) at boot; nothing to rescan"
+	record outcome bound-at-boot
 else
 	# --- 1. probe again in place -------------------------------------------
 	if [ -e "$ep" ]; then
@@ -65,7 +73,10 @@ else
 			sleep 1
 			i=$((i + 1))
 		done
-		bound && log "re-probe bound $(driver)"
+		if bound; then
+			log "re-probe bound $(driver)"
+			record outcome reprobed
+		fi
 	fi
 	# --- 2./3. re-create -----------------------------------------------------
 	attempt=1
@@ -92,10 +103,15 @@ else
 	done
 	if ! bound; then
 		log 'no driver-bound PCIe endpoint after rescans'
+		record outcome unbound
 		exit 0
 	fi
-	[ "$rescanned" = 1 ] && log "endpoint bound to $(driver) after a rescan"
+	if [ "$rescanned" = 1 ]; then
+		log "endpoint bound to $(driver) after a rescan"
+		record outcome rescanned
+	fi
 fi
+record driver "$(driver)"
 
 # --- L1 substates ------------------------------------------------------------------
 want=
@@ -121,6 +137,8 @@ if [ -n "$want" ] && [ -d "$ep/link" ]; then
 			log "writing $want to link/$a failed"
 	done
 	log "L1 substates set to $want (policy $policy)"
+	record l1ss "$want"
 fi
 log "link: $(link_states)"
+record link "$(link_states)"
 exit 0

@@ -111,7 +111,7 @@ class WlanAddressTest(unittest.TestCase):
 
     def script(self):
         text = SCRIPT.read_text()
-        pattern = re.compile(r"/run/systemd/network|/run/ubuntu-gts9u-wlan-efs|"
+        pattern = re.compile(r"/run/systemd/network|/run/ubuntu-gts9u-wlan-efs|/run/ubuntu-gts9u/|"
                              r"/sys/class/net|/sys/class/block|/proc/mounts|/dev/(?!null)")
         return pattern.sub(lambda match: str(self.root) + match.group(0), text)
 
@@ -133,6 +133,10 @@ class WlanAddressTest(unittest.TestCase):
     def link(self):
         return (self.root / LINK).read_text()
 
+    def state(self):
+        path = self.root / "run/ubuntu-gts9u/wlan-address"
+        return dict(line.split("=", 1) for line in path.read_text().splitlines())
+
     def assert_unmounted(self):
         self.assertEqual((self.root / "proc/mounts").read_text(), "")
         self.assertFalse((self.root / "run/ubuntu-gts9u-wlan-efs").exists())
@@ -145,6 +149,11 @@ class WlanAddressTest(unittest.TestCase):
         self.assertIn("ip link set dev wlp1s0 address 68:df:e4:12:34:56", self.calls())
         self.assertIn("00:03:7f:12:09:4b -> 68:df:e4:12:34:56", result.stderr)
         self.assert_unmounted()
+        self.assertEqual(self.state(), {
+            "address": "68:df:e4:12:34:56",
+            "link": str(self.root / LINK),
+            "wlp1s0": "set-from 00:03:7f:12:09:4b",
+            "result": "ok"})
 
     def test_efs_is_mounted_read_only_and_unmounted(self):
         self.interface()
@@ -169,6 +178,14 @@ class WlanAddressTest(unittest.TestCase):
         result = self.run_script()
         self.assertIn("no Wi-Fi interface yet", result.stderr)
         self.assertFalse(any(c.startswith("ip ") for c in self.calls()))
+        self.assertEqual(self.state()["interface"], "none-yet")
+
+    def test_state_is_per_run(self):
+        self.interface()
+        self.run_script()
+        self.efs_mac("garbage")
+        self.run_script()
+        self.assertEqual(self.state(), {"result": "no-valid-efs-address"})
 
     def test_interface_that_is_up_is_left_alone(self):
         self.interface(flags="0x1003")
@@ -176,6 +193,7 @@ class WlanAddressTest(unittest.TestCase):
         self.assertEqual(self.address(), "00:03:7f:12:09:4b")
         self.assertFalse(any(c.startswith("ip ") for c in self.calls()))
         self.assertIn("already up", result.stderr)
+        self.assertEqual(self.state()["wlp1s0"], "up-left-alone 00:03:7f:12:09:4b")
         # ... but the next creation gets it.
         self.assertIn("MACAddress=68:df:e4:12:34:56", self.link())
 
@@ -209,6 +227,7 @@ class WlanAddressTest(unittest.TestCase):
                 self.assertIn("no valid wifi/.mac.info", result.stderr)
                 self.assertFalse((self.root / LINK).exists())
                 self.assert_unmounted()
+                self.assertEqual(self.state(), {"result": "no-valid-efs-address"})
 
     def test_multicast_and_zero_addresses_are_refused(self):
         for text in ("01:00:5E:00:00:01", "00:00:00:00:00:00"):
@@ -265,6 +284,7 @@ class WlanAddressTest(unittest.TestCase):
         self.assertFalse((self.root / LINK).exists())
         self.assertFalse(any(c.startswith(("ip ", "udevadm")) for c in self.calls()))
         self.assert_unmounted()
+        self.assertFalse((self.root / "run/ubuntu-gts9u/wlan-address").exists())
 
 
 if __name__ == "__main__":

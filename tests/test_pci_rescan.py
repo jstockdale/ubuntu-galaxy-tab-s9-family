@@ -67,7 +67,7 @@ fi
 exit 0
 """
 
-TOOLS = ("cat", "tr", "ls", "readlink", "basename")
+TOOLS = ("cat", "tr", "ls", "readlink", "basename", "mkdir")
 
 
 class PciRescanTest(unittest.TestCase):
@@ -110,7 +110,7 @@ class PciRescanTest(unittest.TestCase):
         (self.root / "etc/ubuntu-gts9u/pcie-l1ss").write_text(text)
 
     def run_script(self):
-        text = re.sub(r"/sys/bus/pci|/etc/ubuntu-gts9u",
+        text = re.sub(r"/sys/bus/pci|/etc/ubuntu-gts9u|/run/ubuntu-gts9u",
                       lambda match: str(self.root) + match.group(0), SCRIPT.read_text())
         env = dict(os.environ, FAKE_ROOT=str(self.root),
                    PATH="%s:%s" % (self.root / "bin", self.root / "tools"))
@@ -126,6 +126,10 @@ class PciRescanTest(unittest.TestCase):
     def substates(self):
         return {a: (self.root / EP / "link" / a).read_text().strip() for a in SUBSTATES}
 
+    def state(self):
+        path = self.root / "run/ubuntu-gts9u/pci-rescan"
+        return dict(line.split("=", 1) for line in path.read_text().splitlines())
+
     # --- bound at boot: the vendor_boot firmware did its job ------------
     def test_bound_at_boot_is_a_no_op(self):
         self.endpoint(bound=True)
@@ -134,6 +138,9 @@ class PciRescanTest(unittest.TestCase):
         self.assertNotIn("sleep", " ".join(self.calls()))
         self.assertEqual(set(self.substates().values()), {"1"})
         self.assertIn("link: l0s_aspm=1 l1_aspm=1 l1_1_aspm=1", result.stderr)
+        self.assertEqual(self.state(), {
+            "policy": "auto", "outcome": "bound-at-boot", "driver": "ath11k_pci",
+            "link": "l0s_aspm=1 l1_aspm=1 l1_1_aspm=1 l1_2_aspm=1 l1_1_pcipm=1 l1_2_pcipm=1 "})
 
     def test_bound_at_boot_keeps_whatever_the_kernel_chose(self):
         self.endpoint(bound=True, substates="0")
@@ -153,6 +160,8 @@ class PciRescanTest(unittest.TestCase):
         # nothing writes them.
         self.assertEqual(set(self.substates().values()), {"1"})
         self.assertNotIn("L1 substates set", result.stderr)
+        self.assertEqual(self.state()["outcome"], "reprobed")
+        self.assertNotIn("l1ss", self.state())
 
     # --- re-probe fails: re-create, then re-enable the substates ------------------
     def test_recreated_endpoint_gets_its_substates_back(self):
@@ -166,6 +175,8 @@ class PciRescanTest(unittest.TestCase):
         self.assertIn("endpoint bound to ath11k_pci after a rescan", result.stderr)
         self.assertEqual(set(self.substates().values()), {"1"})
         self.assertIn("L1 substates set to 1 (policy auto)", result.stderr)
+        self.assertEqual(self.state()["outcome"], "rescanned")
+        self.assertEqual(self.state()["l1ss"], "1")
 
     def test_late_link_rescans_the_root_port(self):
         self.scenario("rescan-binds")
@@ -187,6 +198,7 @@ class PciRescanTest(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(sum(1 for line in result.stderr.splitlines() if ": attempt " in line), 4)
         self.assertIn("no driver-bound PCIe endpoint after rescans", result.stderr)
+        self.assertEqual(self.state(), {"policy": "auto", "outcome": "unbound"})
 
     # --- /etc/ubuntu-gts9u/pcie-l1ss ---------------------------------------------
     def test_policy_off_disables_even_at_boot(self):
