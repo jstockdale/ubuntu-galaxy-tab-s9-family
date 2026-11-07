@@ -42,8 +42,8 @@ mkdir -p "$out"
 chgrp adm "$top" "$out"
 chmod 2750 "$top" "$out"
 d=/sys/kernel/debug
-tr=/sys/kernel/tracing
-[ -d "$tr/events" ] || tr=$d/tracing
+tracefs=/sys/kernel/tracing
+[ -d "$tracefs/events" ] || tracefs=$d/tracing
 
 ok() { echo "  ok     $*"; }
 ck() { echo "  CHECK  $*"; }
@@ -74,8 +74,8 @@ cp "$d/devices_deferred" "$out/devices_deferred.txt" 2>/dev/null
 find /sys/devices -maxdepth 6 -name state_synced 2>/dev/null | while read -r f; do
 	echo "${f%/state_synced} $(cat "$f")"
 done | sort > "$out/state_synced.txt"
-trace_on=$(cat "$tr/events/clk/clk_disable/enable" 2>/dev/null || echo 0)
-[ "$trace_on" = 1 ] && cp "$tr/trace" "$out/trace.txt"
+trace_on=$(cat "$tracefs/events/clk/clk_disable/enable" 2>/dev/null || echo 0)
+[ "$trace_on" = 1 ] && cp "$tracefs/trace" "$out/trace.txt"
 
 # Enabled in hardware with enable count 0, from clk_summary: the input of
 # clk_disable_unused() (it acts only on those whose ops can disable them).
@@ -146,6 +146,8 @@ if [ "$want_clk" = 0 ]; then
 				print $(k + 2), substr(ev, 1, length(ev) - 1), tss }' "$out/trace.txt" > "$out/clk-disabled-at-boot.txt"
 		if [ -n "$first" ] && awk -v f="$first" -v t="$tc" 'BEGIN {exit !(f + 0 > t + 0)}'; then
 			ck "the trace buffer wrapped (first event after the cleanup): the list below is incomplete"
+		elif [ -n "$hd" ] && [ "${hd% *}" != "${hd#* }" ]; then
+			ck "the ring buffer overwrote $(( ${hd#* } - ${hd% *} )) events: if they include the cleanup, the list below is incomplete"
 		fi
 		sed 's/^/  info   /' "$out/clk-disabled-at-boot.txt"
 		got=$(awk '$2 == "clk_disable" {print $1}' "$out/clk-disabled-at-boot.txt" | sort -u)
