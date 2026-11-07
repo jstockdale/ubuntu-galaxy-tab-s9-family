@@ -20,7 +20,10 @@
  * The input report was decoded from 5200 captured frames.  Pressure is
  * non-zero in exactly the frames whose status byte has bit 4 set and zero in
  * all 5059 others, which is what makes the tip bit and the pressure field
- * certain rather than plausible.
+ * certain rather than plausible.  Bytes 7 to 9 are the hover height, then
+ * tilt X and tilt Y, as Samsung's X710 driver reads them
+ * (wacom_i2c_coord_handler()); an earlier decode here took byte 7 for tilt X,
+ * so "tilt X" was really the height and the distance was really tilt Y.
  */
 
 #include <linux/atomic.h>
@@ -100,16 +103,44 @@
 #define WACOM_REPORT_X		1
 #define WACOM_REPORT_Y		3
 #define WACOM_REPORT_PRESSURE	5
-#define WACOM_REPORT_TILT_X	7
-#define WACOM_REPORT_TILT_Y	8
-#define WACOM_REPORT_DISTANCE	9
+#define WACOM_REPORT_HEIGHT	7
+#define WACOM_REPORT_TILT_X	8
+#define WACOM_REPORT_TILT_Y	9
 
 /*
  * Bit 15 of the pressure word is set in every frame, with or without contact,
- * so it marks the field rather than scaling it.  The device tree caps pressure
- * at 4095, which fits comfortably in the remaining fifteen bits.
+ * so it marks the field rather than scaling it.  Pressure is the low twelve
+ * bits, as Samsung reads it ((data[5] & 0x0f) << 8 | data[6]), which is also
+ * the 4095 the device tree caps it at.
  */
-#define WACOM_PRESSURE_MASK	GENMASK(14, 0)
+#define WACOM_PRESSURE_MASK	GENMASK(11, 0)
+
+/*
+ * The height byte is a distance: 0 at contact, rising as the pen goes up to
+ * about 90 to 103 where it leaves range (the query's 255 is the field's
+ * width, not the range), measured on an SM-X710 on 2026-11-07.  It is
+ * ABS_DISTANCE as it stands, as in Samsung's driver.
+ *
+ * The side button split (side_button_split, off by default) calls the pen
+ * near or far on it, with hysteresis so that a pen held at the boundary does
+ * not flicker between the two: near at a height of 36 or less and far again
+ * only above 44, which the owner found best by hand on 2026-11-07 (a 45/55
+ * band, about halfway down the range, felt too high).  Both are attributes.
+ */
+#define WACOM_SIDE_NEAR_HEIGHT		36
+#define WACOM_SIDE_FAR_HEIGHT		44
+
+enum samsung_wacom_side {
+	WACOM_SIDE_UP,		/* not pressed */
+	WACOM_SIDE_FAR,		/* pressed far: BTN_STYLUS while held */
+	WACOM_SIDE_NEAR,	/* pressed near: contacts are right clicks */
+};
+
+enum samsung_wacom_contact {
+	WACOM_CONTACT_UP,
+	WACOM_CONTACT_TIP,	/* an ordinary contact: BTN_TOUCH and pressure */
+	WACOM_CONTACT_RIGHT,	/* a contact begun with a near press: BTN_STYLUS2 */
+};
 
 /*
  * The controller powers up at its slowest rate and stays there: measured, the
@@ -259,6 +290,18 @@ struct samsung_wacom {
 	bool docked;
 	bool cover_closed;
 	bool disable_when_docked;
+	/*
+	 * Side button split.  side, contact and near are guarded by lock, like
+	 * in_range, because leaving range resets them; the three settings are
+	 * read with READ_ONCE.  height is the last frame's, for pen_height.
+	 */
+	bool side_button_split;
+	u8 side_near_height;
+	u8 side_far_height;
+	u8 height;
+	bool near;
+	enum samsung_wacom_side side;
+	enum samsung_wacom_contact contact;
 	bool pen_irq_disabled;
 	/* Dock detect is armed for system wake (board policy, set at probe). */
 	bool pdct_wake;
@@ -865,6 +908,108 @@ static ssize_t disable_digitizer_when_docked_store(
 }
 static DEVICE_ATTR_RW(disable_digitizer_when_docked);
 
+static ssize_t side_button_split_show(
+	struct device *dev, struct device_attribute *attribute, char *buf)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(wacom->side_button_split));
+}
+
+/* Takes effect from the next press; one already held keeps what it is. */
+static ssize_t side_button_split_store(
+	struct device *dev, struct device_attribute *attribute,
+	const char *buf, size_t count)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+	WRITE_ONCE(wacom->side_button_split, enabled);
+	return count;
+}
+static DEVICE_ATTR_RW(side_button_split);
+
+/*
+ * The hysteresis thresholds, in height units.  A near height above the far
+ * one is read as the far one, which leaves no hysteresis.
+ */
+static ssize_t samsung_wacom_store_height(u8 *field, const char *buf,
+					  size_t count)
+{
+	u8 value;
+	int ret;
+
+	ret = kstrtou8(buf, 0, &value);
+	if (ret)
+		return ret;
+	WRITE_ONCE(*field, value);
+	return count;
+}
+
+static ssize_t side_button_near_height_show(
+	struct device *dev, struct device_attribute *attribute, char *buf)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(wacom->side_near_height));
+}
+
+static ssize_t side_button_near_height_store(
+	struct device *dev, struct device_attribute *attribute,
+	const char *buf, size_t count)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+
+	return samsung_wacom_store_height(&wacom->side_near_height, buf, count);
+}
+static DEVICE_ATTR_RW(side_button_near_height);
+
+static ssize_t side_button_far_height_show(
+	struct device *dev, struct device_attribute *attribute, char *buf)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(wacom->side_far_height));
+}
+
+static ssize_t side_button_far_height_store(
+	struct device *dev, struct device_attribute *attribute,
+	const char *buf, size_t count)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+
+	return samsung_wacom_store_height(&wacom->side_far_height, buf, count);
+}
+static DEVICE_ATTR_RW(side_button_far_height);
+
+/*
+ * The last frame's height and whether the pen counts as near, "<height>
+ * near|far", or "out" when it is out of range: for calibrating the two above.
+ */
+static ssize_t pen_height_show(
+	struct device *dev, struct device_attribute *attribute, char *buf)
+{
+	struct samsung_wacom *wacom = dev_get_drvdata(dev);
+	unsigned long flags;
+	bool in_range, near;
+	u8 height;
+
+	spin_lock_irqsave(&wacom->lock, flags);
+	in_range = wacom->in_range;
+	near = wacom->near;
+	height = wacom->height;
+	spin_unlock_irqrestore(&wacom->lock, flags);
+
+	if (!in_range)
+		return sysfs_emit(buf, "out\n");
+	return sysfs_emit(buf, "%u %s\n", height, near ? "near" : "far");
+}
+static DEVICE_ATTR_RO(pen_height);
+
 static struct attribute *samsung_wacom_attrs[] = {
 	&dev_attr_pen_docked.attr,
 	&dev_attr_pen_orientation.attr,
@@ -872,6 +1017,10 @@ static struct attribute *samsung_wacom_attrs[] = {
 	&dev_attr_pen_ble_reset.attr,
 	&dev_attr_ignore_finger_while_hovering.attr,
 	&dev_attr_disable_digitizer_when_docked.attr,
+	&dev_attr_side_button_split.attr,
+	&dev_attr_side_button_near_height.attr,
+	&dev_attr_side_button_far_height.attr,
+	&dev_attr_pen_height.attr,
 	NULL,
 };
 
@@ -889,6 +1038,7 @@ static void samsung_wacom_report_leave(struct samsung_wacom *wacom)
 
 	input_report_key(input, BTN_TOUCH, 0);
 	input_report_key(input, BTN_STYLUS, 0);
+	input_report_key(input, BTN_STYLUS2, 0);
 	input_report_key(input, BTN_TOOL_PEN, 0);
 	input_report_abs(input, ABS_PRESSURE, 0);
 	input_sync(input);
@@ -904,6 +1054,10 @@ static bool samsung_wacom_leave_range(struct samsung_wacom *wacom)
 	leaving = wacom->in_range;
 	wacom->in_range = false;
 	wacom->out_of_range = 0;
+	wacom->side = WACOM_SIDE_UP;
+	wacom->contact = WACOM_CONTACT_UP;
+	wacom->near = false;
+	wacom->height = 0;
 	spin_unlock_irqrestore(&wacom->lock, flags);
 	atomic_set(&samsung_wacom_pen_proximity, 0);
 
@@ -946,6 +1100,27 @@ static void samsung_wacom_prox_timeout(struct timer_list *t)
 			WACOM_PROXIMITY_TIMEOUT_MS);
 }
 
+/*
+ * Tilt turns with the screen like the position does.  touchscreen_report_pos()
+ * applies the device tree's inversions to the controller's axes and then the
+ * swap; tilt takes the same steps in the same order, which is also how
+ * Samsung's driver turns it with its own flags (wacom_i2c_coord_modify()).
+ */
+static void samsung_wacom_report_tilt(struct samsung_wacom *wacom,
+				      u8 raw_x, u8 raw_y)
+{
+	int x = (s8)raw_x, y = (s8)raw_y;
+
+	if (wacom->props.invert_x)
+		x = -x;
+	if (wacom->props.invert_y)
+		y = -y;
+	if (wacom->props.swap_x_y)
+		swap(x, y);
+	input_report_abs(wacom->input, ABS_TILT_X, x);
+	input_report_abs(wacom->input, ABS_TILT_Y, y);
+}
+
 static irqreturn_t samsung_wacom_irq(int irq, void *dev_id)
 {
 	struct samsung_wacom *wacom = dev_id;
@@ -954,7 +1129,10 @@ static irqreturn_t samsung_wacom_irq(int irq, void *dev_id)
 	unsigned int pressure;
 	unsigned long flags;
 	bool in_range, tip, barrel, first;
+	enum samsung_wacom_side side;
+	enum samsung_wacom_contact contact;
 	unsigned int missed;
+	u8 height, near_height, far_height;
 	int ret;
 
 	ret = i2c_master_recv(wacom->client, data, sizeof(data));
@@ -1016,10 +1194,48 @@ static irqreturn_t samsung_wacom_irq(int irq, void *dev_id)
 	mod_timer(&wacom->prox_timer,
 		  jiffies + msecs_to_jiffies(WACOM_PROXIMITY_TIMEOUT_MS));
 
+	tip = data[WACOM_REPORT_STATUS] & WACOM_STATUS_TIP;
+	barrel = data[WACOM_REPORT_STATUS] & WACOM_STATUS_BARREL;
+	height = data[WACOM_REPORT_HEIGHT];
+	far_height = READ_ONCE(wacom->side_far_height);
+	near_height = min(READ_ONCE(wacom->side_near_height), far_height);
+
 	spin_lock_irqsave(&wacom->lock, flags);
 	first = !wacom->in_range;
 	wacom->in_range = true;
 	wacom->out_of_range = 0;
+	wacom->height = height;
+	/* Hysteresis; a pen entering range decides afresh. */
+	if (first || height <= near_height)
+		wacom->near = height <= near_height;
+	else if (height > far_height)
+		wacom->near = false;
+	/*
+	 * Off, the side button is BTN_STYLUS and every contact a tip contact,
+	 * as before.  Split, the press decides what it is when it goes down
+	 * and keeps it until it comes up: far, it is BTN_STYLUS (GNOME's middle
+	 * click); near, or with the tip already down, it makes the contacts
+	 * that begin while it is held right clicks -- BTN_STYLUS2 for as long
+	 * as the tip stays down, with no BTN_TOUCH and no pressure, so the tap
+	 * clicks instead of drawing.  A contact keeps its kind until it lifts.
+	 * A button already held when the pen comes into range (pressed out of
+	 * range, or held while the pen left and came back) counts as near: it
+	 * was pressed for the screen, and the entry height, close to the edge
+	 * of range, would otherwise make it a stray middle click.
+	 */
+	if (!barrel)
+		wacom->side = WACOM_SIDE_UP;
+	else if (wacom->side == WACOM_SIDE_UP)
+		wacom->side = READ_ONCE(wacom->side_button_split) &&
+			      (first || tip || wacom->near) ?
+			      WACOM_SIDE_NEAR : WACOM_SIDE_FAR;
+	if (!tip)
+		wacom->contact = WACOM_CONTACT_UP;
+	else if (wacom->contact == WACOM_CONTACT_UP)
+		wacom->contact = wacom->side == WACOM_SIDE_NEAR ?
+				 WACOM_CONTACT_RIGHT : WACOM_CONTACT_TIP;
+	side = wacom->side;
+	contact = wacom->contact;
 	spin_unlock_irqrestore(&wacom->lock, flags);
 	atomic_set(&samsung_wacom_pen_proximity, 1);
 
@@ -1031,8 +1247,6 @@ static irqreturn_t samsung_wacom_irq(int irq, void *dev_id)
 		 */
 		samsung_wacom_set_max_rate(wacom);
 	}
-	tip = data[WACOM_REPORT_STATUS] & WACOM_STATUS_TIP;
-	barrel = data[WACOM_REPORT_STATUS] & WACOM_STATUS_BARREL;
 	pressure = get_unaligned_be16(&data[WACOM_REPORT_PRESSURE]) &
 		   WACOM_PRESSURE_MASK;
 
@@ -1040,13 +1254,15 @@ static irqreturn_t samsung_wacom_irq(int irq, void *dev_id)
 			       get_unaligned_be16(&data[WACOM_REPORT_X]),
 			       get_unaligned_be16(&data[WACOM_REPORT_Y]),
 			       false);
-	input_report_abs(input, ABS_PRESSURE, pressure);
-	input_report_abs(input, ABS_TILT_X, (s8)data[WACOM_REPORT_TILT_X]);
-	input_report_abs(input, ABS_TILT_Y, (s8)data[WACOM_REPORT_TILT_Y]);
-	input_report_abs(input, ABS_DISTANCE, data[WACOM_REPORT_DISTANCE]);
+	input_report_abs(input, ABS_PRESSURE,
+			 contact == WACOM_CONTACT_TIP ? pressure : 0);
+	samsung_wacom_report_tilt(wacom, data[WACOM_REPORT_TILT_X],
+				  data[WACOM_REPORT_TILT_Y]);
+	input_report_abs(input, ABS_DISTANCE, height);
 	input_report_key(input, BTN_TOOL_PEN, 1);
-	input_report_key(input, BTN_TOUCH, tip);
-	input_report_key(input, BTN_STYLUS, barrel);
+	input_report_key(input, BTN_TOUCH, contact == WACOM_CONTACT_TIP);
+	input_report_key(input, BTN_STYLUS, side == WACOM_SIDE_FAR);
+	input_report_key(input, BTN_STYLUS2, contact == WACOM_CONTACT_RIGHT);
 	input_sync(input);
 
 	return IRQ_HANDLED;
@@ -1239,6 +1455,8 @@ static int samsung_wacom_probe(struct i2c_client *client)
 	input_set_capability(input, EV_KEY, BTN_TOOL_PEN);
 	input_set_capability(input, EV_KEY, BTN_TOUCH);
 	input_set_capability(input, EV_KEY, BTN_STYLUS);
+	/* Only with side_button_split; see samsung_wacom_irq(). */
+	input_set_capability(input, EV_KEY, BTN_STYLUS2);
 	input_set_capability(input, EV_SW, SW_PEN_INSERTED);
 	input_set_capability(input, EV_SW, SW_MACHINE_COVER);
 	input_set_capability(input, EV_SW, SW_LID);
@@ -1258,6 +1476,16 @@ static int samsung_wacom_probe(struct i2c_client *client)
 	 * describe both and userspace sees one orientation.
 	 */
 	touchscreen_parse_properties(input, false, &wacom->props);
+	/* Tilt is swapped with the position (samsung_wacom_report_tilt()). */
+	if (wacom->props.swap_x_y) {
+		input_set_abs_params(input, ABS_TILT_X, -features.tilt_y_max,
+				     features.tilt_y_max, 0, 0);
+		input_set_abs_params(input, ABS_TILT_Y, -features.tilt_x_max,
+				     features.tilt_x_max, 0, 0);
+	}
+
+	wacom->side_near_height = WACOM_SIDE_NEAR_HEIGHT;
+	wacom->side_far_height = WACOM_SIDE_FAR_HEIGHT;
 
 	input_set_drvdata(input, wacom);
 
