@@ -200,6 +200,95 @@ it emerges from is correct in all four rotations, and it waits for a real
 orientation before showing itself rather than guessing one. It is on by default
 and can be turned off under the S Pen behaviour options.
 
+### The pen test
+
+S Pen → S Pen test → Open shows a white sheet in the web browser that draws
+with the pen and reports what the browser receives from it: the pointer type,
+pressure, tilt, buttons and sample rate, and a checklist of what has been seen
+(hover, a pressure range, tilt, the side button, an eraser end, a finger
+touch). The line follows the pressure and turns red while the side button is
+held. Pressure is ticked only once it has varied: a pen whose pressure does not
+reach the browser still reads 0.5 there whenever the tip is down, and that
+shows as "pressure constant".
+
+Five crosshairs, at the corners and the centre, check the alignment, kept
+separately for landscape and portrait, and for a turned-over screen where the
+browser tells it apart (Chromium does; Firefox on Linux reports only the two
+primary orientations, so there a turned-over screen shares the result, and a
+Check alignment after turning replaces it). Tap them with the pen tip in any
+order: a tap counts for the nearest crosshair within 48 px, and the sheet
+reports how far from its centre the tip landed. Only the moment the tip lands
+counts, so a stroke dragged through a crosshair does not. Free taps cannot
+catch a mirrored or rotated pen, whose taps land on the crosshair opposite, so
+Check alignment clears the orientation's results and the drawing and then
+highlights the crosshairs one at a time, measuring each tap against the
+highlighted one however far off it lands; a row finished that way says
+"checked in turn". An offset above 8 px is flagged: more than a careful tap
+misses by. Reset results clears everything.
+
+When the sheet comes from Tab Companion it also shows the digitiser's live
+hover height, with near or far and the side button split's band and state (see
+[the side button split](#the-side-button-split)); a browser cannot read
+these, so the helper answers them at `/pen`. Opened as a file, the sheet works
+without that line.
+
+GNOME sends the pen's side button as a middle click by default, which the
+browser reports as `buttons` 4 while hovering and 5 with the tip down; a right
+click (mapped in Settings → Wacom Tablet, or a tap with the split) reports 2
+and 3. The sheet accepts either.
+
+The page is `/usr/share/tab-companion/spen-test.html`, self-contained (no
+storage, and no network beyond its helper: a `default-src 'none';
+connect-src 'self'` content policy). It is in the six languages of the app,
+from a `?lang=` the helper adds or the browser's language. Ubuntu's Firefox is
+a snap and cannot read `/usr/share`, so the app does not open the file:
+`/usr/libexec/tab-companion-spen-test --print-url` starts a loopback-only HTTP
+server on a random port for that page and `/pen`, prints the address and
+returns, and the window opens the address through GTK, which brings the
+browser to the front and needs no `xdg-open` (the port's images do not ship
+it); a failure shows a dialog with the address. The server keeps serving in
+the background until nothing has asked it anything for 20 minutes. Any other
+path, or any `Host` other than the address it printed, is refused. Run by hand,
+the helper opens the default browser itself, and `--no-open` prints the address
+and serves in the foreground instead, for another browser.
+
+### The side button split
+
+The S Pen has one side button. S Pen → S Pen behaviour → "Tap with the side
+button to right-click" (off by default) makes it two, by how far from the
+screen the pen is when the button goes down:
+
+- **near** (hover height 36 or less): nothing happens until the tip touches;
+  while the button is held, each tap is a right click there, and a drag is a
+  right-button drag. The driver reports those contacts as `BTN_STYLUS2`, with
+  no `BTN_TOUCH` and no pressure, so the tap clicks instead of drawing.
+  GNOME's Settings → Wacom Tablet lists this as Button 2
+  (`secondary-button-action`, a right click by default).
+- **far** (above 44): the button's usual action at once, `BTN_STYLUS`, a
+  middle click by default; Settings lists it as Button 1 (`button-action`).
+
+A press keeps what it is until it is released, and a contact keeps its kind
+until the tip lifts, so landing or lifting the tip never turns one into the
+other; a stroke already under way when the button goes down finishes as a
+stroke. A button already held when the pen comes into range counts as near, so
+holding it before bringing the pen down, or lifting the pen out of range and
+back with it held, still gives right-click taps. Between 36 and 44 the pen
+keeps whichever of near and far it was last (hysteresis), so a press at the
+boundary does not flicker. Pointer mode and the
+air actions see only far presses, as `BTN_STYLUS`.
+
+The height is the digitiser's: 0 at contact, rising to about 90 to 103 where
+the pen leaves range (measured on an SM-X710; the controller declares 255). The
+36/44 band is the owner's choice after trying 45/55, about halfway. The
+settings are `spen-side-button-split`, `spen-side-button-near-height` and
+`spen-side-button-far-height`, for example
+`gsettings set io.github.agcarbajo.TabCompanion spen-side-button-near-height 30`;
+the hardware service writes them to the driver's `side_button_split`,
+`side_button_near_height` and `side_button_far_height` on the digitiser's I2C
+device, and the pen test sheet shows the live height, from the driver's
+`pen_height` (`<height> near|far`, or `out`). An older kernel has none of these,
+and the switch then says the updated kernel is required.
+
 ## Dual boot
 
 The Dualboot page lists the systems whose boot sets are saved on the root
@@ -344,9 +433,9 @@ on the tablet without starting a capture; physical verification remains pending.
 
 ## Languages
 
-The interface, the pickers, the states, the model list and "About" are
-available in English, Spanish, French, German, Italian and Portuguese. The
-session's language is used, falling back to English.
+The interface, the pickers, the states, the model list, "About" and the S Pen
+test sheet are available in English, Spanish, French, German, Italian and
+Portuguese. The session's language is used, falling back to English.
 
 ## Validation and limits
 
@@ -370,9 +459,13 @@ cycle (see [the interconnect notes](gts9wifi-interconnect.md)).
 On the SM-X710 (2026-11-07) the digitiser binds, the pen charges in its
 garage, docking and undocking are detected, the pairing service and the
 hardware service run, and the EF-DX720 cover enumerates with its switches on
-the separate device. Not yet confirmed there: pressure, hover and side
-button, coordinate mapping in landscape and portrait, finger rejection while
-hovering, and the haptic motor.
+the separate device. The owner then drew with the pen on the pen test in
+landscape and portrait: pressure, tilt, hover and the side button all arrive.
+The haptic motor runs the test pulse and the on-screen keyboard's pulses. The
+tilt shown then was wrong, though: the driver read the report's height byte as
+tilt X (see the porting log). With the decode fixed (fix5, 2026-11-07) the owner
+checked tilt, the hover height and the side button split, and chose the 36/44
+band. Not yet confirmed there: finger rejection while hovering.
 
 Still pending: feeling the motor physically, calibrating the pointer with real
 use, testing EF-DX900/910/915/925 and verifying their touchpads. BLE recovery

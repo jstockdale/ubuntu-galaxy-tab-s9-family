@@ -9,9 +9,11 @@ HexagonFS tree, which carries Samsung's sensor registry, is per board.
 
 Status (2026-11-07): SSC comes up on the first attempt, iio-sensor-proxy
 reports `HasAccelerometer` and `HasAmbientLight`, and auto-rotation works with
-the keyboard cover detached.  The only recorded light level, 0 lux, was read
-at night; whether lux follows room light is still to be checked
-(`ssccli --sensor light --timeout 8` below).
+the keyboard cover detached.  The light level follows the room: 0 lux at
+night, and 1 to 290 lux over a morning of handling on 2026-11-07 (the cover
+on and off, the tablet picked up), read as iio-sensor-proxy's `LightLevel`
+once a second by a watcher during the owner's tests.  `ssccli --sensor light
+--timeout 8` (below) reads the sensor directly.
 
 For builders: the tree is a generated manifest entry, so staging
 `configs/firmware/x710-bl5-X710XXS5CYG1.toml` needs `--sscregistrygen`:

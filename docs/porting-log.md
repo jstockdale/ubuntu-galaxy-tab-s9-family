@@ -7011,3 +7011,77 @@ the fingerprint stack gated to the SM-X910), the analysis of the three
 the DISP-5 panel experiment kit and the power and thermal fixes. Device package
 2.56 carries them. Still open: the panel needs the boot-time cycle (DISP-5),
 and the suspend runs decide the default mode.
+
+### The integrated set on the tablet (2026-11-07)
+
+The owner installed it on the morning of 2026-11-07 (`fix4`: the integration
+kernel, its module tree, device package 2.56, the bwmon blacklist and rtkit),
+and the first boot came up with the screen and touch working.
+
+- The post-boot checks passed 47 of 48. The one flag was a false alarm: the
+  pen's two logged replies in the first ten minutes were real charge-state
+  changes, not the old poll. rpmhpd, gcc, gpu_cc and videocc are synced at
+  boot. `ubuntu-gts9u-icc-late-release` released both NoCs after the boot cycle,
+  and the cycle completed. `icc_bwmon` stayed out. Wi-Fi took its address from
+  EFS at the first probe, with L1 substates on, and the RTC restore ran once.
+- The GPU test battery lost 0 of 296 frames.
+- The kernel journal now starts at 0 s. Every error it shows that the old
+  ~40 s gap used to hide was also in the root-captured dmesg of the earlier
+  Stage 2 boots: the reserved-memory overlaps, the `wcn`-prefixed Bluetooth
+  firmware names before the fallback, the ADSP's first firmware request, and
+  the CS35L45 DSP control duplicates.
+- Owner tests: double tap to wake woke the blanked screen with the cover
+  detached (the driver logged it, and the panel came on 0.1 s later). The
+  haptic motor ran a 400 ms test pulse, and the on-screen keyboard sent its
+  42 ms pulses. The S Pen showed pressure, tilt, hover and the side button in
+  landscape and portrait. The side button looked missing at first: GNOME
+  maps it to a middle click (`buttons` 4 and 5), and the first test page only
+  looked for a right click. That page became Tab Companion 1.3.14's pen test
+  ([`tab-companion.md`](tab-companion.md#the-pen-test)).
+- The light sensor follows the room. A watcher read iio-sensor-proxy's
+  `LightLevel` once a second during these tests: 290, 79, 66, 241, 20, 1 and
+  186 lux as the cover came off and on and the tablet was handled, against 0
+  at night.
+- Still to test at the tablet: recording and playback, the cover folded
+  back, the on-screen keyboard at the lock screen, and AAC audio.
+
+### The S Pen decode and the side button split (fix5, 2026-11-07)
+
+The pen test's tilt sat at -1 whenever the tip was down. Samsung's own X710
+driver (`wacom_i2c_coord_handler()` in `drivers/input/wacom/wacom_i2c.c` of
+the kernel source drop) reads byte 7 of the report as the hover height and
+bytes 8 and 9 as tilt X and Y. Ours read byte 7 as tilt X, 8 as tilt Y and 9
+as the distance, one place off, since the Ultra's bring-up. A 40 s `evtest`
+capture on the X710 confirmed it:
+
+- Byte 7 falls as the pen comes down: about 85 on entering range, then 71,
+  53, 31, 17, and 0 for every frame with the tip down. The pen leaves range at
+  89 to 103 (2061 hover frames, maximum 103), not the 255 the query declares.
+- Bytes 8 and 9 span about ±58 as the pen leans.
+
+The driver now reads them as Samsung's does. It reports the height as
+`ABS_DISTANCE` (0 at contact, as Linux expects), turns tilt with the
+screen the way `touchscreen_report_pos()` turns the position, and reads
+pressure as the low 12 bits, also Samsung's. Taking the four leans of the
+capture in the order the owner was asked to make them, the rotation gives right
+= +X, toward the user = +Y and away = -Y, the convention of libinput and Pointer
+Events. The Ultra shares the driver, so its tilt was wrong the same way.
+
+The owner asked for the one side button to act as two. The split is off by
+default. Switched on, a press near the screen arms right-click taps: while the
+button is held, a contact is `BTN_STYLUS2` with no `BTN_TOUCH` and no
+pressure. A press farther away stays `BTN_STYLUS`. Near and far come from the
+height with hysteresis. The owner started at 45/55, about halfway, and settled
+on near at 36 or below and far above 44. The thresholds and a live
+`pen_height` are attributes, and Tab Companion 1.3.14 has a switch for the
+split and settings for both heights
+([`tab-companion.md`](tab-companion.md#the-side-button-split)). The pen test
+sheet shows the live height.
+
+The kernel needed its module tree with it: the struct change alters vmlinux's
+BTF, and this kernel refuses modules whose BTF does not match
+(`CONFIG_MODULE_ALLOW_BTF_MISMATCH` is off). `fix5` is therefore the fix4 kit's
+approach with only `boot` changing. The DTB was identical, so vendor_boot stayed
+fix4's. The install checks that the tablet is on fix4 and reads `boot` back;
+`rollback.sh` returns to fix4. It booted with the same 47 of 48 checks, no BTF
+errors, and only `ip_tables` loaded, as on fix4.
