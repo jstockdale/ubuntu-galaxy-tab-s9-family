@@ -63,6 +63,27 @@ MODULE_PARM_DESC(mode_30hz,
 		 "also offer the 30 Hz mode of glasses that have one (experimental)");
 
 /*
+ * Cold-boot experiments (see the comment above ANA38407_TCON_RDY_TIMEOUT_US).
+ * The first power-on resets a DDIC the bootloader left running; every later
+ * one starts from a DDIC whose own supplies were off.  cold_start_ms=N makes
+ * the first power-on start the same way: the DDIC is taken down as
+ * unprepare() does and held there for N ms first.  trace_power_on logs, for
+ * every power-on, what the first one already reports: the supplies as the
+ * regulator framework sees them, TCON_RDY and the id the DDIC answered.
+ */
+static unsigned int param_cold_start_ms;
+module_param_named(cold_start_ms, param_cold_start_ms, uint, 0444);
+MODULE_PARM_DESC(cold_start_ms,
+		 "power the bootloader's DDIC down for this many ms before the first power-on (0: reset it while powered, the default; at most 2000)");
+
+static bool param_trace_power_on;
+module_param_named(trace_power_on, param_trace_power_on, bool, 0444);
+MODULE_PARM_DESC(trace_power_on,
+		 "log supplies, TCON_RDY and the panel id of every power-on (bring-up)");
+
+#define ANA38407_COLD_START_MAX_MS	2000
+
+/*
  * DCS 0x51 carries 11 significant bits on this DDIC, not 12: Samsung's own
  * power-on sequence programs 0x07ff as "full brightness", and anything with bit
  * 11 set wraps back to the bottom of the range.  Declaring 4095 made the
@@ -146,6 +167,12 @@ struct ana38407_desc {
  * as Samsung's Anapass power sequence does, and the first prepare reports how
  * the DDIC came out of reset: a DDIC that never raises TCON_RDY is dead on
  * the panel side, one that does but still reads 00:00:00 points at the host.
+ * On the SM-X710 it does (high before the reset, high again 114-115 ms after
+ * it, every boot of 2026-11-07), so the host is the main suspect.  Samsung
+ * itself never resets the DDIC over the bootloader's display: it inherits the
+ * splash, and its first power-on follows a full power-off.  cold_start_ms
+ * reproduces that power-off on the panel side alone; the msm switches
+ * mdss_handoff_gdsc_cycle and boot_display_cycle do it on the host side.
  */
 #define ANA38407_TCON_RDY_TIMEOUT_US	200000
 
@@ -168,6 +195,8 @@ struct ana38407 {
 	bool fod_circle;
 	bool prepared_once;
 	bool id_read;
+	/* Power-ons since probe, for trace_power_on. */
+	unsigned int power_ons;
 	enum ana38407_vrr vrr;
 	/* GLUT_OFFSET_60HS row the DDIC holds, -1 for none (120 Hz zeroes). */
 	int glut_row;
@@ -254,6 +283,62 @@ static int ana38407_wait_tcon_ready(struct ana38407 *ctx)
 		return ret;
 
 	return ktime_ms_delta(ktime_get(), start);
+}
+
+static const char *ana38407_level(int value)
+{
+	return value < 0 ? "unknown" : value ? "high" : "low";
+}
+
+/*
+ * The supplies as the regulator framework sees them, for the power-on traces:
+ * 1 enabled (by anyone), 0 off, negative an error.  A rail the bootloader left
+ * on but nobody has claimed yet may read 0 although it is up.
+ */
+static void ana38407_supply_states(struct ana38407 *ctx, char *buf, size_t len)
+{
+	size_t pos = 0;
+	unsigned int i;
+
+	buf[0] = '\0';
+	for (i = 0; i < ARRAY_SIZE(ana38407_supplies) && pos < len; i++)
+		pos += scnprintf(buf + pos, len - pos, "%s%s %d", i ? ", " : "",
+				 ana38407_supplies[i].supply,
+				 regulator_is_enabled(ctx->supplies[i].consumer));
+}
+
+/*
+ * cold_start_ms: before the first power-on, take the DDIC the bootloader left
+ * running down the way unprepare() does - reset asserted, every supply this
+ * driver holds released - and keep it there, so that it starts like every
+ * later power-on.  The supplies are claimed first so that the release is
+ * balanced.  Rails another consumer also holds stay up, as they do at every
+ * blank (on the SM-X710 vddio with the touchscreen, vci with the digitizer).
+ */
+static void ana38407_cold_start(struct ana38407 *ctx)
+{
+	struct device *dev = &ctx->dsi->dev;
+	unsigned int ms = min_t(unsigned int, param_cold_start_ms,
+				ANA38407_COLD_START_MAX_MS);
+	int tcon_before = -1, tcon_after = -1;
+	int ret;
+
+	if (ctx->tcon_rdy_gpio)
+		tcon_before = gpiod_get_value_cansleep(ctx->tcon_rdy_gpio);
+
+	ret = ana38407_power_on(ctx);
+	if (ret) {
+		dev_warn(dev, "cold start: could not claim the supplies: %d\n", ret);
+		return;
+	}
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	regulator_bulk_disable(ARRAY_SIZE(ana38407_supplies), ctx->supplies);
+	msleep(ms);
+
+	if (ctx->tcon_rdy_gpio)
+		tcon_after = gpiod_get_value_cansleep(ctx->tcon_rdy_gpio);
+	dev_info(dev, "first power-on: DDIC held off %u ms before it (TCON_RDY %s, then %s)\n",
+		 ms, ana38407_level(tcon_before), ana38407_level(tcon_after));
 }
 
 /*
@@ -921,6 +1006,7 @@ static int ana38407_prepare(struct drm_panel *panel)
 	struct device *dev = &ctx->dsi->dev;
 	const u8 *expected = ctx->desc->expected_id;
 	int tcon_before = 0, tcon_ms = 0;
+	char supplies[64] = "";
 	int ret;
 
 	mutex_lock(&ctx->lock);
@@ -931,6 +1017,13 @@ static int ana38407_prepare(struct drm_panel *panel)
 
 	ctx->vrr = ana38407_target_vrr(ctx);
 
+	if (!ctx->prepared_once && param_cold_start_ms)
+		ana38407_cold_start(ctx);
+
+	ctx->power_ons++;
+	if (param_trace_power_on)
+		ana38407_supply_states(ctx, supplies, sizeof(supplies));
+
 	ret = ana38407_power_on(ctx);
 	if (ret)
 		goto out_unlock;
@@ -940,6 +1033,12 @@ static int ana38407_prepare(struct drm_panel *panel)
 	ana38407_reset(ctx);
 	if (ctx->tcon_rdy_gpio) {
 		tcon_ms = ana38407_wait_tcon_ready(ctx);
+		if (param_trace_power_on)
+			dev_info(dev, "power-on %u: supplies before it: %s; TCON_RDY %s before reset, %s %d ms after it\n",
+				 ctx->power_ons, supplies,
+				 ana38407_level(tcon_before),
+				 tcon_ms < 0 ? "still low" : "high",
+				 tcon_ms < 0 ? ANA38407_TCON_RDY_TIMEOUT_US / 1000 : tcon_ms);
 		/*
 		 * The first power-on takes over the bootloader's splash: record
 		 * how the DDIC came out of reset, for the cold-boot fault above.
@@ -954,12 +1053,18 @@ static int ana38407_prepare(struct drm_panel *panel)
 		else if (tcon_ms < 0)
 			dev_warn(dev, "TCON_RDY still low %d ms after reset\n",
 				 ANA38407_TCON_RDY_TIMEOUT_US / 1000);
+	} else if (param_trace_power_on) {
+		dev_info(dev, "power-on %u: supplies before it: %s; no TCON_RDY line\n",
+			 ctx->power_ons, supplies);
 	}
 	ctx->prepared_once = true;
 
 	ret = ctx->desc->on(ctx);
 	/* on() reads the id whether or not its writes went through. */
 	ctx->id_read = true;
+	if (param_trace_power_on)
+		dev_info(dev, "power-on %u: panel id %02x %02x %02x, on sequence %d\n",
+			 ctx->power_ons, ctx->id[0], ctx->id[1], ctx->id[2], ret);
 	if (ret) {
 		ctx->glut_row = -1;
 		gpiod_set_value_cansleep(ctx->reset_gpio, 0);
