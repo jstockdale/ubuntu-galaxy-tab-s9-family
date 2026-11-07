@@ -128,6 +128,7 @@ others (0x50020, 0x50044) now toggle to zero (0x40000000).
 | GPU | bound, never opened (first open ~45 s) | initialised, GMU cycling |
 | panel | DDIC dead (`00 00 00`), DSI reads failing, fbcon on it | alive, GNOME |
 | Wi-Fi | WCN6855 probed 1 to 2 s before, after the PCI rescan; MSIs through the GIC ITS | long running |
+| USB | cable to the PC, VBUS present, UDC not bound yet (`gts9u-usb-gadget` is ordered after the cycle); dwc3-qcom still logs "HS-PHY not in L2" and drops its clocks and paths | NCM gadget bound and carrying the SSH session |
 | deferred | LPI pinctrl, VA codec, sound card, aux_bridge still deferred; deferred-probe timeout 0.5 s before | all bound |
 | floor dropped | 13.3 s, in the initramfs, before Wi-Fi and the USB gadget came up | minutes after boot |
 | kernel | fix2/fix3 (videocc =y, aligned 3.36 GHz OPP overlay, bwmon =y on fix2-s3, RTC/qcom_stats/temp-alarm =y) | baseline |
@@ -156,7 +157,9 @@ the MDSS (`ae00000`) and is probably behind the same port; that is to be
 checked against the trace, not assumed.  Next in line: the WCN6855, probed one
 to two seconds before the cycle after the PCI rescan and power-cycled by it,
 whose DMA path to DDR sits on a non-keepalive BCM (SN7, `qns_pcie_mem_noc`)
-and whose MSIs go through the GIC ITS (SN1, a BCM no DT node votes).
+and whose MSIs go through the GIC ITS (SN1, a BCM no DT node votes).  Then
+the USB controller, which at the boot cycle has VBUS but no gadget bound, a
+state the runtime rung never had.
 Predicts: W1 passes, W2 hangs, and its trace names the callback.
 
 **H2, the APSS as the only voter.**  At runtime the ADSP votes DDR, LLCC and
@@ -181,9 +184,9 @@ during the cycle).
   the Ultra before the helper starts (checked on the tablet with
   `systemd-analyze condition`); the helper checks the compatible again.
 * `After=ubuntu-gts9u-panel-coldboot-recover.service
-  ubuntu-gts9u-adsp-boot.service`, ordering only, and `Before=sleep.target`.
-  It runs at about 33 s, in the state every runtime release so far was made
-  in (cycle done, ADSP up).  The GPU's first open (~45 s) then happens with
+  ubuntu-gts9u-adsp-boot.service gts9u-usb-gadget.service`, ordering only,
+  and `Before=sleep.target`.  It runs at about 33 s, in the state every
+  runtime release so far was made in (cycle done, ADSP up, gadget bound).  The GPU's first open (~45 s) then happens with
   the floor gone, which is the upstream norm.
 * It releases only interconnect providers (`#interconnect-cells`) that are
   unsynced and whose only unsatisfied consumers are the two bwmon PMUs with no
@@ -241,8 +244,9 @@ callback reaches the ramoops and sec_log consoles while it runs.
 4. **W2**: `arm-boot release-before-cycle --trace`, reboot (Stage 2 images,
    no flashing).  The floor goes from userspace right before the boot cycle.
    Hang: H1, reproduced without the kernel's early sync; read the trace, then
-   one variant per boot: `--unbind-wifi` (passes: the WCN6855; hangs: look at
-   the display first).  Pass: H3; go to W3.
+   one variant per boot: `--unbind-wifi` (passes: the WCN6855), then the USB
+   cable unplugged for the boot, SSH over Wi-Fi (passes: the dwc3 path); if
+   both still hang, the display is next.  Pass: H3; go to W3.
 5. **W3** (only if W2 passed): `arm-boot kernel-early --trace`, then
    `sudo sh ~/display-exp/apply.sh fix2-s3`, reboot.  If it hangs, the boot
    after it (still fix2-s3) skips the panel cycle: panel dark, SSH works.
