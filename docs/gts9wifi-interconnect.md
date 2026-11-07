@@ -122,6 +122,17 @@ others (0x50020, 0x50044) now toggle to zero (0x40000000).
   so pstore has not yet carried a console across a reset on this unit.  TWRP's
   `/proc/last_kmsg` (the sec_log ring) is the other channel; its retention
   across a watchdog reset on the X710 is untested.
+* It is a hard hang, not a slow cycle cut short.  Nothing in Linux can time
+  the cycle out on this kernel: `/sys/class/watchdog` is empty (qcom_wdt is
+  =m and not loaded), systemd's `RuntimeWatchdogUSec=0`, and the soft- and
+  hard-lockup detectors are not built (hence "Unknown kernel command line
+  parameters nowatchdog" in every boot log).  A callback that merely waited
+  on a long timeout would have returned, minutes later if need be.  The reset
+  comes from the firmware below Linux, which only resets when it is no longer
+  serviced itself: the whole SoC stopped (a CPU stalled on a bus access that
+  never completes is the classic way), or a fatal NoC/XPU error trapped to
+  TZ.  Both fit an access to an unclocked port better than a software
+  deadlock, and both explain the missing panic trace.
 
 ## What differs between the boot cycle and the runtime rung that passed
 
@@ -199,17 +210,34 @@ during the cycle).
   never ran this boot, while a pm_test level is selected, or while
   `/etc/ubuntu-gts9u/icc-hold` exists.  A kernel without pm_test (the cycle
   unit's condition fails) releases.
+* Loop breaker: right before the writes it leaves
+  `/var/lib/ubuntu-gts9u/icc-release.pending` (this boot's id) on disk, and
+  the unit's `ExecStop` removes it again; a clean shutdown or reboot always
+  stops the unit.  A marker from another boot means that boot released the
+  floor and then hung (or was force-restarted, or lost power): the next boot
+  keeps the floor once, records why (`result=held`, "loop breaker"), and moves
+  the marker to `icc-release.unclean`; the boot after that releases again.
+  Whatever the release turns out to break later, it cannot become a boot
+  loop, and no TWRP visit is needed to get a held boot back.
 * Records: `/run/ubuntu-gts9u/icc-release`, `/var/log/ubuntu-gts9u-icc-release.log`
   (group adm), and two `/dev/kmsg` markers, because this board's journal
-  usually starts at ~40 s.  `ubuntu-gts9u-icc-late-release status|check` read
-  only.
+  usually starts at ~40 s.  The kernel files lines written to `/dev/kmsg`
+  from userspace under the user facility, so rsyslog puts the markers in
+  `/var/log/syslog`, not `kern.log` (`journalctl -k` shows them).
+  `ubuntu-gts9u-icc-late-release status|check` read only.
 
 Suspend: the release lasts until reboot, so every later suspend runs without
 the floor, which is the point (DDR low power, CX collapse).  What is proven:
 a pm_test=platform rung on the baseline kernel.  Not yet: the same rung on the
 fix kernels (morning test), and real s2idle and deep with the floor gone (the
 suspend ladder).  If real suspend fails that way, `/etc/ubuntu-gts9u/icc-hold`
-keeps the floor without touching anything else.
+keeps the floor without touching anything else; the loop breaker already
+holds the boot right after any such hang.
+
+Policy edges: a masked or disabled panel cycle unit keeps the floor (a cycle
+started by hand later would run without it).  If DISP-5 retires the boot
+cycle by masking that unit, this policy has to change with it, or the floor
+stays held for good.
 
 By hand: `printf 1 | sudo tee /sys/bus/platform/devices/24100000.interconnect/state_synced`
 and the same for `interconnect-1` (not `echo`).  `sudo grep -c 2147483647
@@ -223,8 +251,10 @@ and the same for `interconnect-1` (not `echo`).  `sudo grep -c 2147483647
 --unit=gts9u-icc-exp --collect sh ~/icc/weekend/icc-cycle-experiment.sh
 runtime ...` so that a dropped SSH session cannot cut them.  Every rung logs to
 `/var/log/gts9u-icc-exp/experiment.log` (group adm) line by line with a sync,
-and marks the kernel log.  A runtime rung that hangs costs one watchdog reset
-and comes back on a normal Stage 2 boot.  A boot rung disarms itself before
+and marks the kernel log (`gts9u-icc-exp:`; rsyslog files those lines in
+`/var/log/syslog`, and `collect` merges them with `kern.log`).  A runtime
+rung that hangs costs one watchdog reset and comes back on a normal Stage 2
+boot (which keeps the floor once: the loop breaker).  A boot rung disarms itself before
 the cycle, so it cannot loop.  `--trace` sets `console_suspend=N`,
 `pm_print_times` and `pm_debug_messages` for the cycle, so every device
 callback reaches the ramoops and sec_log consoles while it runs.
@@ -235,12 +265,22 @@ callback reaches the ramoops and sec_log consoles while it runs.
    collect` (pstore), and TWRP `cat /proc/last_kmsg` (sec_log).  The boot
    cycle's `PM: calling ...` lines must survive in one of them; if neither
    keeps them, a hang can only be located by bisection (the `--level` and
-   `--unbind-wifi` switches), not read.
+   `--unbind-wifi` switches), not read.  The forced restart counts as an
+   unclean end of a release boot, so the next boot keeps the floor once
+   (loop breaker, expected).  While in TWRP, also look for Samsung's
+   sec_debug reset records, if TWRP's kernel carries them: `ls /proc/reset_*
+   /proc/auto_comment` and `cat /proc/reset_history /proc/reset_summary
+   /proc/reset_tzlog`.  A TZ log naming a NoC error or an XPU violation after
+   a hung boot would settle "bus fault" against "everything stopped"; "DP" is
+   the watchdog, "MP" a manual reset.  Do not `cat /proc/reset_reason` before
+   the others: reading it clears it.
 1. **W0** (the morning test): the late release, then
    `sudo sh ~/pmtest/run-level.sh platform`.  Expected to pass, as Stage 0
    did on the baseline kernel.  If it hangs on the fix kernel, the release
-   is unsafe for any later cycle or suspend: `sudo touch
-   /etc/ubuntu-gts9u/icc-hold` and the rest of this list runs at runtime.
+   is unsafe for any later cycle or suspend.  The boot after the hang keeps
+   the floor by itself (loop breaker); `sudo mkdir -p /etc/ubuntu-gts9u &&
+   sudo touch /etc/ubuntu-gts9u/icc-hold` then keeps it on every later boot,
+   and the rest of this list runs at runtime.
 2. **W1**: `runtime --stop-adsp --trace` (USB SSH; follow it with
    `sh ~/icc/weekend/icc-cycle-experiment.sh status`).  The boot cycle's
    lone voter, recreated at runtime.  Hang: H2; go to W1b.
@@ -258,6 +298,16 @@ callback reaches the ramoops and sec_log consoles while it runs.
    `sudo sh ~/display-exp/apply.sh fix2-s3`, reboot.  If it hangs, the boot
    after it (still fix2-s3) skips the panel cycle: panel dark, SSH works.
    `collect`, `sudo sh ~/display-exp/apply.sh fix2-s2`, `disarm`, reboot.
+
+If C0 shows that a console survives the reset but a hung cycle still leaves
+no callback trail, the next experiment kernel should build the soft- and
+hard-lockup detectors (`CONFIG_SOFTLOCKUP_DETECTOR`, the buddy
+`CONFIG_HARDLOCKUP_DETECTOR`, `hardlockup_panic=1`) with arm64 pseudo-NMI
+(`CONFIG_ARM64_PSEUDO_NMI`, `irqchip.gicv3_pseudo_nmi=1`): the pm_test
+cycle keeps the other CPUs online, so a single CPU stalled on a register
+access is then named, backtraced and panicked into pstore by its neighbours
+instead of waiting for the firmware watchdog.  That needs a rebuild and a
+vendor_boot flash, so it comes after W0 to W2.
 
 Reading a trace: with `pm_print_times` each device callback is a pair of
 lines, `<drv> <dev>: calling <callback> @ <pid>, parent: <parent>` and

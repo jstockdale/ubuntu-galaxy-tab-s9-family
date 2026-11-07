@@ -168,5 +168,41 @@ set -- {' '.join(args)}
         self.assertFalse((self.state / "armed").exists())
 
 
+    def test_runtime_rung_releases_cycles_and_restores_the_sleep_mode(self):
+        r = self.root
+        (r / "sys/power/mem_sleep").write_text("[s2idle] deep\n")
+        (r / "sys/power/state").write_text("")
+        (r / "sys/power/suspend_stats/last_failed_dev").write_text("\n")
+        (r / "sys/power/suspend_stats/last_failed_errno").write_text("0\n")
+        script = re.sub(r"/(?:sys|proc|var|etc|usr/local)/",
+                        lambda m: f"{r}{m.group(0)}", SCRIPT.read_text())
+        script = script.replace("/dev/kmsg", f"{r}/kmsg")
+        prelude = f"""
+id() {{ echo 0; }}
+sync() {{ :; }}
+sleep() {{ :; }}
+chgrp() {{ :; }}
+dmesg() {{ :; }}
+systemctl() {{
+    case "$*" in
+    *Result*) echo success ;;
+    *ActiveState*) echo active ;;
+    esac
+}}
+set -- runtime --trace
+"""
+        res = subprocess.run(["/bin/sh", "-s"], input=prelude + script, text=True,
+                             capture_output=True, timeout=30)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        for p in PROVIDERS:
+            self.assertEqual(self.synced(p), "1")
+        self.assertEqual((r / "sys/power/state").read_text().strip(), "mem")
+        self.assertEqual((r / "sys/power/pm_test").read_text().strip(), "none")
+        # Deep for the cycle only: the default sleep mode is put back.
+        self.assertEqual((r / "sys/power/mem_sleep").read_text().strip(), "s2idle")
+        self.assertEqual((r / "sys/module/printk/parameters/console_suspend").read_text().strip(), "Y")
+        self.assertIn("runtime: returned rc=0", res.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

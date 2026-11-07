@@ -184,10 +184,13 @@ runtime() {
 	echo "$marker" > /dev/kmsg 2>/dev/null
 	say "runtime: entering pm_test=$level (mem, deep); USB networking drops for ~10 s"
 	sync
+	# Deep for the cycle, as the boot cycle pins it; the default goes back after.
+	mem_before=$(sed -n 's/.*\[\([a-z0-9]*\)\].*/\1/p' /sys/power/mem_sleep 2>/dev/null)
 	echo deep > /sys/power/mem_sleep
 	echo "$level" > /sys/power/pm_test
 	if echo mem > /sys/power/state; then rc=0; else rc=$?; fi
 	echo none > /sys/power/pm_test
+	[ -n "$mem_before" ] && echo "$mem_before" > /sys/power/mem_sleep 2>/dev/null
 	[ "$trace" = 1 ] && trace_off
 	[ "$unbind_wifi" = 1 ] && wifi_bind
 	say "runtime: returned rc=$rc; suspend_stats $(cat /sys/power/suspend_stats/success)/$(cat /sys/power/suspend_stats/fail) last_failed_dev='$(cat /sys/power/suspend_stats/last_failed_dev)' errno=$(cat /sys/power/suspend_stats/last_failed_errno)"
@@ -310,8 +313,19 @@ collect() {
 	ls -laR /sys/fs/pstore /var/lib/systemd/pstore > "$out/pstore/listing.txt" 2>&1
 	cp -a "$state/." "$out/state/" 2>/dev/null
 	journalctl --list-boots --no-pager 2>/dev/null | tail -n 6 > "$out/boots.txt"
-	journalctl -b -1 -k --no-pager -o short-monotonic 2>/dev/null | tail -n 400 > "$out/prev-boot-kernel-tail.txt"
-	grep -a 'gts9u-icc-exp\|icc-late-release\|PM: suspend entry\|PM: suspend exit' /var/log/kern.log 2>/dev/null | tail -n 60 > "$out/kernlog-markers.txt"
+	# A boot that hung in its first ~40 s never reached the journal on this
+	# board (none of the Stage 3 loops is in --list-boots), so "-b -1" is then
+	# the boot before it: kern.log.tail below is the one that has it.
+	{
+		echo "# journal boot -1 = $(journalctl --list-boots --no-pager 2>/dev/null | tail -n 2 | head -n 1)"
+		echo '# a hung boot is usually missing from the journal; see kern.log.tail'
+		journalctl -b -1 -k --no-pager -o short-monotonic 2>/dev/null | tail -n 400
+	} > "$out/prev-boot-kernel-tail.txt"
+	# Kernel lines are in kern.log; the /dev/kmsg markers written from
+	# userspace carry the user facility, so rsyslog files them in syslog.
+	cat /var/log/kern.log /var/log/syslog 2>/dev/null |
+		grep -a 'gts9u-icc-exp\|icc-late-release\|PM: suspend entry\|PM: suspend exit' |
+		sort -u | tail -n 60 > "$out/kernlog-markers.txt"
 	tail -n 600 /var/log/kern.log > "$out/kern.log.tail" 2>/dev/null
 	dmesg > "$out/dmesg-this-boot.txt"
 	chgrp -R adm "$out" 2>/dev/null
