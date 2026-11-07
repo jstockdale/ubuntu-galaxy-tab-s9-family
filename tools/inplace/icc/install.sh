@@ -20,7 +20,9 @@
 # Hangups are ignored, so a dropped SSH session does not cut it short; every
 # line goes to /var/log/gts9u-icc-kit.log first.
 #
-# If a boot ever hangs after the release (watchdog reset loop), from TWRP:
+# If a boot ever hangs after the release, the unit's loop breaker keeps the
+# floor on the boot after it (README.md).  To keep it on every boot without
+# Linux, from TWRP:
 #   [ -d /data/home ] || mount -t ext4 /dev/block/by-name/userdata /data
 #   mkdir -p /data/etc/ubuntu-gts9u && touch /data/etc/ubuntu-gts9u/icc-hold
 # then reboot: the unit keeps the floor while that file exists.
@@ -126,6 +128,9 @@ fi
 run_logged enable systemctl enable "$name.service" || die "systemctl enable $name.service failed"
 [ -L "$wants" ] || die "$wants was not created"
 say "enabled: $(systemctl is-enabled "$name.service" 2>&1)"
+# The off switch's directory, so that 'sudo touch /etc/ubuntu-gts9u/icc-hold'
+# works as written (no package creates it).
+mkdir -p /etc/ubuntu-gts9u || die 'cannot create /etc/ubuntu-gts9u'
 [ -e /etc/ubuntu-gts9u/icc-hold ] &&
 	say 'NOTE: /etc/ubuntu-gts9u/icc-hold exists, so the unit keeps the floor until it is removed'
 

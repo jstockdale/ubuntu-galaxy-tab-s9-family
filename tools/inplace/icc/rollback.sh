@@ -23,6 +23,7 @@ name=ubuntu-gts9u-icc-late-release
 helper=/usr/libexec/$name
 unit=/usr/lib/systemd/system/$name.service
 wants=/etc/systemd/system/multi-user.target.wants/$name.service
+pending=/var/lib/ubuntu-gts9u/icc-release.pending
 
 say() {
 	line="$(date '+%F %T') rollback: $*"
@@ -84,6 +85,13 @@ else
 		done
 	fi
 	run_logged daemon-reload systemctl daemon-reload || die 'systemctl daemon-reload failed'
+fi
+# The loop breaker's marker is cleared by the unit's ExecStop at shutdown; a
+# removed or masked unit has none, and a stale marker would make a later
+# reinstall keep the floor for one boot for no reason.
+if [ -e "$pending" ]; then
+	rm -f "$pending" || die "cannot remove $pending"
+	say "removed the loop-breaker marker $pending"
 fi
 say "unit now: $(systemctl is-enabled "$name.service" 2>&1)"
 say 'done; the floor comes back with the next reboot (sudo reboot)'

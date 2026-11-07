@@ -40,7 +40,7 @@ rel_start=$(prop "$name.service" ExecMainStartTimestampMonotonic)
 inf "panel cycle unit: $(prop ubuntu-gts9u-panel-coldboot-recover.service ActiveState) / $(prop ubuntu-gts9u-panel-coldboot-recover.service Result), returned at $(( ${cyc_exit:-0} / 1000000 )) s"
 if [ "${rel_start:-0}" != 0 ] && [ "${cyc_exit:-0}" != 0 ]; then
 	if [ "$rel_start" -gt "$cyc_exit" ]; then
-		ok "release ran at $(( rel_start / 1000000 )) s, after the panel cycle returned"
+		ok "release ran at $(( rel_start / 1000000 )) s, after the panel cycle returned at $(( cyc_exit / 1000000 )) s"
 	else
 		ck "release started at $(( rel_start / 1000000 )) s, BEFORE the panel cycle returned at $(( cyc_exit / 1000000 )) s"
 	fi
@@ -65,6 +65,24 @@ if [ -r "$record" ]; then
 else
 	ck "no release record ($record): the unit has not run this boot"
 fi
+# The loop breaker (world-readable markers under /var/lib/ubuntu-gts9u).
+pending=/var/lib/ubuntu-gts9u/icc-release.pending
+unclean=/var/lib/ubuntu-gts9u/icc-release.unclean
+if [ -r "$pending" ]; then
+	if [ "$(sed -n 's/^boot_id=//p' "$pending")" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
+		ok 'loop breaker armed for this boot (a clean shutdown clears it)'
+	else
+		ck "loop breaker: a marker from boot $(sed -n 's/^boot_id=//p' "$pending" | cut -c1-8) is waiting; the next run of the unit keeps the floor once"
+	fi
+fi
+if [ -r "$unclean" ]; then
+	held=$(sed -n 's/^held_boot=//p' "$unclean")
+	if [ "$held" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
+		ck "loop breaker held the floor on this boot: boot $(sed -n 's/^boot_id=//p' "$unclean" | cut -c1-8) released it and ended without a clean shutdown"
+	else
+		inf "loop breaker last held the floor on boot $(printf '%s' "$held" | cut -c1-8)"
+	fi
+fi
 line=
 for p in 24100000.interconnect interconnect-1; do line="$line $p=$(synced "$p")"; done
 case "$line" in
@@ -88,8 +106,10 @@ if [ -r /var/log/ubuntu-gts9u-icc-release.log ]; then
 else
 	inf '/var/log/ubuntu-gts9u-icc-release.log not readable (or absent)'
 fi
-if [ -r /var/log/kern.log ]; then
-	grep -a "$name" /var/log/kern.log | tail -n 2 | sed 's/^/  info   /'
+# The /dev/kmsg markers: the kernel files lines written from userspace under
+# the user facility, so rsyslog puts them in syslog, never in kern.log.
+if [ -r /var/log/syslog ]; then
+	grep -a "kernel: $name:" /var/log/syslog | tail -n 2 | sed 's/^/  info   /'
 fi
 # Anything alarming in the kernel log since the release marker (journal, adm).
 # The journal of this board usually starts at ~40 s, after the boot-time
