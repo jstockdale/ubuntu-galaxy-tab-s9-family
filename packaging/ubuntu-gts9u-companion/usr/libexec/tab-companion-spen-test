@@ -1,0 +1,214 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+"""Serve the S Pen test page to the desktop's web browser.
+
+The page is self-contained, but Ubuntu's Firefox is a snap and cannot read
+/usr/share, so the page is not opened as a file: a loopback-only HTTP server
+hands it to the browser.  The server answers for the page and for /pen, the
+digitiser's live hover height and side button settings, which a browser
+cannot read; nothing else.  It exits once nothing has asked it anything for
+IDLE_SECONDS.
+
+  tab-companion-spen-test              open the page in the default browser
+  tab-companion-spen-test --print-url  start the server, print its address and
+                                       return; Tab Companion opens the address
+                                       itself, so the browser comes to the front
+  tab-companion-spen-test --no-open    print the address and serve in the
+                                       foreground, for another browser
+"""
+
+import argparse
+from glob import glob
+import http.server
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+PAGE = Path("/usr/share/tab-companion/spen-test.html")
+SYSFS = Path("/sys")
+IDLE_SECONDS = 20 * 60
+PAGE_PATHS = {"/", "/index.html", "/spen-test.html"}
+# The same policy as the page's own meta tag, sent as a header as well.
+CSP = ("default-src 'none'; style-src 'unsafe-inline'; "
+       "script-src 'unsafe-inline'; img-src data:; connect-src 'self'")
+LANGUAGES = {"en", "es", "fr", "de", "it", "pt"}
+
+
+def language():
+    """The session language, in the order Tab Companion's own i18n reads it."""
+    for name in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name)
+        if value:
+            code = value.split(":", 1)[0].split("_", 1)[0].split("-", 1)[0].lower()
+            return code if code in LANGUAGES else "en"
+    return "en"
+
+
+def pen_state(sysfs):
+    """The digitiser's hover height and side button settings, or unavailable."""
+    devices = sorted(glob(str(sysfs / "bus/i2c/devices/*/pen_docked")))
+    device = Path(devices[0]).parent if devices else None
+    if device is None or not (device / "pen_height").exists():
+        return {"available": False}
+
+    def read(name):
+        try:
+            return (device / name).read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def number(name):
+        value = read(name)
+        return int(value) if value is not None and value.isdigit() else None
+
+    height = (read("pen_height") or "").split()
+    in_range = len(height) == 2 and height[0].isdigit()
+    return {
+        "available": True,
+        "in_range": in_range,
+        "height": int(height[0]) if in_range else None,
+        "near": height[1] == "near" if in_range else None,
+        "split": read("side_button_split") == "1",
+        "near_height": number("side_button_near_height"),
+        "far_height": number("side_button_far_height"),
+    }
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "tab-companion-spen-test"
+    sys_version = ""
+    # One stuck connection must not hold the single-threaded server.
+    timeout = 10
+
+    def do_GET(self):
+        self._reply(body=True)
+
+    def do_HEAD(self):
+        self._reply(body=False)
+
+    def _reply(self, body):
+        self.server.last_request = time.monotonic()
+        # Only the address this server printed: another name for 127.0.0.1
+        # (a rebound DNS name) gets nothing.
+        if self.headers.get("Host") != self.server.host_header:
+            self.send_error(421)
+            return
+        path = self.path.split("?", 1)[0]
+        if path in PAGE_PATHS:
+            data, kind = self.server.page, "text/html; charset=utf-8"
+        elif path == "/pen":
+            data = json.dumps(pen_state(self.server.sysfs)).encode("ascii")
+            kind = "application/json"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        if body:
+            self.wfile.write(data)
+
+    def log_message(self, format, *args):
+        pass
+
+
+def make_server(page, sysfs):
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    server.page = page
+    server.sysfs = sysfs
+    server.host_header = f"127.0.0.1:{server.server_address[1]}"
+    server.last_request = time.monotonic()
+    server.timeout = 5
+    return server
+
+
+def serve(server, idle):
+    try:
+        while time.monotonic() - server.last_request < idle:
+            server.handle_request()
+    finally:
+        server.server_close()
+
+
+def detach(server, idle):
+    """Fork a child that serves in its own session; the parent returns.
+
+    The parent's stdout must not reach the child: a caller reading it to the
+    end (Tab Companion does) would otherwise wait for the server to exit.
+    """
+    if os.fork():
+        server.server_close()
+        return
+    try:
+        os.setsid()
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        os.close(null)
+        serve(server, idle)
+    finally:
+        os._exit(0)
+
+
+def open_in_browser(url):
+    from gi.repository import Gio, GLib
+
+    try:
+        Gio.AppInfo.launch_default_for_uri(url, None)
+    except GLib.Error as error:
+        return error.message
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Serve the S Pen test page.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--no-open", action="store_true",
+                      help="print the address and serve in the foreground")
+    mode.add_argument("--print-url", action="store_true",
+                      help="start the server, print its address and return")
+    parser.add_argument("--idle", type=float, default=IDLE_SECONDS,
+                        help="seconds without a request before the server exits")
+    parser.add_argument("--page", type=Path, default=PAGE, help=argparse.SUPPRESS)
+    parser.add_argument("--sysfs", type=Path, default=SYSFS, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    try:
+        page = args.page.read_bytes()
+    except OSError as error:
+        print(f"tab-companion-spen-test: {error}", file=sys.stderr)
+        return 1
+    server = make_server(page, args.sysfs)
+    url = f"http://{server.host_header}/?lang={language()}"
+
+    if args.no_open:
+        print(url, flush=True)
+        try:
+            serve(server, args.idle)
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    sys.stdout.flush()
+    detach(server, args.idle)
+    if args.print_url:
+        print(url)
+        return 0
+    error = open_in_browser(url)
+    if error is not None:
+        print(f"tab-companion-spen-test: could not start a browser ({error}); "
+              f"open {url} in one", file=sys.stderr)
+        return 1
+    print(url)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -10,11 +10,16 @@ esac
 device_dir=/sys$devpath
 [ -d "$device_dir" ]
 
-for attribute in ignore_finger_while_hovering disable_digitizer_when_docked; do
+for attribute in ignore_finger_while_hovering disable_digitizer_when_docked \
+	side_button_split side_button_near_height side_button_far_height; do
 	path=$device_dir/$attribute
 	[ -e "$path" ] || continue
 	chgrp input "$path"
-	chmod 0660 "$path"
+	# Readable by everyone (the pen test helper runs outside the input group
+	# and reads the split's settings); written by the input group and the
+	# desktop user only.  At boot the owner file does not exist yet, so the
+	# group is what the hardware service writes through.
+	chmod 0664 "$path"
 	owner_file=/run/ubuntu-gts9u/desktop-user
 	if [ -r "$owner_file" ]; then
 		owner=$(cat "$owner_file")

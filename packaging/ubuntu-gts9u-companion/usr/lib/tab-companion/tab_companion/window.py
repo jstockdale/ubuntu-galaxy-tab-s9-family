@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 
+from glob import glob
 import os
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
@@ -28,6 +29,8 @@ GESTURES = (
     ("circle-counterclockwise", N_("Counter-clockwise circle"), N_("Draw a counter-clockwise circle")),
 )
 KEYBOARD_HAPTIC_DURATIONS_MS = (24, 42, 66)
+PEN_TEST = "/usr/libexec/tab-companion-spen-test"
+SIDE_SPLIT_ATTRIBUTE = "/sys/bus/i2c/devices/*/side_button_split"
 
 KEYS = (
     ("galaxy-ai", "Galaxy AI", N_("Tab Companion by default")),
@@ -706,6 +709,19 @@ class CompanionWindow(Adw.ApplicationWindow):
         status.add(self.battery_row)
         page.add(status)
 
+        test_group = Adw.PreferencesGroup()
+        test_row = Adw.ActionRow(
+            title=_("S Pen test"),
+            subtitle=_("Draw on a test sheet in the web browser to check pressure, tilt, hover, the side button and alignment."),
+        )
+        test_row.add_prefix(Gtk.Image(icon_name="document-edit-symbolic"))
+        open_test = Gtk.Button(label=_("Open"), valign=Gtk.Align.CENTER)
+        open_test.connect("clicked", self._open_pen_test)
+        test_row.add_suffix(open_test)
+        test_row.set_activatable_widget(open_test)
+        test_group.add(test_row)
+        page.add(test_group)
+
         behaviour = Adw.PreferencesGroup(
             title=_("S Pen behaviour"),
             description=_("Control touch rejection and when the digitizer is active."),
@@ -740,6 +756,20 @@ class CompanionWindow(Adw.ApplicationWindow):
             Gio.SettingsBindFlags.DEFAULT,
         )
         behaviour.add(dock_popup)
+        side_split = Adw.SwitchRow(
+            title=_("Tap with the side button to right-click"),
+            subtitle=_("Hold the side button with the pen close to the screen, then tap. Pressed farther away it keeps its usual action."),
+        )
+        side_split.add_prefix(Gtk.Image(icon_name="input-mouse-symbolic"))
+        self.settings.bind(
+            "spen-side-button-split", side_split, "active",
+            Gio.SettingsBindFlags.DEFAULT,
+        )
+        # The kernel option is the driver's; an older kernel has no such file.
+        if not glob(SIDE_SPLIT_ATTRIBUTE):
+            side_split.set_sensitive(False)
+            side_split.set_subtitle(_("The updated kernel is required"))
+        behaviour.add(side_split)
         page.add(behaviour)
         page.add(remote)
 
@@ -780,6 +810,49 @@ class CompanionWindow(Adw.ApplicationWindow):
         page.add(pointer)
         self._update_remote_sections()
         return page
+
+    def _open_pen_test(self, _button):
+        # The helper starts its loopback server, prints the address and
+        # returns.  The window opens the address itself: through GTK the
+        # browser gets an activation token and comes to the front, and no
+        # xdg-open is needed.
+        try:
+            helper = Gio.Subprocess.new(
+                [PEN_TEST, "--print-url"],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+            )
+        except GLib.Error as error:
+            self._pen_test_failed(error.message)
+            return
+        helper.communicate_utf8_async(None, None, self._pen_test_started)
+
+    def _pen_test_started(self, helper, result):
+        try:
+            _ok, out, err = helper.communicate_utf8_finish(result)
+        except GLib.Error as error:
+            self._pen_test_failed(error.message)
+            return
+        url = (out or "").strip()
+        if not helper.get_successful() or not url.startswith("http://127.0.0.1:"):
+            self._pen_test_failed((err or "").strip() or url)
+            return
+        Gtk.UriLauncher.new(url).launch(self, None, self._pen_test_opened, url)
+
+    def _pen_test_opened(self, launcher, result, url):
+        try:
+            launcher.launch_finish(result)
+        except GLib.Error as error:
+            self._pen_test_failed(f"{error.message}\n\n{url}")
+
+    def _pen_test_failed(self, detail):
+        print(f"Cannot open the S Pen test: {detail}", flush=True)
+        dialog = Adw.MessageDialog(
+            transient_for=self, modal=True,
+            heading=_("Cannot open the S Pen test"),
+            body=detail,
+        )
+        dialog.add_response("close", _("Close"))
+        dialog.present()
 
     def _scale_setting_row(self, setting, title, subtitle, lower, upper, step, icon):
         row = Adw.ActionRow(title=title, subtitle=subtitle)

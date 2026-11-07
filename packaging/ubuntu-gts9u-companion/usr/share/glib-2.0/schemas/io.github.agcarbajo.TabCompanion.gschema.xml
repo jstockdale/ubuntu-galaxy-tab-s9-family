@@ -31,6 +31,12 @@
     <key name="last-pen-battery" type="i"><default>-1</default></key>
     <key name="ignore-finger-while-hovering" type="b"><default>true</default></key>
     <key name="disable-digitizer-when-docked" type="b"><default>false</default></key>
+    <!-- The side button split: held near the screen, the side button makes taps right clicks;
+         pressed farther away it keeps its usual action.  Near at or below the near height,
+         far again only above the far height (the driver's height units, 0 at contact). -->
+    <key name="spen-side-button-split" type="b"><default>false</default></key>
+    <key name="spen-side-button-near-height" type="i"><range min="0" max="255"/><default>36</default></key>
+    <key name="spen-side-button-far-height" type="i"><range min="0" max="255"/><default>44</default></key>
     <key name="pen-dock-popup" type="b"><default>true</default></key>
     <key name="spen-remote-enabled" type="b"><default>true</default></key>
     <key name="spen-remote-mode" type="s"><default>'gestures'</default></key>

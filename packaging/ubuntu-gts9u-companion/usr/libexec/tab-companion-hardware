@@ -1231,12 +1231,24 @@ class HardwareService:
             "disable_digitizer_when_docked": self.settings.get_boolean(
                 "disable-digitizer-when-docked"
             ),
+            "side_button_split": self.settings.get_boolean(
+                "spen-side-button-split"
+            ),
+            "side_button_near_height": self.settings.get_int(
+                "spen-side-button-near-height"
+            ),
+            "side_button_far_height": self.settings.get_int(
+                "spen-side-button-far-height"
+            ),
         }
-        for attribute, enabled in options.items():
+        for attribute, value in options.items():
             path = self.wacom / attribute
             if not path.exists():
                 continue
-            desired = "1" if enabled else "0"
+            if isinstance(value, bool):
+                desired = "1" if value else "0"
+            else:
+                desired = str(value)
             if read_text(path) == desired:
                 self.pen_option_errors.discard(attribute)
                 continue

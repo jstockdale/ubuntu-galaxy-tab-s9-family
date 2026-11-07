@@ -18,6 +18,9 @@
   <launchable type="desktop-id">io.github.agcarbajo.TabCompanion.desktop</launchable>
   <url type="homepage">https://github.com/agcarbajo/ubuntu-galaxy-tab-s9-ultra</url>
   <releases>
+    <release version="1.3.14" date="2026-11-07">
+      <description><p>Adds an S Pen test sheet, opened from the S Pen page, that shows pressure, tilt, hover height, the side button and alignment. A new option makes a tap with the side button held near the screen a right click.</p></description>
+    </release>
     <release version="1.3.13" date="2026-11-06">
       <description><p>Recognizes the Galaxy Tab S9 keyboard covers and reports cover state from the kernel. The keyboard backend now runs as a system service, so desktop apps no longer get raw access to input devices.</p></description>
     </release>

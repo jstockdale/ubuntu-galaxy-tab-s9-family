@@ -1,0 +1,509 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<!--
+  S Pen test sheet.  Draw with the pen: the line follows the pressure and turns
+  red while the side button is held.  The strip at the top shows what the
+  browser receives (pointer type, pressure, tilt, buttons, sample rate), a
+  checklist of what has been seen, the alignment results and, when the sheet
+  comes from Tab Companion's helper, the live hover height and the side button
+  split, which a browser cannot read itself (the helper's /pen).
+
+  The five crosshairs can be tapped in any order: a tap lands on the nearest
+  one within 48 px.  Check alignment instead clears the orientation's results
+  and highlights the crosshairs one at a time, measuring each tap against the
+  highlighted one however far off it lands, so a mirrored or rotated mapping
+  shows as a large offset rather than passing on the crosshair opposite (free
+  taps cannot catch that).  Results are kept per screen orientation as the
+  browser reports it: Chromium tells a turned-over screen apart, Firefox on
+  Linux reports only the two primary orientations, so there a turned-over
+  screen shares its result and a Check alignment after turning replaces it.
+
+  Self-contained: no network beyond the helper that served it, no storage.
+  Tab Companion opens it through /usr/libexec/tab-companion-spen-test; opened
+  as a file it works without the height line.
+
+  GNOME sends the pen's side button as a middle click by default, which the
+  browser reports as buttons 4 (hovering) or 5 (with the tip down); a right
+  click (GNOME Settings, Wacom Tablet, or a tap with the side button split)
+  reports 2 or 3.  Both count.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'self'">
+<link rel="icon" href="data:,">
+<title>S Pen test</title>
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; color: #1d1d1d;
+    font: 16px system-ui, sans-serif; -webkit-user-select: none; user-select: none; }
+  canvas { position: fixed; inset: 0; display: block; }
+  #ink { touch-action: none; }
+  #hud { position: fixed; top: 8px; left: 84px; right: 84px; padding: 8px 12px; border-radius: 8px;
+    background: rgba(238, 238, 238, 0.93); font: 14px/1.5 ui-monospace, "DejaVu Sans Mono", monospace;
+    white-space: pre-wrap; pointer-events: none; }
+  #hud .yes { color: #1f7a35; font-weight: 600; }
+  #hud .no { color: #8a8a8a; }
+  #hud .warn { color: #b3261e; font-weight: 600; }
+  #bar { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; }
+  button { font: inherit; font-size: 17px; padding: 10px 20px; border-radius: 8px; border: 1px solid #b9b9b9;
+    background: #f4f4f4; color: #1d1d1d; white-space: nowrap; }
+  button.armed { background: #1a5fb4; border-color: #1a5fb4; color: #fff; }
+</style>
+</head>
+<body>
+<canvas id="marks"></canvas>
+<canvas id="ink"></canvas>
+<div id="hud" role="status"></div>
+<div id="bar">
+  <button id="align" type="button"></button>
+  <button id="clear" type="button"></button>
+  <button id="reset" type="button"></button>
+</div>
+<script>
+'use strict';
+
+// ---- language ---------------------------------------------------------
+// English is the source; each entry is es, fr, de, it, pt (European).
+const LANGS = ['es', 'fr', 'de', 'it', 'pt'];
+const STRINGS = {
+  'Move the S Pen over the page.': ['Mueve el S Pen sobre la página.', 'Déplacez le S Pen au-dessus de la page.', 'Den S Pen über die Seite bewegen.', 'Muovi la S Pen sulla pagina.', 'Mova a S Pen sobre a página.'],
+  'Check alignment': ['Comprobar alineación', 'Vérifier l’alignement', 'Ausrichtung prüfen', 'Verifica allineamento', 'Verificar alinhamento'],
+  'Clear': ['Borrar', 'Effacer', 'Löschen', 'Cancella', 'Limpar'],
+  'Reset results': ['Reiniciar resultados', 'Réinitialiser les résultats', 'Ergebnisse zurücksetzen', 'Azzera risultati', 'Repor resultados'],
+  'hover': ['sin contacto', 'survol', 'Schweben', 'senza contatto', 'sem contacto'],
+  'pressure': ['presión', 'pression', 'Druck', 'pressione', 'pressão'],
+  'pressure {min}–{max}': ['presión {min}–{max}', 'pression {min}–{max}', 'Druck {min}–{max}', 'pressione {min}–{max}', 'pressão {min}–{max}'],
+  'pressure constant at {value}': ['presión constante en {value}', 'pression constante à {value}', 'Druck konstant bei {value}', 'pressione costante a {value}', 'pressão constante em {value}'],
+  'tilt': ['inclinación', 'inclinaison', 'Neigung', 'inclinazione', 'inclinação'],
+  'tilt x {x0}..{x1} y {y0}..{y1}': ['inclinación x {x0}..{x1} y {y0}..{y1}', 'inclinaison x {x0}..{x1} y {y0}..{y1}', 'Neigung x {x0}..{x1} y {y0}..{y1}', 'inclinazione x {x0}..{x1} y {y0}..{y1}', 'inclinação x {x0}..{x1} y {y0}..{y1}'],
+  'side button': ['botón lateral', 'bouton latéral', 'Seitentaste', 'tasto laterale', 'botão lateral'],
+  'side button ({kinds})': ['botón lateral ({kinds})', 'bouton latéral ({kinds})', 'Seitentaste ({kinds})', 'tasto laterale ({kinds})', 'botão lateral ({kinds})'],
+  'middle click': ['clic central', 'clic du milieu', 'Mittelklick', 'clic centrale', 'clique do meio'],
+  'right click': ['clic derecho', 'clic droit', 'Rechtsklick', 'clic destro', 'clique direito'],
+  'eraser': ['borrador', 'gomme', 'Radierer', 'gomma', 'borracha'],
+  'finger touch': ['toque con el dedo', 'toucher du doigt', 'Fingerberührung', 'tocco con il dito', 'toque com o dedo'],
+  'landscape': ['horizontal', 'paysage', 'Querformat', 'orizzontale', 'horizontal'],
+  'portrait': ['vertical', 'portrait', 'Hochformat', 'verticale', 'vertical'],
+  'landscape, turned over': ['horizontal, girada', 'paysage, retournée', 'Querformat, gedreht', 'orizzontale, capovolta', 'horizontal, virada'],
+  'portrait, turned over': ['vertical, girada', 'portrait, retournée', 'Hochformat, gedreht', 'verticale, capovolta', 'vertical, virada'],
+  '{orientation}: alignment not checked': ['{orientation}: alineación sin comprobar', '{orientation} : alignement non vérifié', '{orientation}: Ausrichtung nicht geprüft', '{orientation}: allineamento non verificato', '{orientation}: alinhamento por verificar'],
+  ', checked in turn': [', comprobadas por turno', ', vérifiées tour à tour', ', nacheinander geprüft', ', verificati uno alla volta', ', verificadas à vez'],
+  '{orientation}: {n} of 5 crosshairs, worst offset {px} px': ['{orientation}: {n} de 5 cruces, peor desviación {px} px', '{orientation} : {n} croix sur 5, pire écart {px} px', '{orientation}: {n} von 5 Kreuzen, größte Abweichung {px} px', '{orientation}: {n} di 5 mirini, scarto massimo {px} px', '{orientation}: {n} de 5 cruzes, maior desvio {px} px'],
+  'Touch the highlighted crosshair with the pen tip ({n} of 5).': ['Toca la cruz resaltada con la punta del lápiz ({n} de 5).', 'Touchez la croix en surbrillance avec la pointe du stylet ({n} sur 5).', 'Das hervorgehobene Kreuz mit der Stiftspitze berühren ({n} von 5).', 'Tocca il mirino evidenziato con la punta della penna ({n} di 5).', 'Toque na cruz destacada com a ponta da caneta ({n} de 5).'],
+  'Tap the crosshairs with the pen tip in any order, or press Check alignment to be led through them one at a time, which also catches a mirrored or rotated pen. Check again after rotating the tablet.': ['Toca las cruces con la punta del lápiz en cualquier orden, o pulsa Comprobar alineación para recorrerlas una a una, lo que además detecta un lápiz reflejado o girado. Vuelve a comprobar tras girar la tablet.', 'Touchez les croix avec la pointe du stylet dans n’importe quel ordre, ou appuyez sur Vérifier l’alignement pour être guidé de l’une à l’autre, ce qui détecte aussi un stylet inversé ou pivoté. Vérifiez de nouveau après avoir tourné la tablette.', 'Die Kreuze in beliebiger Reihenfolge mit der Stiftspitze antippen oder Ausrichtung prüfen drücken, um nacheinander durch sie geführt zu werden; das erkennt auch einen gespiegelten oder gedrehten Stift. Nach dem Drehen des Tablets erneut prüfen.', 'Tocca i mirini con la punta della penna in qualsiasi ordine, oppure premi Verifica allineamento per essere guidato uno alla volta, che rileva anche una penna specchiata o ruotata. Verifica di nuovo dopo aver ruotato il tablet.', 'Toque nas cruzes com a ponta da caneta por qualquer ordem, ou prima Verificar alinhamento para ser guiado por elas uma a uma, o que também deteta uma caneta espelhada ou rodada. Verifique de novo depois de rodar o tablet.'],
+  'types seen: {types}': ['tipos vistos: {types}', 'types vus : {types}', 'gesehene Typen: {types}', 'tipi visti: {types}', 'tipos vistos: {types}'],
+  'none': ['ninguno', 'aucun', 'keine', 'nessuno', 'nenhum'],
+  'hover height: open the sheet from Tab Companion (S Pen → S Pen test) to see it': ['altura sin contacto: abre la hoja desde Tab Companion (S Pen → Prueba del S Pen) para verla', 'hauteur de survol : ouvrez la feuille depuis Tab Companion (S Pen → Test du S Pen) pour la voir', 'Schwebehöhe: das Blatt aus Tab Companion öffnen (S Pen → S Pen-Test), um sie zu sehen', 'altezza senza contatto: apri il foglio da Tab Companion (S Pen → Test della S Pen) per vederla', 'altura sem contacto: abra a folha a partir do Tab Companion (S Pen → Teste da S Pen) para a ver'],
+  'hover height: waiting for the helper': ['altura sin contacto: esperando al asistente', 'hauteur de survol : en attente de l’assistant', 'Schwebehöhe: warte auf das Hilfsprogramm', 'altezza senza contatto: in attesa dell’assistente', 'altura sem contacto: a aguardar o assistente'],
+  'hover height: the helper stopped answering; open the sheet again': ['altura sin contacto: el asistente dejó de responder; abre la hoja de nuevo', 'hauteur de survol : l’assistant ne répond plus ; rouvrez la feuille', 'Schwebehöhe: das Hilfsprogramm antwortet nicht mehr; das Blatt erneut öffnen', 'altezza senza contatto: l’assistente non risponde più; riapri il foglio', 'altura sem contacto: o assistente deixou de responder; abra a folha de novo'],
+  'hover height: not reported by this kernel': ['altura sin contacto: este kernel no la proporciona', 'hauteur de survol : non fournie par ce noyau', 'Schwebehöhe: von diesem Kernel nicht gemeldet', 'altezza senza contatto: non fornita da questo kernel', 'altura sem contacto: não fornecida por este kernel'],
+  'hover height: out of range': ['altura sin contacto: fuera de alcance', 'hauteur de survol : hors de portée', 'Schwebehöhe: außer Reichweite', 'altezza senza contatto: fuori portata', 'altura sem contacto: fora de alcance'],
+  'hover height {height}': ['altura sin contacto {height}', 'hauteur de survol {height}', 'Schwebehöhe {height}', 'altezza senza contatto {height}', 'altura sem contacto {height}'],
+  'near': ['cerca', 'proche', 'nah', 'vicino', 'perto'],
+  'far': ['lejos', 'loin', 'fern', 'lontano', 'longe'],
+  '(near ≤ {near}, far > {far})': ['(cerca ≤ {near}, lejos > {far})', '(proche ≤ {near}, loin > {far})', '(nah ≤ {near}, fern > {far})', '(vicino ≤ {near}, lontano > {far})', '(perto ≤ {near}, longe > {far})'],
+  'side button: near, tap to right-click; far, its usual action': ['botón lateral: cerca, toca para clic derecho; lejos, su acción habitual', 'bouton latéral : proche, touchez pour un clic droit ; loin, son action habituelle', 'Seitentaste: nah, tippen für Rechtsklick; fern, ihre übliche Aktion', 'tasto laterale: vicino, tocca per il clic destro; lontano, la sua azione abituale', 'botão lateral: perto, toque para clique direito; longe, a sua ação habitual'],
+  'side button split off': ['división del botón lateral desactivada', 'partage du bouton latéral désactivé', 'Seitentasten-Aufteilung aus', 'divisione del tasto laterale disattivata', 'divisão do botão lateral desativada'],
+};
+const lang = (() => {
+  const wanted = (new URLSearchParams(location.search).get('lang') || navigator.language || 'en').slice(0, 2).toLowerCase();
+  return LANGS.indexOf(wanted);
+})();
+function t(text, vars) {
+  const entry = STRINGS[text];
+  let out = entry && lang >= 0 ? entry[lang] : text;
+  for (const [name, value] of Object.entries(vars || {})) out = out.split('{' + name + '}').join(String(value));
+  return out;
+}
+if (lang >= 0) document.documentElement.lang = LANGS[lang];
+
+// ---- state ------------------------------------------------------------
+const ink = document.getElementById('ink');
+const marks = document.getElementById('marks');
+const hud = document.getElementById('hud');
+const alignButton = document.getElementById('align');
+const ictx = ink.getContext('2d');
+const mctx = marks.getContext('2d');
+
+const TARGET_INSET = 40;   // CSS px from the edges
+const TARGET_RADIUS = 14;
+const HIT_RADIUS = 48;     // a free tap this close to a crosshair is a try at it
+const WARN_OFFSET = 8;     // px; more than a careful tap misses by
+const TARGET_IDS = ['top-left', 'top-right', 'centre', 'bottom-left', 'bottom-right'];
+
+let seen, targets = [], live = null, samples = 0, rate = 0, pending = false;
+const last = new Map();      // pointerId -> previous sample while drawing
+const tipDown = new Set();   // pointerIds whose tip is on the glass
+// The alignment check: armed, which crosshair is next, and for which
+// orientation; results live in seen.hits, keyed "orientation:target".
+const align = { armed: false, index: 0, bucket: '' };
+// The digitiser's hover height and side button settings, from the helper's
+// /pen (a browser cannot read them): null until the first answer.
+let pen = null;
+
+function resetSeen() {
+  seen = {
+    types: new Set(), hover: false, tip: false, pressureMin: Infinity, pressureMax: 0,
+    tiltX: [Infinity, -Infinity], tiltY: [Infinity, -Infinity], sides: new Set(), eraser: false,
+    touch: false, hits: new Map(),
+  };
+}
+
+// The screen's orientation where the browser reports it (Chrome tells a
+// turned-over screen apart; Firefox on Linux reports only the primary two),
+// else the window's shape.
+function orientation() {
+  const type = screen.orientation && screen.orientation.type;
+  if (type) return type;
+  return innerWidth >= innerHeight ? 'landscape-primary' : 'portrait-primary';
+}
+function orientationName(type) {
+  const base = type.startsWith('portrait') ? 'portrait' : 'landscape';
+  return t(type.endsWith('secondary') ? base + ', turned over' : base);
+}
+
+function layout() {
+  const r = devicePixelRatio || 1;
+  for (const c of [ink, marks]) {
+    c.width = Math.round(innerWidth * r);
+    c.height = Math.round(innerHeight * r);
+    c.style.width = innerWidth + 'px';
+    c.style.height = innerHeight + 'px';
+    c.getContext('2d').setTransform(r, 0, 0, r, 0, 0);
+  }
+  ictx.lineCap = ictx.lineJoin = 'round';
+  const w = innerWidth, h = innerHeight, i = TARGET_INSET;
+  const at = { 'top-left': [i, i], 'top-right': [w - i, i], centre: [w / 2, h / 2],
+    'bottom-left': [i, h - i], 'bottom-right': [w - i, h - i] };
+  targets = TARGET_IDS.map((id) => ({ id, x: at[id][0], y: at[id][1] }));
+  last.clear();
+  tipDown.clear();
+  // The crosshairs have moved, so a check under way is void.
+  disarm();
+  drawTargets();
+  schedule();
+}
+
+function drawTargets() {
+  mctx.clearRect(0, 0, innerWidth, innerHeight);
+  const o = orientation();
+  targets.forEach((target, index) => {
+    const hit = seen.hits.get(o + ':' + target.id);
+    const next = align.armed && index === align.index;
+    mctx.strokeStyle = next ? '#1a5fb4' : hit ? (hit.offset > WARN_OFFSET ? '#b3261e' : '#1f7a35') : '#9a9a9a';
+    mctx.lineWidth = next ? 3 : 1.5;
+    const r = next ? TARGET_RADIUS + 6 : TARGET_RADIUS;
+    mctx.beginPath();
+    mctx.arc(target.x, target.y, r, 0, 2 * Math.PI);
+    mctx.moveTo(target.x - r - 8, target.y); mctx.lineTo(target.x + r + 8, target.y);
+    mctx.moveTo(target.x, target.y - r - 8); mctx.lineTo(target.x, target.y + r + 8);
+    mctx.stroke();
+    if (hit && !next) {
+      // Relative to the crosshair, so the dot follows it when the layout changes.
+      const x = Math.min(Math.max(target.x + hit.dx, 0), innerWidth);
+      const y = Math.min(Math.max(target.y + hit.dy, 0), innerHeight);
+      mctx.fillStyle = mctx.strokeStyle;
+      mctx.beginPath();
+      mctx.arc(x, y, 3, 0, 2 * Math.PI);
+      mctx.fill();
+    }
+  });
+}
+
+// Check alignment starts this orientation afresh: its crosshair results and
+// the drawing go, then the crosshairs are led through one at a time.
+function arm() {
+  align.armed = true;
+  align.index = 0;
+  align.bucket = orientation();
+  for (const key of [...seen.hits.keys()]) if (key.startsWith(align.bucket + ':')) seen.hits.delete(key);
+  ictx.clearRect(0, 0, innerWidth, innerHeight);
+  alignButton.classList.add('armed');
+  drawTargets();
+  schedule();
+}
+function disarm() {
+  align.armed = false;
+  alignButton.classList.remove('armed');
+}
+
+// GNOME sends the side button as a middle click (4) by default, a right click
+// (2) when remapped or as a split tap; bit 32 is an eraser end.
+function sideButton(b) {
+  return b & 4 ? 'middle click' : b & 2 ? 'right click' : '';
+}
+
+function note(e) {
+  seen.types.add(e.pointerType);
+  if (e.pointerType === 'touch') seen.touch = true;
+  if (e.pointerType !== 'pen') return;
+  if (e.buttons === 0) seen.hover = true;
+  const side = sideButton(e.buttons);
+  if (side) seen.sides.add(side);
+  if (e.buttons & 32) seen.eraser = true;
+  if (e.tiltX || e.tiltY) {
+    seen.tiltX = [Math.min(seen.tiltX[0], e.tiltX), Math.max(seen.tiltX[1], e.tiltX)];
+    seen.tiltY = [Math.min(seen.tiltY[0], e.tiltY), Math.max(seen.tiltY[1], e.tiltY)];
+  }
+  if (e.buttons & 1 && e.pressure > 0) {
+    seen.tip = true;
+    seen.pressureMin = Math.min(seen.pressureMin, e.pressure);
+    seen.pressureMax = Math.max(seen.pressureMax, e.pressure);
+  }
+}
+
+// Only the sample where the tip lands counts, so a stroke dragged through a
+// crosshair does not.  During a check it is measured against the highlighted
+// crosshair however far off it lands; otherwise against the nearest one, if
+// it is within HIT_RADIUS.
+function landed(e) {
+  if (!(e.buttons & 1)) {
+    tipDown.delete(e.pointerId);
+    return;
+  }
+  if (tipDown.has(e.pointerId)) return;
+  tipDown.add(e.pointerId);
+  if (e.pointerType !== 'pen') return;
+  const bucket = orientation();
+  let target;
+  if (align.armed) {
+    if (bucket !== align.bucket) {
+      disarm();
+      return;
+    }
+    target = targets[align.index];
+  } else {
+    target = targets.reduce((best, t) =>
+      Math.hypot(e.clientX - t.x, e.clientY - t.y) < Math.hypot(e.clientX - best.x, e.clientY - best.y) ? t : best);
+    if (Math.hypot(e.clientX - target.x, e.clientY - target.y) > HIT_RADIUS) return;
+  }
+  seen.hits.set(bucket + ':' + target.id, {
+    offset: Math.hypot(e.clientX - target.x, e.clientY - target.y),
+    dx: e.clientX - target.x, dy: e.clientY - target.y, guided: align.armed,
+  });
+  if (align.armed) {
+    align.index += 1;
+    if (align.index >= targets.length) disarm();
+  }
+  drawTargets();
+  schedule();
+}
+
+function stroke(e, from, to) {
+  const isPen = e.pointerType === 'pen';
+  if (e.buttons & 32) {
+    ictx.globalCompositeOperation = 'destination-out';
+    ictx.lineWidth = 28;
+  } else {
+    ictx.globalCompositeOperation = 'source-over';
+    ictx.strokeStyle = !isPen ? '#8f8f8f' : sideButton(e.buttons) ? '#c01c28' : '#1a5fb4';
+    ictx.lineWidth = isPen ? 1 + to.pressure * 22 : e.pointerType === 'touch' ? 2 : 3;
+  }
+  ictx.beginPath();
+  ictx.moveTo(from.clientX, from.clientY);
+  ictx.lineTo(to.clientX, to.clientY);
+  ictx.stroke();
+}
+
+function coalesced(e) {
+  const list = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : [];
+  return list.length ? list : [e];
+}
+
+function describe(e, what) {
+  live = { what, type: e.pointerType, pressure: e.pressure, tiltX: e.tiltX, tiltY: e.tiltY, buttons: e.buttons };
+  schedule();
+}
+
+function schedule() {
+  if (pending) return;
+  pending = true;
+  requestAnimationFrame(render);
+}
+
+// ---- the strip --------------------------------------------------------
+function render() {
+  pending = false;
+  const out = [];
+  const span = (text, cls) => {
+    const s = document.createElement('span');
+    s.textContent = text;
+    if (cls) s.className = cls;
+    out.push(s);
+  };
+  const item = (ok, text, cls) => span((ok ? '✓ ' : '· ') + text + '   ', cls || (ok ? 'yes' : 'no'));
+
+  // What the browser receives now.  The words are the browser's own.
+  span(live
+    ? `${live.what.padEnd(5)} ${live.type.padEnd(5)} pressure ${live.pressure.toFixed(3)}  ` +
+      `tilt ${String(live.tiltX).padStart(3)},${String(live.tiltY).padStart(3)}  buttons ${live.buttons}  ` +
+      `pen rate ${rate} Hz  ${orientationName(orientation())}\n`
+    : t('Move the S Pen over the page.') + '\n');
+
+  // What has been seen.  Pressure only counts once it has varied: a driver
+  // without it still gets 0.5 from the browser whenever the tip is down.
+  item(seen.hover, t('hover'));
+  if (!seen.tip) {
+    item(false, t('pressure'));
+  } else if (seen.pressureMax - seen.pressureMin > 0.05) {
+    item(true, t('pressure {min}–{max}', { min: seen.pressureMin.toFixed(3), max: seen.pressureMax.toFixed(3) }));
+  } else {
+    item(false, t('pressure constant at {value}', { value: seen.pressureMax.toFixed(3) }), 'warn');
+  }
+  const tilt = seen.tiltX[0] !== Infinity;
+  item(tilt, tilt ? t('tilt x {x0}..{x1} y {y0}..{y1}', { x0: seen.tiltX[0], x1: seen.tiltX[1], y0: seen.tiltY[0], y1: seen.tiltY[1] }) : t('tilt'));
+  item(seen.sides.size > 0, seen.sides.size
+    ? t('side button ({kinds})', { kinds: [...seen.sides].map((k) => t(k)).join(', ') }) : t('side button'));
+  item(seen.eraser, t('eraser'));
+  item(seen.touch, t('finger touch'));
+  span('\n');
+
+  // Alignment, for every orientation checked and the one on screen.
+  const buckets = new Set([...seen.hits.keys()].map((k) => k.split(':')[0]));
+  buckets.add(orientation());
+  for (const bucket of buckets) {
+    const hits = [...seen.hits].filter(([k]) => k.startsWith(bucket + ':')).map(([, v]) => v);
+    if (!hits.length) {
+      span(t('{orientation}: alignment not checked', { orientation: orientationName(bucket) }) + '   ', 'no');
+      continue;
+    }
+    const worst = Math.max(...hits.map((h) => h.offset));
+    const checked = hits.length === targets.length && hits.every((h) => h.guided);
+    span(t('{orientation}: {n} of 5 crosshairs, worst offset {px} px', {
+      orientation: orientationName(bucket), n: hits.length, px: worst.toFixed(1),
+    }) + (checked ? t(', checked in turn') : '') + '   ',
+    worst > WARN_OFFSET ? 'warn' : hits.length === targets.length ? 'yes' : 'no');
+  }
+  span('\n');
+  penLine(span);
+  span('\n' + t('types seen: {types}', { types: [...seen.types].join(', ') || t('none') }) + '.  ');
+  span(align.armed
+    ? t('Touch the highlighted crosshair with the pen tip ({n} of 5).', { n: align.index + 1 })
+    : t('Tap the crosshairs with the pen tip in any order, or press Check alignment to be led through them one at a time, which also catches a mirrored or rotated pen. Check again after rotating the tablet.'));
+  hud.replaceChildren(...out);
+}
+
+// One line about the hover height and the side button split.
+function penLine(span) {
+  if (!/^https?:$/.test(location.protocol)) {
+    span(t('hover height: open the sheet from Tab Companion (S Pen → S Pen test) to see it'), 'no');
+    return;
+  }
+  if (pen === null) {
+    span(t('hover height: waiting for the helper'), 'no');
+    return;
+  }
+  if (pen.error) {
+    span(t('hover height: the helper stopped answering; open the sheet again'), 'warn');
+    return;
+  }
+  if (!pen.available) {
+    span(t('hover height: not reported by this kernel'), 'no');
+    return;
+  }
+  const band = pen.near_height !== null && pen.far_height !== null
+    ? ' ' + t('(near ≤ {near}, far > {far})', { near: pen.near_height, far: pen.far_height }) : '';
+  const split = '   ' + t(pen.split ? 'side button: near, tap to right-click; far, its usual action' : 'side button split off');
+  if (!pen.in_range) {
+    span(t('hover height: out of range') + band + split, 'no');
+    return;
+  }
+  // Height runs from 0 at contact to about 100 at the edge of range.
+  const filled = Math.max(0, Math.min(20, Math.round((100 - pen.height) / 5)));
+  span(t('hover height {height}', { height: String(pen.height).padStart(3) }) + ' ' +
+    '█'.repeat(filled) + '░'.repeat(20 - filled) + ' ');
+  span(t(pen.near ? 'near' : 'far'), pen.near ? 'yes' : 'no');
+  span(band + split);
+}
+
+let polling = false;
+function pollPen() {
+  if (polling || !/^https?:$/.test(location.protocol) || document.visibilityState !== 'visible') return;
+  polling = true;
+  fetch('/pen', { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+    .then((state) => { pen = state; }, () => { pen = { error: true }; })
+    .then(() => { polling = false; schedule(); });
+}
+setInterval(pollPen, 100);
+
+// ---- input ------------------------------------------------------------
+ink.addEventListener('pointerdown', (e) => {
+  e.preventDefault();           // no middle-click paste, text selection or focus change
+  try {
+    ink.setPointerCapture(e.pointerId);   // keep the stroke when the pen leaves the canvas
+  } catch (error) {
+    // the pointer was already gone; draw without capture
+  }
+  last.set(e.pointerId, e);
+  note(e);
+  landed(e);
+  describe(e, 'down');
+});
+ink.addEventListener('pointermove', (e) => {
+  const list = coalesced(e);
+  if (e.pointerType === 'pen') samples += list.length;
+  let prev = last.get(e.pointerId);
+  for (const s of list) {
+    note(s);
+    if ((s.buttons & 1 || s.buttons & 32) && prev) stroke(s, prev, s);
+    landed(s);
+    prev = s;
+  }
+  if (e.buttons) last.set(e.pointerId, prev);
+  else last.delete(e.pointerId);
+  describe(e, e.buttons ? 'draw' : 'hover');
+});
+for (const type of ['pointerup', 'pointercancel']) {
+  ink.addEventListener(type, (e) => {
+    last.delete(e.pointerId);
+    tipDown.delete(e.pointerId);
+    describe(e, type === 'pointerup' ? 'up' : 'lost');
+  });
+}
+ink.addEventListener('pointerleave', (e) => last.delete(e.pointerId));
+for (const type of ['contextmenu', 'auxclick']) ink.addEventListener(type, (e) => e.preventDefault());
+
+setInterval(() => {
+  const next = samples * 2;
+  samples = 0;
+  if (next !== rate) {
+    rate = next;
+    schedule();
+  }
+}, 500);
+
+// ---- buttons ----------------------------------------------------------
+alignButton.textContent = t('Check alignment');
+document.getElementById('clear').textContent = t('Clear');
+document.getElementById('reset').textContent = t('Reset results');
+alignButton.addEventListener('click', arm);
+document.getElementById('clear').addEventListener('click', () => {
+  ictx.clearRect(0, 0, innerWidth, innerHeight);
+});
+document.getElementById('reset').addEventListener('click', () => {
+  ictx.clearRect(0, 0, innerWidth, innerHeight);
+  resetSeen();
+  disarm();
+  live = null;
+  drawTargets();
+  schedule();
+});
+
+// A display-scale change alters devicePixelRatio without always firing
+// resize; re-lay out then too, or the strokes go soft.
+function watchScale() {
+  matchMedia(`(resolution: ${devicePixelRatio}dppx)`)
+    .addEventListener('change', () => { layout(); watchScale(); }, { once: true });
+}
+
+resetSeen();
+addEventListener('resize', layout);
+if (screen.orientation) screen.orientation.addEventListener('change', layout);
+watchScale();
+layout();
+</script>
+</body>
+</html>

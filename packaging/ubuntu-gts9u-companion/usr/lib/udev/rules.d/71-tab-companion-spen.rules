@@ -1,4 +1,5 @@
-# Allow the desktop user to change only the two boolean S Pen policy knobs.
+# Allow the desktop user to change only the S Pen policy knobs: the two
+# touch/dock switches and the side button split with its two heights.
 SUBSYSTEM=="i2c", DRIVER=="samsung-wacom-w90xx", RUN+="/usr/libexec/tab-companion-spen-permissions %p"
 
 # The docked S Pen pairing service belongs to the digitiser, so the digitiser
