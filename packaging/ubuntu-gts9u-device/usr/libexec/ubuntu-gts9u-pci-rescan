@@ -36,11 +36,12 @@
 # for the devices present at host init; a device created by a rescan keeps the
 # core's devicetree default of L0s and L1, so for it the writes change nothing
 # (aspm_attr_store_common -> policy_to_aspm_state, drivers/pci/pcie/aspm.c).
-# When the substates still read 0 after the writes, the global policy is set to
-# powersupersave, which enables every supported state on every link: on both
-# boards that is this one link (pcie0 is the only PCIe controller enabled), and
-# it is what host init gives a boot-time endpoint.  The per-link aspm_disable
-# mask stays in force under every policy, so `off` keeps working afterwards.
+# When the substates still read 0 after the writes, the global policy is set
+# from default to powersupersave, which enables every supported state on every
+# link: on both boards that is this one link (pcie0 is the only PCIe
+# controller enabled), and it is what host init gives a boot-time endpoint.  A
+# policy someone chose (performance, powersave) is left alone.  The per-link
+# aspm_disable mask stays in force under every policy, so `off` keeps working.
 #
 # The outcome is also left in /run/ubuntu-gts9u/pci-rescan (key=value), so it
 # can be checked without the journal, which may not hold the early boot.
@@ -170,6 +171,12 @@ if [ -n "$want" ] && [ -d "$ep/link" ]; then
 		was=$(aspm_policy_now)
 		if [ "$was" = powersupersave ]; then
 			log 'L1 substates still off under the powersupersave ASPM policy'
+		elif [ -n "$was" ] && [ "$was" != default ]; then
+			# performance or powersave was chosen on purpose (for example
+			# pcie_aspm.policy= on the kernel command line, the early way to
+			# keep L1.x off from host init on); do not override it.
+			log "ASPM policy is $was, not default; leaving it, the L1 substates stay off"
+			record aspm_policy "left-$was"
 		elif echo powersupersave > "$aspm_policy" 2>/dev/null; then
 			log "ASPM policy ${was:-?} -> powersupersave, so the L1 substates can be enabled"
 			record aspm_policy "powersupersave (was ${was:-unknown})"

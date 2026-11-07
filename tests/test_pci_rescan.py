@@ -232,6 +232,17 @@ class PciRescanTest(unittest.TestCase):
         self.assertEqual(self.state()["l1ss"], "1")
         self.assertIn("l1_1_aspm=1 l1_2_aspm=1 l1_1_pcipm=1 l1_2_pcipm=1", self.state()["link"])
 
+    def test_a_deliberate_aspm_policy_is_not_overridden(self):
+        # e.g. pcie_aspm.policy=powersave on the command line to keep L1.x off
+        (self.root / POLICY).write_text("default performance [powersave] powersupersave \n")
+        self.endpoint(bound=False)
+        self.scenario("rescan-binds")
+        result = self.run_script()
+        self.assertIn("ASPM policy is powersave, not default; leaving it", result.stderr)
+        self.assertEqual(self.aspm_policy(), "default performance [powersave] powersupersave")
+        self.assertEqual(self.state()["aspm_policy"], "left-powersave")
+        self.assertEqual(self.state()["l1ss"], "1-requested-not-on")
+
     def test_recreated_endpoint_when_the_policy_cannot_be_set(self):
         (self.root / POLICY).unlink()
         (self.root / POLICY).mkdir()  # every write to it fails

@@ -118,9 +118,11 @@ address.
 
 * **Wi-Fi misbehaves with L1.2 (AER errors, stalls, drops):** switch the
   substates off now, without a reboot (**sudo**):
-  `echo off | sudo tee /etc/ubuntu-gts9u/pcie-l1ss && sudo systemctl restart gts9u-pci-rescan`
-  (`verify.sh` then shows them 0). It stays off on every boot until the file
-  is removed.
+  `sudo mkdir -p /etc/ubuntu-gts9u && echo off | sudo tee /etc/ubuntu-gts9u/pcie-l1ss && sudo systemctl restart gts9u-pci-rescan`
+  (`/etc/ubuntu-gts9u` does not exist on the tablet yet, so the `mkdir` is
+  needed; `verify.sh` then shows the substates 0). It stays off on every boot
+  until the file is removed (`sudo rm /etc/ubuntu-gts9u/pcie-l1ss`). Writing
+  0 works under any ASPM policy, powersupersave included.
 * **Address or rescan helpers misbehave:** `sudo sh ~/wifi-kit/rollback.sh`
   undoes everything (vendor_boot from the backup, units removed or restored),
   then `sudo reboot`. If another kit wrote vendor_boot after this one,

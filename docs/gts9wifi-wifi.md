@@ -121,12 +121,17 @@ substates still read 0 after the writes, the helper sets
 `/sys/module/pcie_aspm/parameters/policy` to `powersupersave` (every
 supported state on every link; pcie0 is the only PCIe controller enabled on
 either board, so this is the state host init gives a boot-time endpoint).  The
-`aspm_disable` mask, and with it `off` below, is honoured under every policy.
+`aspm_disable` mask, and with it `off` below, is honoured under every policy,
+and a policy other than `default` (someone's deliberate choice) is left alone.
 
 `/etc/ubuntu-gts9u/pcie-l1ss` overrides step 3's choice: `auto` (default),
 `on` (always enable), `off` (always disable, the escape hatch if a link
 misbehaves in L1.2).  The outcome is left in `/run/ubuntu-gts9u/pci-rescan`
-(`aspm_policy=` when the policy had to change).
+(`aspm_policy=` when the policy had to change).  `off` acts only when the
+unit runs (after `basic.target`), so the substates are still on from host
+init (~11 s) until then; to keep them off from the start, add
+`pcie_aspm.policy=powersave` (L0s and L1 only) to the vendor_boot command
+line (`GTS9U_EXTRA_CMDLINE`).
 
 ## Userspace
 
