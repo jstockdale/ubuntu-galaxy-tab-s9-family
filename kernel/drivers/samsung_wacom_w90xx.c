@@ -154,6 +154,15 @@
 #define WACOM_PDCT_DEBOUNCE_MS		300
 
 /*
+ * charge_stage of samsung_wacom_charge_work, beyond the handshake's 0, 1 and
+ * 2: send the charge-off command, then run the handshake from stage 0 after
+ * WACOM_CHARGE_OFF_GAP_MS.  That is what the boot pulse used to get, read as
+ * an undock and a dock: on the six timed boots the two were 107-675 ms apart.
+ */
+#define WACOM_CHARGE_STAGE_OFF_FIRST	3
+#define WACOM_CHARGE_OFF_GAP_MS		300
+
+/*
  * The book cover arrives here and nowhere else.  The tablet's own Hall sensor
  * (TLMM 107, wired as gpio-keys SW_LID) answers the plain Book Cover, but the
  * keyboard folio's magnet never reaches it: measured with the cover shut, that
@@ -256,6 +265,10 @@ struct samsung_wacom {
 	bool pdct_wake_armed;
 	/* Between the system-sleep suspend and resume callbacks. */
 	bool suspended;
+	/* The suspend callback took charge_work off the queue. */
+	bool charge_resume;
+	/* A bounce has replayed the charge-off and handshake (pdct_work only). */
+	bool bounce_replayed;
 	u8 garage_direction;
 	/* Raw charge state of the last garage reply, for change-only logging. */
 	u8 garage_charge_state;
@@ -457,6 +470,18 @@ static void samsung_wacom_charge_work(struct work_struct *work)
 		return;
 	}
 
+	if (wacom->charge_stage == WACOM_CHARGE_STAGE_OFF_FIRST) {
+		ret = samsung_wacom_send_command(wacom,
+						 WACOM_CMD_BLE_CHARGE_KEEP_OFF);
+		if (ret)
+			dev_dbg(&wacom->client->dev,
+				"could not stop S Pen charging: %d\n", ret);
+		wacom->charge_stage = 0;
+		mod_delayed_work(system_freezable_wq, &wacom->charge_work,
+				 msecs_to_jiffies(WACOM_CHARGE_OFF_GAP_MS));
+		return;
+	}
+
 	if (wacom->charge_stage == 0) {
 		ret = samsung_wacom_send_command(wacom,
 					       WACOM_CMD_BLE_CHARGE_ENABLE);
@@ -588,14 +613,15 @@ static bool samsung_wacom_handle_cover_noti(struct samsung_wacom *wacom,
 }
 
 /*
- * Start the silo handshake over: charging from the top when docked, the
- * charge-off command when not.  The work in flight is stopped first, or it
- * could advance the stage again right after it has been reset here.
+ * Start the silo handshake over from @stage (0, or WACOM_CHARGE_STAGE_OFF_FIRST)
+ * when docked; send the charge-off command when not.  The work in flight is
+ * stopped first, or it could advance the stage again right after it has been
+ * reset here.
  */
-static void samsung_wacom_restart_charge(struct samsung_wacom *wacom)
+static void samsung_wacom_restart_charge(struct samsung_wacom *wacom, u8 stage)
 {
 	cancel_delayed_work_sync(&wacom->charge_work);
-	wacom->charge_stage = 0;
+	wacom->charge_stage = stage;
 	mod_delayed_work(system_freezable_wq, &wacom->charge_work, 0);
 }
 
@@ -617,16 +643,28 @@ static void samsung_wacom_pdct_work(struct work_struct *work)
 			return;
 		/*
 		 * The line moved and came back: the boot pulse, or a bounce.
-		 * Nothing for userspace and nothing to wake for.  The silo may
-		 * still have dropped the pen for that moment, and before this
-		 * filter every boot answered the pulse with a fresh charging
-		 * handshake that is known to leave the pen charging, so the
-		 * digitiser still gets one.
+		 * Nothing for userspace and nothing to wake for.
 		 */
 		dev_info(&wacom->client->dev,
 			 "S Pen dock detect bounced (%u edges), still %s\n",
 			 edges, docked ? "docked" : "undocked");
-		samsung_wacom_restart_charge(wacom);
+		/*
+		 * The silo still gets what it used to.  Read edge by edge, the
+		 * boot pulse sent it the charge-off command and then the
+		 * handshake from the top (ENABLE, START, KEEP_OFF, ENABLE,
+		 * START, KEEP_ON at every boot), which is known to leave the
+		 * pen charging, so that is replayed, without the reports.  A
+		 * second handshake straight after the first, with no
+		 * charge-off between, has never been tried on this hardware.
+		 * At most once per dock: what sets the pulse off is not known,
+		 * and if the replay could, answering each pulse with another
+		 * replay would never end.
+		 */
+		if (docked && !wacom->bounce_replayed) {
+			wacom->bounce_replayed = true;
+			samsung_wacom_restart_charge(wacom,
+						     WACOM_CHARGE_STAGE_OFF_FIRST);
+		}
 		return;
 	}
 
@@ -647,6 +685,7 @@ static void samsung_wacom_pdct_work(struct work_struct *work)
 		pm_wakeup_hard_event(&wacom->client->dev);
 
 	WRITE_ONCE(wacom->docked, docked);
+	wacom->bounce_replayed = false;
 	/* Never expose the orientation reported for a previous insertion. */
 	WRITE_ONCE(wacom->garage_direction, 0);
 	WRITE_ONCE(wacom->garage_charge_state, WACOM_GARAGE_STATE_NONE);
@@ -662,7 +701,7 @@ static void samsung_wacom_pdct_work(struct work_struct *work)
 	dev_info(&wacom->client->dev, "S Pen %s\n",
 		 docked ? "docked" : "undocked");
 
-	samsung_wacom_restart_charge(wacom);
+	samsung_wacom_restart_charge(wacom, 0);
 }
 
 static irqreturn_t samsung_wacom_pdct_irq(int irq, void *dev_id)
@@ -670,17 +709,24 @@ static irqreturn_t samsung_wacom_pdct_irq(int irq, void *dev_id)
 	struct samsung_wacom *wacom = dev_id;
 
 	atomic_inc(&wacom->pdct_edges);
+	/* Every edge pushes the read out again: it settles after the last. */
+	mod_delayed_work(system_dfl_wq, &wacom->pdct_work,
+			 msecs_to_jiffies(WACOM_PDCT_DEBOUNCE_MS));
+
 	/*
 	 * Once the suspend callback has run, the sleep cannot wait out the
 	 * debounce, so any edge aborts it at once.  A bounce costs a suspend
 	 * attempt, which is the safe way round; a drawn pen left asleep is not.
+	 *
+	 * Queue first, then look, with a barrier that pairs with the one in
+	 * samsung_wacom_suspend(): either its flush finds this edge's work
+	 * pending and settles it, or this sees the flag.  Looked at first, an
+	 * edge could read the flag clear and queue its work only after the
+	 * flush had gone by, and abort nothing.
 	 */
+	smp_mb();
 	if (wacom->pdct_wake && READ_ONCE(wacom->suspended))
 		pm_wakeup_hard_event(&wacom->client->dev);
-
-	/* Every edge pushes the read out again: it settles after the last. */
-	mod_delayed_work(system_dfl_wq, &wacom->pdct_work,
-			 msecs_to_jiffies(WACOM_PDCT_DEBOUNCE_MS));
 
 	return IRQ_HANDLED;
 }
@@ -1318,12 +1364,16 @@ static int samsung_wacom_suspend(struct device *dev)
 	 * between the two.
 	 */
 	WRITE_ONCE(wacom->suspended, true);
+	/* Pairs with the barrier in samsung_wacom_pdct_irq(). */
+	smp_mb();
 	flush_delayed_work(&wacom->pdct_work);
 	/*
-	 * The status poll stops for the duration (see samsung_wacom_charge_work).
-	 * After the flush, because settling the dock restarts this work.
+	 * The status poll stops for the duration (see samsung_wacom_charge_work),
+	 * and resume queues again only what this took off the queue: with the
+	 * pen out there is normally nothing, and nothing to send.  After the
+	 * flush, because settling the dock restarts this work.
 	 */
-	cancel_delayed_work_sync(&wacom->charge_work);
+	wacom->charge_resume = cancel_delayed_work_sync(&wacom->charge_work);
 
 	if (!wacom->pdct_wake || !device_may_wakeup(dev))
 		return 0;
@@ -1356,13 +1406,14 @@ static int samsung_wacom_resume(struct device *dev)
 			 msecs_to_jiffies(WACOM_PDCT_DEBOUNCE_MS));
 	/*
 	 * Pick the silo up where the suspend left it: docked, the handshake or
-	 * the status poll carries on after a second's grace; undocked, the work
-	 * sends the charge-off command once, in case the suspend cancelled it
-	 * before it could, and stops.
+	 * the status poll (always queued while docked) carries on after a
+	 * second's grace; undocked, a charge-off command the suspend cancelled
+	 * before it went out is sent now.
 	 */
-	mod_delayed_work(system_freezable_wq, &wacom->charge_work,
-			 READ_ONCE(wacom->docked) ?
-			 msecs_to_jiffies(WACOM_CHARGE_START_DELAY_MS) : 0);
+	if (wacom->charge_resume)
+		mod_delayed_work(system_freezable_wq, &wacom->charge_work,
+				 READ_ONCE(wacom->docked) ?
+				 msecs_to_jiffies(WACOM_CHARGE_START_DELAY_MS) : 0);
 
 	return 0;
 }
