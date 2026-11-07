@@ -1,0 +1,16 @@
+[Unit]
+Description=Galaxy Tab S9 family V4L2 camera nodes
+# Replaces the fixed modules-load.d/modprobe.d pair, which gave every board
+# the SM-X910's four camera nodes.  The helper creates one node per camera the
+# board has (none on an SM-X710 whose cameras are off) and leaves the table in
+# /run/ubuntu-gts9u/camera-profile for the relays.
+After=systemd-modules-load.service systemd-udevd.service
+Before=ubuntu-gts9u-camera-relays.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/ubuntu-gts9u-camera-loopback
+
+[Install]
+WantedBy=multi-user.target

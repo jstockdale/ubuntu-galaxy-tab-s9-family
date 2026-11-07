@@ -487,6 +487,27 @@ fi
 grep -q 'dw9808_vcm.o' "$camera_dir/Makefile" || \
 	printf 'obj-$(CONFIG_VIDEO_DW9808_VCM) += dw9808_vcm.o\n' \
 		>> "$camera_dir/Makefile"
+# The SM-X710's camera nodes are disabled in its DTB; this built-in switch
+# turns them on at runtime, on request only (docs/gts9wifi-cameras.md).
+# X710 trees only: on the Ultra even an unset Kconfig symbol would add a line
+# to its .config, which CONFIG_IKCONFIG embeds in the Image, and the gts9uwifi
+# build must stay byte-for-byte what it was (scripts/lib/device.sh).
+if [ "$DEVICE" = gts9wifi ]; then
+	install -m 0644 "$drv/gts9wifi_camera.c" "$camera_dir/gts9wifi_camera.c"
+	if ! grep -q 'VIDEO_GTS9WIFI_CAMERA' "$camera_dir/Kconfig"; then
+		sed -i '/^config VIDEO_HI847/i \
+config VIDEO_GTS9WIFI_CAMERA\
+\tbool "Opt-in camera switch for the Samsung Galaxy Tab S9 (SM-X710)"\
+\tdepends on OF_DYNAMIC\
+\thelp\
+\t  Enables the disabled SM-X710 camera nodes at runtime through\
+\t  /sys/module/gts9wifi_camera/parameters/enable.\
+' "$camera_dir/Kconfig"
+	fi
+	grep -q 'gts9wifi_camera.o' "$camera_dir/Makefile" || \
+		printf 'obj-$(CONFIG_VIDEO_GTS9WIFI_CAMERA) += gts9wifi_camera.o\n' \
+			>> "$camera_dir/Makefile"
+fi
 
 panel_dir=$kernel_tree/drivers/gpu/drm/panel
 # The pinned baseline driver only knows the Ultra's AMSA46AS02 glass.

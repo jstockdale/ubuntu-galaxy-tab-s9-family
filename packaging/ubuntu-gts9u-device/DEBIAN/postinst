@@ -30,6 +30,8 @@ ubuntu-gts9u-sensors-resume.service:multi-user.target
 ubuntu-gts9u-pogo-firmware.service:multi-user.target
 ubuntu-gts9u-desktop-user.service:multi-user.target
 ubuntu-gts9u-desktop-user.path:multi-user.target
+ubuntu-gts9u-camera-enable.service:multi-user.target
+ubuntu-gts9u-camera-loopback.service:multi-user.target
 ubuntu-gts9u-camera-relays.service:graphical.target
 ubuntu-gts9u-fingerprint-ui.service:multi-user.target
 ubuntu-gts9u-fingerprint-secure.service:multi-user.target
@@ -151,6 +153,14 @@ case "$1" in
 		relays_were_active=false
 		if systemctl is-active --quiet ubuntu-gts9u-camera-relays.service 2>/dev/null; then
 			relays_were_active=true
+		fi
+		# The camera nodes follow the board's table now; earlier packages gave
+		# every board the SM-X910's four.  Rebuild them with the relays, their
+		# only holders, stopped (on the SM-X910 the table is unchanged and the
+		# loader leaves the module alone).
+		if [ -d /run/systemd/system ]; then
+			systemctl stop ubuntu-gts9u-camera-relays.service || true
+			systemctl restart ubuntu-gts9u-camera-loopback.service || true
 		fi
 		/usr/libexec/ubuntu-gts9u-desktop-user || true
 		if $relays_were_active; then

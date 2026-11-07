@@ -1,0 +1,94 @@
+#!/bin/sh
+# Turn on the SM-X710's cameras and wait until their sensors have bound.
+#
+#   ubuntu-gts9u-camera-enable [rear|front|both]
+#
+# Without an argument the choice is the first word of /etc/ubuntu-gts9u/cameras
+# (ubuntu-gts9u-camera-enable.service runs it that way at boot, after the
+# panel's boot-time suspend cycle; no file means the cameras stay off).
+#
+# The SM-X710 device tree keeps CAMSS, its CCI buses and both camera modules
+# disabled, so nothing camera-related probes while the board boots.  The
+# kernel's gts9wifi_camera switch enables the chosen ones once, until the next
+# reboot; this asks it, then waits until CAMSS has completed its graph (the
+# chosen HI1337s, and the rear lens, bound and given their V4L2 subdevice
+# nodes) so that the loopback loader that runs next sees usable cameras.
+# After a manual run:
+#
+#   systemctl stop ubuntu-gts9u-camera-relays.service
+#   systemctl restart ubuntu-gts9u-camera-loopback.service
+#   systemctl start ubuntu-gts9u-camera-relays.service
+set -eu
+
+param=/sys/module/gts9wifi_camera/parameters/enable
+config=/etc/ubuntu-gts9u/cameras
+hi1337=/sys/bus/i2c/drivers/hi1337-gts9u
+camss=/sys/bus/platform/drivers/qcom-camss
+
+log() { echo "ubuntu-gts9u-camera-enable: $*" >&2; }
+
+choice=${1:-}
+if [ -z "$choice" ] && [ -r "$config" ]; then
+	choice=$(sed -e 's/#.*//' "$config" | tr -s ' \t' '\n\n' | grep -m1 . || true)
+fi
+case "$choice" in
+rear | front | both) ;;
+'') log "nothing chosen (no argument, nothing in $config); cameras stay off"; exit 0 ;;
+*) log "unknown choice '$choice' (rear, front or both)"; exit 2 ;;
+esac
+
+if ! tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null | grep -qx samsung,gts9wifi; then
+	log 'not an SM-X710; its cameras are not switched this way'
+	exit 0
+fi
+if [ ! -w "$param" ]; then
+	log "$param is missing: this kernel has no gts9wifi_camera switch"
+	exit 1
+fi
+
+# usable DT_PATH_SUFFIX: the HI1337 at that node is bound and has its V4L2
+# subdevice node, which CAMSS creates only once its async notifier completed
+# (the same test ubuntu-gts9u-camera-profile applies).
+usable() {
+	for dev in "$hi1337"/*; do
+		[ -e "$dev/of_node" ] || continue
+		case "$(readlink -f "$dev/of_node")" in
+		*"$1") ;;
+		*) continue ;;
+		esac
+		for subdev in "$dev"/video4linux/v4l-subdev*; do
+			[ -e "$subdev" ] && return 0
+		done
+	done
+	return 1
+}
+ready() {
+	[ -e "$camss/acb7000.isp" ] || return 1
+	case "$choice" in
+	rear | both) usable /cci@ac15000/i2c-bus@1/camera@21 || return 1 ;;
+	esac
+	case "$choice" in
+	front | both) usable /cci@ac16000/i2c-bus@1/camera@20 || return 1 ;;
+	esac
+}
+
+state=$(cat "$param")
+case "$state" in
+none) log "enabling: $choice"; echo "$choice" > "$param" ;;
+"$choice" | "$choice (pending)") log "already enabled: $state" ;;
+*) log "the cameras were already switched to '$state' this boot; reboot to choose '$choice'"; exit 1 ;;
+esac
+
+# Sensors probe from the reconfiguration notifier or, when a supplier (CAMSS,
+# a regulator) is created later in the same changeset, from the deferred-probe
+# work.  Twenty seconds is generous for both.
+waited=0
+while ! ready; do
+	if [ "$waited" -ge 20 ]; then
+		log "not ready after ${waited}s (switch: $(cat "$param"); CAMSS $([ -e "$camss/acb7000.isp" ] && echo bound || echo 'not bound')); see: dmesg | grep -iE 'gts9wifi-camera|hi1337|dw9808|cci|camss'"
+		exit 1
+	fi
+	sleep 1
+	waited=$((waited + 1))
+done
+log "ready after ${waited}s: $choice (switch: $(cat "$param"))"

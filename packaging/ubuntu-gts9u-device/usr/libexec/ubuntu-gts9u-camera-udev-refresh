@@ -3,10 +3,12 @@ set -eu
 
 # With exclusive_caps=1 the nodes initially advertise output-only. The relay
 # opens its producer side immediately, after which a change event makes udev,
-# Chrome and sandbox rules cache the final capture capability.
+# Chrome and sandbox rules cache the final capture capability.  The nodes are
+# the ones in the table the loopback loader left (four on the SM-X910).
 sleep 2
-for node in 20 21 22 23; do
+while read -r node _ <&3; do
+	[ -n "$node" ] || continue
 	[ -e "/sys/class/video4linux/video$node" ] || exit 1
 	udevadm trigger --action=change "/sys/class/video4linux/video$node"
-done
+done 3< /run/ubuntu-gts9u/camera-profile
 udevadm settle

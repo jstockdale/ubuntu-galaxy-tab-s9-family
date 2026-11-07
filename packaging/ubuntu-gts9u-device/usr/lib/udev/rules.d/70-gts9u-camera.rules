@@ -11,3 +11,6 @@ SUBSYSTEM=="video4linux", ATTR{name}=="GTS9U-Front-Ultra-Wide", SYMLINK+="gts9u-
 SUBSYSTEM=="video4linux", ATTR{name}=="GTS9U-Front-Main", SYMLINK+="gts9u-camera/front-main v4l/by-id/platform-gts9u-front-main-video-index0"
 SUBSYSTEM=="video4linux", ATTR{name}=="GTS9U-Rear-Main", SYMLINK+="gts9u-camera/rear-main v4l/by-id/platform-gts9u-rear-main-video-index0"
 SUBSYSTEM=="video4linux", ATTR{name}=="GTS9U-Rear-Ultra-Wide", SYMLINK+="gts9u-camera/rear-ultrawide v4l/by-id/platform-gts9u-rear-ultrawide-video-index0"
+# SM-X710 (gts9wifi): its two processed cameras, when gts9wifi_camera enabled them.
+SUBSYSTEM=="video4linux", ATTR{name}=="GTS9-Front", SYMLINK+="gts9u-camera/front v4l/by-id/platform-gts9-front-video-index0"
+SUBSYSTEM=="video4linux", ATTR{name}=="GTS9-Rear", SYMLINK+="gts9u-camera/rear v4l/by-id/platform-gts9-rear-video-index0"

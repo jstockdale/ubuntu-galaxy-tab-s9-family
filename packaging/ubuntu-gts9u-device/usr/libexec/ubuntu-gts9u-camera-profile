@@ -1,0 +1,69 @@
+#!/bin/sh
+# Print the processed cameras this board has, one per line:
+#
+#   VIDEO_NR LABEL PIPEWIRE_NODE ALIAS
+#
+# VIDEO_NR is the /dev/videoN its V4L2 relay publishes, LABEL that node's card
+# name (what browsers and OBS list), PIPEWIRE_NODE the libcamera source the
+# relay reads and ALIAS its /dev/gts9u-camera/ name.  The loopback loader
+# keeps a copy in /run/ubuntu-gts9u/camera-profile, and the relays and the
+# udev refresh read that copy, so none of them can disagree with the others
+# about how many cameras there are.
+#
+#   samsung,gts9uwifi (SM-X910)  the four modules, unconditionally, in the
+#                                same order and with the same names as the
+#                                fixed configuration this table replaces.
+#   samsung,gts9wifi (SM-X710)   front then rear, but only modules whose
+#                                HI1337 is bound and part of a complete CAMSS
+#                                graph.  Its cameras are off unless
+#                                gts9wifi_camera enabled them, and a relay with
+#                                no camera behind it is a phantom webcam.
+#   anything else                nothing.
+set -eu
+
+compatible=/proc/device-tree/compatible
+hi1337=/sys/bus/i2c/drivers/hi1337-gts9u
+
+board() {
+	[ -r "$compatible" ] && tr '\0' '\n' < "$compatible" | grep -qx "$1"
+}
+
+# usable DT_PATH_SUFFIX: an HI1337 bound to its driver at that device-tree
+# node AND carrying its V4L2 subdevice node.  CAMSS creates the sensors'
+# subdevice nodes only when its async notifier completes (every sensor in its
+# graph and the rear lens bound, the CSIPHY links made); /dev/media0 itself
+# exists from CAMSS probe on.  A sensor that is merely bound -- the lens or
+# the other sensor missing -- is no camera libcamera can open, and a relay
+# for it would be exactly the phantom webcam this table exists to avoid.
+usable() {
+	for dev in "$hi1337"/*; do
+		[ -e "$dev/of_node" ] || continue
+		case "$(readlink -f "$dev/of_node")" in
+		*"$1") ;;
+		*) continue ;;
+		esac
+		for subdev in "$dev"/video4linux/v4l-subdev*; do
+			[ -e "$subdev" ] && return 0
+		done
+	done
+	return 1
+}
+
+if board samsung,gts9uwifi; then
+	cat <<'EOF'
+20 GTS9U-Front-Ultra-Wide libcamera_input._base_soc_0_geniqup_8c0000_i2c_884000_camera_21 front-ultrawide
+21 GTS9U-Front-Main libcamera_input._base_soc_0_cci_ac16000_i2c-bus_1_camera_20 front-main
+22 GTS9U-Rear-Main libcamera_input._base_soc_0_cci_ac15000_i2c-bus_1_camera_21 rear-main
+23 GTS9U-Rear-Ultra-Wide libcamera_input._base_soc_0_cci_ac15000_i2c-bus_0_camera_21 rear-ultrawide
+EOF
+elif board samsung,gts9wifi; then
+	nr=20
+	if usable /cci@ac16000/i2c-bus@1/camera@20; then
+		echo "$nr GTS9-Front libcamera_input._base_soc_0_cci_ac16000_i2c-bus_1_camera_20 front"
+		nr=$((nr + 1))
+	fi
+	if usable /cci@ac15000/i2c-bus@1/camera@21; then
+		echo "$nr GTS9-Rear libcamera_input._base_soc_0_cci_ac15000_i2c-bus_1_camera_21 rear"
+	fi
+fi
+exit 0

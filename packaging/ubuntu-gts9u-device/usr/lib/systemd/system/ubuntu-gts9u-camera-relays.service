@@ -1,5 +1,5 @@
 [Unit]
-Description=Galaxy Tab S9 Ultra standard V4L2 cameras
+Description=Galaxy Tab S9 family standard V4L2 cameras
 # User=, its runtime directory and the ordering against user@UID.service all
 # come from a drop-in that ubuntu-gts9u-desktop-user writes at boot.  They
 # cannot be named here any more: the account belongs to the owner and is
@@ -7,9 +7,15 @@ Description=Galaxy Tab S9 Ultra standard V4L2 cameras
 #
 # The condition on that drop-in is what keeps a machine whose wizard has not
 # run yet from restart-looping this service as root every two seconds.
-After=systemd-modules-load.service systemd-user-sessions.service
+#
+# The camera table comes from ubuntu-gts9u-camera-loopback, which also creates
+# the nodes: an empty table (an SM-X710 whose cameras are off) skips this unit
+# instead of publishing webcams with no camera behind them.
+Wants=ubuntu-gts9u-camera-loopback.service
+After=systemd-modules-load.service systemd-user-sessions.service ubuntu-gts9u-camera-loopback.service
 Requires=ubuntu-gts9u-desktop-user.service
 After=ubuntu-gts9u-desktop-user.service
+ConditionFileNotEmpty=/run/ubuntu-gts9u/camera-profile
 ConditionPathExists=/dev/video20
 ConditionPathExists=/run/systemd/system/ubuntu-gts9u-camera-relays.service.d/50-desktop-user.conf
 StartLimitIntervalSec=0
@@ -21,6 +27,7 @@ ExecStart=/usr/libexec/ubuntu-gts9u-camera-relays
 ExecStartPost=+/usr/libexec/ubuntu-gts9u-camera-udev-refresh
 Restart=always
 RestartSec=2
+RestartPreventExitStatus=78
 TimeoutStartSec=15
 
 [Install]

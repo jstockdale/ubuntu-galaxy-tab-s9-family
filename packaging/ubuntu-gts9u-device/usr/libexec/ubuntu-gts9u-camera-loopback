@@ -1,0 +1,72 @@
+#!/bin/sh
+# Create the V4L2 loopback nodes for the processed cameras this board really
+# has (ubuntu-gts9u-camera-loopback.service, ordered before the relays).
+#
+# This used to be a modules-load.d entry plus fixed modprobe.d options for the
+# SM-X910's four cameras.  The same package on an SM-X710 therefore published
+# four GTS9U-* webcams with nothing behind them, each served black frames by a
+# relay.  The table now comes from ubuntu-gts9u-camera-profile; it is kept in
+# /run/ubuntu-gts9u/camera-profile for the relays and the udev refresh, and an
+# empty table creates no node at all.  On the SM-X910 the module options are
+# exactly the old fixed ones.
+#
+# Re-running it (systemctl restart ubuntu-gts9u-camera-loopback.service, with
+# the relays stopped) brings the nodes in line with the cameras present now:
+# stale nodes this port created are removed when nothing holds them open.
+set -eu
+
+state=/run/ubuntu-gts9u
+profile=$state/camera-profile
+
+log() { echo "ubuntu-gts9u-camera-loopback: $*" >&2; }
+
+install -d -m 0755 "$state"
+tmp=$(mktemp "$state/.camera-profile.XXXXXX")
+if ! /usr/libexec/ubuntu-gts9u-camera-profile > "$tmp"; then
+	rm -f "$tmp"
+	log "cannot work out this board's cameras"
+	exit 1
+fi
+chmod 0644 "$tmp"
+mv -f "$tmp" "$profile"
+
+# NR:LABEL of every loopback node present now, and of every node wanted.
+present() {
+	for node in /sys/devices/virtual/video4linux/video*; do
+		[ -r "$node/name" ] || continue
+		printf '%s:%s\n' "${node##*/video}" "$(cat "$node/name")"
+	done | sort -n
+}
+want=$(awk '{ print $1 ":" $2 }' "$profile" | sort -n)
+
+if [ -d /sys/module/v4l2loopback ]; then
+	have=$(present)
+	if [ "$have" = "$want" ]; then
+		log "loopback nodes already match: $(echo ${want:-none})"
+		exit 0
+	fi
+	# Only ever take down nodes this port created.
+	if printf '%s\n' "$have" | grep -q -v -E '^([0-9]+:GTS9U?-.*)?$'; then
+		log "v4l2loopback is loaded with nodes this port did not create ($(echo $have)); leaving it alone"
+		[ -z "$want" ] && exit 0
+		exit 1
+	fi
+	if ! modprobe -r v4l2loopback; then
+		log "stale camera nodes ($(echo $have)) are in use; close what holds them, stop ubuntu-gts9u-camera-relays.service and restart ubuntu-gts9u-camera-loopback.service"
+		exit 1
+	fi
+	log "removed stale camera nodes: $(echo $have)"
+fi
+
+if [ -z "$want" ]; then
+	log 'no cameras on this board right now; no loopback nodes'
+	exit 0
+fi
+
+column() { awk -v f="$1" '{ printf "%s%s", sep, $f; sep = "," }' "$profile"; }
+count=$(wc -l < "$profile")
+ones=$(awk '{ printf "%s1", sep; sep = "," }' "$profile")
+modprobe v4l2loopback devices="$count" video_nr="$(column 1)" \
+	card_label="$(column 2)" exclusive_caps="$ones" \
+	max_buffers=4 max_openers=16
+log "created: $(echo $want)"

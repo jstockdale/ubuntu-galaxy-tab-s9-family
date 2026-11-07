@@ -4,8 +4,8 @@
  * (SM-X710, gts9wifi).  Derived from the validated gts9uwifi board; the
  * family shares the SoC, bus topology, amplifiers, charging and pen stack.
  * X710 deltas: AMSA10FA01 panel glass, STM FTS touch (Goodix on some units),
- * WCN6855/QCA6490 WLAN+BT, three cameras (Ultra sensor nodes left in place;
- * absent hardware simply fails i2c probe until the X710 camera pass).
+ * WCN6855/QCA6490 WLAN+BT, two HI1337 cameras (described at the end of this
+ * file and disabled at boot; gts9wifi_camera enables them on request).
  *
  * Only hardware evidenced by the live downstream tree is enabled here.
  * Native display support remains disabled; Samsung ABL's preserved splash
@@ -1935,4 +1935,213 @@
  */
 &hub_i2c6_data_clk {
 	drive-strength = <8>;
+};
+
+/*
+ * Cameras.  The SM-X710 has two modules and both are SK hynix HI1337s (stock
+ * CamX com.samsung.sensormodule.0_hynix_hi1337, 1_hynix_hi1337_front and
+ * 12_hynix_hi1337_front_full), wired exactly like the SM-X910's rear-main and
+ * front-main modules (stock gts9wifi overlay: qcom,cam-sensor0, eeprom0,
+ * actuator0, eeprom20 and cam-sensor1/12):
+ *
+ *   rear   CCI0 master 1 @ 0x21, CSIPHY1 x4, MCLK2 (GPIO102), reset GPIO70,
+ *          VIO L4B 1.8 V through the GPIO15 switch (RCAM_LDO_EN), VDIG L1C
+ *          1.1 V; DW9808 VCM on CCI1 master 0 @ 0x0c behind the same switch.
+ *   front  CCI1 master 1 (the AON pair, GPIO208/209) @ 0x20, CSIPHY4 x4,
+ *          MCLK4 (GPIO104), reset GPIO117, module LDO GPIO17 (FCAM_LDO_EN),
+ *          VIO L4B, VDIG L11B.
+ *
+ * The register tables the hi1337-gts9u driver writes were decoded from the
+ * SM-X910's blobs; the SM-X710 blobs carry the same 1476-entry global table,
+ * a rear 4128x3096 mode identical to the X910 rear-main's, and a front
+ * 4000x3000 mode (12_..._front_full) identical to the X910 front
+ * ultra-wide's.  Hence the "rear" and "front-uw" variants below.
+ *
+ * Stock votes 1.1 V for the front VDIG on L11B (every gts9wifi overlay entry
+ * sets pm_humu_l11 to 1.1 V); this tree holds L11B at 1.2 V for the panel and
+ * the sensor driver sets no voltage, so the front module runs its core 0.1 V
+ * above stock.
+ *
+ * Nothing here probes at boot: CAMSS, both CCI controllers, the rear VIO
+ * switch and the three I2C devices are disabled.  gts9wifi_camera
+ * (drivers/media/i2c/gts9wifi_camera.c) turns the chosen camera(s) on at
+ * runtime, on request only; see docs/gts9wifi-cameras.md.  The two LDOs below
+ * are only registered: nothing enables them until a camera powers up.
+ */
+&apps_rsc {
+	regulators-0 {
+		/* Shared 1.8 V camera I/O rail (Samsung pm_humu_l4). */
+		vreg_l4b_1p8: ldo4 {
+			regulator-name = "vreg_l4b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	/* PM8550VS-C L1: the rear module's 1.1 V digital rail (pm_v6c_l1). */
+	regulators-1 {
+		compatible = "qcom,pm8550vs-rpmh-regulators";
+		qcom,pmic-id = "c";
+
+		vreg_l1c_1p1: ldo1 {
+			regulator-name = "vreg_l1c_1p1";
+			/* PM8550VS NLDO steps are 8 mV; 1.104 V is closest to stock 1.1 V. */
+			regulator-min-microvolt = <1104000>;
+			regulator-max-microvolt = <1104000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+/ {
+	/*
+	 * GPIO15 (RCAM_LDO_EN) switches the rear module rail shared by the
+	 * HI1337's VIO and the DW9808's VCC.  A regulator lets both media
+	 * entities hold it without fighting over the GPIO.
+	 */
+	rear_cam_vio: rear-camera-vio-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "rear_cam_vio";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&vreg_l4b_1p8>;
+		gpio = <&tlmm 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		status = "disabled";
+	};
+};
+
+&camss {
+	vdda-phy-supply = <&vreg_l1e_0p88>;
+	vdda-pll-supply = <&vreg_l3e_1p2>;
+	/* Enabled at runtime by gts9wifi_camera. */
+	status = "disabled";
+
+	ports {
+		port@1 {
+			csiphy1_gts9_rear_ep: endpoint {
+				clock-lanes = <4>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&gts9_rear_cam_ep>;
+			};
+		};
+
+		port@4 {
+			csiphy4_gts9_front_ep: endpoint {
+				clock-lanes = <4>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&gts9_front_cam_ep>;
+			};
+		};
+	};
+};
+
+&cci0 {
+	/* Enabled at runtime by gts9wifi_camera. */
+	status = "disabled";
+};
+
+&cci0_i2c1 {
+	gts9_rear_cam: camera@21 {
+		compatible = "hynix,hi1337-gts9u-rear";
+		reg = <0x21>;
+		clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clock-rates = <19200000>;
+		vddio-supply = <&rear_cam_vio>;
+		vdig-supply = <&vreg_l1c_1p1>;
+		reset-gpios = <&tlmm 70 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam2_default>;
+		pinctrl-1 = <&cam2_sleep>;
+		pinctrl-names = "default", "sleep";
+		/* Stock sensor-position roll 90, yaw 180. */
+		orientation = <1>;
+		rotation = <90>;
+		lens-focus = <&gts9_rear_focus>;
+		status = "disabled";
+
+		port {
+			gts9_rear_cam_ep: endpoint {
+				clock-lanes = <4>;
+				data-lanes = <0 1 2 3>;
+				link-frequencies = /bits/ 64 <360200000>;
+				remote-endpoint = <&csiphy1_gts9_rear_ep>;
+			};
+		};
+	};
+};
+
+&cci1 {
+	pinctrl-0 = <&cci1_0_default &cci1_1_default>;
+	pinctrl-1 = <&cci1_0_sleep &cci1_1_sleep>;
+	/* Enabled at runtime by gts9wifi_camera. */
+	status = "disabled";
+
+	cci1_i2c1: i2c-bus@1 {
+		reg = <1>;
+		clock-frequency = <1000000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&cci1_i2c0 {
+	/* Stock actuator0: slave-addr 0x18 (8-bit), CCI1 master 0. */
+	gts9_rear_focus: lens@c {
+		compatible = "dongwoon,dw9808-vcm";
+		reg = <0x0c>;
+		vcc-supply = <&rear_cam_vio>;
+		status = "disabled";
+	};
+};
+
+&cci1_i2c1 {
+	gts9_front_cam: camera@20 {
+		/* The 4000x3000 table of the X910 front ultra-wide; see above. */
+		compatible = "hynix,hi1337-gts9u-front-uw";
+		/* Stock slave-addr 0x40 is the 8-bit form of 0x20. */
+		reg = <0x20>;
+		clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		assigned-clock-rates = <19200000>;
+		vddio-supply = <&vreg_l4b_1p8>;
+		vdig-supply = <&vreg_l11b_1p2>;
+		enable-gpios = <&tlmm 17 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&tlmm 117 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam4_default>;
+		pinctrl-1 = <&cam4_sleep>;
+		pinctrl-names = "default", "sleep";
+		/* Stock sensor-position roll 270, yaw 0. */
+		orientation = <0>;
+		rotation = <270>;
+		status = "disabled";
+
+		port {
+			gts9_front_cam_ep: endpoint {
+				clock-lanes = <4>;
+				data-lanes = <0 1 2 3>;
+				link-frequencies = /bits/ 64 <360200000>;
+				remote-endpoint = <&csiphy4_gts9_front_ep>;
+			};
+		};
+	};
+};
+
+&tlmm {
+	/* CCI1 master 1 is Samsung's AON CCI pair (stock cci_aon_i2c_*). */
+	cci1_1_default: cci1-1-default-state {
+		pins = "gpio208", "gpio209";
+		function = "aon_cci";
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+
+	cci1_1_sleep: cci1-1-sleep-state {
+		pins = "gpio208", "gpio209";
+		function = "aon_cci";
+		drive-strength = <4>;
+		bias-disable;
+		input-enable;
+	};
 };
