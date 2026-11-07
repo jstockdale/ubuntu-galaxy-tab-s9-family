@@ -17,13 +17,22 @@ Before=ubuntu-gts9u-adsp-boot.service
 
 [Service]
 Type=notify
-# READY=1 comes from the helper, a child of systemd-inhibit.
+# The helper is the main process and takes the lock through a background
+# systemd-inhibit.  It must not run as systemd-inhibit's command: that child
+# gets no NOTIFY_SOCKET (systemd >= 254), so READY=1 would never arrive.
+# READY=1 is sent by systemd-notify, a child of the helper, hence "all".
 NotifyAccess=all
-ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block --who=ubuntu-gts9u-adsp-start "--why=The audio DSP is starting" /usr/libexec/ubuntu-gts9u-adsp-start-inhibit hold
-# The DSP start only Wants= this unit: if logind cannot grant the lock,
-# systemd-inhibit fails at once and the DSP starts without it; if readiness
+# Holds the "held" marker that the systemd-inhibit holder creates.
+RuntimeDirectory=ubuntu-gts9u-adsp-start-inhibit
+ExecStart=/usr/libexec/ubuntu-gts9u-adsp-start-inhibit hold
+# The DSP start only Wants= this unit: if logind cannot grant the lock, the
+# helper reports ready at once and the DSP starts without it; if readiness
 # never arrives, it starts after this timeout.
 TimeoutStartSec=15
+# The helper gives up by itself after 90 s plus 10 s of settling.  This is
+# the backstop: a helper that wedged must not keep sleep blocked for the
+# rest of the boot.
+RuntimeMaxSec=150
 TimeoutStopSec=5
 
 [Install]

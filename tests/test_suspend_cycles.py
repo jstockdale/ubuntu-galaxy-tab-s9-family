@@ -619,9 +619,11 @@ class LadderTest(unittest.TestCase):
 
 
 class AdspStartInhibitTest(unittest.TestCase):
-    # sleep: each call is one second; the DSP comes up on call UP_AT.
+    # sleep: each whole-second call is one second; the DSP comes up on call
+    # UP_AT.  Fractional sleeps (the lock poll) really sleep.
     STUB = """#!/bin/sh
 R=$FAKE_ROOT
+case "$1" in *.*) exec /usr/bin/sleep "$1" ;; esac
 n=$(( $(cat "$R/sleep-n" 2>/dev/null || echo 0) + 1 ))
 echo $n > "$R/sleep-n"
 echo "sleep $*" >> "$R/sleep.log"
@@ -631,10 +633,21 @@ if [ -n "${UP_AT:-}" ] && [ "$n" -ge "$UP_AT" ]; then
 	echo ' 0 [SamsungGalaxyTa]: sm8550 - Samsung-Galaxy-Tab-S9' > "$R/proc/asound/cards"
 fi
 """
+    # systemd-inhibit: grant the lock (unless refused) and run the holder,
+    # which keeps this PID through its execs.
+    INHIBIT_STUB = """#!/bin/sh
+R=$FAKE_ROOT
+echo "systemd-inhibit $*" >> "$R/inhibit.log"
+[ -e "$R/inhibit-refused" ] && exit 1
+echo $$ > "$R/holder.pid"
+while [ $# -gt 0 ]; do case $1 in --*) shift ;; *) break ;; esac; done
+exec "$@"
+"""
 
     def setUp(self):
         self.fake = FakeRoot()
         f = self.fake
+        f.stub("bin/systemd-inhibit", self.INHIBIT_STUB)
         (f.root / "proc/asound").mkdir(parents=True, exist_ok=True)
         f.write("proc/asound/cards", "--- no soundcards ---\n")
         f.write("sys/class/remoteproc/remoteproc0/state", "offline\n")
@@ -650,12 +663,67 @@ fi
         env.setdefault("NOTIFY_SOCKET", "/run/fake-notify")
         return self.fake.run(self.script, "hold", env_extra=env)
 
+    def holder_alive(self):
+        pid = int(self.fake.read("holder.pid"))
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        # A zombie left for the test runner's own reaping is not a holder.
+        try:
+            stat = pathlib.Path("/proc/%d/stat" % pid).read_text()
+        except FileNotFoundError:
+            return False
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
     def test_releases_after_the_dsp_is_up_and_settled(self):
         result = self.hold(UP_AT="4", ADSP_INHIBIT_SETTLE="7")
         self.assertEqual(result.returncode, 0)
         self.assertIn("notify --ready", self.fake.read("notify.log"))
         self.assertIn("audio DSP up after 4s", result.stderr)
         self.assertIn("sleep 7", self.fake.read("sleep.log"))
+        # The holder (and with it logind's lock) is gone with the helper.
+        self.assertFalse(self.holder_alive())
+        self.assertFalse(self.fake.exists("run/ubuntu-gts9u-adsp-start-inhibit/held"))
+
+    def test_lock_is_taken_before_ready(self):
+        result = self.hold(UP_AT="2", ADSP_INHIBIT_SETTLE="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(self.fake.read("inhibit.log"),
+                         r"--what=sleep --mode=block --who=ubuntu-gts9u-adsp-start "
+                         r"--why=The audio DSP is starting /bin/sh -c ")
+        err = result.stderr
+        self.assertLess(err.index("sleep lock taken"), err.index("held off until"))
+        # READY=1 comes from this script, the unit's main process, not from
+        # a child of systemd-inhibit (which gets no NOTIFY_SOCKET).
+        self.assertEqual(self.fake.read("notify.log").count("notify --ready"), 1)
+
+    def test_refused_lock_still_lets_the_dsp_start(self):
+        self.fake.write("inhibit-refused", "")
+        result = self.hold(UP_AT="2")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("logind did not grant the sleep lock", result.stderr)
+        self.assertIn("notify --ready", self.fake.read("notify.log"))
+        self.assertNotIn("held off until", result.stderr)
+
+    def test_terminated_helper_drops_the_lock(self):
+        f = self.fake
+        env = dict(FAKE_ROOT=str(f.root), HOME=str(f.root), NOTIFY_SOCKET="/run/fake-notify",
+                   PATH="%s:%s" % (f.root / "bin", f.root / "tools"), UP_AT="100000")
+        f.stub("bin/sleep", "#!/bin/sh\nexec /usr/bin/sleep \"$1\"\n")
+        proc = subprocess.Popen(["/bin/sh", str(self.script), "hold"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        import time
+        for _ in range(100):
+            if f.exists("run/ubuntu-gts9u-adsp-start-inhibit/held"):
+                break
+            time.sleep(0.05)
+        time.sleep(0.5)
+        self.assertTrue(self.holder_alive())
+        proc.terminate()
+        proc.communicate(timeout=10)
+        time.sleep(0.3)
+        self.assertFalse(self.holder_alive())
 
     def test_nothing_to_hold_when_already_up(self):
         f = self.fake
@@ -692,7 +760,11 @@ fi
         self.assertIn("ConditionFirmware=device-tree-compatible(samsung,gts9wifi)", unit)
         self.assertRegex(unit, r"(?m)^Type=notify$")
         self.assertRegex(unit, r"(?m)^NotifyAccess=all$")
-        self.assertRegex(unit, r"(?m)^ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block .* /usr/libexec/ubuntu-gts9u-adsp-start-inhibit hold$")
+        # The helper is the main process: under systemd-inhibit it would get
+        # no NOTIFY_SOCKET (systemd >= 254) and READY=1 would never arrive.
+        self.assertRegex(unit, r"(?m)^ExecStart=/usr/libexec/ubuntu-gts9u-adsp-start-inhibit hold$")
+        self.assertRegex(unit, r"(?m)^RuntimeDirectory=ubuntu-gts9u-adsp-start-inhibit$")
+        self.assertRegex(unit, r"(?m)^RuntimeMaxSec=150$")
         self.assertIn("ubuntu-gts9u-adsp-start-inhibit.service:ubuntu-gts9u-adsp-boot.service",
                       POSTINST.read_text())
 

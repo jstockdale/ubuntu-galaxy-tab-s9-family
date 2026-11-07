@@ -146,6 +146,14 @@ menu, a sleep key. It does not hold off the power key, because
 `ubuntu-gts9u-powerkey` asks for the suspend as root, and logind lets root pass
 a block lock. The runner refuses to start while the lock is held.
 
+The helper is the unit's main process (`Type=notify`) and runs
+`systemd-inhibit` as a background holder; it sends `READY=1` once the holder
+has started, which systemd-inhibit only does after logind granted the lock.
+It cannot be `systemd-inhibit`'s command instead: systemd 254 and later remove
+`NOTIFY_SOCKET` from that child's environment, so its `READY=1` never arrives
+and the unit fails (`protocol`, or the start timeout, which also drops the
+lock before the DSP starts).
+
 ## Choosing a mode
 
 1. 20/20 s2idle and 20/20 deep cycles pass (`run`), without and then with
