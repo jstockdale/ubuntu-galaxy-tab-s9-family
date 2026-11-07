@@ -1,0 +1,30 @@
+[Unit]
+Description=Hold off system sleep while the audio DSP starts (SM-X710)
+Documentation=file:///usr/libexec/ubuntu-gts9u-adsp-start-inhibit
+# A suspend that overlaps the ADSP start timed out APM on the SM-X710.  The
+# lock is taken before ubuntu-gts9u-adsp-boot starts the DSP (that unit waits
+# for this one to be ready, which it is only once logind granted the lock)
+# and dropped once the DSP is up.  The panel's boot-time cycle is ordered
+# before both; it writes /sys/power/state itself and is not affected.
+#
+# SM-X710 only for now.  The Ultra has the same start path; widening this is
+# one line, left for an Ultra regression pass.
+ConditionFirmware=device-tree-compatible(samsung,gts9wifi)
+ConditionPathExists=/usr/lib/firmware/qcom/sm8550/adsp.mdt
+After=local-fs.target dbus.service systemd-logind.service
+After=ubuntu-gts9u-panel-coldboot-recover.service
+Before=ubuntu-gts9u-adsp-boot.service
+
+[Service]
+Type=notify
+# READY=1 comes from the helper, a child of systemd-inhibit.
+NotifyAccess=all
+ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block --who=ubuntu-gts9u-adsp-start "--why=The audio DSP is starting" /usr/libexec/ubuntu-gts9u-adsp-start-inhibit hold
+# The DSP start only Wants= this unit: if logind cannot grant the lock,
+# systemd-inhibit fails at once and the DSP starts without it; if readiness
+# never arrives, it starts after this timeout.
+TimeoutStartSec=15
+TimeoutStopSec=5
+
+[Install]
+WantedBy=ubuntu-gts9u-adsp-boot.service
