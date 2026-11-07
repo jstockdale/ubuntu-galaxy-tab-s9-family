@@ -18,6 +18,11 @@ Before=sleep.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/libexec/ubuntu-gts9u-icc-late-release release
+# Loop breaker: a clean shutdown or reboot stops this unit, and the stop
+# clears the marker the release left on disk.  A boot that released the floor
+# and then hung never gets here, so the next boot keeps the floor once.
+# "-": a stop must never fail, e.g. after the helper was removed by hand.
+ExecStop=-/usr/libexec/ubuntu-gts9u-icc-late-release stop
 # Normally a fraction of a second; the helper waits up to 120 s for a cycle
 # unit that is somehow still running.
 TimeoutStartSec=180

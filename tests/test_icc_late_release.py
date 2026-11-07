@@ -106,6 +106,8 @@ class IccLateReleaseTest(unittest.TestCase):
             "BOOT_ID": root / "boot_id",
             "UPTIME": root / "uptime",
             "HOLD_FILE": root / "icc-hold",
+            "PENDING": root / "varlib" / "icc-release.pending",
+            "UNCLEAN": root / "varlib" / "icc-release.unclean",
         }
         for var, path in paths.items():
             script, n = re.subn(rf"^{var}=.*$", f"{var}='{path}'", script, flags=re.M)
@@ -280,6 +282,146 @@ set -- {mode}
                                 text=True, capture_output=True, timeout=20)
         self.assertEqual(result.returncode, 1)
         self.assertIn("needs root", result.stderr)
+
+
+    # --- loop breaker -------------------------------------------------------
+
+    def pending(self, tree):
+        return tree.root / "varlib" / "icc-release.pending"
+
+    def unclean(self, tree):
+        return tree.root / "varlib" / "icc-release.unclean"
+
+    def set_boot(self, tree, boot_id):
+        (tree.root / "boot_id").write_text(boot_id + "\n")
+
+    def test_release_arms_the_loop_breaker_before_writing(self):
+        tree = self.make()
+        x710_stage2(tree)
+        r = self.run_helper(tree)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        marker = self.pending(tree).read_text()
+        self.assertIn("boot_id=df92b567-453c-4cfe-a950-578d4d595476", marker)
+        self.assertIn("uptime=33.95", marker)
+
+    def test_clean_stop_clears_this_boots_marker(self):
+        tree = self.make()
+        x710_stage2(tree)
+        self.assertEqual(self.run_helper(tree).returncode, 0)
+        r = self.run_helper(tree, "stop")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.pending(tree).exists())
+        self.assertIn("loop-breaker marker cleared", (tree.root / "log").read_text())
+
+    def test_stop_leaves_another_boots_marker(self):
+        tree = self.make()
+        x710_stage2(tree)
+        self.pending(tree).parent.mkdir()
+        self.pending(tree).write_text("boot_id=aaaaaaaa-1111\nuptime=33.10\n")
+        r = self.run_helper(tree, "stop")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(self.pending(tree).exists())
+
+    def test_stop_without_marker_is_quiet(self):
+        tree = self.make()
+        x710_stage2(tree)
+        r = self.run_helper(tree, "stop")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((tree.root / "log").exists())
+
+    def test_unclean_end_after_a_release_holds_exactly_one_boot(self):
+        tree = self.make()
+        x710_stage2(tree)
+        # Boot aaaa released and then hung: no ExecStop ran.
+        self.pending(tree).parent.mkdir()
+        self.pending(tree).write_text("boot_id=aaaaaaaa-1111\nuptime=33.10\n")
+        self.assert_held(tree, "loop breaker: boot aaaaaaaa released the floor at 33.10 s")
+        self.assertFalse(self.pending(tree).exists())
+        tripped = self.unclean(tree).read_text()
+        self.assertIn("boot_id=aaaaaaaa-1111", tripped)
+        self.assertIn("held_boot=df92b567-453c-4cfe-a950-578d4d595476", tripped)
+        self.assertIn("loop breaker: boot aaaaaaaa released the floor", (tree.root / "kmsg").read_text())
+        # The boot after it releases again.
+        self.set_boot(tree, "bbbbbbbb-2222")
+        r = self.run_helper(tree)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state(tree)["result"], "released")
+        self.assertEqual(tree.synced("interconnect-1"), "1")
+
+    def test_restart_after_a_loop_breaker_hold_releases(self):
+        tree = self.make()
+        x710_stage2(tree)
+        self.pending(tree).parent.mkdir()
+        self.pending(tree).write_text("boot_id=aaaaaaaa-1111\nuptime=33.10\n")
+        self.assert_held(tree, "loop breaker")
+        # systemctl restart: ExecStop, then ExecStart again, same boot.
+        self.assertEqual(self.run_helper(tree, "stop").returncode, 0)
+        r = self.run_helper(tree)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state(tree)["result"], "released")
+
+    def test_own_boots_marker_is_not_unclean(self):
+        tree = self.make()
+        x710_stage2(tree)
+        self.assertEqual(self.run_helper(tree).returncode, 0)
+        # Run by hand again in the same boot: everything synced, no hold.
+        r = self.run_helper(tree)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state(tree)["result"], "nothing")
+        self.assertTrue(self.pending(tree).exists())
+        self.assertFalse(self.unclean(tree).exists())
+
+    def test_check_reports_the_loop_breaker_without_consuming_it(self):
+        tree = self.make()
+        x710_stage2(tree)
+        self.pending(tree).parent.mkdir()
+        self.pending(tree).write_text("boot_id=aaaaaaaa-1111\nuptime=33.10\n")
+        r = self.run_helper(tree, "check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("HOLD: loop breaker", r.stdout)
+        self.assertTrue(self.pending(tree).exists())
+        self.assertFalse(self.unclean(tree).exists())
+        self.assertEqual(tree.synced("interconnect-1"), "0\n")
+
+    def test_marker_from_a_hung_boot_is_consumed_even_when_nothing_is_left(self):
+        tree = self.make()
+        x710_stage2(tree)
+        for name in ("24100000.interconnect", "interconnect-1"):
+            (tree.platform / name / "state_synced").write_text("1\n")
+        self.pending(tree).parent.mkdir()
+        self.pending(tree).write_text("boot_id=aaaaaaaa-1111\nuptime=33.10\n")
+        r = self.run_helper(tree)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state(tree)["result"], "nothing")
+        self.assertFalse(self.pending(tree).exists())
+        self.assertTrue(self.unclean(tree).exists())
+
+    def test_failed_write_leaves_no_marker(self):
+        tree = self.make()
+        x710_stage2(tree)
+        # A directory in place of the attribute: the write fails, the floor
+        # cannot have dropped.
+        attr = tree.platform / "interconnect-1" / "state_synced"
+        attr.unlink()
+        attr.mkdir()
+        r = self.run_helper(tree)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(self.state(tree)["result"], "failed")
+        self.assertFalse(self.pending(tree).exists())
+
+    def test_status_shows_the_loop_breaker(self):
+        tree = self.make()
+        x710_stage2(tree)
+        self.pending(tree).parent.mkdir()
+        self.pending(tree).write_text("boot_id=aaaaaaaa-1111\nuptime=33.10\n")
+        r = self.run_helper(tree, "status")
+        self.assertIn("marker from boot aaaaaaaa is waiting", r.stdout)
+
+    def test_unit_runs_the_stop_action_and_never_fails_on_it(self):
+        unit = (HELPER.parents[1] / "lib/systemd/system/ubuntu-gts9u-icc-late-release.service").read_text()
+        self.assertIn("ExecStop=-/usr/libexec/ubuntu-gts9u-icc-late-release stop\n", unit)
+        self.assertIn("RemainAfterExit=yes\n", unit)
+        self.assertIn("ConditionFirmware=device-tree-compatible(samsung,gts9wifi)\n", unit)
 
 
 if __name__ == "__main__":

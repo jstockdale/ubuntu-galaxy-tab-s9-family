@@ -34,6 +34,9 @@
 #   - while a pm_test level is selected;
 #   - while /etc/ubuntu-gts9u/icc-hold exists (the owner's persistent off
 #     switch; it can also be created from TWRP, under /data);
+#   - on the first boot after a boot that released the floor and then ended
+#     without a clean shutdown (watchdog reset, forced restart, power loss):
+#     the loop breaker below;
 #   - if any unsynced interconnect provider waits for anything else.  The
 #     release is all or nothing: a partial one would hand the moment the floor
 #     drops to whichever consumer binds last.
@@ -41,7 +44,17 @@
 # gpu_cc, ...), whatever it reads.  A release cannot be undone; a reboot
 # brings the floor back.
 #
+# Loop breaker: right before releasing, the helper writes $PENDING (this
+# boot's id) and syncs; the unit's ExecStop (run "stop") removes it again when
+# the unit is stopped, which a clean shutdown or reboot always does.  A marker
+# from another boot therefore means that boot released the floor and never
+# shut down cleanly.  The next boot keeps the floor once, says why, and moves
+# the marker to $UNCLEAN; the boot after that releases again.  So a hang
+# caused by the release can never turn into a boot loop: every other boot
+# comes up in the known-good held state, without TWRP.
+#
 #   ubuntu-gts9u-icc-late-release release   what the unit runs (root)
+#   ubuntu-gts9u-icc-late-release stop      the unit's ExecStop: clears this boot's marker
 #   ubuntu-gts9u-icc-late-release check     what release would do now; writes nothing
 #   ubuntu-gts9u-icc-late-release status    providers, blockers and the last release
 #
@@ -62,6 +75,8 @@ LOG=/var/log/ubuntu-gts9u-icc-release.log
 STATE=/run/ubuntu-gts9u/icc-release
 BOOT_ID=/proc/sys/kernel/random/boot_id
 HOLD_FILE=/etc/ubuntu-gts9u/icc-hold
+PENDING=/var/lib/ubuntu-gts9u/icc-release.pending
+UNCLEAN=/var/lib/ubuntu-gts9u/icc-release.unclean
 UPTIME=/proc/uptime
 
 BOARD=samsung,gts9wifi
@@ -284,6 +299,49 @@ pm_test_idle() {
 	grep -q '\[none\]' "$PM_TEST"
 }
 
+this_boot() {
+	cat "$BOOT_ID" 2>/dev/null
+}
+
+marker_boot() { # file
+	sed -n 's/^boot_id=//p' "$1" 2>/dev/null | head -n 1
+}
+
+# Sets $unclean when $PENDING was left by another boot: that boot released the
+# floor and was never stopped cleanly.  A real run ($1 = no) consumes the
+# marker, so only the next boot keeps the floor.
+unclean_check() {
+	unclean=
+	[ -e "$PENDING" ] || return 0
+	prev=$(marker_boot "$PENDING")
+	cur=$(this_boot)
+	# This boot's own marker: a release earlier in this boot, run by hand.
+	[ -n "$prev" ] && [ "$prev" = "$cur" ] && return 0
+	at=$(sed -n 's/^uptime=//p' "$PENDING" 2>/dev/null | head -n 1)
+	unclean="boot $(printf '%s' "${prev:-?}" | cut -c1-8) released the floor at ${at:-?} s and then ended without a clean shutdown (watchdog reset, forced restart or power loss)"
+	[ "$1" = no ] || return 0
+	{ cat "$PENDING"; echo "held_boot=$cur"; } > "$UNCLEAN" 2>/dev/null
+	rm -f "$PENDING"
+	kmsg "loop breaker: $unclean"
+}
+
+mark_pending() {
+	mkdir -p "${PENDING%/*}" 2>/dev/null
+	printf 'boot_id=%s\nuptime=%s\n' "$(this_boot)" "$(uptime_s)" > "$PENDING" 2>/dev/null ||
+		say "note: cannot write $PENDING; the loop breaker cannot cover this boot"
+}
+
+# ExecStop: the unit is being stopped (clean shutdown, reboot, restart), so
+# whatever this boot released did not end in a hang.
+do_stop() {
+	[ -e "$PENDING" ] || return 0
+	[ "$(marker_boot "$PENDING")" = "$(this_boot)" ] || return 0
+	rm -f "$PENDING" 2>/dev/null || return 0
+	open_log
+	say "stop: this boot's release ended in a clean stop; loop-breaker marker cleared"
+	return 0
+}
+
 others_line() {
 	echo "not touched: rpmhpd=$(synced_of "$PLATFORM_DEVICES/17a00000.rsc:power-controller")" \
 		"gcc=$(synced_of "$PLATFORM_DEVICES/100000.clock-controller")" \
@@ -299,6 +357,11 @@ do_release() {
 	fi
 	[ "$dry" = no ] && open_log
 	say "boot $(cut -c1-8 "$BOOT_ID" 2>/dev/null), kernel $(uname -r)$([ "$dry" = yes ] && echo ', dry run')"
+
+	# First, whatever this boot decides: a marker left by a boot that hung
+	# after its release is consumed here, so it costs exactly one held boot.
+	unclean_check "$dry"
+	[ -n "$unclean" ] && say "loop breaker: $unclean"
 
 	plan
 	[ -n "$synced_list" ] && say "already synced: $synced_list"
@@ -316,6 +379,12 @@ do_release() {
 	if [ -e "$HOLD_FILE" ]; then
 		say "HOLD: $HOLD_FILE exists; remove it to let the next boot release the floor"
 		[ "$dry" = no ] && record held "$HOLD_FILE"
+		return 0
+	fi
+
+	if [ -n "$unclean" ]; then
+		say "HOLD: loop breaker: $unclean.  The floor stays this boot only; the next boot releases again unless $HOLD_FILE exists ('systemctl restart ${me}.service' releases it now)"
+		[ "$dry" = no ] && record held "loop breaker: $unclean"
 		return 0
 	fi
 
@@ -343,6 +412,8 @@ do_release() {
 
 	say "releasing: $names (INT_MAX nodes: $intmax_before; suspend_stats $(cat "$SUSPEND_STATS/success" 2>/dev/null)/$(cat "$SUSPEND_STATS/fail" 2>/dev/null))"
 	kmsg "releasing $names (blocked only by the unbound DDR bandwidth monitors)"
+	# The loop-breaker marker must be on disk before the floor moves.
+	mark_pending
 	sync
 	released=
 	failed=
@@ -367,6 +438,11 @@ do_release() {
 	done
 	released=${released# }
 	failed=${failed# }
+	# The floor only drops once every provider reads 1, so after a failed
+	# write it is still in place: no later hang can be blamed on a release.
+	if [ -z "$released" ] || [ -n "$failed" ]; then
+		rm -f "$PENDING"
+	fi
 	intmax_after=$(intmax_count)
 	say "read back:$(for p in $eligible; do printf ' %s=%s' "${p##*/}" "$(synced_of "$p")"; done); INT_MAX nodes $intmax_before -> $intmax_after"
 	say "$(others_line)"
@@ -398,6 +474,16 @@ do_status() {
 	done
 	echo "$(others_line)"
 	echo "INT_MAX nodes now: $(intmax_count) (n/a: needs root and debugfs)"
+	if [ -e "$PENDING" ]; then
+		if [ "$(marker_boot "$PENDING")" = "$(this_boot)" ]; then
+			echo "loop breaker: armed for this boot's release (cleared by a clean shutdown)"
+		else
+			echo "loop breaker: a marker from boot $(marker_boot "$PENDING" | cut -c1-8) is waiting; the next release run keeps the floor once"
+		fi
+	fi
+	if [ -r "$UNCLEAN" ]; then
+		echo "loop breaker last held the floor on boot $(sed -n 's/^held_boot=//p' "$UNCLEAN" | cut -c1-8) after boot $(marker_boot "$UNCLEAN" | cut -c1-8) ended uncleanly"
+	fi
 	if [ -r "$STATE" ]; then
 		echo "--- $STATE"
 		cat "$STATE"
@@ -415,10 +501,11 @@ release)
 	[ "$(id -u)" = 0 ] || { echo "$me: release needs root" >&2; exit 1; }
 	do_release no
 	;;
+stop) do_stop ;;
 check) do_release yes ;;
 status) do_status ;;
 *)
-	echo "usage: ${0##*/} [release|check|status]" >&2
+	echo "usage: ${0##*/} [release|stop|check|status]" >&2
 	exit 2
 	;;
 esac
