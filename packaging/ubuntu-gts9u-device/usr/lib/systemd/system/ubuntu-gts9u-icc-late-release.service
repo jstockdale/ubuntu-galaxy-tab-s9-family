@@ -1,0 +1,32 @@
+[Unit]
+Description=Release the SM-X710 interconnect boot floor after the boot-time panel cycle
+Documentation=file:/usr/libexec/ubuntu-gts9u-icc-late-release
+# SM-X710 only: on the Ultra this is skipped before the helper even starts.
+ConditionFirmware=device-tree-compatible(samsung,gts9wifi)
+# An interconnect that leaves its INT_MAX boot floor before the panel
+# recovery's pm_test=platform cycle hangs that cycle on this board (Stage 3
+# and 3b, 2026-11-07); released after it, it held.  So never before the cycle:
+# the helper also checks that the cycle unit finished successfully and keeps
+# the floor otherwise.  After the ADSP boot and the bring-up USB gadget as
+# well: every runtime release so far was made with both up.  Ordering only:
+# none of them is pulled in, and a missing one is no obstacle.
+After=ubuntu-gts9u-panel-coldboot-recover.service ubuntu-gts9u-adsp-boot.service gts9u-usb-gadget.service
+# A suspend queued while this runs waits for it instead of racing the write.
+Before=sleep.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/ubuntu-gts9u-icc-late-release release
+# Loop breaker: a clean shutdown or reboot stops this unit, and the stop
+# clears the marker the release left on disk.  A boot that released the floor
+# and then hung never gets here, so the next boot keeps the floor once.
+# "-": a stop must never fail, e.g. after the helper was removed by hand.
+ExecStop=-/usr/libexec/ubuntu-gts9u-icc-late-release stop
+# Normally a fraction of a second; the helper waits up to 120 s for a cycle
+# unit that is somehow still running.
+TimeoutStartSec=180
+SyslogIdentifier=ubuntu-gts9u-icc-late-release
+
+[Install]
+WantedBy=multi-user.target
