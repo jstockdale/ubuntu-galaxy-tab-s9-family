@@ -356,6 +356,8 @@ CHVT_SIM = r"""#!/bin/sh
 s=%(root)s
 echo "tty$1" > "$s/active_vt"
 if [ -s "$s/scenario_vt_answer" ]; then
+	echo active > "$s/mdss_status"
+	echo on > "$s/gd/current_state"
 	cat "$s/scenario_vt_answer" > "$s/panel_id"
 	echo "[  90.0] panel-samsung-ana38407 ae94000.dsi.0: ana38407 panel id: $(cat "$s/scenario_vt_answer")" >> "$s/dmesg"
 fi
@@ -366,18 +368,20 @@ class E3Test(unittest.TestCase):
     """e3.sh against a simulated display: files for sysfs/debugfs, stubs for
     chvt, dmesg and sleep (the last one advances the simulated kernel)."""
 
-    def run_e3(self, collapse=True, answer="80 00 04", vt_answer="", cmdline=None):
+    def run_e3(self, collapse=True, answer="80 00 04", vt_answer="", cmdline=None,
+               idle_blanked=False):
         root = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root)
         (root / "gd").mkdir()
         (root / "bin").mkdir()
         files = {
-            "panel_id": "00 00 00\n", "mdss_status": "active\n", "fb0_blank": "",
+            "panel_id": "00 00 00\n", "fb0_blank": "",
+            "mdss_status": "suspended\n" if idle_blanked else "active\n",
             "active_vt": "tty1\n", "state_synced": "1\n",
             "cmdline": cmdline if cmdline is not None else
             "root=LABEL=x msm.dsi_regdump=1 systemd.mask=ubuntu-gts9u-panel-coldboot-recover.service\n",
             "dmesg": "[  12.0] panel-samsung-ana38407 ae94000.dsi.0: ana38407 panel id: 00 00 00\n",
-            "gd/current_state": "on\n",
+            "gd/current_state": "off-0\n" if idle_blanked else "on\n",
             "gd/idle_states": "State          Time Spent(ms) Usage      Rejected\nS0             10             5          0\n",
             "scenario_collapse": "yes\n" if collapse else "no\n",
             "scenario_answer": answer + "\n", "scenario_vt_answer": vt_answer,
@@ -441,6 +445,12 @@ class E3Test(unittest.TestCase):
         self.assertIn("the switch to VT 3 re-powered the panel", result.stdout)
         self.assertIn("E3 NOT TESTED", result.stdout)
         self.assertNotIn("E3 PASS", result.stdout)
+
+    def test_recovery_through_the_login_screen_idle_blank(self):
+        result, _root = self.run_e3(vt_answer="80 00 04", idle_blanked=True)
+        self.assertIn("before: panel id '00 00 00', VT tty1, MDSS suspended, mdss_gdsc off-0",
+                      result.stdout)
+        self.assertIn("E3 PASS (through the login screen idle blank)", result.stdout)
 
     def test_refuses_a_boot_that_ran_the_cycle(self):
         result, root = self.run_e3(cmdline="root=LABEL=x msm.dsi_regdump=1\n")

@@ -122,6 +122,10 @@ Do not plug in a DisplayPort monitor during the masked boots (see Couplings).
      `sudo /usr/libexec/ubuntu-gts9u-panel-coldboot-recover; sudo sh ~/panel/collect.sh e0-platform`
      (expect `80 00 04`).
    * `E3 RECOVERED WITHOUT A GDSC COLLAPSE` - panel side; note it.
+   * `E3 PASS (through the login screen idle blank)` - more than ~5 minutes
+     had passed, the login screen had blanked (display runtime-suspended,
+     GDSC off), and the power-on at the switch to VT 3 answered. Same result
+     as `E3 PASS`.
    * `E3 NOT TESTED` - the console's own modeset at the switch to VT 3 (a
      panel power cycle inside one commit, no GDSC collapse) already brought
      `80 00 04`; panel side as well, note it. The line before it says so.

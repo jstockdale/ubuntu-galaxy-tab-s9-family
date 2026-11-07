@@ -47,7 +47,11 @@ sh "$kit/collect.sh" e3-before > /dev/null
 vt_before=$(cat /sys/class/tty/tty0/active)
 usage_before=$(usage)
 lines_before=$(id_lines)
-say "before: panel id '$id_before', VT $vt_before, MDSS $(cat "$mdss"), mdss_gdsc $(cat "$gd/current_state" 2>/dev/null) usage ${usage_before:-?}"
+# The login screen blanks after ~5 idle minutes; then the display is already
+# runtime-suspended (GDSC off) and the switch below powers it on again.
+mdss_before=$(cat "$mdss")
+gdsc_before=$(cat "$gd/current_state" 2>/dev/null)
+say "before: panel id '$id_before', VT $vt_before, MDSS $mdss_before, mdss_gdsc $gdsc_before usage ${usage_before:-?}"
 
 timeout 15 chvt 3 || say 'chvt 3 did not complete'
 sleep 3
@@ -89,7 +93,9 @@ if [ "$mdss_blank" = suspended ] && { [ "${gdsc_blank%%-*}" = off ] ||
 	{ [ -n "$usage_before" ] && [ -n "$usage_blank" ] && [ "$usage_blank" -gt "$usage_before" ]; }; }; then
 	collapsed=yes
 fi
-if [ "$id_vt" = '80 00 04' ]; then
+if [ "$id_vt" = '80 00 04' ] && [ "$mdss_before" = suspended ] && [ "${gdsc_before%%-*}" = off ]; then
+	say 'E3 PASS (through the login screen idle blank): the display was runtime-suspended with the MDSS GDSC off before the switch, and the power-on at the switch to VT 3 answered; no system suspend'
+elif [ "$id_vt" = '80 00 04' ]; then
 	say 'E3 NOT TESTED: the console modeset of the VT switch (panel power cycle, no GDSC collapse) already recovered the DDIC; note it (panel side)'
 elif [ "$collapsed" = yes ] && [ "$id_after" = '80 00 04' ]; then
 	say 'E3 PASS: a runtime blank/unblank (MDSS GDSC off, panel supplies cycled) recovered the DDIC; no system suspend'
