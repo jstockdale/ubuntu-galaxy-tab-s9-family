@@ -1,0 +1,182 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Keep system sleep off while the audio DSP starts.
+#
+# ubuntu-gts9u-adsp-boot starts the ADSP late, after the panel's boot-time
+# suspend cycle, and returns a second later.  The DSP then authenticates its
+# firmware and brings up glink, APM and FastRPC; the sound card follows about
+# ten seconds on.  On the SM-X710 a suspend that overlapped that start took
+# six seconds and timed out APM (B-32), and the same race froze the Fedora
+# SM-X710 port.  Ordering already keeps the boot-time cycle out (it writes
+# /sys/power/state itself, so no lock could hold it); this lock keeps out
+# everything that asks logind while the DSP comes up: the cover, GNOME's idle
+# timeout, Suspend in the menus and on the login screen, a sleep key.
+#
+# ubuntu-gts9u-adsp-start-inhibit.service (Type=notify) runs this as its main
+# process, ordered before ubuntu-gts9u-adsp-boot.service.  It takes the lock
+# with a background
+#
+#   systemd-inhibit --what=sleep --mode=block ... /bin/sh -c ': > held; exec sleep N'
+#
+# systemd-inhibit starts that holder only once logind has granted the lock, so
+# the holder's marker file means "held"; only then does this script send
+# READY=1, which is what lets the DSP start go ahead.  It then waits until the
+# DSP is up (remoteproc running, /dev/fastrpc-adsp present, a sound card
+# registered), lets it settle, and exits; the holder goes with it, which drops
+# the lock.  It gives up after ADSP_INHIBIT_MAX seconds, or as soon as the DSP
+# start has visibly failed, so a DSP that never comes up cannot keep the
+# tablet awake.
+#
+# Why not "ExecStart=systemd-inhibit ... this-script": systemd-inhibit starts
+# its command through systemd's safe_fork(), which since systemd 254 removes
+# NOTIFY_SOCKET from the child's environment.  A READY=1 from there never
+# reaches the service manager: the unit fails ('protocol' when the command
+# exits first, else the start timeout kills it and the lock with it) and the
+# DSP starts late and unprotected.  Measured on systemd 259; the tablet's
+# libsystemd-shared-255 carries the same unset.
+#
+# Known gap: logind lets a caller pass a block lock held by its own uid, and
+# lets root pass any.  ubuntu-gts9u-powerkey suspends as root through
+# `systemctl suspend`, so the power key is not held off by this lock; the
+# helper has to look for it itself (systemd-inhibit --list, mode block, what
+# sleep) before asking for a suspend.
+set -u
+
+max=${ADSP_INHIBIT_MAX:-90}
+settle=${ADSP_INHIBIT_SETTLE:-10}
+boot_unit=ubuntu-gts9u-adsp-boot.service
+who=ubuntu-gts9u-adsp-start
+rundir=${RUNTIME_DIRECTORY:-/run/ubuntu-gts9u-adsp-start-inhibit}
+held=$rundir/held
+holder=
+
+log() { echo "ubuntu-gts9u-adsp-start-inhibit: $*" >&2; }
+
+# Tell the service manager the DSP start may go ahead.  Without a notify
+# socket (run by hand) there is nobody to tell.
+ready() {
+	[ -n "${NOTIFY_SOCKET:-}" ] || return 0
+	systemd-notify --ready || log 'could not report readiness; the DSP start waits for the start timeout'
+}
+
+# Drop the lock: end the holder.  systemd stops whatever is left of the unit
+# when this script exits anyway; this only makes it immediate.
+release() {
+	if [ -n "$holder" ]; then
+		kill "$holder" 2>/dev/null
+		holder=
+	fi
+	rm -f "$held"
+}
+
+holding() { [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; }
+
+adsp_dir() {
+	for d in /sys/class/remoteproc/remoteproc*; do
+		[ "$(cat "$d/name" 2>/dev/null)" = adsp ] && { echo "$d"; return; }
+	done
+}
+
+card_present() {
+	grep -q '^ *[0-9]' /proc/asound/cards 2>/dev/null
+}
+
+# What is still missing, or nothing when the DSP is up.
+missing() {
+	m=
+	[ "$(cat "$rp/state" 2>/dev/null)" = running ] || m="$m remoteproc"
+	[ -e /dev/fastrpc-adsp ] || m="$m fastrpc-adsp"
+	card_present || m="$m sound-card"
+	echo "${m# }"
+}
+
+case "${1:-}" in
+hold) ;;
+*)
+	echo "usage: ${0##*/} hold   (the main process of ubuntu-gts9u-adsp-start-inhibit.service)" >&2
+	exit 2
+	;;
+esac
+
+trap release EXIT
+trap 'exit 0' TERM INT HUP
+
+# --- take the lock ------------------------------------------------------------
+mkdir -p "$rundir" 2>/dev/null
+rm -f "$held"
+# The holder only marks the lock as held and waits; it outlives the longest
+# hold below by a minute, so even a holder this script lost cannot keep sleep
+# blocked for long (RuntimeMaxSec= in the unit is the other backstop).
+systemd-inhibit --what=sleep --mode=block --who="$who" \
+	"--why=The audio DSP is starting" \
+	/bin/sh -c ': > "$1" && exec /usr/bin/sleep "$2"' adsp-start-lock \
+	"$held" $((max + settle + 60)) &
+holder=$!
+n=0
+while [ ! -e "$held" ]; do
+	if ! holding; then
+		holder=
+		log 'logind did not grant the sleep lock; the DSP starts without it'
+		ready
+		exit 0
+	fi
+	if [ "$n" -ge 50 ]; then
+		log 'no sleep lock after 10s; the DSP starts without it'
+		ready
+		exit 0
+	fi
+	sleep 0.2
+	n=$((n + 1))
+done
+log "sleep lock taken ($who)"
+ready
+
+# --- hold it while the DSP starts ------------------------------------------------
+rp=$(adsp_dir)
+if [ -z "$rp" ]; then
+	log 'no adsp remoteproc: nothing to hold'
+	exit 0
+fi
+if [ -z "$(missing)" ]; then
+	log 'the audio DSP is already up: nothing to hold'
+	exit 0
+fi
+
+log "system sleep held off until the audio DSP is up (at most ${max}s)"
+t=0
+while [ "$t" -lt "$max" ]; do
+	m=$(missing)
+	if [ -z "$m" ]; then
+		log "audio DSP up after ${t}s (remoteproc running, fastrpc-adsp and a sound card present); releasing in ${settle}s"
+		sleep "$settle"
+		exit 0
+	fi
+	if ! holding; then
+		log "the sleep lock went away after ${t}s (logind restarted?); nothing left to hold"
+		exit 0
+	fi
+	case "$(cat "$rp/state" 2>/dev/null)" in
+	crashed)
+		log "the audio DSP crashed after ${t}s; releasing"
+		exit 0
+		;;
+	esac
+	# The start itself failed, or was skipped (no firmware): nothing comes.
+	case "$(systemctl show -p ActiveState --value "$boot_unit" 2>/dev/null)" in
+	failed)
+		log "$boot_unit failed after ${t}s; releasing"
+		exit 0
+		;;
+	inactive)
+		if [ "$t" -ge 15 ]; then
+			log "$boot_unit has not run after ${t}s; releasing"
+			exit 0
+		fi
+		;;
+	esac
+	sleep 1
+	t=$((t + 1))
+done
+log "audio DSP still missing $(missing) after ${max}s; releasing anyway"
+exit 0
