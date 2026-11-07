@@ -1449,8 +1449,13 @@ that transaction; a press after a non-key wake remains a new command.
 
 The daemon also tracks the difference between those clocks independently of
 its own suspend requests. This covers suspend initiated by GNOME, systemd or
-a diagnostic tool: the first power-key event after thaw still carries IRQ 21
-and is consumed as a wake event instead of becoming a second suspend request.
+a diagnostic tool: the first power-key event after thaw still carries the
+`pmic_pwrkey` IRQ and is consumed as a wake event instead of becoming a second
+suspend request. The helper looks that IRQ up by name ("pmic power-key wake
+IRQ is N" in its journal) because the number moves with probe order: it is 21
+on the Ultra, but 22 on the SM-X710, where the PMIC RTC registers first and
+takes 21 for `pm8xxx_rtc_alarm` (`pmic_resin`, Volume Down, is 23 there). Every
+"IRQ 21" power-key result in the rest of these notes was measured on the Ultra.
 
 That rule — a recent request plus no measurable sleep means "entry in progress"
 — swallowed every second press whenever no sleep followed the first one: the
