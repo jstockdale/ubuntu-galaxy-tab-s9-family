@@ -9,10 +9,10 @@ ConditionFirmware=device-tree-compatible(samsung,gts9wifi)
 # initramfs exists (still down) and can take the address directly; before
 # NetworkManager, which keeps whatever address the interface has when it first
 # sees it.  An interface created later gets it from the .link file this
-# writes.
-After=systemd-udev-trigger.service local-fs.target
-Before=NetworkManager.service network-pre.target
-Wants=network-pre.target
+# writes.  Only NetworkManager is named: both units already come after
+# basic.target, so this adds no ordering anything else could cycle on.
+After=systemd-udev-trigger.service
+Before=NetworkManager.service
 
 [Service]
 Type=oneshot
