@@ -7726,3 +7726,33 @@ fix7-ice's own `vendor_boot` footer is stale. Its digest matches its body only
 with ` iommu.strict=0` zeroed, so the cmdline was patched in place after
 footing. vbmeta is disabled, so ABL never checks it. The kit's image gets a
 fresh, correct footer.
+
+The build (2026-11-08):
+- Source: a fresh worktree of `linux-mainline` at a13c140cc, built from the
+  snapshot `~/ubuntu-gts9u/snapshots/cx-0992e2a13671` of commit 0992e2a (the
+  `SNAPSHOT` file names its commit and tree). Build directory and worktree:
+  `gts9u-scratch/build-cxg5`. Output: `~/ubuntu-gts9u/out/kernel-gts9wifi-cx`.
+- The kernel tree differs from the G5 kernel's (`build-g5/linux-src-gts9wifi`)
+  in three files only: the X710 DTS, `ufshcd.c` and `dwc3-qcom.c`.
+- Image.gz `8b6d58c9…`, DTB `290a5395…`, release `7.2.0-rc3-dirty`.
+- `config` `c17980f0…`, fix6's and the G5 kernel's.
+- Exported symbols: the same 17,610 as the G5 build. The same 62 modules,
+  every one signed by this build's certificate (serial `1E124EA5…`).
+- The signing key, ID `1ded767e…`, is archived in `~/ubuntu-gts9u/kernel-keys`,
+  mirrored to the external drive and copied to `gdrive:gts9u-kernel-keys`.
+- The first run stopped at the snvm module: `cp -a` copies
+  `kernel/drivers/snvm` from the snapshot with its modes, and this snapshot had
+  been made read-only. Keep snapshots owner-writable, as the G5 one is.
+
+Device package 2.58, built against this kernel, sha256 `99366b71…`. Its
+`qcom_spss_irq.ko` is byte-identical to the kernel's signed copy.
+
+Kit `~/ubuntu-gts9u/backups/ufs-cx-kit`:
+- `boot.img` `47f7df27…`: the kernel is exactly `Image.gz` plus the CX DTB, and
+  every header field matches the G5 kit's.
+- `vendor_boot.img` `be06a00f…`.
+- `modules-7.2.0-rc3-dirty.tar` `f7d38300…`: root-owned, and the same module
+  list as the build.
+- The device package.
+
+Not flashed. It goes on the tablet after the G5 kit, as the owner ordered.
