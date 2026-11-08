@@ -191,3 +191,31 @@ sudo sh ~/cameras-kit/camera-test.sh both
 sudo install -d /etc/ubuntu-gts9u                               # no package creates it
 echo both | sudo tee /etc/ubuntu-gts9u/cameras && sudo reboot   # cameras at every boot
 ```
+
+## First light: rear (2026-11-08)
+
+On squirtle (CX kernel `bfb40d20…`, device 2.58), `camera-test.sh rear` gave
+the following. Results are in `/var/log/gts9u-cameras-test/20261108-120850-rear`.
+- The switch went from `none` to `rear`; the camera was ready after 1 s.
+- The HI1337 identified (`rear-main model=0x1337 vendor=0x2000`) at
+  `13-0021` on CCI0, and the DW9808 bound at `14-000c` on CCI1.
+- `/dev/media0` (qcom-camss, 49 entities). The sensor joined the graph as
+  `v4l-subdev30`; the lens is `v4l-subdev31`.
+- libcamera's "Internal back camera" captured 60 frames at 640x480 BGR888
+  through the software ISP. The last frame is a real, upright view of the
+  room: dark (mean 40/255) and soft, with colour plausible.
+- PipeWire has one libcamera node; the table is `20 GTS9-Rear …`. The owner
+  saw the picture in the Camera app.
+- Exposure (4–3260) and analogue gain (0–240) are live, and libcamera's AGC
+  drives them.
+
+Not working:
+- Focus. The DW9808's first register write got a CCI timeout at probe
+  (`i2c-qcom-cci ac16000.cci: master 0 queue 0 timeout`, then
+  `dw9808-vcm 14-000c: register 0x02 write failed: -110`). Opening
+  `/dev/v4l-subdev31` then fails with `EINVAL`, and libcamera logs "Lens
+  initialisation failed, lens disabled", so the lens sits at rest.
+- The `/dev/video20` relay (the browser path) served only its black splash
+  within the script's 5 s read (mean luma 16, spread 0).
+
+Front: not tried yet. Its open risks are listed above.
