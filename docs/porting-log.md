@@ -7834,3 +7834,46 @@ Device package 2.58 on squirtle (2026-11-08), measured:
   votes nominal. That is the "other consumer" that had kept CX at nominal
   before any of this work. The other CX children are the GCC GDSCs.
 - Still to run: steps 4 (five times) to 11.
+
+### Bluetooth lost to a UART IRQ storm in the boot-time cycle (2026-11-08)
+
+On boot `0824d1f3` (CX kernel, device 2.58) Bluetooth came up at 21 s and
+went dead at 35 s. In the boot-time panel cycle's `pm_test=platform` suspend,
+at 24.8 s:
+- IRQ 191 (`qcom_geni_serial_uart1`, the BT UART at `898000.serial`, `ttyHS1`)
+  logged "nobody cared" inside `qcom_geni_serial_suspend()`;
+- the kernel then printed "Disabling IRQ #191".
+
+With its RX interrupt gone the UART could not receive. Every HCI command
+after the cycle timed out (from 35.0 s), and the QCA crash dump, the re-setup
+and three power-on retries all failed by about 181 s. 1 of the 32 boots with a
+kernel log in the journal shows this. Early bring-up saw it once, as "irq 188:
+nobody cared = ttyHS1 (BT UART) during the fake suspend". Boot −1, on the
+same kernel and DTB, was clean. The CX and USB changes do not touch this path.
+
+Mechanism (drivers/tty/serial/qcom_geni_serial.c):
+- `qcom_geni_serial_isr()` returns `IRQ_NONE` as soon as `uport->suspended`
+  is set, without clearing the SE's interrupt status.
+- `uart_suspend_port()` sets `suspended` before `stop_rx` masks RX.
+- An HCI event arriving in that window leaves the level-triggered interrupt
+  asserted. It refires, every time "unhandled", until the spurious-IRQ
+  detector disables it.
+- Every real suspend with Bluetooth on has the same window, so this matters
+  before a suspend mode is enabled.
+
+Recovery without a reboot, three steps, all root:
+1. Rebind the UART:
+   `echo 898000.serial > /sys/bus/platform/drivers/qcom_geni_serial/unbind`,
+   then the same name to `.../bind`. The driver requests its IRQ at probe, and
+   `__setup_irq()` clears `IRQS_SPURIOUS_DISABLED` for a first handler. The
+   BT serdev device re-probes and loads its firmware again (setup completed
+   at 11:54:13).
+2. The new `hci0` comes up with the NVM's null address. Unconfigured
+   controllers are skipped by bluetoothd, and restarting it does not help.
+3. `systemctl restart ubuntu-gts9u-bluetooth-address.service` applies the EFS
+   address again (`68:DF:E4:B4:91:C1`). bluetoothd and GNOME took the
+   controller at once (11:57:06).
+
+The second step is what made a re-probed controller invisible.
+`ubuntu-gts9u-bluetooth-address` is a oneshot with `RemainAfterExit`, so it
+runs only at boot.
