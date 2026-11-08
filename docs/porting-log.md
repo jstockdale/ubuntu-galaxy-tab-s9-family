@@ -7230,3 +7230,51 @@ there is a DTB-only fallback that needs no kernel change: `limit-hs-gear =
 <4>` starts the PHY at G4, so the Rate-A rule does not apply and the link runs
 G4 Rate-B, about 17 % more line rate than now. The SM-X910 has the same SoC
 and driver, so the same cap applies there.
+
+#### The HS-G5 kit (built 2026-11-07, not flashed)
+
+The owner asked for the experiment. Commit `b9f5b08` adds
+`ufs-qcom-hs-g5-at-300mhz-sm8550.patch`. `build-mainline-kernel.sh` applies it
+for `DEVICE=gts9wifi` only, so the Ultra gets it only after the X710 has
+passed. `scripts/test-ufs-hs-g5-gear.py` applies it with zero fuzz to the
+pinned source. It then runs the real mapping function against stubs: 300 MHz
+gives G5 on HW ver 5, G4 when the device stops at G4, and G4 on other host
+versions.
+
+The kernel was built from a frozen export of `b9f5b08` into a new worktree
+and build directory. Another session's uncommitted ICE driver patch sat in the
+shared X710 tree, and the G5 kernel does not contain it. The first run failed
+at the SNVM module. The snapshot had been made read-only, and the script copies
+`kernel/drivers/snvm` with its mode, so the build could not write there. A
+writable snapshot of the same tree finished.
+
+Checks against fix6:
+
+- Same configuration (`c17980f0…`), `UTS_VERSION` (`#1 … Jul 12 21:16:39
+  UTC 2026`) and exported-symbol list.
+- The same 62 modules.
+- A new signing certificate, because the build directory is new. The kit
+  ships the whole module tree from this build.
+- In the disassembly, `ufs_qcom_freq_to_gear_speed()` now reads
+  `hw_ver.major` and compares it with 5 in the 300 MHz case.
+
+Outputs:
+
+- `Image.gz`: `6f7b96d5…`, vmlinux build ID `c0db6fe5…`.
+- The kit (`tools/inplace/ufs-g5`):
+  - `boot.img`: `4179f406…`. It is fix7-ice's image with this kernel, and the
+    fix7-ice DTB (`2da18630…`) appended. `vendor_boot` stays fix7-ice's. The
+    same packing reproduces fix7-ice's `boot.img` byte for byte from fix6's
+    kernel.
+  - `modules-7.2.0-rc3-dirty.tar`: `6f25de45…`.
+
+The kit is staged on squirtle as `~/ufs-g5` and not installed. Before it, on
+fix7-ice, `verify.sh` read `HS_GEAR4/HS_RATE_A` under load.
+
+The PCS-reset patch stays gated to the SM-X910, as
+[resume-recovery.md](resume-recovery.md#sm-x710-gts9wifi) decided. The 15
+boots before this one logged no UFS PHY error. They include each boot's
+`pm_test=platform` cycle and, on 2026-11-06, five `pm_test` levels, one real
+s2idle and one real deep sleep. Adding it to
+the G5 build would have made two PHY-side changes at once. If the G5 suspend
+runs show `PCS_READY` timeouts, it gets its own build.
