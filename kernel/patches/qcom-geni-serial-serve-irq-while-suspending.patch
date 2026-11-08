@@ -1,0 +1,54 @@
+Subject: [PATCH] serial: qcom-geni: keep serving the interrupt while the port suspends
+
+uart_suspend_port() sets uport->suspended first.  Only after that does it
+stop the transmitter and the receiver under the port lock, and the port's
+interrupt stays enabled until qcom_geni_serial_shutdown() disables it.
+The handler returns IRQ_NONE as soon as the port is marked suspended,
+without reading or clearing the engine's interrupt status.  The line is
+level-triggered, so any status latched in that window keeps it asserted:
+received data, or the cancels issued by stop_rx() and stop_tx().  When
+the interrupt targets the CPU that runs the suspend, the CPU takes it
+again as soon as the locked section ends, and the suspend makes no
+further progress.  After 100,000 unhandled interrupts the
+spurious-interrupt detector disables the line:
+
+  irq 191: nobody cared (try booting with the "irqpoll" option)
+  ...
+   _raw_spin_unlock_irq+0x1c/0x60 (P)
+   qcom_geni_serial_suspend+0x60/0x78
+   dpm_run_callback+0x8c/0x19c
+  ...
+  Disabling IRQ #191
+
+With its interrupt gone the port receives nothing after resume.  On a
+Bluetooth UART, every HCI command then times out.
+
+The window opened when system suspend moved out of the noirq phase.
+Clearing the status and returning IRQ_HANDLED while suspended would end
+the storm, but it would drop a TX DMA completion.  start_tx_dma() does
+nothing while tx_dma_addr is still set, so transmission would stall
+after resume.  Instead, serve the interrupt as before the port was
+marked suspended.  The handler cannot run on an unclocked engine:
+shutdown() disables the interrupt and waits for a running handler before
+uart_change_pm() turns the resources off, and startup() enables it again
+only after they are back on.
+
+Fixes: b1f84dd32166 ("tty: serial: qcom_geni_serial: Rectify UART suspend mechanism")
+
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -1067,9 +1067,11 @@ static irqreturn_t qcom_geni_serial_isr(
+ 	struct tty_port *tport = &uport->state->port;
+ 	struct qcom_geni_serial_port *port = to_dev_port(uport);
+ 
+-	if (uport->suspended)
+-		return IRQ_NONE;
+-
++	/*
++	 * Serve the interrupt even once uart_suspend_port() has marked the
++	 * port suspended: RX and TX are stopped after that, and shutdown()
++	 * masks the level-triggered interrupt only then.
++	 */
+ 	uart_port_lock(uport);
+ 
+ 	m_irq_status = readl(uport->membase + SE_GENI_M_IRQ_STATUS);
