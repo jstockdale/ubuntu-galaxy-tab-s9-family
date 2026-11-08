@@ -1,73 +1,107 @@
-# Ubuntu 24.04 LTS for Samsung Galaxy Tab S9 Ultra Wi-Fi
+# Ubuntu for the Samsung Galaxy Tab S9 family
 
-<img width="4000" height="2252" alt="20260911_124542" src="https://github.com/user-attachments/assets/80a44675-d588-43b5-b86d-514cd7875800" />
+<img width="4000" height="2252" alt="Galaxy Tab S9 Ultra running Ubuntu with GNOME" src="https://github.com/user-attachments/assets/80a44675-d588-43b5-b86d-514cd7875800" />
 
-Ubuntu 24.04 LTS arm64 for the Samsung Galaxy Tab S9 Ultra Wi-Fi
-(`SM-X910`, `gts9uwifi`), running GNOME 46 on Wayland and upstream Linux
-7.2-rc3.
+Ubuntu LTS arm64 with GNOME on Wayland and an upstream Linux kernel for the
+Samsung Galaxy Tab S9 tablets, all built on the Snapdragon 8 Gen 2 (SM8550):
 
-The same source tree also builds for the Galaxy Tab S9 Wi-Fi (`SM-X710`,
-`gts9wifi`) with `DEVICE=gts9wifi`. That port is experimental, installs on the
-whole tablet only, and has no published ZIP: you build it yourself. See
-[Galaxy Tab S9 (SM-X710)](#galaxy-tab-s9-sm-x710).
+| Device | Model | Codename | State |
+|---|---|---|---|
+| Galaxy Tab S9 Ultra Wi-Fi | SM-X910 | `gts9uwifi` | Released upstream, daily-driver quality |
+| Galaxy Tab S9 Wi-Fi (11") | SM-X710 | `gts9wifi` | Bring-up on this branch, experimental |
+| Galaxy Tab S9+ Wi-Fi | SM-X810 | `gts9pwifi` | Planned, not started |
 
-## Hardware compatibility (SM-X910)
+## Origin and credit
 
-| Component | Status | Summary |
-|---|---:|---|
-| Display | ✅ | Native 2960×1848 at 120 Hz |
-| Desktop | ✅ | GNOME 46, Wayland and GDM |
-| GPU | ✅ | Adreno 740 hardware acceleration, up to 719 MHz |
-| Touchscreen | ✅ | Goodix multitouch |
-| S Pen writing | ✅ | Hover, pressure, tilt, side button and palm rejection |
-| S Pen dock | ✅ | Insertion, orientation and charging |
-| S Pen BLE | ✅ | Pairing, battery, air gestures and pointer mode |
-| Tab Companion | ✅ | Device settings, fingerprint, dual boot and system updates |
-| Keyboard cover | ✅ | EF-DX920 tested |
-| Cover switch | ✅ | Suspend on close and wake on open |
-| Power and volume buttons | ✅ | Power, wake and volume controls |
-| Wi-Fi | ✅ | WCN7850 / ath12k |
-| Bluetooth | ✅ | Controller, audio and S Pen BLE |
-| Speakers and microphones | ✅ | Four speakers and digital microphones |
-| Vibration / haptics | ✅ | On-screen keyboard feedback |
-| Motion sensors | ✅ | Rotation, accelerometer, gyroscope and compass |
-| Battery telemetry | ✅ | Charge, voltage, current and temperature |
-| USB-PD/PPS charging | ✅ | Up to 25 W measured into the battery |
-| Suspend / resume | ✅ | Deep sleep and reliable storage recovery |
-| microSD | ✅ | Read and write storage works normally |
-| USB host | ✅ | HID and storage, powered or unpowered |
-| USB-C DisplayPort | ✅ | External video output |
-| Cameras and flash | ✅ | Four cameras, full field of view, autofocus and flash |
-| Fingerprint reader | ✅ | Login, enrolment and recognition |
-| Ambient light sensor | ✅ | Automatic screen brightness |
-| NPU | ✅ | Hardware acceleration support |
-| Virtual machines | 🟡 | Gunyah host support; guest VMs still in development |
-| Waydroid | ✅ | Android with Google Play, GPU acceleration and Internet |
+This project was created by **Arturo González Carbajo**
+([@agcarbajo](https://github.com/agcarbajo)) as *Ubuntu for the Samsung Galaxy
+Tab S9 Ultra*, and his repository,
+[agcarbajo/ubuntu-galaxy-tab-s9-ultra](https://github.com/agcarbajo/ubuntu-galaxy-tab-s9-ultra),
+remains the home of the SM-X910 releases, the Dualboot app and the Tab
+Companion application. The kernel work, the device tree, the firmware staging,
+the installers, the updater and the documentation structure are his. He also
+wrote the postmarketOS port this work descends from.
+
+This fork, maintained by John Stockdale
+([@jstockdale](https://github.com/jstockdale)), extends the same source tree to
+the smaller members of the family, the Galaxy Tab S9 (SM-X710) and Galaxy Tab
+S9+ (SM-X810), at Arturo's invitation. The intent is one tree that builds every
+model from a `DEVICE=` axis, with the changes contributed back upstream.
+
+If the project is useful to you, consider supporting its author:
+
+<a href='https://ko-fi.com/V7W426ZJIP' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Arturo a coffee at ko-fi.com' /></a>
+
+## Hardware support by device
 
 ✅ working on the physical tablet · 🟡 experimental or partially validated ·
-❌ unavailable · ❓ not tested
+❌ not available · ❓ not yet assessed · — not started
 
-The evidence and limitations are documented in
-[hardware-status.md](docs/hardware-status.md) for most components, and in
+| Subsystem | S9 Ultra (SM-X910) | S9 (SM-X710) | S9+ (SM-X810) | Notes |
+|---|:---:|:---:|:---:|---|
+| Display | ✅ | ✅ | — | X910 2960×1848 at 120 Hz; X710 2560×1600 at 120 Hz or 60 Hz. Same ANA38407 driver IC, different glass |
+| Desktop | ✅ | ✅ | — | GNOME 46 on Wayland with GDM |
+| GPU | ✅ | ✅ | — | Adreno 740 with Mesa freedreno and turnip; X910 up to 719 MHz. On the X710 the stray pixels seen during bring-up are fixed: with `videocc` built in, `rpmhpd` reaches `sync_state` at boot ([display notes](docs/gts9wifi-display.md)) |
+| CPU | ✅ | ✅ | — | Prime core up to 3.36 GHz |
+| Touchscreen | ✅ | ✅ | — | X910 Goodix; X710 STM FTS1BA90A, with double tap to wake (off by default). X710 units with the Goodix GT9916 are not yet described ([touch notes](docs/gts9wifi-touch-fts1ba90a.md)) |
+| S Pen writing | ✅ | ✅ | — | Hover, pressure, tilt, side button and palm rejection |
+| S Pen dock | ✅ | ✅ | — | Insertion, orientation and charging |
+| S Pen BLE | ✅ | 🟡 | — | Pairing, battery, air gestures and pointer mode on the X910; on the X710 the pairing service starts, pairing a pen is not yet recorded |
+| Tab Companion | ✅ | ✅ | — | Device settings, S Pen, keyboard and touch; fingerprint and dual boot are X910 features |
+| Keyboard cover | ✅ | ✅ | — | EF-DX920 on the X910; EF-DX720 on the X710 with the posture switch (laptop vs tablet mode) |
+| Cover switch | ✅ | ✅ | — | X910 suspends on close; X710 locks on close |
+| Power and volume buttons | ✅ | ✅ | — | On the X710 the power key locks and blanks instead of suspending |
+| Wi-Fi | ✅ | ✅ | — | Different companion chips: X910 WCN7850 on ath12k, X710 WCN6855 on ath11k with Samsung's board data for 5 GHz ([Wi-Fi notes](docs/gts9wifi-wifi.md)) |
+| Bluetooth | ✅ | 🟡 | — | Controller and audio on the X910; the X710 controller comes up, Bluetooth audio not yet tested |
+| Speakers and microphones | ✅ | ✅ | — | Four CS35L45 amplifiers and digital microphones on both; the X710 needs Samsung's speaker-protection files staged by hand |
+| Vibration / haptics | ✅ | ✅ | — | On-screen keyboard feedback |
+| Motion sensors | ✅ | ✅ | — | Through the ADSP sensor core: rotation and the light sensor on the X710 ([sensor notes](docs/gts9wifi-sensors.md)) |
+| Ambient light sensor | ✅ | ✅ | — | Automatic screen brightness |
+| Battery telemetry | ✅ | ✅ | — | Charge, voltage, current and temperature |
+| USB-PD charging | ✅ | 🟡 | — | X910 up to 25 W measured; X710 charges at 9 V from a PD charger, PPS not assessed |
+| RTC and sleep statistics | ✅ | ✅ | — | PMIC RTC and `qcom_stats` |
+| Suspend / resume | ✅ | 🟡 | — | X910 deep sleep with storage recovery; on the X710 suspend is off by default until repeated RTC-woken runs pass ([tools](scripts/diagnostics/suspend/README.md)) |
+| microSD | ✅ | 🟡 | — | Detected and mounted on the X710; not exercised further |
+| USB host | ✅ | ❓ | — | HID and storage on the X910 |
+| USB-C DisplayPort | ✅ | ❓ | — | [DisplayPort notes](docs/gts9u-displayport.md) |
+| Cameras and flash | ✅ | 🟡 | — | X910 four cameras with autofocus; X710 two HI1337 described, off unless enabled, not yet tested ([camera notes](docs/gts9wifi-cameras.md)) |
+| Fingerprint reader | ✅ | ❌ | — | EL721 under-display reader works on the X910; not supported on the X710 yet, its services are skipped there |
+| NPU | ✅ | ❌ | — | Not built for the X710 (`GTS9U_INCLUDE_NPU=0`) |
+| Virtual machines | 🟡 | ❓ | — | Gunyah host support on the X910; guests still in development |
+| Waydroid | ✅ | ❓ | — | Android with Google Play, GPU acceleration and network on the X910 |
+| Dual boot with Android | ✅ | ❌ | — | X910 only: the split installer refuses other models |
+
+The SM-X910 column describes the upstream tree; its evidence and limitations
+are in [hardware-status.md](docs/hardware-status.md), with
 [npu-status.md](docs/npu-status.md), [gunyah.md](docs/gunyah.md) and
 [waydroid.md](docs/waydroid.md) for the NPU, virtual machines and Waydroid.
-
-This table describes the current source tree; previously published installation
-ZIPs may not include the latest changes. The shared changes made with the
-SM-X710 port (the S Pen decode, tilt included, the kernel configuration and
-patches, the panel, pogo, charger and battery drivers, and the device package
-2.56 units) have not yet been built and booted on an SM-X910.
+The SM-X710 column describes this branch as of 2026-11-07, tested on one
+tablet with bootloader revision 5; its evidence is in
+[hardware-status.md](docs/hardware-status.md#sm-x710-galaxy-tab-s9). The
+tested unit was first installed from an earlier gts9wifi ZIP and updated in
+place; a ZIP built from the current tree has not yet been flashed end to end.
+The changes shared with the SM-X710 port (S Pen decode with tilt, kernel
+configuration and patches, the panel, pogo, charger and battery drivers, and
+the device package 2.56 units) have not yet been built and booted on an
+SM-X910.
 
 ## Tab Companion
-<img width="2164" height="1764" alt="Screenshot from 2026-08-20 04-02-55" src="https://github.com/user-attachments/assets/df7cddca-46e8-438a-bcb8-be713cc93bed" />
 
-Tab Companion provides:
+<img width="2164" height="1764" alt="Tab Companion" src="https://github.com/user-attachments/assets/df7cddca-46e8-438a-bcb8-be713cc93bed" />
 
-- full S Pen settings (pairing, gestures and air-pointer mouse mode);
+Tab Companion, written by Arturo for the Ultra and shared by every model,
+provides:
+
+- full S Pen settings (pairing, gestures and air-pointer mouse mode), and on
+  the X710 a pen test ([notes](docs/tab-companion.md#the-pen-test));
 - remapping for compatible Samsung Book Cover Keyboard keys;
-- adjustable vibration feedback for GNOME's on-screen keyboard and optional notification vibration;
-- fingerprint enrolment with progress, deletion and recognition tests, using the same fingerprints as Ubuntu Settings and login;
-- dual boot to Android, with an optional toggle in quick settings.
+- adjustable vibration feedback for GNOME's on-screen keyboard and optional
+  notification vibration;
+- touch options such as double tap to wake on the X710;
+- fingerprint enrolment with progress, deletion and recognition tests, using
+  the same fingerprints as Ubuntu Settings and login (X910);
+- dual boot to Android, with an optional toggle in quick settings (X910);
+- system updates.
 
 The air-pointer concept is inspired by
 [PenMouse S](https://github.com/jojczak/PenMouseS) by Jakub J (`@jojczak`).
@@ -83,7 +117,10 @@ boot, the Dualboot app and switching systems do not apply to it.
 > [!WARNING]
 > Either way, **everything Android keeps in `userdata` is erased**: its apps,
 > its settings and its files. Android's system itself is not touched. Back up
-> anything you want to keep first. On another note, the project seems really stable so far, but as always: I'm not responsible for bricked devices, missing recovery partitions, nuclear wars or you getting fired because you forgot to boot back into android for the alarm.
+> anything you want to keep first. The project has been stable so far, but as
+> always: nobody here is responsible for bricked devices, missing recovery
+> partitions, nuclear wars or you getting fired because you forgot to boot back
+> into Android for the alarm.
 
 ### Before you start
 
@@ -97,8 +134,11 @@ boot, the Dualboot app and switching systems do not apply to it.
    images, Magisk's patched `init_boot` included, as the set Ubuntu switches
    back to.
 3. Get the installation ZIP for your model:
-   - SM-X910: `ubuntu-24.04-sm-x910-vX.X.X.zip` from the [latest release](https://github.com/agcarbajo/ubuntu-galaxy-tab-s9-ultra/releases/latest). `gts9u-split.zip` and `Dualboot-vX.X.X.apk` only if you want dual boot.
-   - SM-X710: there is no release download. Build `ubuntu-24.04-sm-x710-bl5-vX.X.X.zip` yourself (see [Galaxy Tab S9 (SM-X710)](#galaxy-tab-s9-sm-x710)).
+   - SM-X910: `ubuntu-24.04-sm-x910-vX.X.X.zip` from the upstream
+     [latest release](https://github.com/agcarbajo/ubuntu-galaxy-tab-s9-ultra/releases/latest).
+     `gts9u-split.zip` and `Dualboot-vX.X.X.apk` only if you want dual boot.
+   - SM-X710: there is no release download. Build `ubuntu-24.04-sm-x710-bl5-vX.X.X.zip`
+     yourself (see [Galaxy Tab S9 (SM-X710)](#galaxy-tab-s9-sm-x710)).
 
    A ZIP built from a staged firmware set carries `-bl<rev>` in its name. That
    revision must match your tablet's bootloader revision, the 8th character of
@@ -124,7 +164,6 @@ boot, the Dualboot app and switching systems do not apply to it.
    names as `heimdall print-pit` lists them; any heimdall command after a
    `--no-reboot` one must carry `--resume`, see
    [development notes](docs/development-notes.md#flashing-without-graphical-odin-and-how-to-know-what-the-device-is-booting)).
-   A web-based flashing tool is in preparation.
 5. After flashing, go from Download mode straight into TWRP: hold Volume Down +
    Power until the screen goes off, then immediately hold Volume Up + Power
    until TWRP appears. **Don't let One UI boot** or TWRP will be overwritten
@@ -135,11 +174,11 @@ boot, the Dualboot app and switching systems do not apply to it.
 1. From TWRP flash the installation ZIP (`ubuntu-24.04-sm-x910-v1.2.0.zip`, or
    the SM-X710 ZIP you built) from a microSD (`/external_sd` in TWRP),
    external USB storage or `adb sideload`. **Don't flash it from internal
-   storage** (`/sdcard`) as it will get wiped. With ADB you can also `adb push` the ZIP to `/tmp` and
-   install it from there. Before writing anything the installer checks that the
-   ZIP was built for this model and, for `-bl<rev>` builds, this bootloader
-   revision, and stops with an error otherwise; every partition it writes is
-   read back and verified.
+   storage** (`/sdcard`) as it will get wiped. With ADB you can also `adb push`
+   the ZIP to `/tmp` and install it from there. Before writing anything the
+   installer checks that the ZIP was built for this model and, for `-bl<rev>`
+   builds, this bootloader revision, and stops with an error otherwise; every
+   partition it writes is read back and verified.
 2. Reboot by hand (the ZIP never reboots). The first boot grows the root
    filesystem to fill the partition and then opens the setup wizard, where you
    create your account: the image has no default user or password.
@@ -149,7 +188,9 @@ boot, the Dualboot app and switching systems do not apply to it.
 **SM-X910 only.** `gts9u-split.zip` refuses the SM-X710.
 
 > [!IMPORTANT]
-> The default split is 50% of the storage for Android and 50% for Linux. If you want to modify it just change the value of `ANDROID-PERCENT` inside `gts9u-split.zip` to the percentage you want Android to keep (between 5% and 95%).
+> The default split is 50% of the storage for Android and 50% for Linux. To
+> change it, edit the value of `ANDROID-PERCENT` inside `gts9u-split.zip` to
+> the percentage Android should keep (between 5% and 95%).
 
 1. Flash `gts9u-split.zip` from a microSD or USB drive. It shortens
    `userdata`, creates `linuxroot` beside it, and recreates Android's data so
@@ -162,15 +203,17 @@ boot, the Dualboot app and switching systems do not apply to it.
    write Ubuntu over Android's `userdata`.
 3. Wipe > Format Data.
 4. Flash the installation ZIP (`ubuntu-24.04-sm-x910-v1.2.0.zip`).
-5. Reboot and enjoy! (see below for how to reboot to Android).
+5. Reboot and enjoy (see below for how to reboot to Android).
 
 ### Switching systems
 
-From **Ubuntu**, just use the toggle that you should see on quick settings or from the Tab Companion app under the Dualboot tab.
+From **Ubuntu**, use the toggle in quick settings or the Tab Companion app
+under the Dualboot tab.
 
-From **Android**, install the `Dualboot-vX.X.X.apk` app and give it root access, then reboot from the app or add the toggle to quick settings.
+From **Android**, install the `Dualboot-vX.X.X.apk` app and give it root
+access, then reboot from the app or add the toggle to quick settings.
 
-Both One UI and LineageOS have been tested in dual boot with Ubuntu and they work fine.
+Both One UI and LineageOS have been tested in dual boot with Ubuntu.
 
 ### Going back to Android
 
@@ -178,10 +221,6 @@ After a whole-tablet install, restore stock Android with Odin and the full
 firmware package for your model; on a split tablet, Odin's Re-Partition with
 that package's PIT also returns `userdata` to the whole disk. See
 [Recovery](docs/boot-strategy.md#recovery).
-
-Liked the project? you might want to buy me a coffee, I'll be very grateful!
-
-<a href='https://ko-fi.com/V7W426ZJIP' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
 
 ## Updating an existing installation
 
@@ -204,10 +243,30 @@ on an SM-X710).
 
 ## Known issues
 
-- Regarding the official cover keyboard, as I said, only EF-DX920 cover keyboard has been tested. EF-DX900, EF-DX910, EF-DX915 and
-EF-DX925 are untested as I don't have them, so they might not work.
-- Guest virtual machines remain under development; initial Gunyah host support is included.
+SM-X910 (upstream):
+
+- Only the EF-DX920 cover keyboard has been tested. EF-DX900, EF-DX910,
+  EF-DX915 and EF-DX925 are untested and might not work.
+- Guest virtual machines remain under development; initial Gunyah host support
+  is included.
 - Sometimes returning from deep suspend might need a hard reset.
+
+SM-X710 (this branch):
+
+- **Suspend is off by default.** To try s2idle for one boot:
+  `echo s2idle | sudo tee /run/ubuntu-gts9u/suspend-mode` and then
+  `sudo systemctl restart ubuntu-gts9u-suspend-mode.service`. The same word in
+  `/etc/ubuntu-gts9u/suspend-mode` (create the directory first) keeps it
+  across boots. The reliability tools are in
+  [scripts/diagnostics/suspend](scripts/diagnostics/suspend/README.md).
+- **The panel still needs the boot-time `pm_test` cycle** (as on the
+  SM-X910), so the screen stays dark for roughly the first half minute of a
+  cold boot. Replacing that cycle is open ([display notes](docs/gts9wifi-display.md)).
+- **The interconnect is released only after that cycle**, by
+  `ubuntu-gts9u-icc-late-release`: releasing it earlier hangs the cycle. The
+  DDR bandwidth monitor (`icc_bwmon`) is a module and blacklisted
+  ([interconnect notes](docs/gts9wifi-interconnect.md)).
+- Only the EF-DX720 cover keyboard has been tested.
 
 ## Galaxy Tab S9 (SM-X710)
 
@@ -220,47 +279,6 @@ bootloader revision 5. Compared with the SM-X910:
 - **No GitHub updates.** Update with a ZIP you built (see
   [Updating](#updating-an-existing-installation)); a local-ZIP update has not
   yet been tried on an SM-X710.
-
-### Status (2026-11-07)
-
-| Component | Status | Summary |
-|---|---:|---|
-| Display | ✅ | 2560×1600, 120 Hz or 60 Hz (Settings → Displays) |
-| GPU | ✅ | Adreno 740; the earlier lost pixels are fixed (`videocc` is built in, so `rpmhpd` reaches `sync_state` at boot). No 719 MHz step |
-| CPU | ✅ | Prime core up to 3.36 GHz |
-| Touchscreen | ✅ | STM FTS1BA90A; double tap to wake works, off by default (Tab Companion → Touch) |
-| S Pen | ✅ | Pressure, tilt, hover and the side button, in landscape and portrait; dock detection and charging; the BLE pairing service starts (pairing a pen not yet recorded). Optionally a tap with the side button held near the screen is a right click. Tab Companion → S Pen → S Pen test checks a pen ([notes](docs/tab-companion.md#the-pen-test)) |
-| Vibration / haptics | ✅ | On-screen keyboard feedback |
-| Keyboard cover | ✅ | EF-DX720 tested, with the posture switch: typing posture keeps laptop mode; detaching or folding it back gives tablet mode and the on-screen keyboard |
-| Wi-Fi and Bluetooth | ✅ | WCN6855 / ath11k; the Bluetooth controller comes up, Bluetooth audio (AAC included) not yet tested ([notes](docs/gts9wifi-wifi.md)) |
-| Rotation and light sensor | ✅ | Through the ADSP's sensor core, as on the SM-X910; the light reading follows the room ([notes](docs/gts9wifi-sensors.md)) |
-| RTC and sleep statistics | ✅ | PMIC RTC and `qcom_stats` |
-| Suspend / resume | 🟡 | Off by default until repeated RTC-woken runs pass; the power key locks and blanks the screen instead, and closing the cover locks it |
-| Speakers and microphones | ✅ | Four CS35L45 amplifiers and the digital microphones: recording and playback confirmed, with Samsung's speaker-protection files copied in by hand ([building](#building-the-sm-x710-zip)) |
-| Cameras | 🟡 | Two HI1337 (rear and front), off unless enabled; not yet tested on hardware ([notes](docs/gts9wifi-cameras.md)) |
-| USB-C charging, host and DisplayPort | ❓ | Not yet assessed |
-| Fingerprint reader | ❌ | Not supported yet; its services are skipped on this model |
-| NPU | ❌ | Not built for this model (`GTS9U_INCLUDE_NPU=0`) |
-
-The evidence is in [hardware-status.md](docs/hardware-status.md#sm-x710-galaxy-tab-s9).
-The tested tablet was first installed from an earlier gts9wifi ZIP and then
-updated in place to this tree's kernel and device package 2.56; a ZIP built
-from the current tree has not yet been flashed end to end.
-
-Known limits:
-
-- **Suspend is off by default.** To try s2idle for one boot:
-  `echo s2idle | sudo tee /run/ubuntu-gts9u/suspend-mode` and then
-  `sudo systemctl restart ubuntu-gts9u-suspend-mode.service`. The same word in
-  `/etc/ubuntu-gts9u/suspend-mode` (create the directory first) keeps it
-  across boots. The reliability tools are in [scripts/diagnostics/suspend](scripts/diagnostics/suspend/README.md).
-- **The panel still needs the boot-time `pm_test` cycle** (as on the
-  SM-X910), so the screen stays dark for roughly the first half minute of a
-  cold boot. Replacing that cycle is open ([display notes](docs/gts9wifi-display.md)).
-- **The interconnect is released only after that cycle**, by
-  `ubuntu-gts9u-icc-late-release`: releasing it earlier hangs the cycle. The
-  DDR bandwidth monitor (`icc_bwmon`) is a module and blacklisted
-  ([interconnect notes](docs/gts9wifi-interconnect.md)).
 
 ### Building the SM-X710 ZIP
 
@@ -321,6 +339,28 @@ in TWRP, by comparing
 `sha256sum /dev/block/by-name/boot /dev/block/by-name/init_boot /dev/block/by-name/vendor_boot /dev/block/by-name/dtbo`
 with the `SHA256SUMS` inside the ZIP, not by the command's output.
 
+### GPU write-integrity checks
+
+The lost-pixel investigation left a reusable kit in
+[scripts/diagnostics/gpu-write-check](scripts/diagnostics/gpu-write-check/README.md):
+standalone tests that render into a buffer and verify every byte from the CPU,
+with no display and no root. They are the quickest way to tell a healthy GPU
+path from a damaged one on any of the three models.
+
+## Galaxy Tab S9+ (SM-X810)
+
+Not started. The S9+ (`gts9pwifi`) shares the SoC, the panel driver IC family,
+the audio amplifiers, the charger and the pen with the other two, so most of
+the SM-X710 work applies. What exists today:
+
+- the installer's model gate already recognises `gts9p` / `gts9pwifi`;
+- Samsung's Odin packages for bootloader revisions 1 and 5 and the open-source
+  kernel drop with the board device-tree source are on hand for staging;
+- no device tree, firmware manifest, TWRP link or build target yet.
+
+The planned order is the SM-X710 bring-up first, then the SM-X810 on the same
+`DEVICE=` axis.
+
 ## Documentation
 
 | Document | Contents |
@@ -342,12 +382,12 @@ with the `SHA256SUMS` inside the ZIP, not by the command's output.
 ## Repository layout
 
 ```text
-kernel/       Device tree, drivers, patches and kernel configuration
+kernel/       Device trees, drivers, patches and kernel configuration
 packaging/    Debian packages installed in the Ubuntu image
 android/      The Dualboot app, which switches systems from the Android side
 configs/      System configuration, service overlays, the TWRP installers and
               per-revision firmware manifests (configs/firmware/README.md)
-scripts/      Reproducible build and validation tools
+scripts/      Reproducible build, validation and diagnostic tools
 tools/        In-place experiment kits for the SM-X710 test unit (records, not
               an install path)
 docs/         Detailed documentation and engineering history
@@ -357,7 +397,9 @@ work/         Scratch space for builds; not versioned
 
 ## Firmware and licensing
 
-Keep in mind project has been made with the help of agentic AIs (codex and claude code), so some things might not be done in the best possible way.
+Keep in mind that the project has been made with the help of agentic AIs
+(Codex and Claude Code), upstream and in this fork, so some things might not
+be done in the best possible way.
 
 Proprietary Samsung and Qualcomm firmware is not stored in Git. Build helpers
 stage it from the owner's tablet or official Samsung firmware and verify pinned
