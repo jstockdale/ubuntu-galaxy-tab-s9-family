@@ -1,13 +1,15 @@
 #!/bin/bash
 # Needs root.  Phase 1: pin the GPU to each frequency and run the lost-write check.
 # Phase 2: toggle the clock between min and max every 50 ms while the check runs.
-# Restores the previous devfreq governor at the end.
+# Restores the previous devfreq governor at the end.  late-write-check.py is
+# run from this script's own directory.
+here=$(cd "$(dirname "$0")" && pwd)
 d=/sys/class/devfreq/3d00000.gpu; N=${1:-16}
 gov=$(cat $d/governor); echo "previous governor: $gov"
 cleanup() { kill $toggler 2>/dev/null; echo "$gov" > $d/governor; echo "governor restored to $gov"; }
 trap cleanup EXIT
 echo userspace > $d/governor || { echo "cannot set userspace governor"; exit 1; }
-check() { (cd /home/jstockdale/gputest && FD_MESA_DEBUG=noubwc timeout 200 python3 late-write-check.py $1 2>&1 | awk -F'[:|]' '/^frame/ {n++; split($3,a," "); lost=a[1]; if (lost>0) {f++; t+=lost}} END {printf "%d/%d frames lost pixels, mean %.0f per affected frame", f, n, (f? t/f : 0)}'); }
+check() { (cd "$here" && FD_MESA_DEBUG=noubwc timeout 200 python3 late-write-check.py $1 2>&1 | awk -F'[:|]' '/^frame/ {n++; split($3,a," "); lost=a[1]; if (lost>0) {f++; t+=lost}} END {printf "%d/%d frames lost pixels, mean %.0f per affected frame", f, n, (f? t/f : 0)}'); }
 echo "== phase 1: pinned frequencies"
 for f in $(cat $d/available_frequencies); do
 	echo "$f" > $d/userspace/set_freq; sleep 0.3

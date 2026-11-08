@@ -4,7 +4,7 @@
 # kit installs exactly what the next device package ships.
 #
 #   tools/inplace/icc/make-kit.sh [OUTDIR]        default: work/inplace-icc
-#   scp -r OUTDIR jstockdale@10.42.0.2:icc        the tablet then has ~/icc
+#   scp -r OUTDIR <user>@10.42.0.2:icc        the tablet then has ~/icc
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -28,4 +28,4 @@ install -m0644 "$pkg/usr/lib/systemd/system/ubuntu-gts9u-icc-late-release.servic
 	xargs -d '\n' sha256sum > SHA256SUMS)
 echo "kit in $out:"
 cat "$out/SHA256SUMS"
-echo "copy it with: scp -r $out jstockdale@10.42.0.2:icc"
+echo "copy it with: scp -r $out <user>@10.42.0.2:icc"

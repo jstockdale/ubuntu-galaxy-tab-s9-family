@@ -72,4 +72,4 @@ git -C "$repo" status --porcelain >> "$out/SOURCE"
 echo
 cat "$out/IMAGES"
 echo "kit: $out ($(du -sh "$out" | cut -f1))"
-echo "copy it with:  scp -r $out jstockdale@10.42.0.2:wifi-kit"
+echo "copy it with:  scp -r $out <user>@10.42.0.2:wifi-kit"

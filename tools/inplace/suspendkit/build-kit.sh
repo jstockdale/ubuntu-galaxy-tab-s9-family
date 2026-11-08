@@ -2,7 +2,7 @@
 # Assemble ~/suspendkit for the tablet from this repository (run on the host):
 #
 #   sh tools/inplace/suspendkit/build-kit.sh [OUTDIR]     default: ./suspendkit
-#   tar -C OUTDIR -cf - . | ssh jstockdale@10.42.0.2 'mkdir -p ~/suspendkit && tar -C ~/suspendkit -xf -'
+#   tar -C OUTDIR -cf - . | ssh <user>@10.42.0.2 'mkdir -p ~/suspendkit && tar -C ~/suspendkit -xf -'
 #
 # The kit holds the reliability runner and the ladder (they run from the kit
 # directory, nothing to install), the ADSP-start sleep lock (unit and helper,
@@ -36,4 +36,4 @@ git -C "$repo" rev-parse --short HEAD > "$out/REVISION" 2>/dev/null || echo unkn
 (cd "$out" && find . -type f ! -name SHA256SUMS ! -name .suspendkit | sed 's#^\./##' |
 	LC_ALL=C sort | while IFS= read -r f; do sha256sum "$f"; done > SHA256SUMS)
 echo "kit in $out ($(wc -l < "$out/SHA256SUMS") files, revision $(cat "$out/REVISION"))"
-echo "copy it with: tar -C $out -cf - . | ssh jstockdale@10.42.0.2 'mkdir -p ~/suspendkit && tar -C ~/suspendkit -xf -'"
+echo "copy it with: tar -C $out -cf - . | ssh <user>@10.42.0.2 'mkdir -p ~/suspendkit && tar -C ~/suspendkit -xf -'"

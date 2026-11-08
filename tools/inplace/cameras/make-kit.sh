@@ -2,7 +2,7 @@
 # Assemble the in-place camera kit for the SM-X710 from this repository.
 #
 #   sh tools/inplace/cameras/make-kit.sh OUTDIR
-#   scp -r OUTDIR jstockdale@10.42.0.2:cameras-kit
+#   scp -r OUTDIR <user>@10.42.0.2:cameras-kit
 #
 # OUTDIR gets the kit scripts, files/ (the device-package files exactly as a
 # gts9wifi build of ubuntu-gts9u-device ships them: the WirePlumber labels are

@@ -393,7 +393,7 @@ if [ "$extra_missing" = 1 ] || [ "$extra_cached" != "$extra_fingerprint" ]; then
 	printf '%s\n' "$extra_fingerprint" > "$extra_stamp"
 fi
 
-# PipeWire rebuilt with the Bluetooth AAC codec (fdk-aac, universe).  Ubuntu's
+# PipeWire rebuilt with the Bluetooth AAC codec (fdk-aac, multiverse).  Ubuntu's
 # own libspa-0.2-bluetooth cannot negotiate AAC, so A2DP sinks fall back to
 # SBC.  The whole binary set from the one source build is installed so the
 # versions stay consistent with the archive packages they replace.

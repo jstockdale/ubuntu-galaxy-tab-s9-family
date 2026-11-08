@@ -18,7 +18,9 @@ set -eu
 export LC_ALL=C
 [ "$(id -u)" = 0 ] || { echo 'run with sudo' >&2; exit 1; }
 kit=$(cd "$(dirname "$0")" && pwd)
-exp=/home/jstockdale/display-exp
+# apply.sh and the image sets are in the invoking user's ~/display-exp; under
+# sudo $HOME is root's, so the user's home is looked up.  EXP_DIR overrides.
+exp=${EXP_DIR:-$(getent passwd "${SUDO_USER:-$(id -un)}" | cut -d: -f6)/display-exp}
 sums=$kit/IMAGES-flags.sha256
 fix2_boot=dcf881554a2790b02ce230790cd868ee06f8c9e1ddcb8e7dc48e7c0cc20f09b0
 size=100663296

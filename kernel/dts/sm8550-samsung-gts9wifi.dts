@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * Initial mainline device tree for the Samsung Galaxy Tab S9 Ultra Wi-Fi
+ * Initial mainline device tree for the Samsung Galaxy Tab S9 Wi-Fi
  * (SM-X710, gts9wifi).  Derived from the validated gts9uwifi board; the
  * family shares the SoC, bus topology, amplifiers, charging and pen stack.
  * X710 deltas: AMSA10FA01 panel glass, STM FTS touch (Goodix on some units),

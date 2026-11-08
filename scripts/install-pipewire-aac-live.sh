@@ -20,7 +20,7 @@
 #   installed.  They depend on each other at "= version", so a partial set
 #   cannot install, and installing packages that are not there (the set also
 #   carries libpipewire-0.3-common) would only grow the system.
-# - One APT transaction, which may add libfdk-aac2 (universe) and never
+# - One APT transaction, which may add libfdk-aac2 (multiverse) and never
 #   removes anything (--no-remove) or adds recommends.
 # - No downgrades: it refuses a rebuild that is older than what is installed,
 #   and a rebuild of an Ubuntu version the archive has already superseded.

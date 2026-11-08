@@ -18,11 +18,13 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
-fix2=${FIX2_DIR:-/home/jstockdale/ubuntu-gts9u/backups/x710-fix-integration-2026-11-06/fix2-images/fix2-s2}
-initramfs=${INITRAMFS:-/home/jstockdale/ubuntu-gts9u/rootfs/boot/initrd.img-7.2.0-rc3-dirty}
-tools=${ANDROID_TOOLS:-/home/jstockdale/ubuntu-gts9u/tools}
-mainline=${LINUX_MAINLINE:-/home/jstockdale/ubuntu-gts9u/linux-mainline}
-kernel_meta=${KERNEL_META_DIR:-/home/jstockdale/ubuntu-gts9u/out/kernel-gts9wifi}
+# Each input defaults to its place under the build's work directory.
+workdir=${UBUNTU_WORKDIR:-$HOME/ubuntu-gts9u}
+fix2=${FIX2_DIR:-$workdir/backups/x710-fix-integration-2026-11-06/fix2-images/fix2-s2}
+initramfs=${INITRAMFS:-$workdir/rootfs/boot/initrd.img-7.2.0-rc3-dirty}
+tools=${ANDROID_TOOLS:-$workdir/tools}
+mainline=${LINUX_MAINLINE:-$workdir/linux-mainline}
+kernel_meta=${KERNEL_META_DIR:-$workdir/out/kernel-gts9wifi}
 out=${1:?usage: build-variants.sh <output dir>}
 
 # fix2-s2 as flashed on 2026-11-07 (boot dbe15039 and later).

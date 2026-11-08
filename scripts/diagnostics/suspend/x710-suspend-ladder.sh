@@ -4,15 +4,15 @@
 # Copy to the tablet (tools/inplace/suspendkit puts it in ~/suspendkit) and
 # run the sleeping rungs with sudo:
 #
-#   ssh -t jstockdale@10.42.0.2 "sudo sh ~/suspendkit/x710-suspend-ladder.sh check"
+#   ssh -t <user>@10.42.0.2 "sudo sh ~/suspendkit/x710-suspend-ladder.sh check"
 #
 # Every rung that suspends runs detached in a transient systemd unit, so a
 # USB link that drops while the gadget is suspended (or a closed SSH session)
 # cannot cut it short.  Each step is logged with the syslog tag "pmtest";
 # read the results afterwards, also after a forced restart, with
 #
-#   ssh -t jstockdale@10.42.0.2 "sudo sh ~/suspendkit/x710-suspend-ladder.sh report"     # this boot
-#   ssh -t jstockdale@10.42.0.2 "sudo sh ~/suspendkit/x710-suspend-ladder.sh report -1"  # last boot
+#   ssh -t <user>@10.42.0.2 "sudo sh ~/suspendkit/x710-suspend-ladder.sh report"     # this boot
+#   ssh -t <user>@10.42.0.2 "sudo sh ~/suspendkit/x710-suspend-ladder.sh report -1"  # last boot
 #
 # Subcommands (all but report need root):
 #   check                 read-only snapshot of the sleep configuration

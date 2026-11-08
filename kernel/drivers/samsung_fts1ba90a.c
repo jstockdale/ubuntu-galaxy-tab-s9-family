@@ -32,6 +32,9 @@
  * while the screen is dark, and can wake the system from sleep; without it
  * the rails are cut for system sleep.
  *
+ * (C) COPYRIGHT 2012 STMicroelectronics
+ *     Authors: AMS(Analog Mems Sensor) Team
+ *     (banner of Samsung's downstream fts_ts.c, which aaronsb's port derives from)
  * Copyright (C) Samsung Electronics (downstream protocol and sequencing)
  */
 
