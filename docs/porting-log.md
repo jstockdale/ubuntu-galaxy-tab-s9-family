@@ -7356,3 +7356,37 @@ mostly empty cache, and how empty depends on the timing of everything before
 it. The owner ran SEQ128K Q32T1 on its own after idling and confirmed the full
 speed. A fair G4/G5 comparison has to start each write test with the cache at
 100 %.
+
+#### Stress run at HS-G5 (2026-11-07, 21:16 to 21:48)
+
+`tools/inplace/ufs-g5/stress.sh 10`, no root, on the boot that already carried
+the benchmarks above. Each of the 10 rounds ran 150 s of load and then 30 s
+idle. The load:
+
+- 1 MB sequential reads at QD16 from a file written once;
+- two jobs of 4 KB random reads at QD32;
+- 4 KB random writes capped at 10 MB/s;
+- 128 KB writes at 30 MB/s, read back with crc32c (`verify_backlog=256`,
+  `verify_fatal`).
+
+Result: PASS. There was no fio or verify error and no UFS, I/O or ext4 kernel
+message, and `verify.sh` passed afterwards. Per round:
+
+- Sequential reads ran at 2.74–2.79 GB/s. The random reads were starved
+  behind them (about 7.6k IOPS for both jobs together).
+- Random writes ran at about 5 MB/s, verified writes at 30 MB/s.
+- Every 15 s sample under load read G5. At the end of each round the link
+  dropped to G1, with 2–4 devfreq transitions, about 27 power-mode changes in
+  all.
+- The hottest zone reached 52.7 °C in round 1 and about 40 °C after that. The
+  battery went from 54 % to 47 %, at 26–28 °C.
+
+In total about 4 TB was read, and about 52 GB written and checked.
+
+This does not cover the following:
+
+- UniPro error counters. Those need root
+  (`/sys/kernel/debug/ufshcd/1d84000.ufshc/stats`).
+- Suspend and resume at G5.
+- Idle drain.
+- A second boot.
