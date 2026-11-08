@@ -221,7 +221,7 @@ Not working:
 
 Front: not tried yet. Its open risks are listed above.
 
-## Focus: two lens faults (2026-11-08, tests pending)
+## Focus: two lens faults (2026-11-08)
 
 `lens-diag.sh` and the first lens kit (400 kHz) show two faults, both around
 the lens's power cycles. Neither is the bus speed.
@@ -297,3 +297,32 @@ poll is the only source of `-EBUSY`. That is what looked like a stuck bus.
   cycles that close only once the lens has settled, which tests fault 1 on
   its own, and up to 6 quick cycles, which reproduce fault 2 on the CX
   kernel.
+
+### The power-up kit on squirtle (boot `9c0e3019`)
+
+The running DTB has `startup-delay-us = 10000` on `rear_cam_vio`
+(`/proc/device-tree`). `camera-test.sh rear`
+(`/var/log/gts9u-cameras-test/20261108-134534-rear`):
+- The lens powered up at probe with no error. The kernel log has no `dw9808`
+  or CCI line for the whole boot; both earlier boots failed here.
+- libcamera kept the lens: there was no "Lens initialisation failed".
+  PipeWire had its camera node without a restart.
+- The `/dev/video20` relay served a real frame (mean luma 81, spread 169).
+  First light's black-splash result did not come back.
+- PipeWire and WirePlumber then hold the lens's subdev open, so the lens and
+  `rear_cam_vio` stay powered while PipeWire runs, camera in use or not.
+
+The owner opened GNOME Camera (Snapshot 46.2) twice:
+- First open: the picture focused for about a second, then glitched and
+  froze. The log shows five stream configurations within 1.3 s (640x480,
+  then 1280x1080 four times), then nothing. No kernel or PipeWire error, no
+  lens or CCI error, and no software-ISP benchmark line, which other sessions
+  print about 2.5 s after their last configuration. The stream had stalled.
+- Second open: it focused (owner-confirmed). During its own burst of
+  configurations, CAMSS logged once "Received wm done for unmapped index".
+
+The stall looks like the capture path under fast reconfiguration, not the
+lens; that is a hypothesis. On the Ultra the relay needed a 2 s guard against
+the same kind of churn (porting log, session 32). The frame-done interrupt is
+`acb7000.isp_msm_csid0`. If its count keeps rising during a freeze, frames
+still arrive and userspace stalled. If it stops, CAMSS stalled.

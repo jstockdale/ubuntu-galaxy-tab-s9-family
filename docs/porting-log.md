@@ -7978,3 +7978,39 @@ backups in `/var/backups/ubuntu-gts9u-cam-lens`. Its directory is now
 - the reboot onto the kit, then `camera-test.sh rear` and `lens-diag.sh`;
 - the owner seeing focus in the Camera app;
 - the driver fix on hardware, with the next kernel build.
+
+**On squirtle, boot `9c0e3019` (the power-up kit):**
+- Installed with the 400 kHz kit's rollback, then the new install, without
+  a reboot between. Both logged in `/var/log/gts9u-cam-lens.log`:
+  `vendor_boot` `b18510f38bae…` and `boot` `57406c8001a9…` were written and
+  read back. The CX images are in `/var/backups/ubuntu-gts9u-cam-lens/`.
+  squirtle has no saved Ubuntu boot set (`/var/lib/gts9u-boot-sets/ubuntu`
+  is absent), so none was updated.
+- `/proc/device-tree/rear-camera-vio-regulator/startup-delay-us` = 10000.
+- `camera-test.sh rear` (`20261108-134534-rear`): the probe-time power-up
+  worked, and there is no `dw9808` or CCI line in the boot's kernel log.
+  libcamera kept the lens, and PipeWire had its node without a restart.
+  `/dev/video20` gave a real frame (mean luma 81, spread 169).
+- PipeWire (pid 4789) and WirePlumber (4791) keep `/dev/v4l-subdev31` open
+  from then on. The lens stays `active`, so the module rail stays on while
+  PipeWire runs.
+- Owner, GNOME Camera:
+  - first open: focus for about a second, then a glitch and a frozen
+    picture;
+  - second open: focused.
+  The first session made five stream configurations in 1.3 s (126.0 to
+  127.3 s), then logged nothing. There was no error anywhere and no
+  software-ISP benchmark line, so the stream stalled within its first
+  couple of seconds. The second session logged one
+  `qcom-camss acb7000.isp: Received wm done for unmapped index` (175.5 s).
+- `lens-diag.sh` (commit `06c988b`) found PipeWire holding the lens. A
+  rebind under an open file would free the driver's state, so it now pauses
+  the owner's PipeWire and the relays for its run, then starts them again
+  and reconnects Bluetooth.
+
+**Still pending:**
+- the `lens-diag.sh` stress run;
+- the freeze, for which the next step is to watch the `csid0` interrupt
+  count while it is frozen;
+- the driver fix, with the next kernel build;
+- whether the always-powered lens costs idle power.
