@@ -104,9 +104,9 @@ odin_zip = "XAR-X910XXS5CYG1-20250728211620.zip"
 "hwvault.b07" = { source = "nonhlos:image/hwvault.b07", sha256 = "f7e08a906c7a5f58f32a7eb57a0d09ca9c6f5ac9ab4c43027e6842ee3ffe1f13", class = "tz-auth", group = "fingerprint" }
 "hwvault.b08" = { source = "nonhlos:image/hwvault.b08", sha256 = "9db1602e43cca7f7e3e0f8be802681f58bdb1b702331607a320080de3ee857b8", class = "tz-auth", group = "fingerprint" }
 "hwvault.mdt" = { source = "nonhlos:image/hwvault.mdt", sha256 = "af9e7531dc270e8801c293853957cb2bba3a1e8478a0500967d44c07dd721587", class = "tz-auth", group = "fingerprint" }
-"m3.bin" = { source = "url:https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/ath12k/WCN7850/hw2.0/m3.bin", sha256 = "0e72f44df7defc269fe92dcea25d4d409046c04b77d41c510c52879b3dfc1055", class = "external-pinned" }
-"official-amss.bin" = { source = "url:https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/ath12k/WCN7850/hw2.0/amss.bin", sha256 = "43aadfd3df887f27de74020273aee484bac6a31dd53068f91baf2a9b094d6a68", class = "external-pinned" }
-"official-board-2.bin" = { source = "url:https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/ath12k/WCN7850/hw2.0/board-2.bin", sha256 = "1abee7132dbccb523cca44a8de4e8968aa7bf5a5fcc032c338f687f94ea5bf4e", class = "external-pinned" }
+"m3.bin" = { source = "lfw:18cf97993f06c0a28d88cee30b7b646807642acd:ath12k/WCN7850/hw2.0/m3.bin", sha256 = "0e72f44df7defc269fe92dcea25d4d409046c04b77d41c510c52879b3dfc1055", class = "external-pinned" }
+"official-amss.bin" = { source = "lfw:18cf97993f06c0a28d88cee30b7b646807642acd:ath12k/WCN7850/hw2.0/amss.bin", sha256 = "43aadfd3df887f27de74020273aee484bac6a31dd53068f91baf2a9b094d6a68", class = "external-pinned" }
+"official-board-2.bin" = { source = "lfw:18cf97993f06c0a28d88cee30b7b646807642acd:ath12k/WCN7850/hw2.0/board-2.bin", sha256 = "1abee7132dbccb523cca44a8de4e8968aa7bf5a5fcc032c338f687f94ea5bf4e", class = "external-pinned" }
 "phy_ucode20.elf" = { source = "vendor:firmware/kiwi/phy_ucode20.elf", sha256 = "67396ffa89db6a1378c0d1d41362d33831dd6163d96849a4bcbd865b7cecda19", class = "loose" }
 "qrd-board.bin" = { source = "derived:qrd-extract:official-board-2.bin", sha256 = "0ef5f6f3cb124f33c6de52371819ccd7c13763ceb86d476a178fd56e4cdc26a3", class = "derived" }
 "regdb.bin" = { source = "vendor:firmware/kiwi/regdb.bin", sha256 = "75cc107536d3bd03fa2e29f369a4e6d997d2cf090c50620424a9ab1a749c7546", class = "loose" }
