@@ -67,8 +67,11 @@ if [ "$root" = 1 ]; then
 	done
 	if [ -n "$loaded" ]; then
 		echo "$loaded"
-		printf '%s\n' "$loaded" | grep -q 'gcc_ufs_phy_ice_core_clk=403000000' &&
-			ok 'ICE clock at 403 MHz under load' || bad 'ICE clock not at 403 MHz under load'
+		# The PLL lands a hair under the nominal rate (402999902 Hz measured).
+		ice=$(printf '%s\n' "$loaded" | grep -o 'gcc_ufs_phy_ice_core_clk=[0-9]*' | cut -d= -f2)
+		[ "${ice:-0}" -gt 402000000 ] && [ "${ice:-0}" -lt 404000000 ] &&
+			ok "ICE clock at 403 MHz under load (${ice} Hz)" ||
+			bad "ICE clock not at 403 MHz under load (${ice:-unknown} Hz)"
 		ufs=$(printf '%s\n' "$loaded" | awk '$1 == "ufs_phy_gdsc" {print $3}')
 		cx=$(printf '%s\n' "$loaded" | awk -F= '/^cx perf_state=/ {print $2}')
 		[ "${ufs:-0}" -ge 256 ] && ok "ufs_phy_gdsc votes ${ufs} under load" ||
