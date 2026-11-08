@@ -1,8 +1,8 @@
 #!/bin/bash
 # Pack the lens-bus kit on the build host.  It goes on top of the CX-vote kit
-# and changes only the DTB: CCI1 master 0 (the rear DW9808 lens and its
-# EEPROM) runs at stock's 400 kHz instead of sm8550.dtsi's 1 MHz.  The kernel
-# and module tree stay the CX kit's.
+# and changes only the DTB: the rear module's rail (rear_cam_vio, GPIO15)
+# waits stock's 10 ms after power-up before the DW9808 lens is written to.
+# The kernel and module tree stay the CX kit's.
 #
 #   bash tools/inplace/cam-lens/make-kit.sh CX_KERNEL_OUT_DIR NEW_DTB CX_KIT_DIR KIT_DIR
 #
@@ -28,8 +28,8 @@ size=100663296
 cx_dtb=290a5395f64748ec237c93859b098251f31c3f5fee51ee1677caf2d111fedd8c
 cx_boot=47f7df27477418857bfd087bb44245510c8be5c563d3dcbe2a344778f023df98
 cx_vendor_boot=be06a00f699c104cf5974d2bf85cc6e974d0e3b38b72b42329aa7340fd5272cf
-# The CX DTB with CCI1 master 0 at 400 kHz, nothing else.
-lens_dtb=e6e7b957343ed2909231d79f6cf02c011507801a2273bd91cc7bc6a1f5522eb8
+# The CX DTB with startup-delay-us = <10000> on rear_cam_vio, nothing else.
+lens_dtb=164e1bf8a393c642ffc7bd357ce5dfbc608b07ba77070ede8b2052434de42a84
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/sm8550-samsung-gts9wifi.dtb" \

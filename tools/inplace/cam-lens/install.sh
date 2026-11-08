@@ -1,7 +1,8 @@
 #!/bin/sh
 # Lens-bus kit, on top of the CX-vote kit: the same kernel and modules, and
-# the DTB with CCI1 master 0 (rear DW9808 lens, EEPROM) at stock's 400 kHz,
-# in boot (appended) and in vendor_boot.
+# the DTB whose rear module rail (rear_cam_vio) waits stock's 10 ms after
+# power-up before the DW9808 lens is written to, in boot (appended) and in
+# vendor_boot.
 #
 #   sudo sh ~/cam-lens/install.sh      then reboot
 #   sudo sh ~/cam-lens/rollback.sh     back to the CX kit, then reboot

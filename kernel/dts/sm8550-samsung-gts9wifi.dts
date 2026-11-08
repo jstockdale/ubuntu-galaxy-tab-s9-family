@@ -2320,6 +2320,14 @@
 		vin-supply = <&vreg_l4b_1p8>;
 		gpio = <&tlmm 15 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
+		/*
+		 * Samsung's CamX data for the DW9808 (X710XXS5CYG1, the same on
+		 * the SM-X910) powers it RCAM_LDO_EN, 1 ms, VIO 1.8 V, 10 ms, and
+		 * only then writes to it; dw9808_vcm waits 1 ms.  With 1 ms the
+		 * lens's first write after a power-up timed out on CCI1 again and
+		 * again, at 1 MHz and at 400 kHz (squirtle, 2026-11-08).
+		 */
+		startup-delay-us = <10000>;
 		status = "disabled";
 	};
 };
@@ -2399,14 +2407,6 @@
 };
 
 &cci1_i2c0 {
-	/*
-	 * Stock drives this bus (actuator0 and eeprom0) at i2c-freq-mode 1,
-	 * 400 kHz; sm8550.dtsi sets 1 MHz.  At 1 MHz the DW9808 answered its
-	 * power-up sequence, then a transfer went wrong and every one after
-	 * it timed out until the module lost power (squirtle, 2026-11-08).
-	 */
-	clock-frequency = <400000>;
-
 	/* Stock actuator0: slave-addr 0x18 (8-bit), CCI1 master 0. */
 	gts9_rear_focus: lens@c {
 		compatible = "dongwoon,dw9808-vcm";
