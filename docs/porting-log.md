@@ -7278,3 +7278,51 @@ boots before this one logged no UFS PHY error. They include each boot's
 s2idle and one real deep sleep. Adding it to
 the G5 build would have made two PHY-side changes at once. If the G5 suspend
 runs show `PCS_READY` timeouts, it gets its own build.
+
+#### The HS-G5 kit on squirtle (2026-11-07 evening)
+
+The owner installed the kit at 20:24 (`boot` written and read back as
+`4179f406…`) and rebooted. The new boot runs vmlinux `c0db6fe5…`. `verify.sh`
+passed, both 30 s after boot and once the system was up:
+
+- `HS_GEAR5/HS_RATE_A` under load;
+- no UFS PHY, UIC or link messages;
+- no module BTF, signature or symbol failures.
+
+A 1 GiB `O_DIRECT` `dd` read ran at 2.5–2.7 GB/s, against 1.5 GB/s on
+fix7-ice. The only kernel warning, `disp_cc_mdss_mdp_clk_src: rcg didn't update
+its configuration`, is also on the fix7-ice boot.
+
+fix7-ice was measured with `~/usertests/ufs-bench.sh`, which runs fio jobs of
+8 s each, one job at QD32. The same script on G5, after a sequential rewrite
+of the file:
+
+| | fix7-ice (G4 Rate-A), 18:43 | G5 Rate-A, 20:29 |
+|---|---|---|
+| 1 MB sequential read | 1844 MB/s (after a rewrite) | 3483 MB/s |
+| 1 MB sequential write | 1707 MB/s | 2220 MB/s |
+| 4 KB random read | 199.5k IOPS | 136.6k IOPS (133.8k on a second run) |
+| 4 KB random write | 141k IOPS | 115k IOPS |
+
+Sequential reads reach about the 3.5 GB/s estimated for G5 Rate-A. The
+4 KB numbers are lower, but they are not yet a measured regression:
+
+- On G5, single-job random reads ranged from 80k to 154k IOPS from run to run.
+  They are lowest right after random writes to the same file.
+- Doubling the queue depth gave nothing (141k), while four jobs reached
+  203k IOPS.
+- All UFS interrupts go to CPU 0 (one `ufshcd` line, no MCQ ESI). Pinning fio
+  to CPU 0 drops it to about 10k. Pinned to the prime core, it read 80k and
+  wrote 155k.
+- devfreq made at most one transition per 8 s run, so the gear does not
+  bounce between G5 and G2.
+
+fix7-ice has a single 4 KB run, so a fair comparison needs the same protocol
+on both kernels: several runs, unpinned and pinned, one job and four.
+Rolling back with `rollback.sh` and reinstalling with `install.sh` makes that a
+reboot each way. One possible mechanism, a hypothesis only: HS-G5 bursts carry
+a longer sync (`RX_HS_G5_SYNC_LENGTH_CAPABILITY` 0x4F, as in Samsung's
+tables). That costs most when each burst carries little.
+
+Still to run: the 4 KB A/B, 30 minutes of mixed fio, 20 suspend cycles, idle
+drain and a reboot.
