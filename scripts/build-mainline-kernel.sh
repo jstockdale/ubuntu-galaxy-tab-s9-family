@@ -248,6 +248,15 @@ apply_unless 'static void qmp_ufs_tx_pull_down_ctrl' \
 	drivers/phy/qualcomm/phy-qcom-qmp-ufs.c \
 	qmp-ufs-reset-serdes-before-power-down-gts9u.patch
 bash "$repo/scripts/stage-ufs-resume-experiment.sh" "$kernel_tree"
+# genpd drops performance votes on runtime suspend only.  The UFS host is
+# runtime-active at every SM8550 system suspend and dwc3 never runtime
+# suspends, so both kept their CX votes through the sleep once the GCC GDSCs
+# reach CX (gts9wifi DTS).  Both drop them with their clocks.
+apply_unless 'ufshcd_opp_drop_votes' \
+	drivers/ufs/core/ufshcd.c ufshcd-drop-opp-votes-in-system-suspend.patch
+apply_unless 'dwc3_qcom_set_pstate' \
+	drivers/usb/dwc3/dwc3-qcom.c \
+	dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch
 bash "$repo/scripts/stage-gpu-recovery-experiment.sh" "$kernel_tree"
 apply_unless 'Late-created SM-X910 DSP endpoints' \
 	drivers/mailbox/qcom-ipcc.c ipcc-reserve-gts9u-runtime-channels.patch

@@ -7440,12 +7440,8 @@ Effects checked in the source:
 - gcc-sm8550 does not enable runtime PM, so the bound gcc device keeps the CX
   genpd on at runtime. CX was already on.
 - System suspend: GDSCs set neither `GENPD_FLAG_ACTIVE_WAKEUP` nor
-  `ALWAYS_ON`, so they power off in noirq and release CX as before. If the UFS
-  is runtime-active when suspend starts, its nominal vote stays on the GDSC
-  link. It would then reach the sleep set if anything else kept the CX genpd
-  on. To check during the suspend runs: the `cxsd` count in
-  `/sys/kernel/debug/qcom_stats` across a real suspend. Suspend is still `off`
-  on this board.
+  `ALWAYS_ON`, so they power off in noirq and release the CX genpd as before.
+  The votes on them did not drop, though; see the next section.
 - `dtbs_check`: qcom,sm8550-gcc.yaml does not list `power-domains` yet (the
   x1e80100 binding requires it). For upstream, the binding needs that line.
 
@@ -7497,3 +7493,111 @@ probes with the property in place. A scratch fragment targeting
 `/soc@0/clock-controller@100000` with `power-domains = <&rpmhpd 0>` (CX)
 resolved and applied with `fdtoverlay` onto the pinned Ultra DTS (5046f92)
 compiled here. The Ultra files are unchanged.
+
+### The CX votes across system suspend (2026-11-07)
+
+genpd drops a device's performance state on runtime suspend
+(`genpd_runtime_suspend()`) and restores it on runtime resume. Its system
+sleep path (`genpd_finish_suspend()`/`genpd_finish_resume()`) powers domains
+off and on but leaves the votes alone. A parent also counts the votes of
+powered-off subdomains (`_genpd_reeval_performance_state()`). Two of the
+votes the `&gcc` change made live are held at every system suspend on this
+board:
+
+- UFS: ufs-qcom sets `spm_lvl` 5 on SM8550 (`no_phy_retention`), while
+  `rpm_lvl` stays 3. So `ufshcd_suspend_prepare()` always runtime-resumes the
+  controller before suspend. `ufshcd_system_suspend()` then stops the clocks
+  and keeps the current OPP's CX level.
+- USB: `dwc3_core_probe()` calls `pm_runtime_forbid()`, and nothing in the
+  device package allows it, so the controller is always runtime-active.
+  `dwc3_qcom_pm_suspend()` stops its clocks and interconnect and keeps the
+  nominal `required-opps` vote.
+
+pcie-qcom drops its own OPP in `suspend_noirq` (it keeps low SVS only for S2RAM
+with the link up, on purpose). sdhci-msm and the GENI drivers drop theirs too.
+Upstream practice is that a driver releases its own votes for system sleep, so
+the fix is in the two drivers, not in genpd:
+
+- `ufshcd-drop-opp-votes-in-system-suspend.patch`: after
+  `ufshcd_suspend()`, `dev_pm_opp_set_opp(dev, NULL)`. Before
+  `ufshcd_resume()`, it restores the OPP whose rates the clocks still carry: a
+  ceil lookup of the first clock's rate, as the OPP core's
+  `_find_current_opp()` does. Re-applying that OPP sets the same rates, a
+  no-op. Both calls run under `clk_scaling_lock`, and a controller that is not
+  powered is skipped. A runtime-suspended controller is untouched, because
+  genpd already holds its vote.
+- `dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch`: probe records
+  the `required-opps` level (`of_get_required_opp_performance_state()`), but
+  only for a controller genpd attached to a single domain.
+  Suspend sets it to 0 after `dwc3_qcom_suspend()`, unless the controller is
+  runtime-suspended. Resume restores it before the clocks, with runtime PM
+  disabled. This also fixes an upstream fault: `dwc3_pm_resume()` marks a
+  runtime-suspended controller active without the runtime resume in which
+  genpd would restore its vote. The next runtime suspend then saved 0 as the
+  level to restore, and the vote was lost for good. While runtime PM is
+  disabled, genpd applies the level at once instead of deferring it.
+
+Both are generic and also apply to the SM-X910 build. They are inert there
+while its GCC GDSCs have no parent.
+
+Build test, in an isolated copy of the X710 tree (`build-cx`, hardlinked
+source, own object directory, `.config` identical to the X710 build's, LLVM
+22):
+- `ufshcd.o` and `dwc3-qcom.o` compile with `W=1` and no warnings, before and
+  after the patches.
+- `checkpatch --strict`: clean.
+- Every new symbol either object references is in the X710 `System.map`.
+- Both patches dry-run on the shared tree at fuzz 0.
+- The `apply_unless` markers are absent before patching and present after.
+- The patched files are byte-identical to the compiled ones.
+
+No kernel image was built and nothing was flashed.
+
+dwc3 in s2idle and deep, from the source:
+- Both modes run the same dwc3-qcom callbacks, so the vote change covers both.
+- `dwc3_qcom_suspend()` cannot fail. "HS-PHY not in L2" is only a log line.
+- The existing vetoes are a gadget soft-disconnect timeout in device mode and
+  xHCI in host mode.
+- `wakeup-source` (gts9-family.dtso) arms the PDC wake IRQs and keeps the PHYs
+  only in host mode. `USB30_PRIM_GDSC` still powers off in noirq, so a
+  host-mode session relies on the GDSC's `RETAIN_FF_ENABLE`.
+- None of this changed.
+
+What is new: with dwc3 runtime PM forbidden, USB now holds CX at nominal
+whenever it is bound, in the sleep set as well, so it costs idle power. It
+does not block suspend. Allowing dwc3 runtime PM is a separate change that
+needs gadget and role-switch tests. The resume path above already handles a
+runtime-suspended controller.
+
+On-device check, after the next X710 flash with both patches. This is not
+read-only: it runs one `pm_test=devices` cycle (device callbacks only, no real
+sleep) with two probe events, then removes them.
+
+```sh
+sudo sh -c '
+t=/sys/kernel/tracing
+echo "p:cxvote/opp dev_pm_opp_set_opp dev->kobj.name:string opp" >> $t/dynamic_events
+echo "p:cxvote/ps dev_pm_genpd_set_performance_state dev->kobj.name:string state" >> $t/dynamic_events
+echo > $t/trace
+echo 1 > $t/events/cxvote/enable
+echo devices > /sys/power/pm_test
+echo mem > /sys/power/state
+echo none > /sys/power/pm_test
+echo 0 > $t/events/cxvote/enable
+grep -E "1d84000.ufshc|a600000.usb" $t/trace
+echo "-:cxvote/opp" >> $t/dynamic_events
+echo "-:cxvote/ps" >> $t/dynamic_events
+grep -A3 -E "^(ufs_phy_gdsc|usb30_prim_gdsc) " /sys/kernel/debug/pm_genpd/pm_genpd_summary
+'
+```
+
+Pass:
+- One `1d84000.ufshc` call with `opp=0x0` and one `a600000.usb` call with
+  `state=0` during suspend.
+- On resume, a non-null `opp` for the UFS and `state=256` for USB.
+- The summary shows 256 again for `a600000.usb`, and the UFS's OPP level.
+- dmesg has no "failed to drop", "failed to restore" or "failed to set
+  performance state".
+
+Over real s2idle and deep cycles, `journalctl -t ubuntu-gts9u-sleep-stats`
+shows whether CX collapsed (`cxsd +N`).

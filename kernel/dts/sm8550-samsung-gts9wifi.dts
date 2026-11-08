@@ -2019,7 +2019,9 @@
  * its devices ask for and passes it to no rail, which would leave the CX
  * levels in the UFS and PCIe OPPs and the UFS and USB required-opps unvoted.
  * Name CX here, as sc7280, sc8280xp and x1e80100 do: every GCC GDSC becomes
- * a CX subdomain, and their levels reach rpmhpd.
+ * a CX subdomain, and their levels reach rpmhpd.  genpd keeps them through
+ * system sleep, so the UFS and USB drivers drop their own (ufshcd- and
+ * dwc3-qcom-*-system-suspend.patch).
  */
 &gcc {
 	power-domains = <&rpmhpd RPMHPD_CX>;
