@@ -1704,6 +1704,16 @@ kbuild manufactures it with `openssl req`, and the certificate is linked into
 the image. `KERNEL_CLEAN=1` deletes that directory, so it mints a new key every
 time.
 
+The kernel then trusts only that key, and lockdown (integrity) refuses
+unsigned modules, so a module for a flashed kernel can never be added once the
+key is gone. On 2026-11-07 that is what happened to the kernel on a test
+SM-X910. Every kernel build now archives its key with
+`scripts/kernel-key-registry.sh`. The archive is named by the key ID the
+kernel logs at boot (`Loaded X.509 cert '…: <key id>'`) and holds the
+`.config` and `Module.symvers` needed to build against that kernel. It goes in
+`$UBUNTU_WORKDIR/kernel-keys`, and the registry copies itself to each backup
+directory or `rclone:` remote listed in its `MIRRORS` file.
+
 **2. BTF, which is the real one.** With the key pinned outside the object
 directory, `config` did start matching, but `Image.gz` still differed. The
 difference was isolated in a 1 MB module rather than in a 67 MB image:
