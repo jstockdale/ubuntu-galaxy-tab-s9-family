@@ -1,0 +1,34 @@
+[Unit]
+Description=Let the SM-X710's USB controller runtime-suspend after the boot-time panel cycle
+# dwc3 forbids runtime PM at probe, so the controller (a600000.usb) never
+# suspended while bound: clocks, interconnect and USB30_PRIM_GDSC stayed on,
+# and since the gts9wifi DTS gave the GCC GDSCs CX as their parent, so did its
+# nominal CX vote, in the sleep set too.  With runtime PM allowed it suspends
+# 5 s after it is left unconnected and genpd drops the vote.  Re-attaching
+# resumes it through the Type-C role switch (TCPM reports USB_ROLE_NONE on
+# detach), binding a gadget through dwc3_gadget_pullup(), and in host mode a
+# connect or remote wakeup through the PDC wake interrupts.
+#
+# SM-X710 only: the Ultra keeps its behaviour.
+ConditionFirmware=device-tree-compatible(samsung,gts9wifi)
+# Opt out without removing anything: create this file, then reboot or stop
+# this unit (stopping it forbids runtime PM again).
+ConditionPathExists=!/etc/ubuntu-gts9u/usb-runtime-pm-off
+ConditionPathExists=/sys/bus/platform/devices/a600000.usb/power/control
+# Never before the panel recovery's pm_test=platform cycle, which this board's
+# boot depends on: the controller goes through that cycle runtime-active, as
+# it always has.  After the bring-up gadget too, so it is bound first.
+# Ordering only: neither is pulled in.
+After=ubuntu-gts9u-panel-coldboot-recover.service gts9u-usb-gadget.service
+Before=sleep.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'printf auto > /sys/bus/platform/devices/a600000.usb/power/control'
+# "-": a stop must never fail, e.g. while the controller is being removed.
+ExecStop=-/bin/sh -c 'printf on > /sys/bus/platform/devices/a600000.usb/power/control'
+SyslogIdentifier=ubuntu-gts9u-usb-runtime-pm
+
+[Install]
+WantedBy=multi-user.target

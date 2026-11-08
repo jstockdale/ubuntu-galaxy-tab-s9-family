@@ -261,6 +261,9 @@ Known limits:
   `ubuntu-gts9u-icc-late-release`: releasing it earlier hangs the cycle. The
   DDR bandwidth monitor (`icc_bwmon`) is a module and blacklisted
   ([interconnect notes](docs/gts9wifi-interconnect.md)).
+- **The USB controller may runtime-suspend after that cycle** (device package
+  2.58, not yet tested on hardware). It suspends 5 s after it is left
+  unconnected. To keep it on, create `/etc/ubuntu-gts9u/usb-runtime-pm-off`.
 
 ### Building the SM-X710 ZIP
 

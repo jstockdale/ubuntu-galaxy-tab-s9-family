@@ -321,7 +321,7 @@ environment to disable writes.
 
 State on 2026-11-07, one SM-X710 with bootloader revision 5
 (`X710XXS5CYG1`), built with `DEVICE=gts9wifi` from this tree (kernel 7.2-rc3,
-device package 2.56; this tree now builds 2.57, which fixes the fingerprint-gate generator's mode). The unit was first installed from an earlier gts9wifi
+device package 2.56; this tree now builds 2.58: 2.57 fixes the fingerprint-gate generator's mode, 2.58 lets the USB controller runtime-suspend). The unit was first installed from an earlier gts9wifi
 ZIP and updated in place to this kernel and these packages; a ZIP built from
 this tree has not yet been flashed end to end. The evidence levels are the
 ones above. The SM-X710
@@ -349,6 +349,7 @@ SM-X710 ZIP is published.
 | 4× CS35L45 speakers and DMICs | ✅ | confirmed | The amplifiers probe and the UCM profile loads. The test image had Samsung's speaker-protection files (`cs35l45-dsp1-spk-prot.wmfw`, `.bin` and `-calib.bin`) copied into `FIRMWARE_DIR` by hand; they are not in the X710 manifest yet. The DSP loads them (`DSP1: Firmware: 4fa00 vendor: 0x2 v0.56.0`, tuning named TabS9), and a build without them has not been tested ([firmware manifests](../configs/firmware/README.md)). The owner recorded speech through the digital microphones (about 30 dB above the room's noise floor, peaks at −15 dBFS) and heard it played back on the speakers, with all four amplifiers enabled during playback (2026-11-07) |
 | Cameras | 🟡 | assumed | Two HI1337 (rear 13 MP with DW9808 focus, front 12 MP), described in the DTS but off unless enabled; not tested on hardware ([cameras](gts9wifi-cameras.md)) |
 | USB-C charging, USB host, DisplayPort | ❓ | assumed | Not yet assessed |
+| USB controller power | ⚠️ | assumed | dwc3 forbids runtime PM, so the controller, `USB30_PRIM_GDSC` and, with the DTS's `&gcc` CX parent, a nominal CX vote stayed on whenever it was bound. Device package 2.58 allows runtime PM once the boot-time panel cycle is done (`ubuntu-gts9u-usb-runtime-pm`; opt out with `/etc/ubuntu-gts9u/usb-runtime-pm-off`). Not yet tested on hardware ([porting log](porting-log.md#dwc3-runtime-pm-on-the-sm-x710-device-258-2026-11-07)) |
 | Bring-up flags | ⚠️ | measured | `clk_ignore_unused`, `pd_ignore_unused` and `regulator_ignore_unused` are still on the shared command line ([flags](gts9wifi-bringup-flags.md)) |
 | Fingerprint reader | ❌ | — | Not supported. Device package 2.57 skips the fingerprint services on this model; 2.56, on the test unit, shipped the gate generator without its executable bit, so fprintd was not masked there and the greeter waited 25 s for it (2.57 not yet tested on hardware) |
 | NPU | ❌ | — | Not built for this model (`GTS9U_INCLUDE_NPU=0`) |

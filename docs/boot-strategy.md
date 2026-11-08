@@ -305,6 +305,9 @@ GTS9U_EXTRA_CMDLINE='…' bash scripts/build-android-v4-bundle.sh
   consumer, is therefore a module and blacklisted, and
   `ubuntu-gts9u-icc-late-release.service` releases the vote after the cycle
   ([`gts9wifi-interconnect.md`](gts9wifi-interconnect.md)).
+- The USB controller goes through that cycle runtime-active, as it always has.
+  `ubuntu-gts9u-usb-runtime-pm.service` (device package 2.58) allows its
+  runtime PM only after the cycle.
 - If a DisplayPort dock is already connected, its HPD must stay **deferred**
   until that recovery finishes. An early HPD also blocked the internal DSI in
   the baseline tests.

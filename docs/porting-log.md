@@ -7601,3 +7601,100 @@ Pass:
 
 Over real s2idle and deep cycles, `journalctl -t ubuntu-gts9u-sleep-stats`
 shows whether CX collapsed (`cxsd +N`).
+
+### dwc3 runtime PM on the SM-X710 (device 2.58, 2026-11-07)
+
+`dwc3_core_probe()` calls `pm_runtime_forbid()`, and nothing in the port
+allowed runtime PM again. So `a600000.usb` never runtime-suspended: its clocks,
+interconnect paths and `USB30_PRIM_GDSC` stayed on whenever the controller was
+bound. With the `&gcc` CX parent above, its nominal `required-opps` vote now
+also holds CX at nominal, in the sleep set too.
+
+The source (7.2-rc3 X710 tree) shows every way back from runtime suspend
+exists on this board:
+
+- Cable events: TCPM (the sm5714 TCPC) sets `USB_ROLE_NONE` on detach
+  (`tcpm_reset_port()`) and `USB_ROLE_DEVICE` or `USB_ROLE_HOST` on attach.
+  dwc3-qcom's `pre_set_role` runtime-resumes the controller on every role
+  change and toggles the VBUS-valid override, so the gadget sees connect and
+  disconnect. ps5169 only reads the role.
+- Device mode: the controller may suspend only while not connected
+  (`dwc3_runtime_checks()`), after the 5 s autosuspend delay. Binding a UDC
+  resumes it (`dwc3_gadget_pullup()` takes a runtime reference).
+- Host mode: it suspends only after the xHCI root hubs do. A connect or
+  remote wakeup comes back through the PDC wake IRQs that
+  `dwc3_qcom_suspend(.., true)` arms, and `qcom_dwc3_resume_irq()` then
+  resumes xHCI.
+- DisplayPort: the QMP USB/DP combo PHY forbids its own runtime PM, so a host
+  runtime suspend never gates its clocks. In device mode the suspend runs the
+  same `dwc3_core_exit()` that system suspend already runs on this board.
+- System sleep from runtime suspend: the dwc3-qcom suspend patch above
+  restores the vote, where upstream lost it.
+
+Change, in device package 2.58: `ubuntu-gts9u-usb-runtime-pm.service`
+writes `auto` to `a600000.usb/power/control`.
+- It does not use a udev rule because it must wait for the boot-time
+  `pm_test=platform` panel cycle. That cycle has hung on this board when state
+  changed under it (the interconnect, Stage 3), so the controller goes through
+  it runtime-active, as before.
+- It is ordered after `ubuntu-gts9u-panel-coldboot-recover` and the bring-up
+  gadget.
+- It runs on the SM-X710 only (`ConditionFirmware`).
+- To opt out, create `/etc/ubuntu-gts9u/usb-runtime-pm-off`. Stopping the unit
+  writes `on` again, and so does removing the package (prerm).
+- postinst enables it on both fresh installs and upgrades. An upgrade does not
+  start it; it takes effect at the next boot.
+
+Install 2.58 with, or after, a kernel that carries the dwc3-qcom suspend
+patch. A runtime-suspended controller would otherwise lose its vote at the
+first system sleep. Suspend is off on this board, so only the suspend tests
+reach that path.
+
+Expected costs, all upstream behavior:
+- A host that starts enumerating more than 5 s after the cable goes in (a
+  sleeping PC) is not seen until the cable is replugged, because no role
+  change wakes the controller.
+- Each device-mode runtime suspend may log dwc3-qcom's "HS-PHY not in L2".
+
+Checks:
+- `tests/test_usb_runtime_pm.py` (new, 9 tests: gating, ordering, opt-out, the
+  commands against a fake `power/control`, `systemd-analyze verify`, postinst
+  and prerm) and `tests/test_device_package.py` pass.
+- Package build (`DEVICE=gts9wifi`, under fakeroot, with the X710 kernel's
+  certificate, config and matching `qcom_spss_irq.ko`): `ubuntu-gts9u-device`
+  2.58 arm64, with Depends unchanged. Against the 2.57 backup, the only
+  differences are the version, the new unit (root, 0644), one postinst line and
+  two prerm lines.
+- Not installed, not tested on hardware.
+
+Test matrix for the owner, on the X710 after installing 2.58. Check the
+package's sha256 after the transfer, and require
+`apt-get install --simulate ./ubuntu-gts9u-device_2.58_arm64.deb` to remove
+nothing. "State" means `cat /sys/bus/platform/devices/a600000.usb/power/{control,runtime_status}`
+and `grep -A2 '^usb30_prim_gdsc ' /sys/kernel/debug/pm_genpd/pm_genpd_summary`
+(root).
+
+1. Boot: the panel comes up (the boot cycle completes), and
+   `systemctl is-active ubuntu-gts9u-usb-runtime-pm` reads active. State:
+   `auto`.
+2. No cable for 10 s: `suspended`; the GDSC `off`; `a600000.usb` at 0.
+3. Cable to the PC with the NCM gadget: `active` within a second; `usb0` up and
+   SSH over it works; still `active` after 2 min idle; the GDSC line at 256.
+4. Unplug, wait 10 s (`suspended`), replug: it enumerates again. Five times.
+5. Plug into a sleeping PC, then wake the PC: a known gap. Record whether it
+   enumerates without a replug.
+6. Wall charger only: PD charging as before (sm5714 is independent of dwc3);
+   `suspended` after 5 s.
+7. USB-C hub or dock with a keyboard and a flash drive: both work. Remove both
+   devices: `suspended` once the hub autosuspends. Plug one back in: it wakes
+   and enumerates. Unplug the dock and plug it back in: host role again.
+8. A dock with DisplayPort: the picture stays while the controller suspends.
+9. Suspend ladder: `pm_test` devices and platform, then one real s2idle and one
+   real deep sleep, once with no cable (suspended at entry) and once with NCM
+   up. After each, `active` or `suspended` as before, and 256 on the GDSC line
+   whenever it is `active`.
+10. Opt out: `sudo touch /etc/ubuntu-gts9u/usb-runtime-pm-off` and
+    `sudo systemctl stop ubuntu-gts9u-usb-runtime-pm` give `on`. Remove the
+    file and run `sudo systemctl start ubuntu-gts9u-usb-runtime-pm` to get
+    `auto` back.
+11. Reboot: again `auto` after the boot cycle, no boot loop.
