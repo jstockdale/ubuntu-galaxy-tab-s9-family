@@ -7827,5 +7827,10 @@ Device package 2.58 on squirtle (2026-11-08), measured:
     (step 4, once).
   - dwc3-qcom logged "remote wakeup not configured" at the disconnect and
     "HS-PHY not in L2" at the suspend, as expected.
-- Still to run: the vote and GDSC while suspended (root); steps 4 (five
-  times) to 11.
+- Cable out again, root (`pm_genpd_summary`): `usb30_prim_gdsc` `off-0`
+  at 0, `a600000.usb` `suspended` at 0. Idle, the controller now powers its
+  GDSC off and holds no CX vote.
+- CX stayed at 256. `mmcx` is a CX subdomain, and with the display on MMCX
+  votes nominal. That is the "other consumer" that had kept CX at nominal
+  before any of this work. The other CX children are the GCC GDSCs.
+- Still to run: steps 4 (five times) to 11.
