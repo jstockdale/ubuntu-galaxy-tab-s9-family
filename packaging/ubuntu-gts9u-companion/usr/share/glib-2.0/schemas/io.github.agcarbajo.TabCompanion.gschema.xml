@@ -35,6 +35,10 @@
          pressed farther away it keeps its usual action.  Near at or below the near height,
          far again only above the far height (the driver's height units, 0 at contact). -->
     <key name="spen-side-button-split" type="b"><default>false</default></key>
+    <!-- Double tap to wake on a touchscreen whose driver offers it (the SM-X710's FTS1BA90A).
+         Off by default, as in the stock kernel: armed, the touch IC keeps scanning while the
+         screen is off. -->
+    <key name="double-tap-to-wake" type="b"><default>false</default></key>
     <key name="spen-side-button-near-height" type="i"><range min="0" max="255"/><default>36</default></key>
     <key name="spen-side-button-far-height" type="i"><range min="0" max="255"/><default>44</default></key>
     <key name="pen-dock-popup" type="b"><default>true</default></key>

@@ -223,7 +223,7 @@ bootloader revision 5. Compared with the SM-X910:
 | Display | ✅ | 2560×1600, 120 Hz or 60 Hz (Settings → Displays) |
 | GPU | ✅ | Adreno 740; the earlier lost pixels are fixed (`videocc` is built in, so `rpmhpd` reaches `sync_state` at boot). No 719 MHz step |
 | CPU | ✅ | Prime core up to 3.36 GHz |
-| Touchscreen | ✅ | STM FTS1BA90A; double tap to wake works, off by default ([how to enable](docs/gts9wifi-touch-fts1ba90a.md)) |
+| Touchscreen | ✅ | STM FTS1BA90A; double tap to wake works, off by default (Tab Companion → Touch) |
 | S Pen | ✅ | Pressure, tilt, hover and the side button, in landscape and portrait; dock detection, charging and BLE pairing. Optionally a tap with the side button held near the screen is a right click. Tab Companion → S Pen → S Pen test checks a pen ([notes](docs/tab-companion.md#the-pen-test)) |
 | Vibration / haptics | ✅ | On-screen keyboard feedback |
 | Keyboard cover | ✅ | EF-DX720 tested, with the posture switch: typing posture keeps laptop mode, detaching gives tablet mode; folded back not yet confirmed |

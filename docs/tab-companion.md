@@ -297,6 +297,27 @@ needs authorisation, which polkit asks for with the user's password; a toggle
 in that page can install a rule that stops it asking every time. There is also
 a quick settings toggle. See [dual-boot.md](dual-boot.md).
 
+## Touch
+
+The Touch page (from 1.3.15) appears where the touchscreen's driver offers
+something to set, today the SM-X710's FTS1BA90A; the SM-X910's Goodix driver
+has no such switch, so there is no page there. Its one setting is **Double tap
+to wake**, off by default as in Samsung's kernel. On, the touchscreen keeps
+scanning while the screen is off (at a little battery cost), and a double tap
+turns the screen back on; with the cover closed it is off, as the controller
+stops scanning then.
+
+The setting is the GSettings key `double-tap-to-wake`. The hardware service
+of the tablet's desktop user (the account `/run/ubuntu-gts9u/desktop-user`
+names) writes it to the driver's `double_tap_to_wake` at every boot and within
+a second of a change; other accounts' services leave the touchscreen and the
+pen options alone, so two accounts never overwrite each other. it starts with the user's manager, which this image keeps
+running from boot, so it already holds at the login screen. A touchscreen armed
+another way before the switch was ever used (the udev rule the touch notes
+used to give) is taken as the user's choice and recorded, so upgrading does not
+turn it off; from then on the switch wins. The driver side is in
+[gts9wifi-touch-fts1ba90a.md](gts9wifi-touch-fts1ba90a.md#power-states-and-double-tap-to-wake).
+
 ## Haptics and the on-screen keyboard
 
 The stock firmware describes a COINDC motor enabled through TLMM GPIO18. The

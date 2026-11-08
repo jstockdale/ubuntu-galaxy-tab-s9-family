@@ -18,6 +18,7 @@ import math
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import struct
 import subprocess
@@ -33,6 +34,11 @@ OBJECT_PATH = "/io/github/agcarbajo/TabCompanion/Hardware"
 INTERFACE = BUS_NAME
 KEYBOARD_PREFIX = "Book Cover Keyboard"
 POGO_DRIVER = "/sys/bus/i2c/drivers/samsung-gts9u-stm32-pogo"
+# Written at boot by ubuntu-gts9u-desktop-user: the account the tablet's
+# devices belong to.
+DESKTOP_USER_FILE = "/run/ubuntu-gts9u/desktop-user"
+# Touchscreens whose driver offers double tap to wake (the X710's FTS1BA90A).
+DOUBLE_TAP_ATTRIBUTE = "/sys/bus/i2c/devices/*/double_tap_to_wake"
 PEN_NAME = "Wacom EMR Digitizer"
 BLUEZ = "org.bluez"
 BLUEZ_ADAPTER = "org.bluez.Adapter1"
@@ -570,6 +576,8 @@ class HardwareService:
         self.wacom = self._find_wacom()
         self.settings = Gio.Settings.new("io.github.agcarbajo.TabCompanion")
         self.pen_option_errors = set()
+        self.touch_option_errors = set()
+        self.touch_setting_adopted = False
         self.keyboard_fd = None
         self.keyboard_watch = None
         self.pen_fd = None
@@ -1221,8 +1229,23 @@ class HardwareService:
         matches = glob("/sys/bus/i2c/devices/*/pen_docked")
         return Path(matches[0]).parent if matches else None
 
+    @staticmethod
+    def _owns_devices():
+        """Whether this service belongs to the tablet's desktop user.
+
+        Every account gets its own hardware service, but the pen and touch
+        options are single driver attributes: if each service applied its own
+        user's settings they would overwrite each other every second.  Only
+        the owner's apply them, once ubuntu-gts9u-desktop-user has named it.
+        """
+        owner = read_text(DESKTOP_USER_FILE)
+        try:
+            return bool(owner) and owner == pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            return False
+
     def _apply_pen_options(self):
-        if self.wacom is None:
+        if self.wacom is None or not self._owns_devices():
             return
         options = {
             "ignore_finger_while_hovering": self.settings.get_boolean(
@@ -1259,6 +1282,35 @@ class HardwareService:
                 if attribute not in self.pen_option_errors:
                     print(f"Cannot apply S Pen option {attribute}: {error}", flush=True)
                     self.pen_option_errors.add(attribute)
+
+    def _apply_touch_options(self):
+        """Double tap to wake on every touchscreen whose driver offers it.
+
+        The kernel starts with it off, as Samsung's does; the setting is the
+        user's choice from then on.  A system set up before the switch existed
+        may arm it with a udev rule instead, so until the switch has been used
+        an armed touchscreen is taken as the user's choice rather than undone.
+        """
+        paths = [Path(p) for p in sorted(glob(DOUBLE_TAP_ATTRIBUTE))]
+        if not paths or not self._owns_devices():
+            return
+        if not self.touch_setting_adopted:
+            self.touch_setting_adopted = True
+            if (self.settings.get_user_value("double-tap-to-wake") is None
+                    and any(read_text(p) == "1" for p in paths)):
+                self.settings.set_boolean("double-tap-to-wake", True)
+        desired = "1" if self.settings.get_boolean("double-tap-to-wake") else "0"
+        for path in paths:
+            if read_text(path) == desired:
+                self.touch_option_errors.discard(path)
+                continue
+            try:
+                path.write_text(desired + "\n", encoding="ascii")
+                self.touch_option_errors.discard(path)
+            except OSError as error:
+                if path not in self.touch_option_errors:
+                    print(f"Cannot apply double tap to wake on {path}: {error}", flush=True)
+                    self.touch_option_errors.add(path)
 
     @staticmethod
     def _keyboard_info():
@@ -1612,6 +1664,7 @@ class HardwareService:
         if self.wacom is None:
             self.wacom = self._find_wacom()
         self._apply_pen_options()
+        self._apply_touch_options()
         objects = self._refresh_bluetooth_powered()
         self._sync_remote_control()
         self._ensure_keyboard_reader()

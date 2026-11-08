@@ -31,6 +31,7 @@ GESTURES = (
 KEYBOARD_HAPTIC_DURATIONS_MS = (24, 42, 66)
 PEN_TEST = "/usr/libexec/tab-companion-spen-test"
 SIDE_SPLIT_ATTRIBUTE = "/sys/bus/i2c/devices/*/side_button_split"
+DOUBLE_TAP_ATTRIBUTE = "/sys/bus/i2c/devices/*/double_tap_to_wake"
 
 KEYS = (
     ("galaxy-ai", "Galaxy AI", N_("Tab Companion by default")),
@@ -221,6 +222,11 @@ class CompanionWindow(Adw.ApplicationWindow):
         self.view_stack.add_titled_with_icon(
             self._haptics_page(), "haptics", _("Haptics"), "phone-symbolic"
         )
+        # Only where the touchscreen's driver offers something to set.
+        if glob(DOUBLE_TAP_ATTRIBUTE):
+            self.view_stack.add_titled_with_icon(
+                self._touch_page(), "touch", _("Touch"), "hand-open-symbolic"
+            )
         if boot_sets.available():
             self.view_stack.add_titled_with_icon(
                 self._system_page(), "dualboot", _("Dualboot"), "drive-multidisk-symbolic"
@@ -907,6 +913,22 @@ class CompanionWindow(Adw.ApplicationWindow):
         self.battery_group.set_visible(enabled)
         self.gesture_group.set_visible(enabled and not pointer)
         self.pointer_group.set_visible(enabled and pointer)
+
+    def _touch_page(self):
+        page = self._page()
+        group = Adw.PreferencesGroup(title=_("Touchscreen"))
+        double_tap = Adw.SwitchRow(
+            title=_("Double tap to wake"),
+            subtitle=_("Double-tap the screen to turn it on. While the screen is off the touchscreen keeps scanning, which uses a little more battery. It does not work with the cover closed."),
+        )
+        double_tap.add_prefix(Gtk.Image(icon_name="video-display-symbolic"))
+        self.settings.bind(
+            "double-tap-to-wake", double_tap, "active",
+            Gio.SettingsBindFlags.DEFAULT,
+        )
+        group.add(double_tap)
+        page.add(group)
+        return page
 
     def _haptics_page(self):
         page = self._page()

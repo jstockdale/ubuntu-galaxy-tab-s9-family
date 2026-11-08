@@ -133,6 +133,13 @@ scanning slowly for as long as the screen is off instead of stopping, and stays
 powered through system sleep instead of being switched off, so it costs
 standby power.
 
+The switch is Tab Companion → Touch → Double tap to wake (from 1.3.15; see
+[Tab Companion](tab-companion.md#touch)).  It is the GSettings key
+`double-tap-to-wake`, which Tab Companion's hardware service writes to the
+attribute at every boot and whenever it changes.  That service starts with the
+user's manager, which this image keeps running from boot (linger), so the
+setting already holds at the login screen.
+
 `71-gts9u-touchscreen.rules` (device package) gives the `input` group write
 access to the attribute and, where `/run/ubuntu-gts9u/desktop-user` names the
 desktop user, makes that user its owner.  Ownership is what lets the desktop
@@ -140,15 +147,22 @@ user write it: the account is no longer in `input`.  The I2C bus number is
 not stable, so use the driver's directory:
 
 ```sh
-# now, as the desktop user (no sudo needed once the rule has run)
+# now, as the desktop user; with Tab Companion 1.3.15 or later the switch
+# puts it back to its own setting within a second
 echo 1 > /sys/bus/i2c/drivers/samsung_fts1ba90a/*-0049/double_tap_to_wake
 cat /sys/bus/i2c/drivers/samsung_fts1ba90a/*-0049/power_state   # active / sense-off / low-power (off only during sleep)
 
-# at every boot, once, as root (the driver binds before udevd runs, so the
-# boot-time event is coldplug's "add"; "bind" covers a later rebind)
+# without Tab Companion 1.3.15: at every boot, once, as root (the driver binds
+# before udevd runs, so the boot-time event is coldplug's "add"; "bind" covers
+# a later rebind)
 echo 'ACTION=="add|bind", SUBSYSTEM=="i2c", DRIVER=="samsung_fts1ba90a", ATTR{double_tap_to_wake}="1"' \
 	| sudo tee /etc/udev/rules.d/72-gts9u-double-tap-to-wake.rules
 ```
+
+A system that already arms it with that rule keeps it on when Tab Companion
+1.3.15 arrives: until the switch has been used, an armed touchscreen is taken
+as the user's choice and recorded in the setting.  After that the switch wins
+over the rule, which can then be removed.
 
 To keep the gesture from waking a suspended system while still using it with
 the screen merely blanked, write `disabled` to the device's `power/wakeup`
