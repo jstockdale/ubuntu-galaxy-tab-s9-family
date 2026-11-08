@@ -7149,5 +7149,18 @@ Still open:
 - The test vendor_boot also had `iommu.strict=0`, which is not yet compared
   with strict mode now that the ICE no longer limits.
 - HS-G5, which the 4200 MB/s figures assume, is not negotiated.
-- The SM-X910 has the same SoC and driver, so it very likely has the same
-  ceiling; its device tree is unchanged.
+
+The SM-X910 had the same ceiling. Freshly installed from the 2026-10-28
+v1.2.0 ZIP, the test unit read at 306 MB/s and wrote at 304 MB/s with the
+ICE clock at 19.2 MHz. Its DTB is pinned for ABL, so kernels built from this
+tree make the change in the Ultra's built-in overlay
+(`gts9u-performance.dtso`); that route has not been booted yet. For the
+kernel already on the tablet, a module signed with that kernel's archived
+key (`scripts/kernel-key-registry.sh`) sets the ICE clock from the UFS
+devfreq transitions, at the same three rates. With it, the same fio runs
+give 1844 MB/s sequential write and, after a sequential rewrite, 1918 MB/s
+sequential read; 4 KB at QD32 gives 146k random-read and 131k random-write
+IOPS, with the IOMMU in strict mode (the S9's figures were taken in lazy
+mode). 403 MHz is covered there only because rpmhpd has not synced on the
+SM-X910, which holds CX at its maximum, and the module refuses to load once
+it has.
