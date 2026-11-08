@@ -7390,3 +7390,110 @@ This does not cover the following:
 - Suspend and resume at G5.
 - Idle drain.
 - A second boot.
+
+### The UFS clocks' CX vote never reached the rail (2026-11-07)
+
+The ICE entry ("Storage at 300 MB/s") says the ICE rates sit at "the low SVS,
+SVS and nominal levels those OPPs already vote". They are named but never voted. A review of the
+kernel source (mainline a13c140cc plus this port's patches) traces the path:
+
+- ufshcd scales through `dev_pm_opp_set_opp()`. The OPP core sets each
+  required OPP's level on `opp_table->required_devs[]`, and for a device with
+  one power domain `genpd_set_required_opp_dev()` registers the UFS device
+  itself there. The level lands on that device's domain, `UFS_PHY_GDSC`. The
+  node's own `required-opps = <&rpmhpd_opp_nom>` sets the same GDSC's default
+  at attach (`genpd_set_required_opp()`).
+- A GDSC has no `set_performance_state`. `_genpd_set_performance_state()`
+  only forwards a level along the GDSC's parent links, where
+  `genpd_xlate_performance_state()` passes it through unchanged (no OPP
+  table).
+- `gdsc_register()` takes the parent from the clock controller's own power
+  domain. sm8550.dtsi's `gcc` node has no `power-domains`, so no GCC GDSC has
+  a parent: `UFS_PHY_GDSC` records 256 (nominal) at 300 MHz and nothing votes
+  CX. The same holds for mainline's 300 MHz UFS clocks, the PCIe OPPs' low SVS
+  and the USB controller's nominal `required-opps`.
+
+403 MHz worked because CX was high for other reasons. On the X710, rpmhpd syncs
+at boot. After the Stage 0 release, its RPMh trace showed CX voted at nominal
+by its other consumers. Nothing ties that level to the UFS. On the SM-X910,
+rpmhpd has not synced, so it clamps every enabled rail at its maximum.
+
+Fix (X710 board DTS): `&gcc { power-domains = <&rpmhpd RPMHPD_CX>; }`. This is
+the mainline pattern in 7.2's sc7180, sc7280, sc8180x, sc8280xp, sdm845,
+sa8775p, x1e80100, milos and eliza DTs. `platform_probe()` attaches gcc to CX
+and powers it on. `gdsc_register()` then adds every GCC GDSC as a CX subdomain:
+PCIe 0/1 and their PHYs, UFS and its PHY, USB and its PHY. A GDSC the
+bootloader left on can only join a parent that is already on, and the attach
+has done that. A per-node CX domain on the UFS was rejected: with two power
+domains, ufs-qcom would have to attach them itself, which needs driver code.
+
+Effects checked in the source:
+
+- Votes that now reach CX: the UFS OPPs (low SVS/SVS/nominal, nominal by
+  default), pcie0's OPPs (low SVS; pcie1 is disabled here), and the USB
+  controller's nominal `required-opps` while it is runtime-active. All of them
+  only raise CX.
+- fw_devlink makes gcc a consumer of rpmhpd. Nothing under `apps_rsc` uses a
+  gcc clock, so there is no cycle. gcc is built in and binds early, so
+  rpmhpd's `sync_state` still waits on videocc, as before. The interconnect
+  providers and their late release are untouched.
+- gcc-sm8550 does not enable runtime PM, so the bound gcc device keeps the CX
+  genpd on at runtime. CX was already on.
+- System suspend: GDSCs set neither `GENPD_FLAG_ACTIVE_WAKEUP` nor
+  `ALWAYS_ON`, so they power off in noirq and release CX as before. If the UFS
+  is runtime-active when suspend starts, its nominal vote stays on the GDSC
+  link. It would then reach the sleep set if anything else kept the CX genpd
+  on. To check during the suspend runs: the `cxsd` count in
+  `/sys/kernel/debug/qcom_stats` across a real suspend. Suspend is still `off`
+  on this board.
+- `dtbs_check`: qcom,sm8550-gcc.yaml does not list `power-domains` yet (the
+  x1e80100 binding requires it). For upstream, the binding needs that line.
+
+Build test (no kernel image, nothing flashed): the DTB was compiled with
+kbuild's cpp and `dtc -@` flags against the X710 kernel tree. The baseline
+(8c8be80) came out byte-identical to the last built X710 DTB (sha256
+`2da18630…`), so the method matches. The new DTB (sha256 `290a5395…`) differs
+from it only by `power-domains = <&rpmhpd 0x00>` on `clock-controller@100000`,
+with no new dtc warnings. The built-in `gts9-performance` and `gts9-family`
+overlays still apply with `fdtoverlay`.
+
+On-device check after the next X710 flash (read only; it reads the UFS for
+6 s to hold the 300 MHz OPP):
+
+```sh
+sudo sh -c '
+d=/sys/kernel/debug
+for b in /sys/block/sd*; do
+	readlink -f "$b" | grep -q 1d84000.ufshc && ufs=/dev/${b##*/} && break
+done
+timeout 6 dd if="$ufs" of=/dev/null bs=1M iflag=direct status=none &
+sleep 2
+for c in axi unipro_core ice_core; do
+	echo "gcc_ufs_phy_${c}_clk $(cat $d/clk/gcc_ufs_phy_${c}_clk/clk_rate)"
+done
+grep -A3 "^ufs_phy_gdsc " $d/pm_genpd/pm_genpd_summary
+echo "cx perf_state $(cat $d/pm_genpd/cx/perf_state)"
+grep -x ufs_phy_gdsc $d/pm_genpd/cx/sub_domains || echo "ufs_phy_gdsc: not a cx subdomain"
+wait
+dmesg | grep -iE "performance state|subdomain|gcc-sm8550" || true
+'
+```
+
+Pass:
+- The clocks read 300000000, 300000000 and 403000000.
+- `ufs_phy_gdsc` and its `1d84000.ufshc` line show 256.
+- `ufs_phy_gdsc` is listed as a cx subdomain.
+- cx `perf_state` is at least 256.
+- dmesg shows no performance-state or subdomain errors.
+
+On today's DTB the GDSC already shows 256, but the subdomain line fails. That
+gap is the bug.
+
+SM-X910: it needs the same fix before its rpmhpd syncs (the rpmhpd sync work
+planned there). The overlay route works. `gts9u-performance.c` applies
+`gts9u-performance.dtso` at `core_initcall`, before
+`of_platform_default_populate()` (`arch_initcall_sync`) creates gcc, so gcc
+probes with the property in place. A scratch fragment targeting
+`/soc@0/clock-controller@100000` with `power-domains = <&rpmhpd 0>` (CX)
+resolved and applied with `fdtoverlay` onto the pinned Ultra DTS (5046f92)
+compiled here. The Ultra files are unchanged.

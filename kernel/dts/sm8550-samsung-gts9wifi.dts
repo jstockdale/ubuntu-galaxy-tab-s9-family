@@ -2014,6 +2014,18 @@
 };
 
 /*
+ * The GCC's GDSCs (UFS, PCIe and USB) are powered from CX, but sm8550.dtsi
+ * does not say so.  A GDSC without a parent records the performance state
+ * its devices ask for and passes it to no rail, which would leave the CX
+ * levels in the UFS and PCIe OPPs and the UFS and USB required-opps unvoted.
+ * Name CX here, as sc7280, sc8280xp and x1e80100 do: every GCC GDSC becomes
+ * a CX subdomain, and their levels reach rpmhpd.
+ */
+&gcc {
+	power-domains = <&rpmhpd RPMHPD_CX>;
+};
+
+/*
  * Internal UFS.  The rootfs boots from the microSD; this only exists so pmOS
  * can reach the on-device boot partition and flash new builds over SSH without
  * a TWRP round-trip.  A UFS probe failure does not affect the SD boot.
@@ -2033,9 +2045,17 @@
 	 * 19.2 MHz it moved at most ~300 MB/s, the ceiling every read and write
 	 * hit at HS-G4 x2 (2026-11-07).  Scale it with the controller instead,
 	 * at the corners of Samsung's gcc-kalama.c (rate_max 100 MHz at
-	 * VDD_LOWER, 201.5 MHz at VDD_LOW, 403 MHz at VDD_NOMINAL): the low SVS,
-	 * SVS and nominal levels the OPPs below already vote.  Measured after:
-	 * 1.84 GB/s sequential read, 1.6 GB/s write, 197k random-read IOPS.
+	 * VDD_LOWER, 201.5 MHz at VDD_LOW, 403 MHz at VDD_NOMINAL).  Measured
+	 * after: 1.84 GB/s sequential read, 1.6 GB/s write, 197k random-read
+	 * IOPS.
+	 *
+	 * Those corners are the low SVS, SVS and nominal CX levels in the
+	 * required-opps of the OPPs below.  The OPP core sets each level on
+	 * this device's power domain, UFS_PHY_GDSC, and the GDSC passes it to
+	 * CX only because &gcc names CX (above).  Without that, the level stops
+	 * at the GDSC, as it does in mainline sm8550 for the controller's own
+	 * 300 MHz clocks, and 403 MHz would run at whatever CX level the other
+	 * consumers happen to hold once rpmhpd has synced.
 	 */
 	clocks = <&gcc GCC_UFS_PHY_AXI_CLK>,
 		 <&gcc GCC_AGGRE_UFS_PHY_AXI_CLK>,
