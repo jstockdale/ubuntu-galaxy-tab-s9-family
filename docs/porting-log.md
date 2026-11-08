@@ -7111,3 +7111,43 @@ errors, and only `ip_tables` loaded, as on fix4.
 - The keyboard cover folded back gives tablet mode: rotation, and the
   on-screen keyboard at the lock screen.
 - Still to test: the split by hand on fix6, and AAC over Bluetooth.
+
+### Storage at 300 MB/s: the inline crypto engine's clock (2026-11-07)
+
+The owner's kdiskmark run topped out at 300 MB/s on a UFS 4.0 part (Samsung,
+spec 0x0400). The link was not the cause: it reached HS-G4 on both lanes
+under load, with no PHY, data link or transport errors. The UFS AXI and
+UniPro clocks reached 300 MHz and the controller's interconnect vote (2.9 GB/s
+peak on the path to DDR) was in place. A raw read of `/dev/sda` gave the
+same 299 MB/s, so neither the filesystem, queue depth nor request size was
+involved: 4 parallel readers, 64 MB blocks and fio at QD32 all stopped there.
+
+The IOMMU was in strict mode (`CONFIG_IOMMU_DEFAULT_DMA_STRICT`).
+`iommu.strict=0` (lazy) lifted random 4 KB reads by about 30 % (54k to 72k
+IOPS) but left the sequential ceiling where it was.
+
+The ceiling was the inline crypto engine (ICE). It sits in the data path of
+every transfer, encrypted or not, and its core clock was at 19.2 MHz: the
+mainline ICE driver only enables the clock, and the bootloader leaves it on
+XO. At 16 bytes per cycle, 19.2 MHz is about 307 MB/s. The S9's device tree now
+lists `GCC_UFS_PHY_ICE_CORE_CLK` with the controller's clocks, so it scales
+with the controller's OPPs. The rates are 100, 201.5 and 403 MHz, which
+Samsung's `gcc-kalama.c` allows at the low SVS, SVS and nominal levels those
+OPPs already vote. Only the DTB changed (the kernel image is fix6's).
+
+After the change the clock follows the load (100 MHz idle, 403 MHz under
+load). fio on a 2 GiB file, 1 MB at QD32, gives 1595 MB/s sequential write and
+1844 MB/s sequential read; 4 KB at QD32 gives 197k random-read and 149k
+random-write IOPS. That is about 90 % of what HS-G4 x2 carries.
+
+Flash behaves as expected otherwise. 15 s of 4 KB random overwrites drop the
+same file's sequential read to 631 MB/s, and a sequential rewrite brings it
+back to 1791 MB/s. Those effects explained the slower reads seen while
+testing.
+
+Still open:
+- The test vendor_boot also had `iommu.strict=0`, which is not yet compared
+  with strict mode now that the ICE no longer limits.
+- HS-G5, which the 4200 MB/s figures assume, is not negotiated.
+- The SM-X910 has the same SoC and driver, so it very likely has the same
+  ceiling; its device tree is unchanged.
