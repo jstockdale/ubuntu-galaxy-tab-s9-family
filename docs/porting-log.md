@@ -7576,8 +7576,8 @@ sleep) with two probe events, then removes them.
 ```sh
 sudo sh -c '
 t=/sys/kernel/tracing
-echo "p:cxvote/opp dev_pm_opp_set_opp dev->kobj.name:string opp" >> $t/dynamic_events
-echo "p:cxvote/ps dev_pm_genpd_set_performance_state dev->kobj.name:string state" >> $t/dynamic_events
+echo "p:cxvote/opp dev_pm_opp_set_opp dev=dev->kobj.name:string opp=opp:x64" >> $t/dynamic_events
+echo "p:cxvote/ps dev_pm_genpd_set_performance_state dev=dev->kobj.name:string state=state:u32" >> $t/dynamic_events
 echo > $t/trace
 echo 1 > $t/events/cxvote/enable
 echo devices > /sys/power/pm_test
@@ -7698,3 +7698,31 @@ and `grep -A2 '^usb30_prim_gdsc ' /sys/kernel/debug/pm_genpd/pm_genpd_summary`
     file and run `sudo systemctl start ubuntu-gts9u-usb-runtime-pm` to get
     `auto` back.
 11. Reboot: again `auto` after the boot cycle, no boot loop.
+
+### The CX-vote kit, on top of the G5 kit (2026-11-07)
+
+The owner asked for this work to build on the latest G5 build. The branch now
+starts at the G5 branch tip (`claude/x710-ufs-hs-g5`, 87c6246, the passing
+30-minute G5 stress run). The kernel-key registry commit from
+`feature/sm-x710-gts9wifi` sits under it, so this build's signing key is
+archived. On top come the `&gcc` CX parent, the two suspend patches and
+device package 2.58.
+
+`tools/inplace/ufs-cx/` packs the kit, which installs over the G5 kit:
+- `boot`: the G5 kernel plus the two patches, with the CX DTB appended.
+- `vendor_boot`: fix7-ice's image with only its DTB swapped.
+- The matching module tree.
+- Optionally, device package 2.58.
+
+Packing checks, against the real images:
+- The `boot` recipe, given the G5 kernel and fix7-ice's DTB, reproduces the
+  G5 kit's `boot.img` (`4179f406…`) byte for byte.
+- `vendor_boot`: a repack with fix7-ice's own arguments and DTB reproduces its
+  3,137,536-byte body byte for byte. After the swap, every field reads back
+  unchanged except the DTB, which is the CX one (`290a5395…`).
+- Both footers pass `avbtool verify_image`.
+
+fix7-ice's own `vendor_boot` footer is stale. Its digest matches its body only
+with ` iommu.strict=0` zeroed, so the cmdline was patched in place after
+footing. vbmeta is disabled, so ABL never checks it. The kit's image gets a
+fresh, correct footer.
