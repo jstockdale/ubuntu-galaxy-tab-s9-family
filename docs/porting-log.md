@@ -7817,3 +7817,15 @@ Device package 2.58 on squirtle (2026-11-08), measured:
     `active`, with 0 ms suspended (test matrix steps 1 and 3);
   - the only dwc3 line this boot is "HS-PHY not in L2", from the boot-time
     panel cycle, before the unit ran.
+- Cable out, watched once a second over Wi-Fi:
+  - the gadget disconnected at 01:04:43 (`usb0` down, PD contract 0 mV), and
+    the controller was `suspended` by 01:04:49, after the 5 s autosuspend
+    (step 2);
+  - after 97 s suspended, the cable went back in at 01:06:26. TCPM's role
+    change resumed the controller, charging came back at 5 V / 500 mA, and
+    NetworkManager activated `usb0` the same second. SSH over USB worked again
+    (step 4, once).
+  - dwc3-qcom logged "remote wakeup not configured" at the disconnect and
+    "HS-PHY not in L2" at the suspend, as expected.
+- Still to run: the vote and GDSC while suspended (root); steps 4 (five
+  times) to 11.
