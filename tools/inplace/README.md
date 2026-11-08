@@ -33,6 +33,7 @@ cite their procedures and results.  They are not an install or update path.
 | [`icc/`](icc/README.md) | the interconnect late release, and the weekend experiment | [`docs/gts9wifi-interconnect.md`](../../docs/gts9wifi-interconnect.md) |
 | [`panel/`](panel/README.md) | the DISP-5 panel cold-boot experiments | [`docs/gts9wifi-display.md`](../../docs/gts9wifi-display.md) |
 | [`powerthermal/`](powerthermal/README.md) | rtkit, the greeter's WirePlumber snippet, charging and thermal checks | the kit's README; [`docs/porting-log.md`](../../docs/porting-log.md) |
+| [`ufs-g5/`](ufs-g5/README.md) | the UFS link at HS-G5 Rate-A (a kernel and its module tree on top of fix7-ice) | [`docs/porting-log.md`](../../docs/porting-log.md#why-the-link-stops-at-hs-g4-2026-11-07) |
 | [`suspendkit/`](suspendkit/README.md) | suspend reliability runs, the ADSP-start sleep lock | [`scripts/diagnostics/suspend/README.md`](../../scripts/diagnostics/suspend/README.md) |
 | [`wifi/`](wifi/README.md) | the Wi-Fi address from EFS, firmware at the first probe, the L1 substates | [`docs/gts9wifi-wifi.md`](../../docs/gts9wifi-wifi.md) |
 
