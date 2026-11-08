@@ -138,8 +138,19 @@ inf "camera table: $(tr '\n' ';' < /run/ubuntu-gts9u/camera-profile)"
 # The owner's PipeWire must see cameras that appeared after it started.
 nodes() { as_owner pw-cli ls Node 2>/dev/null | grep -c 'libcamera_input' || :; }
 if [ "$(nodes)" = 0 ]; then
-	as_owner systemctl --user restart wireplumber.service
+	# All three together: WirePlumber alone left pipewire-pulse timing out
+	# and dropped a Bluetooth headset (2026-11-08).  Audio stops for a few
+	# seconds; Bluetooth devices connected before are connected again.
+	bt=$(bluetoothctl devices Connected 2>/dev/null | awk '$1 == "Device" {print $2}')
+	as_owner systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
 	sleep 5
+	for addr in $bt; do
+		if bluetoothctl connect "$addr" > /dev/null 2>&1; then
+			inf "Bluetooth $addr connected again after the PipeWire restart"
+		else
+			ck "Bluetooth $addr did not reconnect after the PipeWire restart"
+		fi
+	done
 fi
 inf "PipeWire libcamera nodes: $(nodes)"
 systemctl start ubuntu-gts9u-camera-relays.service

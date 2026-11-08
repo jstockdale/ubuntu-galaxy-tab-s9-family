@@ -7885,9 +7885,140 @@ PipeWire, read from the user session:
 - `api.bluez5.codec = "aac"`;
 - the sink `RUNNING` at s16le, 2 ch, 48 kHz.
 
+### SM-X710 rear focus: two DW9808 faults, not the bus speed (2026-11-08)
+
+**Baseline:**
+- squirtle, CX kernel `bfb40d20…` with the first lens kit (CCI1 master 0 at
+  400 kHz, DTB `e6e7b957…`), device 2.58, boot `0a434817`.
+- Rear camera enabled by `camera-test.sh rear`; frames and the Camera app
+  worked, focus did not.
+
+**Observed:**
+- Both boots (1 MHz, `0824d1f3`; 400 kHz, `0a434817`) lost the lens at the
+  probe-time power-up. `i2c-qcom-cci ac16000.cci: master 0 queue 0 timeout`,
+  then `dw9808-vcm 14-000c: register 0x02 write failed: -110`. That is the
+  first write of `dw9808_init()`.
+- After a failed resume, runtime PM latched the error, and every open returned
+  `EINVAL` (`lens-diag.sh` sweep logs) until the driver was rebound.
+- 400 kHz, after a rebind: the cold open and the power-ups for 0 and 256
+  worked, and the power-up for 512 failed the same way.
+- 1 MHz, after a rebind:
+  - the cold open and the step to 0 (a 512-code jump, closed at once)
+    worked;
+  - the step to 256 got `EBUSY` from the move;
+  - its park timed out 36 times on CCI1;
+  - the standby write failed;
+  - `_regulator_disable()` warned "unbalanced disables for rear_cam_vio"
+    from `dw9808_suspend` (core.c:3245; the check is per consumer).
+
+**Causes:**
+1. Power-up timing (hypothesis, test pending).
+   - `dw9808_resume()` waits 1 ms after enabling `rear_cam_vio`.
+   - Stock waits 10 ms. Samsung's CamX record for this actuator in
+     `com.samsung.sensormodule.0_hynix_hi1337.bin` (X710XXS5CYG1, from the
+     firmware cache; the SM-X910's, from blastoise's extracted vendor, is
+     identical) is `13,1,1` then `4,1800000,10` for power-up, and `4,0,1`
+     then `13,0,1` for power-down.
+   - In those records, type 4 is VIO 1.8 V and 13 is the `RCAM_LDO_EN` GPIO.
+     The types are read from the same file's sensor and EEPROM records, and
+     the delays are CamX's milliseconds.
+2. The suspend error path (mechanism from the code, consistent with the log).
+   - `dw9808_suspend()` always disables the rail, then returns the park
+     walk's error.
+   - `dw9808_set_position()` turns a status poll that is still busy after
+     10 ms into `-EBUSY`.
+   - For `-EBUSY`, `rpm_suspend()` (runtime.c:472 and 750) puts the device
+     back to `RPM_ACTIVE` without latching an error.
+   - The 256 step's open therefore never ran `dw9808_resume()` (hence the
+     zero enable count in the warning). Its move and park went to an
+     unpowered lens.
+
+**Ruled out:**
+- The bus speed: 400 kHz failed the same way.
+- The actuator data: the X710's and the X910's differ only in the module id
+  and the signature.
+- The pad settings (stock 4 mA and a weak pull-up, against the dtsi's 2 mA
+  and strong 2.2 kOhm). The Ultra focuses with the dtsi's pads, the same lens,
+  rail, bus speed and driver. A pad kit was built (DTB `ab1ffa7b…`) and then
+  withdrawn untested, to keep the next test to one change.
+
+**Changes:**
+- DTS: the 400 kHz override is gone (the bus is at the dtsi's 1 MHz, as the
+  owner prefers). `rear_cam_vio` gets `startup-delay-us = <10000>`. Against
+  the CX DTB, that property is the only difference in the decompiled DTB
+  (`164e1bf8a393c642ffc7bd357ce5dfbc608b07ba77070ede8b2052434de42a84`).
+- `kernel/drivers/dw9808_vcm.c`:
+  - suspend returns 0 once the rail is off, and warns "lens not parked
+    before power-down";
+  - a failed open calls `pm_runtime_set_suspended()`, which clears the
+    latched error, so the next open powers up again.
+  - Compiled with `W=1 -Werror` against the CX object tree (out of tree,
+    compile only).
+  - Not deployed: the driver is built in (`CONFIG_VIDEO_DW9808_VCM=y`), so
+    it waits for the next kernel build. It is shared with the Ultra, and the
+    change touches its error paths only.
+- `tools/inplace/cam-lens/` is now the lens power-up kit, on the CX kit, DTB
+  only. Its self-tests passed: the recipe reproduces the CX `boot.img` and
+  `vendor_boot.img`, and only the DTB differs. Both AVB footers verify.
+  - `boot.img` `57406c8001a9f32c33b0e25171a8996daed4dd4f84d41c6a9338d71b69c76882`
+  - `vendor_boot.img` `b18510f38bae75d285347baef80a2beebfd57e246a2a7e7a4c7ce17983bd166a`
+- `lens-diag.sh`:
+  - the sweep holds the lens open (the old sweep power-cycled it at every
+    step, despite its comment);
+  - 20 power cycles close once the lens has settled, testing cause 1 on its
+    own;
+  - up to 6 quick cycles reproduce cause 2 on the CX kernel.
+
+**Staged:** the kit is in `~/cam-lens` on squirtle, hash-checked, with
+`~/cameras-kit/lens-diag.sh`. The 400 kHz kit is still installed, with its
+backups in `/var/backups/ubuntu-gts9u-cam-lens`. Its directory is now
+`~/cam-lens-400k`; the new kit's `rollback.sh` is the same file.
+
+**Pending:**
+- the reboot onto the kit, then `camera-test.sh rear` and `lens-diag.sh`;
+- the owner seeing focus in the Camera app;
+- the driver fix on hardware, with the next kernel build.
+
+**On squirtle, boot `9c0e3019` (the power-up kit):**
+- Installed with the 400 kHz kit's rollback, then the new install, without
+  a reboot between. Both logged in `/var/log/gts9u-cam-lens.log`:
+  `vendor_boot` `b18510f38bae…` and `boot` `57406c8001a9…` were written and
+  read back. The CX images are in `/var/backups/ubuntu-gts9u-cam-lens/`.
+  squirtle has no saved Ubuntu boot set (`/var/lib/gts9u-boot-sets/ubuntu`
+  is absent), so none was updated.
+- `/proc/device-tree/rear-camera-vio-regulator/startup-delay-us` = 10000.
+- `camera-test.sh rear` (`20261108-134534-rear`): the probe-time power-up
+  worked, and there is no `dw9808` or CCI line in the boot's kernel log.
+  libcamera kept the lens, and PipeWire had its node without a restart.
+  `/dev/video20` gave a real frame (mean luma 81, spread 169).
+- PipeWire (pid 4789) and WirePlumber (4791) keep `/dev/v4l-subdev31` open
+  from then on. The lens stays `active`, so the module rail stays on while
+  PipeWire runs.
+- Owner, GNOME Camera:
+  - first open: focus for about a second, then a glitch and a frozen
+    picture;
+  - second open: focused.
+  The first session made five stream configurations in 1.3 s (126.0 to
+  127.3 s), then logged nothing. There was no error anywhere and no
+  software-ISP benchmark line, so the stream stalled within its first
+  couple of seconds. The second session logged one
+  `qcom-camss acb7000.isp: Received wm done for unmapped index` (175.5 s).
+- `lens-diag.sh` (commit `06c988b`) found PipeWire holding the lens. A
+  rebind under an open file would free the driver's state, so it now pauses
+  the owner's PipeWire and the relays for its run, then starts them again
+  and reconnects Bluetooth.
+
+**Still pending:**
+- the `lens-diag.sh` stress run;
+- the freeze, for which the next step is to watch the `csid0` interrupt
+  count while it is frozen;
+- the driver fix, with the next kernel build;
+- whether the always-powered lens costs idle power.
+
 ### The geni UART handler ignored its interrupt while the port suspended (2026-11-08)
 
-The cause of the storm in the previous entry, and its fix.
+The cause of the storm in "Bluetooth lost to a UART IRQ storm in the
+boot-time cycle", and its fix.
 
 Measured on squirtle, still on boot `0824d1f3`:
 - The report's stack ends `_raw_spin_unlock_irq+0x1c (P)` over
