@@ -1,15 +1,18 @@
 # BT UART kit (SM-X710, November 2026)
 
-The kit goes on top of the [CX-vote kit](../ufs-cx/README.md). It fixes the
+The kit goes on top of the [lens power-up kit](../cam-lens/README.md), which
+sits on top of the [CX-vote kit](../ufs-cx/README.md). It fixes the
 Bluetooth UART interrupt storm that disabled IRQ 191 in the boot-time
 `pm_test=platform` cycle ([porting log](../../docs/porting-log.md#the-geni-uart-handler-ignored-its-interrupt-while-the-port-suspended-2026-11-08)):
 
 - **The kernel** is the CX kernel plus
-  `qcom-geni-serial-serve-irq-while-suspending.patch`. It keeps fix6's
-  configuration.
-- **The DTB** is the CX kit's (`290a5395…`), appended to the kernel in
-  `boot`. `vendor_boot` stays the CX kit's image (`be06a00f…`). The kit does
-  not write it.
+  `qcom-geni-serial-serve-irq-while-suspending.patch`, built from 5b08b13.
+  It keeps fix6's configuration. Like the lens kit's kernel (the CX one), it
+  does not carry dcd0343, the `dw9808_vcm` power-down fix.
+- **The DTB** is the lens kit's (`164e1bf8…`): the CX DTB with the rear lens
+  rail's 10 ms `startup-delay-us`. It is appended to the kernel in `boot`.
+  `vendor_boot` stays the lens kit's image (`b18510f3…`), which carries the
+  same DTB. The kit does not write it.
 - **The module tree** comes from this kernel build. The build reuses the CX
   build's module signing key (ID `1ded767e…`). Both kernels therefore load
   both module trees. The installed device package 2.58's `qcom_spss_irq.ko`,
@@ -29,7 +32,8 @@ DEVICE=gts9wifi UBUNTU_WORKDIR=$HOME/ubuntu-gts9u \
 bash tools/inplace/bt-uart/make-kit.sh \
   $HOME/ubuntu-gts9u/out/kernel-gts9wifi-btirq \
   $HOME/ubuntu-gts9u/out/kernel-gts9wifi-cx \
-  $HOME/ubuntu-gts9u/backups/bt-uart-kit
+  $HOME/ubuntu-gts9u/out/dtb-lens-vdelay/sm8550-samsung-gts9wifi.dtb \
+  $HOME/ubuntu-gts9u/backups/bt-uart-lens-kit
 ```
 
 Copy the key with its `.cmd` file and its times (`cp -p`), so that kbuild
@@ -37,8 +41,9 @@ keeps the key. `make-kit.sh` stops in any of these cases:
 
 - a module is not signed with the CX key;
 - the module list differs from the CX build's;
-- the `boot` recipe, given the CX kernel and DTB, does not reproduce the CX
-  kit's `boot.img` (`47f7df27…`) byte for byte.
+- given the CX kernel, the `boot` recipe does not reproduce byte for byte
+  either the CX kit's `boot.img` (`47f7df27…`, with the CX DTB) or the lens
+  kit's (`57406c80…`, with the lens DTB).
 
 ## Install, check, roll back (tablet)
 
@@ -48,28 +53,31 @@ Copy the kit to `~/bt-uart`, then:
 sudo sh ~/bt-uart/install.sh        # then: sudo reboot
 sh ~/bt-uart/verify.sh              # kernel, logs, hci0 state
 sudo sh ~/bt-uart/verify.sh         # also an HCI command round trip
-sudo sh ~/bt-uart/rollback.sh       # back to the CX kit; then: sudo reboot
+sudo sh ~/bt-uart/rollback.sh       # back to the lens kit; then: sudo reboot
 ```
 
 `install.sh` stops before writing anything unless all of these hold:
 
 - the kit matches its checksums;
-- the CX kit is installed: its marker exists, `boot` holds its image
-  (`47f7df27…`) and `vendor_boot` holds its image (`be06a00f…`);
+- the CX kit and the lens kit are installed: both markers exist, `boot`
+  holds the lens kit's image (`57406c80…`) and `vendor_boot` holds the lens
+  kit's image (`b18510f3…`);
 - the running kernel is `7.2.0-rc3-dirty`;
 - root is writable;
 - the battery is at 30 % or more;
 - dpkg is idle and clean;
 - there is 600 MB free.
 
-It saves `boot` and the CX module tree to `/var/backups/ubuntu-gts9u-bt-uart/`
+It saves `boot` and the module tree (the CX kit's, which the lens kit kept) to
+`/var/backups/ubuntu-gts9u-bt-uart/`
 (root-only, hash-checked), swaps the module tree, then writes `boot`
 synchronously and reads it back. If the saved Ubuntu boot set holds a
 `boot.img`, it keeps it in step.
 
-Roll this kit back before the CX kit's own `rollback.sh`. If the tablet does
-not come back, boot TWRP and write `/var/backups/ubuntu-gts9u-bt-uart/boot-cx.img`
-to `boot` from the Ubuntu root. Then run `rollback.sh` on the next boot.
+Roll back in reverse order: this kit first, then the lens kit's
+`rollback.sh`, then the CX kit's. If the tablet does not come back, boot TWRP
+and write `/var/backups/ubuntu-gts9u-bt-uart/boot-lens.img` to `boot` from
+the Ubuntu root. Then run `rollback.sh` on the next boot.
 
 `dpkg -V ubuntu-gts9u-device` reports `qcom_spss_irq.ko` as changed while
 the kit is installed, as it does under the G5 and CX kits. The kit's copy
@@ -111,7 +119,7 @@ They work with `sleep.target` and `suspend.target` masked.
 
 Matrix:
 
-0. Optional, before installing, on the CX kernel:
+0. Optional, before installing, on the lens kit's (CX) kernel:
    `sudo sh ~/bt-uart/suspend-bt.sh platform 5 --no-scan`. This measures the
    old handler:
    - `unhandled` above 0 while the port was suspending confirms the window;

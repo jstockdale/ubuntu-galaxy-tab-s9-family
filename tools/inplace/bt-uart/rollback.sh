@@ -1,6 +1,7 @@
 #!/bin/sh
-# Undo ~/bt-uart/install.sh: back to the CX kit (its boot image and module
-# tree).  Run it before the CX kit's own rollback.sh.
+# Undo ~/bt-uart/install.sh: back to the lens kit (its boot image, and the CX
+# module tree it kept).  Run it before the lens kit's rollback.sh, and that
+# one before the CX kit's.
 #   sudo sh ~/bt-uart/rollback.sh      then reboot
 set -eu
 export LC_ALL=C
@@ -10,7 +11,7 @@ modules=/usr/lib/modules/$release
 backup=/var/backups/ubuntu-gts9u-bt-uart
 log=/var/log/gts9u-bt-uart.log
 size=100663296
-cx_boot=47f7df27477418857bfd087bb44245510c8be5c563d3dcbe2a344778f023df98
+lens_boot=57406c8001a9f32c33b0e25171a8996daed4dd4f84d41c6a9338d71b69c76882
 saved_set=/var/lib/gts9u-boot-sets/ubuntu
 
 say() {
@@ -29,18 +30,18 @@ exec 9> /run/gts9u-bt-uart.lock
 flock -n 9 || { echo 'install.sh or rollback.sh is still running; see /var/log/gts9u-bt-uart.log' >&2; exit 1; }
 tr '\0' '\n' < /proc/device-tree/compatible | grep -qx 'samsung,gts9wifi' || die 'this is not an SM-X710'
 [ -d "$backup" ] || die "no $backup: install.sh never ran (or was rolled back already)"
-[ "$(sha256sum "$backup/boot-cx.img" | cut -d' ' -f1)" = "$cx_boot" ] ||
-	die 'the saved CX boot image is missing or changed; nothing was changed'
+[ "$(sha256sum "$backup/boot-lens.img" | cut -d' ' -f1)" = "$lens_boot" ] ||
+	die 'the saved lens-kit boot image is missing or changed; nothing was changed'
 
 trap '' HUP PIPE INT TERM
-if [ "$(part_sha boot)" != "$cx_boot" ]; then
-	dd if="$backup/boot-cx.img" of=/dev/disk/by-partlabel/boot bs=4M conv=fsync status=none ||
+if [ "$(part_sha boot)" != "$lens_boot" ]; then
+	dd if="$backup/boot-lens.img" of=/dev/disk/by-partlabel/boot bs=4M conv=fsync status=none ||
 		die 'writing boot failed: do NOT reboot; run rollback.sh again, or flash it from TWRP'
 	blockdev --flushbufs /dev/disk/by-partlabel/boot 2>/dev/null || :
-	[ "$(part_sha boot)" = "$cx_boot" ] ||
+	[ "$(part_sha boot)" = "$lens_boot" ] ||
 		die 'boot read-back does not match: do NOT reboot; run rollback.sh again'
 fi
-say 'boot holds the CX kit (read back from the disk)'
+say 'boot holds the lens kit (read back from the disk)'
 if [ -f "$backup/saved-set-boot.img" ]; then
 	cp "$backup/saved-set-boot.img" "$saved_set/boot.img.new"
 	mv "$saved_set/boot.img.new" "$saved_set/boot.img"
@@ -53,4 +54,4 @@ if [ -d "$backup/modules-$release" ]; then
 	say "modules: CX tree restored ($(find "$modules" -name '*.ko*' | wc -l) modules)"
 fi
 mv "$backup" "$backup.rolled-back-$(date +%Y%m%d-%H%M%S)" || die "cannot retire $backup"
-say 'back on the CX kit; reboot now (sudo reboot)'
+say 'back on the lens kit; reboot now (sudo reboot)'

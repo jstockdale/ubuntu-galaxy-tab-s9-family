@@ -35,7 +35,8 @@ cite their procedures and results.  They are not an install or update path.
 | [`powerthermal/`](powerthermal/README.md) | rtkit, the greeter's WirePlumber snippet, charging and thermal checks | the kit's README; [`docs/porting-log.md`](../../docs/porting-log.md) |
 | [`ufs-g5/`](ufs-g5/README.md) | the UFS link at HS-G5 Rate-A (a kernel and its module tree on top of fix7-ice) | [`docs/porting-log.md`](../../docs/porting-log.md#why-the-link-stops-at-hs-g4-2026-11-07) |
 | [`ufs-cx/`](ufs-cx/README.md) | the UFS, USB and PCIe CX votes reaching the rail and dropped for sleep (on top of the G5 kit) | [`docs/porting-log.md`](../../docs/porting-log.md#the-cx-vote-kit-on-top-of-the-g5-kit-2026-11-07) |
-| [`bt-uart/`](bt-uart/README.md) | the geni UART interrupt served while the port suspends, and the Bluetooth suspend test (on top of the CX kit) | [`docs/porting-log.md`](../../docs/porting-log.md#the-geni-uart-handler-ignored-its-interrupt-while-the-port-suspended-2026-11-08) |
+| [`cam-lens/`](cam-lens/README.md) | the rear lens rail's 10 ms power-up delay, a DTB-only change (on top of the CX kit) | [`docs/gts9wifi-cameras.md`](../../docs/gts9wifi-cameras.md) |
+| [`bt-uart/`](bt-uart/README.md) | the geni UART interrupt served while the port suspends, and the Bluetooth suspend test (on top of the lens kit) | [`docs/porting-log.md`](../../docs/porting-log.md#the-geni-uart-handler-ignored-its-interrupt-while-the-port-suspended-2026-11-08) |
 | [`suspendkit/`](suspendkit/README.md) | suspend reliability runs, the ADSP-start sleep lock | [`scripts/diagnostics/suspend/README.md`](../../scripts/diagnostics/suspend/README.md) |
 | [`wifi/`](wifi/README.md) | the Wi-Fi address from EFS, firmware at the first probe, the L1 substates | [`docs/gts9wifi-wifi.md`](../../docs/gts9wifi-wifi.md) |
 

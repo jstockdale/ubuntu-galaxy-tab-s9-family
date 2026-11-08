@@ -8108,8 +8108,8 @@ The build (2026-11-08):
   strings of the out-of-tree modules' BUG/WARN and dynamic-debug entries,
   which are therefore laid out at shifted offsets.
 
-Kit `~/ubuntu-gts9u/backups/bt-uart-kit` (`tools/inplace/bt-uart/`), on top
-of the CX kit:
+First kit, `~/ubuntu-gts9u/backups/bt-uart-kit` (`tools/inplace/bt-uart/`),
+on top of the CX kit (superseded by the repack below):
 - `boot.img` `061befd0…`. The recipe, given the CX kernel and DTB,
   reproduces the CX kit's `boot.img` (`47f7df27…`) byte for byte. In the new
   image every header field is the CX kit's, and the kernel is exactly
@@ -8156,3 +8156,41 @@ Not yet run: everything on the kit, and the CX-kernel baseline. The
 mechanism's last steps are inferred from the code and the one stack trace,
 not yet measured: which status latched, and why 1 boot in 32. Step 0
 measures them.
+
+The kit, repacked for the lens kit (2026-11-08). squirtle now runs the lens
+power-up kit over the CX kit (boot `9c0e3019`), and the first kit's
+`install.sh` refuses there. The owner asked for a repack that keeps the
+lens fix:
+- `boot.img` `39ecad3d…` is the same kernel (Image.gz `bc68d1a4…`, build ID
+  `82260a22…`) with the lens kit's DTB (`164e1bf8…`) appended.
+  - `dtc` shows that this DTB differs from the CX DTB only by
+    `startup-delay-us = <10000>` on `rear_cam_vio`.
+  - Given the CX kernel, the recipe reproduces the CX kit's `boot.img` with
+    the CX DTB, and the lens kit's (`57406c80…`) with the lens DTB.
+  - The new image's header fields are the lens kit's.
+- `vendor_boot` is not written. It stays the lens kit's `b18510f3…`, which
+  carries the same DTB.
+- `install.sh` checks:
+  - the CX and lens markers;
+  - `boot` = `57406c80…` and `vendor_boot` = `b18510f3…`.
+
+  It saves `boot-lens.img`, and `rollback.sh` writes it back. Roll back in
+  reverse order: this kit, then the lens kit, then the CX kit.
+- The kernel is still the one built from 5b08b13. Like the lens kit's
+  kernel (the CX one), it does not carry dcd0343, the built-in `dw9808_vcm`
+  power-down fix. The branch now merges `claude/x710-cx-kit` (5f4a517), so
+  its DTS matches the kit's DTB.
+- Modules tar `deb1b8ef…`. Its content is the first pack's; only one
+  file's time differs, see below.
+- Staged on squirtle at `~/bt-uart`, with checksums verified there. The
+  first kit moved to `~/bt-uart-cx-only`.
+
+A mistake on the host, repaired. During the module comparison, one
+`llvm-objcopy --dump-section` call had no output path, so llvm-objcopy
+rewrote its input in place and dropped the appended signature:
+- It hit `updates/qcom_sp_hlos_heap.ko` in both `out/kernel-gts9wifi-btirq`
+  and `out/kernel-gts9wifi-cx`.
+- Both copies were restored from the kits' module tars, which predate the
+  mistake. Each output tree now matches its kit's tar file for file; the
+  CX one matches the installed `f7d38300…`.
+- Nothing on the tablet was affected.

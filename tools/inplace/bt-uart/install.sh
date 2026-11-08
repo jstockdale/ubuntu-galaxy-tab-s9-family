@@ -1,19 +1,20 @@
 #!/bin/sh
-# BT UART kit, on top of the CX-vote kit: the CX kernel plus the geni UART
-# interrupt patch, with the CX DTB appended, in boot, and its module tree.
-# vendor_boot keeps the CX kit's image.
+# BT UART kit, on top of the lens power-up kit (itself on top of the CX-vote
+# kit): the CX kernel plus the geni UART interrupt patch, with the lens kit's
+# DTB appended, in boot, and its module tree.  vendor_boot keeps the lens
+# kit's image, which carries the same DTB.
 #
 #   sudo sh ~/bt-uart/install.sh      then reboot
-#   sudo sh ~/bt-uart/rollback.sh     back to the CX kit, then reboot
+#   sudo sh ~/bt-uart/rollback.sh     back to the lens kit, then reboot
 #
-# Before anything is written it checks the kit's checksums, that the CX kit
-# is installed (boot and vendor_boot hold its images), that root is
-# writable, the battery and dpkg.  It saves boot (root-only, hash-checked)
-# and the CX module tree, swaps the module tree, then writes boot
-# synchronously and reads it back from the disk.
+# Before anything is written it checks the kit's checksums, that the lens kit
+# is installed over the CX kit (boot and vendor_boot hold the lens kit's
+# images), that root is writable, the battery and dpkg.  It saves boot
+# (root-only, hash-checked) and the CX module tree, swaps the module tree,
+# then writes boot synchronously and reads it back from the disk.
 #
 # If the tablet does not come back: TWRP, then write the saved image back,
-#   dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-bt-uart/boot-cx.img \
+#   dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-bt-uart/boot-lens.img \
 #      of=/dev/block/by-name/boot bs=4M
 # and run rollback.sh on the next boot to put the module tree back.
 set -eu
@@ -24,10 +25,11 @@ release=7.2.0-rc3-dirty
 modules=/usr/lib/modules/$release
 backup=/var/backups/ubuntu-gts9u-bt-uart
 cx_backup=/var/backups/ubuntu-gts9u-ufs-cx
+lens_backup=/var/backups/ubuntu-gts9u-cam-lens
 log=/var/log/gts9u-bt-uart.log
 size=100663296
-cx_boot=47f7df27477418857bfd087bb44245510c8be5c563d3dcbe2a344778f023df98
-cx_vendor_boot=be06a00f699c104cf5974d2bf85cc6e974d0e3b38b72b42329aa7340fd5272cf
+lens_boot=57406c8001a9f32c33b0e25171a8996daed4dd4f84d41c6a9338d71b69c76882
+lens_vendor_boot=b18510f38bae75d285347baef80a2beebfd57e246a2a7e7a4c7ce17983bd166a
 saved_set=/var/lib/gts9u-boot-sets/ubuntu
 
 say() {
@@ -47,13 +49,14 @@ flock -n 9 || { echo 'install.sh or rollback.sh is still running; see /var/log/g
 tr '\0' '\n' < /proc/device-tree/compatible | grep -qx 'samsung,gts9wifi' || die 'this is not an SM-X710'
 [ -e "$backup/complete" ] && die "the BT UART kit is already installed ($backup); run rollback.sh first"
 [ -e "$cx_backup/complete" ] || die "the CX kit is not installed ($cx_backup/complete missing); install it first"
+[ -e "$lens_backup/complete" ] || die "the lens kit is not installed ($lens_backup/complete missing); install it first"
 [ "$(uname -r)" = "$release" ] || die "running kernel release $(uname -r), expected $release"
 (cd "$kit" && sha256sum -c --quiet SHA256SUMS) || die 'the kit does not match its checksums; nothing was changed'
 new_boot=$(awk '$2 == "boot.img" {print $1}' "$kit/SHA256SUMS")
 [ "$(stat -c %s "$kit/boot.img")" = "$size" ] || die 'boot.img is not the partition size'
 [ -f "$kit/modules-$release.tar" ] || die "no modules-$release.tar in the kit"
-[ "$(part_sha boot)" = "$cx_boot" ] || die 'the boot partition does not hold the CX kit'
-[ "$(part_sha vendor_boot)" = "$cx_vendor_boot" ] || die 'vendor_boot does not hold the CX kit'
+[ "$(part_sha boot)" = "$lens_boot" ] || die 'the boot partition does not hold the lens kit'
+[ "$(part_sha vendor_boot)" = "$lens_vendor_boot" ] || die 'vendor_boot does not hold the lens kit'
 findmnt -no OPTIONS / | tr ',' '\n' | grep -qx rw || die 'the root filesystem is not writable'
 cap=$(cat /sys/class/power_supply/*battery*/capacity 2>/dev/null | head -1)
 [ "${cap:-0}" -ge 30 ] || die "battery at ${cap:-unknown} %; charge to 30 % first"
@@ -69,15 +72,16 @@ mkdir -p "$backup"
 chmod 0700 "$backup"
 
 # The running image, saved from the disk and checked.
-dd if=/dev/disk/by-partlabel/boot of="$backup/boot-cx.img" iflag=direct \
+dd if=/dev/disk/by-partlabel/boot of="$backup/boot-lens.img" iflag=direct \
 	bs=4M count=$((size / 4194304)) status=none
-[ "$(sha256sum "$backup/boot-cx.img" | cut -d' ' -f1)" = "$cx_boot" ] ||
-	die 'the saved boot image does not match the CX kit'
+[ "$(sha256sum "$backup/boot-lens.img" | cut -d' ' -f1)" = "$lens_boot" ] ||
+	die 'the saved boot image does not match the lens kit'
 say "boot saved to $backup"
 
 # The module tree first, the flash last, so that a failure before it leaves
-# the CX kit bootable, and rollback.sh can undo any step.  Both module trees
-# are signed with the same key, so either kernel loads either tree.
+# the lens kit bootable, and rollback.sh can undo any step.  The lens kit
+# kept the CX module tree; both trees are signed with the same key, so
+# either kernel loads either tree.
 stage=/usr/lib/modules/.bt-uart-$release
 rm -rf -- "$stage"
 mkdir -p "$stage"

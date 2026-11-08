@@ -1,18 +1,22 @@
 #!/bin/bash
-# Pack the BT UART kit on the build host.  It goes on top of the CX-vote kit:
-# the CX kernel plus qcom-geni-serial-serve-irq-while-suspending.patch, with
-# the CX DTB appended, in boot only.  vendor_boot keeps the CX kit's image.
+# Pack the BT UART kit on the build host.  It goes on top of the lens
+# power-up kit (tools/inplace/cam-lens, itself on top of the CX-vote kit): the
+# CX kernel plus qcom-geni-serial-serve-irq-while-suspending.patch, with the
+# lens kit's DTB appended, in boot only.  vendor_boot keeps the lens kit's
+# image, which carries the same DTB.
 #
-#   bash tools/inplace/bt-uart/make-kit.sh KERNEL_OUT_DIR CX_KERNEL_OUT_DIR KIT_DIR
+#   bash tools/inplace/bt-uart/make-kit.sh KERNEL_OUT_DIR CX_KERNEL_OUT_DIR LENS_DTB KIT_DIR
 #
 # KERNEL_OUT_DIR is build-mainline-kernel.sh's KERNEL_OUT_DIR for a gts9wifi
-# build of this branch, CX_KERNEL_OUT_DIR the CX kit's
-# (~/ubuntu-gts9u/out/kernel-gts9wifi-cx).
+# build with the patch, CX_KERNEL_OUT_DIR the CX kit's
+# (~/ubuntu-gts9u/out/kernel-gts9wifi-cx), LENS_DTB the lens kit's
+# (~/ubuntu-gts9u/out/dtb-lens-vdelay/sm8550-samsung-gts9wifi.dtb).
 #
-# boot.img: the CX kit's recipe.  It is proven first: given the CX kernel and
-# DTB it must reproduce the CX kit's boot.img byte for byte.  The new image is
-# then read back: every header field is the CX kit's, and the kernel is the
-# new Image.gz with the CX DTB appended.
+# boot.img: the CX kit's recipe, which the lens kit uses too.  It is proven
+# first: given the CX kernel, it must reproduce the CX kit's boot.img with the
+# CX DTB and the lens kit's boot.img with the lens DTB, byte for byte.  The
+# new image is then read back: every header field is the lens kit's, and the
+# kernel is the new Image.gz with the lens DTB appended.
 #
 # The build reuses the CX build's module signing key, so the device package
 # 2.58's qcom_spss_irq.ko (signed for the CX kernel) still loads.  Every module
@@ -20,10 +24,11 @@
 # Nothing is flashed.
 set -euo pipefail
 
-[ $# -eq 3 ] || { echo "usage: $0 KERNEL_OUT_DIR CX_KERNEL_OUT_DIR KIT_DIR" >&2; exit 2; }
+[ $# -eq 4 ] || { echo "usage: $0 KERNEL_OUT_DIR CX_KERNEL_OUT_DIR LENS_DTB KIT_DIR" >&2; exit 2; }
 out=$1
 cx=$2
-kit=$3
+dtb=$3
+kit=$4
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
 workdir=${UBUNTU_WORKDIR:-$HOME/ubuntu-gts9u}
@@ -36,6 +41,10 @@ fix6_config=c17980f07ca04461e67dba7e1b3d58f9719d079f65bcc3d45b723fc2c27ccf5a
 cx_dtb=290a5395f64748ec237c93859b098251f31c3f5fee51ee1677caf2d111fedd8c
 cx_image=8b6d58c969b91e7518423d5845f60f39b286aeb4e2539aaf662ef2f50b94ee37
 cx_boot=47f7df27477418857bfd087bb44245510c8be5c563d3dcbe2a344778f023df98
+# The lens kit: the CX DTB plus startup-delay-us = <10000> on rear_cam_vio,
+# and its boot.img (the CX kernel with that DTB appended).
+lens_dtb=164e1bf8a393c642ffc7bd357ce5dfbc608b07ba77070ede8b2052434de42a84
+lens_boot=57406c8001a9f32c33b0e25171a8996daed4dd4f84d41c6a9338d71b69c76882
 # The CX kernel's GNU build ID, as the tablet reports it from /sys/kernel/notes.
 cx_build_id=bfb40d206abbdfcf7f4f3298fd84c96c4c2ea1c6
 # The CX build's module signing certificate (key 1ded767e...).
@@ -45,7 +54,6 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 release=$(cat "$out/kernel.release")
 modules=$out/modules-root/usr/lib/modules/$release
 cx_modules=$cx/modules-root/usr/lib/modules/$release
-dtb=$out/sm8550-samsung-gts9wifi.dtb
 cycles=$repo/scripts/diagnostics/suspend/gts9u-suspend-cycles.sh
 
 for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$dtb" "$out/config" \
@@ -55,7 +63,7 @@ done
 for t in unpack_bootimg python3 sha256sum cmp tar modinfo xxd; do
 	command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }
 done
-[ "$(sha "$dtb")" = "$cx_dtb" ] || { echo "$dtb is not the CX DTB ($cx_dtb)" >&2; exit 1; }
+[ "$(sha "$dtb")" = "$lens_dtb" ] || { echo "$dtb is not the lens kit's DTB ($lens_dtb)" >&2; exit 1; }
 [ "$(sha "$cx/sm8550-samsung-gts9wifi.dtb")" = "$cx_dtb" ] &&
 	[ "$(sha "$cx/Image.gz")" = "$cx_image" ] ||
 	{ echo "$cx is not the CX kernel build" >&2; exit 1; }
@@ -119,7 +127,10 @@ pack_boot() { # IMAGE_GZ DTB OUT
 pack_boot "$cx/Image.gz" "$cx/sm8550-samsung-gts9wifi.dtb" "$tmp/cx-boot.img"
 [ "$(sha "$tmp/cx-boot.img")" = "$cx_boot" ] || {
 	echo 'self-test failed: the recipe does not reproduce the CX kit boot.img' >&2; exit 1; }
-echo "self-test: the recipe reproduces the CX kit's boot.img (${cx_boot:0:12}) byte for byte"
+pack_boot "$cx/Image.gz" "$dtb" "$tmp/lens-boot.img"
+[ "$(sha "$tmp/lens-boot.img")" = "$lens_boot" ] || {
+	echo 'self-test failed: the recipe does not reproduce the lens kit boot.img' >&2; exit 1; }
+echo "self-test: the recipe reproduces the CX kit's boot.img (${cx_boot:0:12}) and the lens kit's (${lens_boot:0:12}) byte for byte"
 
 mkdir -p "$kit"
 pack_boot "$out/Image.gz" "$dtb" "$kit/boot.img"
@@ -128,7 +139,7 @@ unpack() { # IMAGE DIR
 	mkdir -p "$2"
 	unpack_bootimg --boot_img "$1" --out "$2" --format=mkbootimg --null > "$2/args"
 }
-unpack "$tmp/cx-boot.img" "$tmp/a"
+unpack "$tmp/lens-boot.img" "$tmp/a"
 unpack "$kit/boot.img" "$tmp/b"
 mapfile -d '' a < "$tmp/a/args"
 mapfile -d '' b < "$tmp/b/args"
@@ -136,14 +147,14 @@ mapfile -d '' b < "$tmp/b/args"
 for i in "${!a[@]}"; do
 	case "${a[$i]}" in
 	"$tmp"/a/kernel) cmp -s "${b[$i]}" <(cat "$out/Image.gz" "$dtb") ||
-		{ echo 'the boot kernel is not Image.gz plus the CX DTB' >&2; exit 1; } ;;
+		{ echo 'the boot kernel is not Image.gz plus the lens DTB' >&2; exit 1; } ;;
 	"$tmp"/a/*) cmp -s "${a[$i]}" "${b[$i]}" ||
-		{ echo "boot differs from the CX kit in ${a[$((i - 1))]}" >&2; exit 1; } ;;
+		{ echo "boot differs from the lens kit in ${a[$((i - 1))]}" >&2; exit 1; } ;;
 	*) [ "${a[$i]}" = "${b[$i]}" ] ||
-		{ echo "boot differs from the CX kit: ${a[$i]} vs ${b[$i]}" >&2; exit 1; } ;;
+		{ echo "boot differs from the lens kit: ${a[$i]} vs ${b[$i]}" >&2; exit 1; } ;;
 	esac
 done
-echo 'boot: every header field is the CX kit'"'"'s; the kernel is the new Image.gz plus the CX DTB'
+echo 'boot: every header field is the lens kit'"'"'s; the kernel is the new Image.gz plus the lens DTB'
 
 tar --owner=0 --group=0 -C "$out/modules-root" \
 	-cf "$kit/modules-$release.tar" "usr/lib/modules/$release"
