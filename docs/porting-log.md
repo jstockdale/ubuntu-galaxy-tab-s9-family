@@ -7877,3 +7877,10 @@ Recovery without a reboot, three steps, all root:
 The second step is what made a re-probed controller invisible.
 `ubuntu-gts9u-bluetooth-address` is a oneshot with `RemainAfterExit`, so it
 runs only at boot.
+
+After the recovery the owner played audio over Bluetooth and confirmed that
+AAC works and sounds right. That is the X710's first Bluetooth audio test.
+PipeWire, read from the user session:
+- a `bluez_card` in profile `a2dp-sink` for the Beats Studio Pro headphones;
+- `api.bluez5.codec = "aac"`;
+- the sink `RUNNING` at s16le, 2 ch, 48 kHz.
