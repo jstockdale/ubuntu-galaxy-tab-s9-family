@@ -1,0 +1,39 @@
+Subject: [EXPERIMENTAL] scsi: ufs: qcom: run HS-G5 at the 300 MHz OPP on HW ver 5
+
+With an OPP table, ufs_qcom_freq_to_gear_speed() derives the gear from the
+UniPro clock of the target OPP: 403 MHz gives HS-G5 and 300 MHz HS-G4.
+SM8550 (UFS controller HW ver 5) has no 403 MHz UniPro rate; its top OPP is
+300 MHz, so every scale-up put the link at HS-G4 although the controller
+(PARAM0), the PHY (G5 tables, already used at power-up) and a UFS 4.0
+device all support HS-G5.  The HW ver 5 rule that pins Rate-A whenever the
+PHY is set up for G5 then left the link at G4 Rate-A, below even G4 Rate-B.
+
+Qualcomm's Kalama driver, as shipped by Samsung on these tablets, runs
+HS-G5 Rate-A with the UniPro clock at 300 MHz.  Map 300 MHz to G5 on HW
+ver 5; the existing clamp to the negotiated maximum keeps UFS 3.1 devices
+at G4.  Measured before: HS_GEAR4 / HS_RATE_A under load on the SM-X710.
+Not yet validated on hardware.
+
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -2490,6 +2490,7 @@
+ 
+ static u32 ufs_qcom_freq_to_gear_speed(struct ufs_hba *hba, unsigned long freq)
+ {
++	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+ 	u32 gear = UFS_HS_DONT_CHANGE;
+ 	unsigned long unipro_freq;
+ 
+@@ -2502,7 +2503,11 @@
+ 		gear = UFS_HS_G5;
+ 		break;
+ 	case 300000000:
+-		gear = UFS_HS_G4;
++		/*
++		 * HW ver 5 (SM8550) has no 403 MHz UniPro clock: it runs HS-G5
++		 * Rate-A at 300 MHz, as the Kalama downstream driver does.
++		 */
++		gear = host->hw_ver.major == 0x5 ? UFS_HS_G5 : UFS_HS_G4;
+ 		break;
+ 	case 201500000:
+ 		gear = UFS_HS_G3;
