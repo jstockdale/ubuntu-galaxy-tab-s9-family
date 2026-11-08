@@ -7802,3 +7802,18 @@ tablet were updated with their checksums.
 
 Still to run: device package 2.58 and its test matrix, fio as for the G5 kit,
 and the suspend ladder with real s2idle and deep.
+
+Device package 2.58 on squirtle (2026-11-08), measured:
+- `apt-get install --simulate`: 1 upgraded, 0 to remove. Then installed:
+  status `ii`, `dpkg --audit` and `dpkg -V` clean. The package's
+  `qcom_spss_irq.ko` is the kit's copy.
+- apt's note "Download is performed unsandboxed as root" means `_apt` could
+  not read the .deb in the 0750 home directory, so root read it instead.
+- After the reboot (CX kernel `bfb40d20…`):
+  - the panel cycle finished at 41.9 s, `ubuntu-gts9u-usb-runtime-pm` ran at
+    42.5 s, and the interconnect late release ran at 51.0 s;
+  - `power/control` reads `auto`;
+  - with the USB-C cable to the PC carrying SSH over NCM, the controller stays
+    `active`, with 0 ms suspended (test matrix steps 1 and 3);
+  - the only dwc3 line this boot is "HS-PHY not in L2", from the boot-time
+    panel cycle, before the unit ran.
