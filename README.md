@@ -226,12 +226,12 @@ bootloader revision 5. Compared with the SM-X910:
 | Touchscreen | ✅ | STM FTS1BA90A; double tap to wake works, off by default (Tab Companion → Touch) |
 | S Pen | ✅ | Pressure, tilt, hover and the side button, in landscape and portrait; dock detection, charging and BLE pairing. Optionally a tap with the side button held near the screen is a right click. Tab Companion → S Pen → S Pen test checks a pen ([notes](docs/tab-companion.md#the-pen-test)) |
 | Vibration / haptics | ✅ | On-screen keyboard feedback |
-| Keyboard cover | ✅ | EF-DX720 tested, with the posture switch: typing posture keeps laptop mode, detaching gives tablet mode; folded back not yet confirmed |
+| Keyboard cover | ✅ | EF-DX720 tested, with the posture switch: typing posture keeps laptop mode; detaching or folding it back gives tablet mode and the on-screen keyboard |
 | Wi-Fi and Bluetooth | ✅ | WCN6855 / ath11k ([notes](docs/gts9wifi-wifi.md)) |
 | Rotation and light sensor | ✅ | Through the ADSP's sensor core, as on the SM-X910; the light reading follows the room ([notes](docs/gts9wifi-sensors.md)) |
 | RTC and sleep statistics | ✅ | PMIC RTC and `qcom_stats` |
 | Suspend / resume | 🟡 | Off by default until repeated RTC-woken runs pass; the power key locks and blanks the screen instead, and closing the cover locks it |
-| Speakers and microphones | 🟡 | Four CS35L45 amplifiers and the microphones are set up; not yet validated by ear or recording |
+| Speakers and microphones | ✅ | Four CS35L45 amplifiers and the digital microphones: recording and playback confirmed |
 | Cameras | 🟡 | Two HI1337 (rear and front), off unless enabled; not yet tested on hardware ([notes](docs/gts9wifi-cameras.md)) |
 | USB-C charging, host and DisplayPort | ❓ | Not yet assessed |
 | Fingerprint reader | ❌ | Not supported yet; its services are skipped on this model |

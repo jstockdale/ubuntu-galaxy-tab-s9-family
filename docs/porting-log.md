@@ -7042,8 +7042,9 @@ and the first boot came up with the screen and touch working.
   `LightLevel` once a second during these tests: 290, 79, 66, 241, 20, 1 and
   186 lux as the cover came off and on and the tablet was handled, against 0
   at night.
-- Still to test at the tablet: recording and playback, the cover folded
-  back, the on-screen keyboard at the lock screen, and AAC audio.
+- Still to test at the tablet then: recording and playback, the cover
+  folded back, the on-screen keyboard at the lock screen, and AAC audio (see
+  below).
 
 ### The S Pen decode and the side button split (fix5, 2026-11-07)
 
@@ -7085,3 +7086,28 @@ approach with only `boot` changing. The DTB was identical, so vendor_boot stayed
 fix4's. The install checks that the tablet is on fix4 and reads `boot` back;
 `rollback.sh` returns to fix4. It booted with the same 47 of 48 checks, no BTF
 errors, and only `ip_tables` loaded, as on fix4.
+
+### The rest of the day's tests (2026-11-07 afternoon)
+
+- `fix6` adds one rule to the split. A side button already held when the pen
+  comes into range counts as near: judged at the entry height of about 85, it
+  became a stray middle click, then left clicks. The review found it. The
+  kernel that booted carries the fix6 vmlinux build ID, and the checks passed
+  47 of 48 again. The Wi-Fi address from the EFS was the same as on the fix4
+  boot two reboots earlier.
+- Tab Companion 1.3.14 brought the pen test and the split switch. 1.3.15
+  added a Touch page with a double tap to wake switch, because the setting was
+  lost at every reboot (it is off in the kernel, as in Samsung's). Only the
+  desktop user's hardware service applies the pen and touch options, so a
+  second account cannot fight it over the shared driver attributes. On the
+  tablet the switch took over the armed touchscreen as on. Turning it off and
+  on, the driver followed within two seconds, between `sense-off` and
+  `low-power` with the screen off. The owner confirmed double tap to wake
+  again.
+- Audio: an 8 s recording through the digital microphones had a room noise
+  floor of about −66 dBFS and speech at −35 to −40 dBFS, peaking at −15. The
+  owner heard it played back on the speakers. The playback PCM was running
+  and all four CS35L45 amplifiers were enabled.
+- The keyboard cover folded back gives tablet mode: rotation, and the
+  on-screen keyboard at the lock screen.
+- Still to test: the split by hand on fix6, and AAC over Bluetooth.
