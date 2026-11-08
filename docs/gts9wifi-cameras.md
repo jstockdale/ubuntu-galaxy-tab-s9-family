@@ -214,8 +214,86 @@ Not working:
   (`i2c-qcom-cci ac16000.cci: master 0 queue 0 timeout`, then
   `dw9808-vcm 14-000c: register 0x02 write failed: -110`). Opening
   `/dev/v4l-subdev31` then fails with `EINVAL`, and libcamera logs "Lens
-  initialisation failed, lens disabled", so the lens sits at rest.
+  initialisation failed, lens disabled", so the lens sits at rest. The
+  causes are in "Focus: two lens faults" below.
 - The `/dev/video20` relay (the browser path) served only its black splash
   within the script's 5 s read (mean luma 16, spread 0).
 
 Front: not tried yet. Its open risks are listed above.
+
+## Focus: two lens faults (2026-11-08, tests pending)
+
+`lens-diag.sh` and the first lens kit (400 kHz) show two faults, both around
+the lens's power cycles. Neither is the bus speed.
+
+**1. The first write after a power-up times out.** It is the first write of
+`dw9808_init()`, register 0x02: `i2c-qcom-cci ac16000.cci: master 0 queue 0
+timeout`, then `dw9808-vcm 14-000c: register 0x02 write failed: -110`.
+- It hit the probe-time power-up in both boots, at 1 MHz (`0824d1f3`) and at
+  400 kHz (`0a434817`).
+- At 400 kHz, after a rebind, the cold open and three more power-ups worked,
+  and the fourth failed.
+- The failed resume is latched by runtime PM. Every later open returns
+  `EINVAL` without touching the bus, until the driver is rebound, and
+  libcamera disables the lens ("Lens initialisation failed").
+
+The driver waits 1 ms after enabling `rear_cam_vio`. Samsung's CamX data for
+this actuator (`com.samsung.sensormodule.0_hynix_hi1337.bin`, X710XXS5CYG1;
+the SM-X910's is the same word for word) waits 10 ms. Its power records are
+(type, value, delay) triples:
+
+| sequence | record | meaning |
+|---|---|---|
+| power-up | `13, 1, 1` | `RCAM_LDO_EN` high, 1 ms |
+| power-up | `4, 1800000, 10` | VIO 1.8 V, 10 ms |
+| power-down | `4, 0, 1` | VIO off, 1 ms |
+| power-down | `13, 0, 1` | `RCAM_LDO_EN` low, 1 ms |
+
+The type numbers come from the sensor's and the EEPROM's records in the same
+file: 4 is 1.8 V, 3 is VDIG 1.1 V, 0 is MCLK 19.2 MHz, and 13 is the GPIO. The
+delays are CamX's milliseconds.
+
+**2. A park that finds the lens settling leaves it "active" and unpowered.**
+`dw9808_suspend()` walks the lens back, then switches the rail off and
+returns the walk's error. Its status poll gives up after 10 ms with `-EBUSY`,
+and for `-EBUSY` runtime PM puts the device back to `RPM_ACTIVE` without
+latching an error. The next open then skips `dw9808_resume()` and talks to a
+lens with no power.
+
+The 1 MHz sweep shows the whole chain. Each of its steps was a separate
+`v4l2-ctl` open, so a separate power cycle:
+- The step to 0 jumped the lens 512 codes and closed at once.
+- The step to 256's move found the lens "busy" (`EBUSY`).
+- Its park then timed out 36 times on CCI1, the standby write failed, and
+  `regulator_disable()` warned "unbalanced disables for rear_cam_vio" from
+  `dw9808_suspend`.
+
+The warning means the 256 step's open never ran `dw9808_resume()`. The device
+must have stayed active after the step to 0's park, and that park's status
+poll is the only source of `-EBUSY`. That is what looked like a stuck bus.
+
+**Ruled out:**
+- The lens bus speed. 400 kHz, stock's `i2c-freq-mode 1`, failed the same
+  way; the bus is back at the dtsi's 1 MHz.
+- The X710's actuator data against the X910's. They differ only in the module
+  id and the signature.
+- The pad settings. Stock gives CCI1 master 0 4 mA and a weak pull-up, and
+  the dtsi gives 2 mA and the strong 2.2 kOhm pull-up. The Ultra focuses with
+  the dtsi's pads, on the same lens, rail, 1 MHz bus and driver, so the pads
+  stay.
+
+**The fixes:**
+- Fault 1, test pending. `rear_cam_vio` gets `startup-delay-us = <10000>`,
+  shipped as the [lens power-up kit](../tools/inplace/cam-lens/README.md)
+  (DTB `164e1bf8…`). The HI1337 holds the same rail and gains 10 ms at
+  power-up.
+- Fault 2, built, not yet on a tablet. `dw9808_vcm` now returns 0 from its
+  suspend once the rail is off, warning "lens not parked before power-down".
+  A failed open also clears the latched error, so the next open powers up
+  again. The driver is built in (`CONFIG_VIDEO_DW9808_VCM=y`), so this needs
+  the next kernel build. It changes the Ultra's driver too, in error paths
+  only.
+- `lens-diag.sh` now holds the lens open for its sweep. It then runs 20 power
+  cycles that close only once the lens has settled, which tests fault 1 on
+  its own, and up to 6 quick cycles, which reproduce fault 2 on the CX
+  kernel.

@@ -12,7 +12,16 @@
 #   1. open the lens with the rail cold, as the first open after enabling did
 #   2. if that fails again: open it while the sensor streams, so the shared
 #      rear rail has been up for seconds
-#   3. whichever open works: sweep focus_absolute and read the status register
+#   3. whichever open works: sweep focus_absolute with the lens held open, so
+#      it stays powered between steps
+#   4. 20 power cycles: each open powers the lens up and moves it, and the
+#      close comes 0.2 s later, once it has settled; a failure is rebound and
+#      counted.  This is the power-up on its own.
+#   5. up to 6 quick cycles, closed right after the move.  Before the
+#      dw9808_vcm suspend fix the first may already fail: a park that finds
+#      the lens still settling returns -EBUSY after powering it down, the
+#      device stays "active", and the next open talks to an unpowered lens
+#      (CCI timeouts, then "unbalanced disables for rear_cam_vio").
 #
 # Everything lands in /var/log/gts9u-cameras-test/TIME-lens/ (group adm).
 set -u
@@ -36,6 +45,10 @@ rebind() {
 	echo "$lens" > "$drv/bind" || log "  bind failed"
 	sleep 1
 }
+since() { # MARK FILE: the kernel log after MARK, and its lens and bus lines
+	dmesg | tail -n +"$(($1 + 1))" > "$2"
+	grep -iE 'dw9808|cci|timeout|i2c' "$2" | sed 's/^/  /' | tee -a "$out/summary.txt"
+}
 try_open() { # label
 	mark=$(dmesg | wc -l)
 	sd=$(subdev)
@@ -48,8 +61,7 @@ try_open() { # label
 		ok=0
 	fi
 	state
-	dmesg | tail -n +"$((mark + 1))" > "$out/$1-dmesg.txt"
-	grep -iE 'dw9808|cci|timeout|i2c' "$out/$1-dmesg.txt" | sed 's/^/  /' | tee -a "$out/summary.txt"
+	since "$mark" "$out/$1-dmesg.txt"
 	return $((1 - ok))
 }
 
@@ -70,18 +82,68 @@ if try_open cold; then good=cold; else
 	wait "$cam_pid" 2>/dev/null
 fi
 
-# 3: the lens answering: a focus sweep, with the open held by a reader.
+# 3: the lens answering: a focus sweep, held open by fd 3 so that the lens
+# stays powered from step to step.
 if [ -n "$good" ]; then
 	sd=$(subdev)
-	log "sweep on $sd (opened $good):"
-	for pos in 0 256 512 768 1023 512; do
-		if v4l2-ctl -d "$sd" --set-ctrl focus_absolute=$pos 2>> "$out/sweep.txt"; then
-			log "  focus_absolute=$pos ok"
-		else
-			log "  focus_absolute=$pos FAILED"
+	mark=$(dmesg | wc -l)
+	log "sweep on $sd (opened $good), held open:"
+	(
+		command exec 3<> "$sd" || { log "  hold-open FAILED"; exit 1; }
+		for pos in 0 256 512 768 1023 512; do
+			if v4l2-ctl -d "$sd" --set-ctrl focus_absolute=$pos 2>> "$out/sweep.txt"; then
+				log "  focus_absolute=$pos ok"
+			else
+				log "  focus_absolute=$pos FAILED"
+			fi
+			sleep 0.3
+		done
+	)
+	state
+	since "$mark" "$out/sweep-dmesg.txt"
+
+	# 4: power cycles.  fd 3 opens the lens (power-up, init, walk to the
+	# last position), the set jumps it, and fd 3 closes it 0.2 s later
+	# (walk back, power-down).
+	mark=$(dmesg | wc -l)
+	log "20 power cycles, closed once settled:"
+	fails=0
+	i=1
+	while [ "$i" -le 20 ]; do
+		pos=$((i % 2 ? 800 : 200))
+		if ! (exec 3<> "$sd" && v4l2-ctl -d "$sd" --set-ctrl focus_absolute=$pos &&
+			sleep 0.2) 2>> "$out/cycles.txt"; then
+			fails=$((fails + 1))
+			log "  cycle $i (focus_absolute=$pos) FAILED: $(tail -n 1 "$out/cycles.txt")"
+			rebind
+			sd=$(subdev)
 		fi
 		sleep 0.3
+		i=$((i + 1))
 	done
+	log "  $((20 - fails)) of 20 power cycles ok"
+	state
+	since "$mark" "$out/cycles-dmesg.txt"
+
+	# 5: quick cycles: v4l2-ctl closes right after the jump.
+	mark=$(dmesg | wc -l)
+	log "quick cycles, closed right after the move (stops at the first failure):"
+	i=1
+	while [ "$i" -le 6 ]; do
+		pos=$((i % 2 ? 800 : 200))
+		if ! v4l2-ctl -d "$sd" --set-ctrl focus_absolute=$pos 2>> "$out/quick.txt"; then
+			log "  quick cycle $i (focus_absolute=$pos) FAILED: $(tail -n 1 "$out/quick.txt")"
+			break
+		fi
+		log "  quick cycle $i ok"
+		sleep 0.3
+		i=$((i + 1))
+	done
+	sleep 2
+	state
+	since "$mark" "$out/quick-dmesg.txt"
+	grep -c 'unbalanced disables for rear_cam_vio' "$out/quick-dmesg.txt" |
+		sed 's/^/  unbalanced rear_cam_vio disables: /' | tee -a "$out/summary.txt"
 fi
 log "result: ${good:-no open worked}"
 log "results: $out"
