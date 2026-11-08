@@ -122,7 +122,16 @@ static const struct v4l2_ctrl_ops dw9808_control_ops = {
 static int dw9808_open(struct v4l2_subdev *subdev,
 			struct v4l2_subdev_fh *fh)
 {
-	return pm_runtime_resume_and_get(subdev->dev);
+	int ret = pm_runtime_resume_and_get(subdev->dev);
+
+	/*
+	 * A failed power-up has already switched the rail off.  Clear the
+	 * latched runtime-PM error so that the next open powers up again
+	 * instead of failing with -EINVAL until the driver is rebound.
+	 */
+	if (ret)
+		pm_runtime_set_suspended(subdev->dev);
+	return ret;
 }
 
 static int dw9808_close(struct v4l2_subdev *subdev,
@@ -157,7 +166,15 @@ static int dw9808_suspend(struct device *dev)
 	if (dw9808_write(client, DW9808_REG_CONTROL, 0x01) && !ret)
 		ret = -EIO;
 	regulator_disable(dw9808->vcc);
-	return ret;
+	/*
+	 * The rail is off whatever the park did.  An error would leave the
+	 * device RPM_ACTIVE (-EBUSY, from a lens still settling, always does),
+	 * so the next open would skip dw9808_resume(), talk to an unpowered
+	 * lens and disable the rail a second time.
+	 */
+	if (ret)
+		dev_warn(dev, "lens not parked before power-down: %d\n", ret);
+	return 0;
 }
 
 static int dw9808_resume(struct device *dev)
