@@ -7756,3 +7756,49 @@ Kit `~/ubuntu-gts9u/backups/ufs-cx-kit`:
 - The device package.
 
 Not flashed. It goes on the tablet after the G5 kit, as the owner ordered.
+
+On the tablet (squirtle, 2026-11-08), measured:
+- Host key checked against the stored key. Before the install it ran the G5
+  kernel (build ID `c0db6fe5…`).
+- `install.sh` saved both partitions and the G5 module tree, then wrote
+  `vendor_boot` (`be06a00f…`) and `boot` (`47f7df27…`) and read both back. The
+  tablet has no saved Ubuntu boot set (`/var/lib/gts9u-boot-sets`), so there
+  was none to update.
+- After the reboot it ran the CX kernel (build ID `bfb40d20…`). The panel
+  cycle and the interconnect late release both succeeded.
+- `verify.sh` (non-root): root rw; no UFS, module or vote errors; HS-G5
+  Rate-A under load.
+- `verify.sh` (root): `ufs_phy_gdsc`, `ufs_mem_phy_gdsc`, `usb30_prim_gdsc`
+  and `pcie_0_gdsc` are CX subdomains. Under load:
+  - the AXI and UniPro clocks at 300 MHz and the ICE clock at 402,999,902 Hz;
+  - `1d84000.ufshc` and `ufs_phy_gdsc` at 256;
+  - `a600000.usb` and `usb30_prim_gdsc` at 256 (USB never runtime-suspends);
+  - `cx` `perf_state` 256.
+- UFS devfreq kept scaling across all three OPPs (68 transitions by then).
+- `suspend-votes.sh`, one `pm_test=devices` cycle (mem_sleep `deep`):
+  - suspend: `a600000.usb` state 0 at 693.588 s, then `1d84000.ufshc` OPP
+    NULL at 693.605 s;
+  - resume: the UFS's same OPP again at 698.809 s, then USB state 256 at
+    698.946 s;
+  - no vote errors in the kernel log.
+
+  The raw probe hits are in
+  `~/ubuntu-gts9u/backups/ufs-cx-results-20261108/`.
+- Read speed: 1 GiB `O_DIRECT` `dd` runs at 2.5–3.2 GB/s on
+  `~/usertests/ufs-stress-read.bin`, at or above the G5 kit's 2.5–2.7 GB/s.
+  `verify.sh`'s default `ufs-test.bin` now reads 420 MB/s: the G5 stress run
+  spent 30 minutes of 4 KB random writes in it. That is fragmentation, not the
+  kernel (porting log, "Storage at 300 MB/s"). Rewrite it sequentially before
+  using it as a benchmark again.
+
+Two of the kit's checks needed fixes on the way, both in the checks, not in
+the kernel:
+- `verify.sh` wanted exactly 403000000 Hz for the ICE clock.
+- `suspend-votes.sh` matched kprobe lines by group (`cxvote/opp`); trace lines
+  carry only the event name (`opp:`).
+
+Both are fixed (999e6f2, 158fb55), and the kit's copies on the host and the
+tablet were updated with their checksums.
+
+Still to run: device package 2.58 and its test matrix, fio as for the G5 kit,
+and the suspend ladder with real s2idle and deep.
