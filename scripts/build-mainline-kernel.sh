@@ -66,6 +66,14 @@ fi
 # Slow, so it is opt-in, but it is what a release build and any source-level
 # comparison require.
 if [ "${KERNEL_CLEAN:-0}" = 1 ] && [ -d "$build_dir" ]; then
+	# The old key may be the only one a flashed kernel trusts.
+	if [ -f "$build_dir/certs/signing_key.pem" ]; then
+		bash "$repo/scripts/kernel-key-registry.sh" add "$build_dir" \
+			"archived before KERNEL_CLEAN" || {
+			echo "not discarding $build_dir: its signing key is not archived" >&2
+			exit 1
+		}
+	fi
 	echo "KERNEL_CLEAN=1: discarding $build_dir for a from-scratch build"
 	rm -rf -- "$build_dir"
 fi
@@ -1205,6 +1213,12 @@ install -m 0644 "$build_dir/.config" "$out_dir/config"
 sha256sum "$out_dir/Image.gz" \
 	"$out_dir/$DEVICE_DTS.dtb" \
 	"$out_dir/config" > "$out_dir/SHA256SUMS"
+
+# The kernel trusts only this build's module key, and the next clean build
+# deletes it; without it, no module can ever be added to this kernel.
+bash "$repo/scripts/kernel-key-registry.sh" add "$build_dir" \
+	"$DEVICE kernel built from $(git -c safe.directory="$repo" -C "$repo" \
+		describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)"
 
 cat > "$out_dir/fingerprint.layers" <<EOF
 panel_fod=$fingerprint_panel
