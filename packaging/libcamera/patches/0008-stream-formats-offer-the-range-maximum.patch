@@ -1,0 +1,21 @@
+diff --git a/src/libcamera/stream.cpp b/src/libcamera/stream.cpp
+--- a/src/libcamera/stream.cpp
++++ b/src/libcamera/stream.cpp
+@@ -222,6 +222,17 @@
+ 		for (const Size &size : rangeDiscreteSizes)
+ 			if (limit.contains(size))
+ 				sizes.push_back(size);
++
++		/*
++		 * The list above holds common display sizes, so a camera's
++		 * full output rarely appears in it: a 4128x3096 sensor through
++		 * the software ISP produces up to 4120x3096, and applications
++		 * that pick from this list never get more than 3200x2400 at
++		 * 4:3.  The range's maximum is a size the pipeline produces;
++		 * offer it too.
++		 */
++		if (std::find(sizes.begin(), sizes.end(), limit.max) == sizes.end())
++			sizes.push_back(limit.max);
+ 	}
+ 
+ 	std::sort(sizes.begin(), sizes.end());
