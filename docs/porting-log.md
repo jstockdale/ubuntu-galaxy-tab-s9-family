@@ -7151,3 +7151,82 @@ Still open:
 - HS-G5, which the 4200 MB/s figures assume, is not negotiated.
 - The SM-X910 has the same SoC and driver, so it very likely has the same
   ceiling; its device tree is unchanged.
+
+### Why the link stops at HS-G4 (2026-11-07)
+
+The device, the controller and the PHY can all run HS-G5. One mapping in
+mainline's ufs-qcom keeps the link at G4.
+
+Measured on the SM-X710 (fix7-ice images): during a 2 GiB `O_DIRECT` read,
+`power_info` shows `HS_GEAR4`, `HS_RATE_A` and 2 lanes, with devfreq at its
+300 MHz top OPP. At idle the link drops to G1 or G2 (75 and 150 MHz).
+
+- The device is a Samsung KLUEG4RHHD-B0G1, UFS 4.0
+  (`specification_version` 0x0400). UFS 4.0 defines HS-G5. Its maximum
+  RX gear was not read directly, because that needs root or debug output; the
+  test kernel below shows it.
+- Rate-A is the evidence for the host and the PHY. The device tree sets no
+  `limit-hs-gear` or `limit-gear-rate`, so the default rate is B. ufs-qcom
+  switches to Rate-A only on a HW-version-5 controller (SM8550) whose PHY was
+  powered up for G5. So PARAM0 reports G5, and the PHY carries the G5 tables.
+- Mainline's SM8550 G5 serdes, TX, RX and PCS settings match Samsung's
+  Kalama `phy_cal_table_rate_A_g5` value for value once the second-lane table
+  is applied. The regulator loads (188 and 18.3 mA) match too. The two local
+  qmp-ufs patches do not depend on the gear. The interconnect table already
+  has the G5 x2 vote.
+- The cap is in `ufs_qcom_freq_to_gear_speed()`. With an OPP table, it picks
+  the gear from the OPP's UniPro clock: 403 MHz gives G5 and 300 MHz gives G4.
+  SM8550's UniPro clock stops at 300 MHz, in mainline `gcc-sm8550.c` and in
+  Samsung's `gcc-kalama.c`, so its top OPP is 300 MHz. SM8650's is 403 MHz.
+  On SM8550, every scale-up therefore sets G4, whatever the link negotiated.
+  Turning `clkscale_enable` off pins the 300 MHz OPP, which is still G4.
+- Samsung's Kalama kernel runs HS-G5 Rate-A at the same 300 MHz:
+  `ufs_qcom_parse_limits()` selects Rate-A and the G5 PHY mode for a HW v5
+  host with a UFS 4.0 device, and `freq-table-hz` ends at 300 MHz. The
+  upstream series that added the mapping (January 2025, "Support
+  Multi-frequency scale for UFS") was tested on SM8550 only with UFS 3.1,
+  which stops at G4 anyway.
+- Rate-A also costs throughput at G4. G4 Rate-A carries 9.98 Gbit/s per lane,
+  against 11.66 Gbit/s for G4 Rate-B. 1.84 GB/s is about 92 % of G4 Rate-A
+  x2 after 8b/10b coding (2.0 GB/s).
+
+The proposed fix is not built or flashed yet. It makes 300 MHz map to G5 on
+HW v5 hosts:
+
+```c
+	case 300000000:
+		/* HW ver 5 (SM8550) has no 403 MHz UniPro clock; it runs HS-G5 here */
+		gear = host->hw_ver.major == 0x5 ? UFS_HS_G5 : UFS_HS_G4;
+		break;
+```
+
+The existing `min_t()` against the negotiated maximum keeps a UFS 3.1 device
+at G4. The UFS driver is built in, so the change needs a new kernel image,
+which must ship with the module tree from the same build. HS-G5 Rate-A runs at
+19.97 Gbit/s per lane. UFS 4.0's 4200 MB/s figure assumes Rate-B
+(23.3 Gbit/s), so this part may stop nearer 3.5 GB/s; the test will measure
+it.
+
+Risks:
+- Link errors at G5. Samsung's shipping kernel uses the same PHY tables on
+  this board, but G5 has not been run on mainline here. Mainline also adds a
+  3.5 dB TX de-emphasis at G5 for Samsung devices, which Samsung's Kalama
+  driver does not set.
+- Resume. The PHY already starts with the G5 tables today, so calibration is
+  unchanged. Only the operating gear changes.
+- More PHY power and heat while busy. Idle still drops to G1 or G2.
+
+Tests:
+1. Under load, `power_info` shows `HS_GEAR5` / `HS_RATE_A`.
+2. No UIC or data-link errors in `dmesg` or in
+   `/sys/kernel/debug/ufshcd/1d84000.ufshc/stats` (root).
+3. fio on a freshly rewritten 2 GiB file, compared with 1844 and 1595 MB/s.
+4. 30 minutes of mixed fio.
+5. 20 suspend and resume cycles, checking the gear and errors after each.
+6. Idle drain compared with fix7-ice, and a reboot.
+
+Rollback is the fix7-ice boot image with its module set. If G5 is unreliable,
+there is a DTB-only fallback that needs no kernel change: `limit-hs-gear =
+<4>` starts the PHY at G4, so the Rate-A rule does not apply and the link runs
+G4 Rate-B, about 17 % more line rate than now. The SM-X910 has the same SoC
+and driver, so the same cap applies there.
