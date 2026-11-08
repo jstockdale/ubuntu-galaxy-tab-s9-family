@@ -8014,3 +8014,19 @@ backups in `/var/backups/ubuntu-gts9u-cam-lens`. Its directory is now
   count while it is frozen;
 - the driver fix, with the next kernel build;
 - whether the always-powered lens costs idle power.
+
+**`lens-diag.sh`, boot `9c0e3019` (`20261108-141752-lens`):**
+- the cold open, the held-open sweep to 1023, and 20 settled power cycles
+  (closed 0.2 s after the move): all OK;
+- quick cycle 1 (closed right after a 600-code jump): OK;
+- quick cycle 2's power-up: `master 0 queue 0 timeout`, then `register 0x02
+  write failed: -110` and `ETIMEDOUT` at the open, then `rpm=error`. No
+  unbalanced disable.
+- After the test the lens stayed latched in `error`, so PipeWire's libcamera
+  could not reopen it.
+
+Fault 1 is therefore narrower than the power-up delay. A clean power-up
+works with 10 ms. A power-up after a power-down taken mid-move can still
+fail. The stock data decoded so far shows no park or settle sequence to
+compare against (the actuator block has 13 init records and the power
+records, plus unidentified tuning words such as 7500 and 10000).

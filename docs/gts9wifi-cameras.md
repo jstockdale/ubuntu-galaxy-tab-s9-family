@@ -326,3 +326,23 @@ lens; that is a hypothesis. On the Ultra the relay needed a 2 s guard against
 the same kind of churn (porting log, session 32). The frame-done interrupt is
 `acb7000.isp_msm_csid0`. If its count keeps rising during a freeze, frames
 still arrive and userspace stalled. If it stops, CAMSS stalled.
+
+`lens-diag.sh` on the same boot (`20261108-141752-lens`; it paused PipeWire
+and the relays, then started them again):
+- the cold open: OK;
+- the sweep with the lens held open, 0, 256, 512, 768, 1023 and 512: all OK;
+- 20 power cycles, each closed 0.2 s after its move: 20 of 20 OK;
+- quick cycles, each closed right after its move: cycle 1 was OK. Cycle 2's
+  power-up failed the old way, with a CCI timeout, then `register 0x02 write
+  failed: -110` and the open timing out. There was no "unbalanced disables",
+  so cycle 1's park did not hit fault 2.
+
+So the 10 ms holds for a power-up after a clean power-down. It does not
+cover a power-up that follows a power-down taken while the lens was still
+moving. Every failed sweep step before the kit had that history too: the
+old sweep closed right after each jump. Why the move matters is not known.
+In normal use PipeWire keeps the lens open, so this only arises when
+PipeWire stops or restarts. The failed resume is latched (`error`), so
+PipeWire's libcamera could not reopen the lens after the test: focus is off
+until the next boot, or until the driver fix lets the next open power up
+again.
