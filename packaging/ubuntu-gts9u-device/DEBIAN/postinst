@@ -24,7 +24,7 @@ ubuntu-gts9u-adsp-start-inhibit.service:ubuntu-gts9u-adsp-boot.service
 ubuntu-gts9u-speaker-cal.service:multi-user.target
 ubuntu-gts9u-sensor-registry.service:multi-user.target
 ubuntu-gts9u-powerkey.service:multi-user.target
-ubuntu-gts9u-bluetooth-address.service:multi-user.target
+ubuntu-gts9u-bt-uart-recover.service:multi-user.target
 ubuntu-gts9u-wlan-address.service:multi-user.target
 gts9u-pci-rescan.service:multi-user.target
 ubuntu-gts9u-sensors-resume.service:multi-user.target
@@ -59,6 +59,13 @@ case "$1" in
 			release=${release%%/*}
 			depmod -a "$release"
 		done
+		# Up to 2.58 the Bluetooth address unit was enabled in multi-user.target.
+		# udev starts it for every hci0 now (70-gts9u-bluetooth-address.rules),
+		# and that link would run it a second time at boot.
+		if command -v deb-systemd-helper >/dev/null 2>&1; then
+			deb-systemd-helper purge ubuntu-gts9u-bluetooth-address.service >/dev/null 2>&1 || true
+		fi
+		rm -f /etc/systemd/system/multi-user.target.wants/ubuntu-gts9u-bluetooth-address.service
 		for pair in $UNITS; do
 			unit=${pair%%:*}
 			# deb-systemd-helper is not guaranteed inside a foreign-arch
@@ -84,6 +91,12 @@ case "$1" in
 			systemctl restart ubuntu-gts9u-suspend-mode.service || true
 			systemctl try-restart ubuntu-gts9u-powerkey.service || true
 			systemctl restart ubuntu-gts9u-cpu-boost.service || true
+			# 2.58's address unit stayed active after its run (RemainAfterExit),
+			# which would make udev's start for the next hci0 a no-op until a
+			# reboot.  The stop only resets that: hci0 keeps its address.
+			if [ "$(systemctl is-active ubuntu-gts9u-bluetooth-address.service 2>/dev/null)" = active ]; then
+				systemctl stop ubuntu-gts9u-bluetooth-address.service || true
+			fi
 			systemctl reset-failed \
 				ubuntu-gts9u-desktop-user.service \
 				ubuntu-gts9u-desktop-user.path \

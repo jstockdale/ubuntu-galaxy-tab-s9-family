@@ -308,6 +308,11 @@ GTS9U_EXTRA_CMDLINE='…' bash scripts/build-android-v4-bundle.sh
 - The USB controller goes through that cycle runtime-active, as it always has.
   `ubuntu-gts9u-usb-runtime-pm.service` (device package 2.58) allows its
   runtime PM only after the cycle.
+- The cycle's suspend can leave the SM-X710's Bluetooth UART with its IRQ
+  disabled (1 of 32 logged boots). `ubuntu-gts9u-bt-uart-recover.service`
+  (device package 2.59) checks for that after the cycle, and its
+  system-sleep hook after every resume. If it finds it, it rebinds the UART
+  once.
 - If a DisplayPort dock is already connected, its HPD must stay **deferred**
   until that recovery finishes. An early HPD also blocked the internal DSI in
   the baseline tests.

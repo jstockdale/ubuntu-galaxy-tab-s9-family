@@ -7885,6 +7885,191 @@ PipeWire, read from the user session:
 - `api.bluez5.codec = "aac"`;
 - the sink `RUNNING` at s16le, 2 ch, 48 kHz.
 
+### Bluetooth bring-up without a human (device 2.59, 2026-11-08)
+
+The recovery above took three root steps. Device package 2.59 does both
+halves of it by itself. Not yet tested on hardware.
+
+**Every new `hci0` gets its native address.** Up to 2.58,
+`ubuntu-gts9u-bluetooth-address.service` was a oneshot with
+`RemainAfterExit=yes`, enabled in `multi-user.target`. It ran once per boot,
+and any later start was a no-op.
+- `70-gts9u-bluetooth-address.rules` now starts it from udev on every `add`
+  of `hci0` (`SYSTEMD_WANTS`). systemd applies that once per plug of the
+  device unit, so once per controller and never on a `change` event.
+- The unit has no `RemainAfterExit`. It is inactive after each run, so the
+  next `hci0` starts it again.
+- It has no `[Install]` section, because `multi-user.target` would run it a
+  second time at boot. postinst removes 2.58's link
+  (`deb-systemd-helper purge` and the `multi-user.target.wants` symlink).
+- On a live upgrade postinst also stops the unit if it reads `active`.
+  Otherwise 2.58's `RemainAfterExit` state would make udev's next start a
+  no-op until a reboot. The stop runs nothing, and the controller keeps its
+  address.
+- The helper is unchanged: it runs after `bluetooth.service`, feeds `btmgmt`
+  an empty pipe and bounds every call (development notes, "two `btmgmt`
+  traps").
+- At boot, `bluetoothd` is now started by `bluetooth.target` when `hci0`
+  appears, as on stock Ubuntu (systemd's `99-systemd.rules`). Until now it
+  started earlier, because this unit's `Wants=` pulled it in at
+  `multi-user.target`.
+- The SM-X910 gets the same change. There it only moves the boot run to the
+  `hci0` add. Not tested on the SM-X910.
+
+**The UART is rebound when its IRQ is gone.**
+`ubuntu-gts9u-bt-uart-recover.service` runs the helper of the same name, on
+the SM-X710 only (`ConditionFirmware`).
+- It runs at boot, after `ubuntu-gts9u-panel-coldboot-recover`,
+  `bluetooth.service` and the address unit. These are ordering-only
+  dependencies, as in `ubuntu-gts9u-icc-late-release`.
+- It runs again after every resume. The system-sleep hook
+  `ubuntu-gts9u-bt-uart-recover` starts it with `--no-block`, so the resume
+  is not held up. `Before=sleep.target` makes a suspend that is requested
+  during a rebind wait for it.
+- The boot cycle writes `/sys/power/state` itself, so no sleep hook runs for
+  it. That is why the boot needs its own run.
+
+It treats two conditions as a fault:
+1. The incident's. The kernel log has `Disabling IRQ #N`, where N is the IRQ
+   whose `/sys/kernel/irq/N/actions` reads `qcom_geni_serial_uart1`, and the
+   line comes after the UART's last probe report. Every bind prints
+   `898000.serial: ttyHS1 at MMIO 0x898000 (irq = N, …)`, so a disable from
+   before a rebind does not count, whether the rebind was by hand or by this
+   unit. N is read at run time: it was 188 in early bring-up and is 191 on
+   the CX kernel.
+2. `hci0` is UP, and three Read Local Version commands, 5 s apart, all time
+   out (`hciconfig hci0 version` waits 1 s). A controller that is DOWN or
+   absent is not asked. An error other than a timeout is not a fault.
+
+On a fault it:
+- unbinds and binds `898000.serial` on `qcom_geni_serial`, once;
+- waits up to 30 s for the new `hci0`, then up to 45 s for its address;
+- if udev's start of the address unit has not restored the address by then,
+  starts that unit itself and waits once more;
+- runs the diagnosis again, and logs `recovered` or `failed` in the journal
+  and the kernel log.
+
+Bounds:
+- One rebind per run and three per boot. A rebind that does not help is
+  logged, not retried in that run.
+- With `/etc/ubuntu-gts9u/bt-uart-recover-off` present, a fault is logged and
+  left alone.
+- A loop breaker covers a crash or hang inside the unbind and bind. A marker
+  in `/var/lib/ubuntu-gts9u` exists only for those seconds. A boot that finds
+  one from another boot rebinds nothing for that whole boot.
+
+`ubuntu-gts9u-bt-uart-recover check` shows what a run would do and changes
+nothing. `status` shows the UART, the IRQ, `hci0` and this boot's record
+(`/run/ubuntu-gts9u/bt-uart-recover`). Without root the kernel log is
+unreadable, so the probe is the only test in that case.
+
+This is a userspace safety net. The race itself is in `qcom_geni_serial` and
+needs a kernel fix, which is separate work. Once that fix is in, this unit
+should only ever log `healthy`.
+
+Checks, all offline:
+- `tests/test_bt_uart_recover.py` (new, 34 tests) runs the helper against a
+  simulated sysfs, kernel log and `hciconfig`. The stubbed `sleep` plays the
+  kernel's side of a rebind. The tests also cover the units, the udev rule,
+  the sleep hook and postinst.
+- Mutation check: ten mutants of the helper each fail at least one test. The
+  mutants are: no probe-report reset, one probe try, no cap, no loop breaker,
+  no opt-out, marker kept, no bind retry, no address fallback, probing a
+  dead UART, and writes in `check` mode.
+- `tests/test_device_package.py` and `tests/test_usb_runtime_pm.py` pass.
+- `systemd-analyze verify` (systemd 259, with ExecStart pointed at
+  `/bin/true`) accepts both units, and `udevadm verify` accepts the rule.
+- `sh -n` passes on the helper, the hook and postinst, and
+  `git diff --check` is clean.
+- Package build: `DEVICE=gts9wifi`, under fakeroot, against the CX kernel's
+  certificate and config. The `qcom_spss_irq.ko` is the signed one from the
+  CX `modules-root`, the same file as in the kit's 2.58. (The copy in
+  `build-cxg5/spss-irq-module-gts9wifi` is unsigned and fails the build's
+  key check.)
+- Result: `ubuntu-gts9u-device_2.59_arm64.deb`, sha256
+  `feb771a660c00202a860f9279d11af17df3bb44912b01b0d562238774be6df2c`, in
+  `~/ubuntu-gts9u/backups/bt-uart-recover-2.59/`. Depends are unchanged.
+- Compared with the kit's 2.58 (`99366b71…`), the only differences are:
+  - the four new files: the unit and the rule (0644), the helper and the hook
+    (0755), all owned by root;
+  - the address unit;
+  - control and postinst.
+- Not installed, not tested on hardware.
+
+Test plan for the owner, on squirtle (CX kit, device 2.58). Commands marked
+(root) need sudo. The journal and `/run/ubuntu-gts9u/bt-uart-recover` are
+readable without root.
+`irq=$(grep -lx qcom_geni_serial_uart1 /sys/kernel/irq/*/actions | cut -d/ -f5)`
+gives the UART's IRQ.
+
+1. Install.
+   - `sha256sum ubuntu-gts9u-device_2.59_arm64.deb` matches the hash above.
+   - (root) `apt-get install --simulate ./ubuntu-gts9u-device_2.59_arm64.deb`
+     removes nothing. Then install it.
+   - With no reboot:
+     - `ls /etc/systemd/system/multi-user.target.wants/ | grep bluetooth-address`
+       prints nothing;
+     - `systemctl is-active ubuntu-gts9u-bluetooth-address` reads `inactive`;
+     - `systemctl is-enabled ubuntu-gts9u-bt-uart-recover` reads `enabled`;
+     - `hciconfig hci0` still shows the native address and `UP RUNNING`, and
+       Bluetooth audio still plays.
+2. The address alone, as on 2026-11-08 but without its third step.
+   - (root) `echo 898000.serial > /sys/bus/platform/drivers/qcom_geni_serial/unbind`,
+     then the same name to `.../bind`.
+   - Within about 15 s, `hciconfig hci0` shows the native address.
+   - `journalctl -b -u ubuntu-gts9u-bluetooth-address -o cat` shows a second
+     run that applied it.
+   - GNOME shows the controller, and the headphones reconnect and play AAC.
+3. The full recovery path. The incident's log line is injected: the IRQ is
+   not really disabled, but every step after detection is real.
+   - (root) `echo "Disabling IRQ #$irq" > /dev/kmsg`.
+   - (root) `ubuntu-gts9u-bt-uart-recover check` says "would rebind".
+   - (root) `systemctl start ubuntu-gts9u-bt-uart-recover`.
+   - `journalctl -b -u ubuntu-gts9u-bt-uart-recover -o cat` shows `FAULT`,
+     `rebinding`, then `recovered: IRQ <irq>, hci0 answers, hci0 at <native>`.
+   - The record shows `result=recovered` and `rebinds=1`, and audio works.
+   - Start the unit again: it logs `healthy`, because the new probe report
+     supersedes the injected line.
+4. The opt-out.
+   - (root) `touch /etc/ubuntu-gts9u/bt-uart-recover-off`, inject, start: the
+     unit logs `FAULT` and `HOLD`, and Bluetooth is not reset.
+   - Remove the file and start the unit again: it recovers, with
+     `rebinds=2`.
+5. The cap. Inject and start once more (`rebinds=3`). The next injection and
+   start logs `HOLD: 3 rebinds this boot already (limit 3)`.
+6. The loop breaker.
+   - (root)
+     `printf 'boot_id=00000000-test\nuptime=1\n' > /var/lib/ubuntu-gts9u/bt-uart-recover.pending`,
+     then inject and start.
+   - The unit logs `HOLD: loop breaker: boot 00000000 began a rebind …`, and
+     the marker is gone afterwards.
+7. Reboot.
+   - The panel comes up, and there is no boot loop.
+   - `journalctl -b -u ubuntu-gts9u-bluetooth-address -o cat` shows a single
+     run at boot: one `Starting` line.
+   - `journalctl -b -u ubuntu-gts9u-bt-uart-recover -o short-monotonic` shows
+     one `healthy: IRQ <irq> log clear; hci0 answers (suspend_stats …)`,
+     after the panel cycle.
+   - The record reads `result=healthy` and `rebinds=0`, and Bluetooth audio
+     works.
+8. The resume path.
+   - (root) `/usr/lib/systemd/system-sleep/ubuntu-gts9u-bt-uart-recover post suspend`
+     makes the unit log a new `healthy` line.
+   - Then one real test cycle through systemd-sleep:
+     - (root) `echo s2idle > /run/ubuntu-gts9u/suspend-mode`,
+       `systemctl restart ubuntu-gts9u-suspend-mode` and
+       `echo platform > /sys/power/pm_test`;
+     - `systemctl suspend`, which returns after pm_test's 5 s;
+     - check for a new `healthy` line, with the suspend_stats success count
+       one higher;
+     - (root) `echo none > /sys/power/pm_test`,
+       `rm /run/ubuntu-gts9u/suspend-mode` and
+       `systemctl restart ubuntu-gts9u-suspend-mode`.
+9. Optional: the real race. Play audio over Bluetooth and repeat step 8's
+   cycle 20 times. Any cycle that hits the race should log
+   `FAULT: the kernel disabled IRQ …`, then `recovered`, and the audio should
+   come back by itself.
+
 ### SM-X710 rear focus: two DW9808 faults, not the bus speed (2026-11-08)
 
 **Baseline:**

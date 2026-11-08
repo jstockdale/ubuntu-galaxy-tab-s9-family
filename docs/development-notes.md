@@ -266,6 +266,13 @@ without restarting.
 To check whether the address is already set, `hciconfig` is used: it is an
 ioctl, answers in ~3 ms and cannot block.
 
+Every new `hci0` needs the address again. A re-probed controller, for
+example after a rebind of its UART, comes back with the NVM's null address
+and stays unconfigured, and restarting `bluetoothd` does not help. So since
+device package 2.59 the unit is started by udev for every `hci0` add. It is
+a oneshot without `RemainAfterExit`, so each add runs it again, and it has
+no `[Install]` section, so the boot runs it only once.
+
 ## A symbol at `=m` is absent, not degraded
 
 This port installs no module tree: only the isolated, signed modules in the

@@ -1,0 +1,7 @@
+# hci0 comes up with the NVM's null address every time it is created: at boot,
+# and again whenever the BT serdev re-probes, e.g. when
+# ubuntu-gts9u-bt-uart-recover rebinds its UART.  Until it has an address the
+# controller is unconfigured and bluetoothd ignores it, so give each new one
+# its native address.  The unit returns to inactive after every run, so every
+# add starts it again; a change event does not.
+ACTION=="add", SUBSYSTEM=="bluetooth", KERNEL=="hci0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ubuntu-gts9u-bluetooth-address.service"
