@@ -1,0 +1,1068 @@
+From: Ubuntu gts9uwifi port contributors <gts9uwifi@example.com>
+Subject: [PATCH] input: goodix: add Samsung double tap to wake
+
+Samsung's GT6936 firmware on the Galaxy Tab S9 Ultra can turn the screen
+on with a double tap, which the stock kernel calls "AOT".  Implement it
+with the protocol of Samsung's GPL driver for this hardware
+(drivers/input/touchscreen/goodix/berlin in the SM-X910 kernel source):
+
+- aot_enable() sets bit 5 (SEC_TS_MODE_SPONGE_DOUBLETAP_TO_WAKEUP) of the
+  sponge mode byte at offset 0.  The FOD press is bit 4 of the same byte,
+  so the existing read-modify-write is shared and each feature changes
+  only its own bit.
+- gsx_gesture_before_suspend() enters the low-power gesture mode: the mode
+  byte, the wall clock in seconds at sponge offset 0x10, then command 0xa6;
+  it keeps the controller powered and arms the IRQ with enable_irq_wake().
+  gsx_gesture_before_resume() leaves it with command 0xa7.
+- goodix_ts_report_gesture() decodes gesture type 1, id 1 as KEY_WAKEUP.
+- After five contacts reported in the gesture mode, the gesture command is
+  sent again (brl_event_handler(), lpm_coord_event_cnt).
+- Sponge reads wake the controller ("exit LPI", 0x9f 00) first, as
+  writes do.  goodix_ts_reinit() writes the sponge after 0xa6, so the
+  wake does not leave the gesture mode.
+
+The interface matches the SM-X710's samsung_fts1ba90a driver, which Tab
+Companion already drives: a double_tap_to_wake attribute on the I2C device
+(0/1, off by default, root-only until udev opens it to the desktop user),
+a read-only power_state attribute, KEY_WAKEUP on a separate key-only input
+device that the compositor keeps open while the screen is dark, and a hard
+wakeup event so that a gesture during suspend entry aborts it.  Both
+attributes and the wake device exist only where the firmware publishes the
+Samsung sponge.
+
+The screen-off signal is the touchscreen's input close, as in Samsung's
+driver: GNOME closes the touchscreen while the panel is blanked.  With the
+setting on and no SW_LID switch reporting closed, the controller enters the
+gesture mode; otherwise it keeps scanning, as before.  For system sleep the
+controller stays in the gesture mode with its IRQ armed if the setting is
+on, power/wakeup allows it and no lid is closed; otherwise it is powered
+off, as before.  The pinned DT cannot carry wakeup-source, so the driver
+makes the device wakeup capable itself.  From late suspend to early resume
+the GENI I2C controller cannot transfer, so an IRQ thread in that window
+parks the line, and resume_early re-enables it and runs the thread once to
+read the gesture that woke the system, as Samsung's
+goodix_ts_handler_wait_resume_work() does.
+
+With the setting off the controller behaves as before: no gesture mode,
+no new I2C traffic, no wake IRQ and the same power-off for system sleep.
+Only the new attributes, the idle wake input device and the device's
+wakeup capability are visible.
+
+Untested on hardware.
+
+Signed-off-by: Ubuntu gts9uwifi port contributors <gts9uwifi@example.com>
+
+---
+diff --git a/drivers/input/touchscreen/goodix_berlin_core.c b/drivers/input/touchscreen/goodix_berlin_core.c
+index 6bf439a..6a731b6 100644
+--- a/drivers/input/touchscreen/goodix_berlin_core.c
++++ b/drivers/input/touchscreen/goodix_berlin_core.c
+@@ -30,14 +30,21 @@
+ #include <linux/input.h>
+ #include <linux/input/mt.h>
+ #include <linux/input/touchscreen.h>
++#include <linux/interrupt.h>
+ #include <linux/mutex.h>
++#include <linux/pm_wakeirq.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/samsung_wacom.h>
+ #include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
+ #include <linux/sysfs.h>
++#include <linux/timekeeping.h>
+ #include <linux/unaligned.h>
++#include <linux/workqueue.h>
+ 
+ #include "goodix_berlin.h"
+ 
+@@ -66,6 +73,8 @@
+ #define GOODIX_BERLIN_SAMSUNG_EVENT_TYPE_MASK	GENMASK(5, 2)
+ #define GOODIX_BERLIN_SAMSUNG_GESTURE_EVENT	2
+ #define GOODIX_BERLIN_SAMSUNG_FOD_GESTURE_TYPE	3
++#define GOODIX_BERLIN_SAMSUNG_DOUBLE_TAP_TYPE	1
++#define GOODIX_BERLIN_SAMSUNG_GESTURE_ID_WAKEUP	1
+ #define GOODIX_BERLIN_SAMSUNG_ACTION_PRESS	1
+ #define GOODIX_BERLIN_SAMSUNG_ACTION_RELEASE	3
+ 
+@@ -75,17 +84,25 @@
+ #define GOODIX_BERLIN_FOD_EVENT_VI		4
+ 
+ #define GOODIX_BERLIN_SPONGE_MODE_OFFSET		0x00
++#define GOODIX_BERLIN_SPONGE_UTC		0x10
+ #define GOODIX_BERLIN_SPONGE_PRESS_PROPERTY	0x14
+ #define GOODIX_BERLIN_SPONGE_FOD_RECT		0x4b
+ #define GOODIX_BERLIN_SPONGE_FOD_BIT		BIT(4)
++#define GOODIX_BERLIN_SPONGE_DOUBLE_TAP_BIT	BIT(5)
+ 
+ #define GOODIX_BERLIN_CMD_SET_POWER_MODE	0x9f
++#define GOODIX_BERLIN_CMD_GESTURE_MODE		0xa6
++#define GOODIX_BERLIN_CMD_COORD_MODE		0xa7
+ #define GOODIX_BERLIN_CMD_NOTIFY_SPONGE		0xf2
+ #define GOODIX_BERLIN_CMD_ACK_BUSY		0x02
+ #define GOODIX_BERLIN_CMD_ACK_OK			0x80
+ #define GOODIX_BERLIN_CMD_RETRIES		6
+ #define GOODIX_BERLIN_CMD_BUF_SIZE		16
+ 
++/* Samsung re-arms the gesture mode after this many contacts reported in it. */
++#define GOODIX_BERLIN_LP_COORD_EVENT_LIMIT	5
++#define GOODIX_BERLIN_WAKE_EVENT_MS		1000
++
+ #define GOODIX_BERLIN_DEV_CONFIRM_VAL		0xAA
+ #define GOODIX_BERLIN_BOOTOPTION_ADDR		0x10000
+ 
+@@ -224,6 +241,7 @@ struct goodix_berlin_core {
+ 	struct touchscreen_properties props;
+ 	struct goodix_berlin_fw_version fw_version;
+ 	struct input_dev *input_dev;
++	struct input_dev *wake_input;	/* KEY_WAKEUP only, double tap to wake */
+ 	int irq;
+ 
+ 	/* Runtime parameters extracted from IC_INFO buffer  */
+@@ -234,7 +252,11 @@ struct goodix_berlin_core {
+ 	u32 sponge_addr;
+ 	u16 sponge_len;
+ 
+-	/* Serializes sponge I/O, FOD state and suppressed touch slots. */
++	/*
++	 * Serializes sponge I/O and controller commands, FOD state, suppressed
++	 * touch slots and the double tap to wake state below.  Taken by the IRQ
++	 * thread, so never call disable_irq() while holding it.
++	 */
+ 	struct mutex fod_lock;
+ 	bool fod_enabled;
+ 	bool fod_rect_valid;
+@@ -246,6 +268,25 @@ struct goodix_berlin_core {
+ 	u16 fod_y;
+ 	u64 fod_sequence;
+ 
++	/*
++	 * Double tap to wake.  double_tap, powered and lowpower are written
++	 * under fod_lock and read locklessly by the IRQ thread and the mode
++	 * work; opened is lockless.
++	 */
++	struct work_struct mode_work;
++	struct input_handler lid_handler;
++	bool lid_watch;
++	bool opened;		/* the touchscreen has a reader */
++	bool double_tap;	/* user setting, off by default */
++	bool powered;
++	bool lowpower;		/* in Samsung's gesture mode */
++	bool irq_wake;		/* enable_irq_wake() done for this sleep */
++	u8 lp_coord_events;	/* IRQ thread, or with the IRQ disabled */
++	/* late suspend to early resume with the gesture armed */
++	spinlock_t irq_lock;
++	bool suspended;
++	bool irq_parked;
++
+ 	const struct goodix_berlin_ic_data *ic_data;
+ 
+ 	struct goodix_berlin_event event;
+@@ -362,10 +403,53 @@ static int goodix_berlin_write_fod_rect_locked(struct goodix_berlin_core *cd,
+ 			GOODIX_BERLIN_SPONGE_FOD_RECT, data, sizeof(data));
+ }
+ 
++/*
++ * The sponge mode byte holds every Samsung low-power feature: FOD press and
++ * double tap to wake share it, so each owner changes only its own bits.
++ */
++static int goodix_berlin_set_sponge_bits_locked(struct goodix_berlin_core *cd,
++						u8 mask, u8 bits)
++{
++	u8 mode, normal_power = 0;
++	int error;
++
++	/*
++	 * Samsung's sponge reads wake the controller first, as its writes do;
++	 * that matters in the gesture mode.
++	 */
++	if (cd->lowpower) {
++		error = goodix_berlin_send_cmd_locked(cd,
++						      GOODIX_BERLIN_CMD_SET_POWER_MODE,
++						      &normal_power,
++						      sizeof(normal_power));
++		if (error)
++			return error;
++	}
++
++	error = regmap_raw_read(cd->regmap,
++				cd->sponge_addr + GOODIX_BERLIN_SPONGE_MODE_OFFSET,
++				&mode, sizeof(mode));
++	if (error)
++		return error;
++
++	mode = (mode & ~mask) | bits;
++
++	return goodix_berlin_write_sponge_locked(cd,
++			GOODIX_BERLIN_SPONGE_MODE_OFFSET, &mode, sizeof(mode));
++}
++
++static int goodix_berlin_write_double_tap_locked(struct goodix_berlin_core *cd)
++{
++	const u8 bit = GOODIX_BERLIN_SPONGE_DOUBLE_TAP_BIT;
++
++	return goodix_berlin_set_sponge_bits_locked(cd, bit,
++						    cd->double_tap ? bit : 0);
++}
++
+ static int goodix_berlin_set_fod_mode_locked(struct goodix_berlin_core *cd,
+ 					     bool enable)
+ {
+-	u8 mode;
++	const u8 fod_bit = GOODIX_BERLIN_SPONGE_FOD_BIT;
+ 	int error;
+ 
+ 	if (!cd->cmd_addr || !cd->sponge_addr ||
+@@ -381,20 +465,8 @@ static int goodix_berlin_set_fod_mode_locked(struct goodix_berlin_core *cd,
+ 			return error;
+ 	}
+ 
+-	error = regmap_raw_read(cd->regmap,
+-				cd->sponge_addr + GOODIX_BERLIN_SPONGE_MODE_OFFSET,
+-				&mode, sizeof(mode));
+-	if (error)
+-		return error;
+-
+-	if (enable)
+-		mode |= GOODIX_BERLIN_SPONGE_FOD_BIT;
+-	else
+-		mode &= ~GOODIX_BERLIN_SPONGE_FOD_BIT;
+-
+-	error = goodix_berlin_write_sponge_locked(cd,
+-						  GOODIX_BERLIN_SPONGE_MODE_OFFSET, &mode,
+-				sizeof(mode));
++	error = goodix_berlin_set_sponge_bits_locked(cd, fod_bit,
++						     enable ? fod_bit : 0);
+ 	if (error || !enable)
+ 		return error;
+ 
+@@ -781,6 +853,47 @@ out:
+ 	return suppress;
+ }
+ 
++static void goodix_berlin_report_wake(struct goodix_berlin_core *cd)
++{
++	/*
++	 * A hard wakeup event also aborts a suspend that is already under
++	 * way, so that a running system handles the key.
++	 */
++	pm_wakeup_dev_event(cd->dev, GOODIX_BERLIN_WAKE_EVENT_MS, true);
++
++	input_report_key(cd->wake_input, KEY_WAKEUP, 1);
++	input_sync(cd->wake_input);
++	input_report_key(cd->wake_input, KEY_WAKEUP, 0);
++	input_sync(cd->wake_input);
++
++	dev_info(cd->dev, "double tap to wake\n");
++}
++
++/*
++ * Samsung gesture records other than FOD.  Type 1 id 1
++ * (SEC_TS_GESTURE_CODE_DOUBLE_TAP, SEC_TS_GESTURE_ID_DOUBLETAP_TO_WAKEUP) is
++ * "double tap to turn on screen"; this driver arms no other gesture.
++ */
++static bool goodix_berlin_report_samsung_gesture(struct goodix_berlin_core *cd,
++						 const u8 *data)
++{
++	if (FIELD_GET(GOODIX_BERLIN_SAMSUNG_EVENT_ID_MASK, data[0]) !=
++	    GOODIX_BERLIN_SAMSUNG_GESTURE_EVENT)
++		return false;
++
++	if (FIELD_GET(GOODIX_BERLIN_SAMSUNG_EVENT_TYPE_MASK, data[0]) ==
++	    GOODIX_BERLIN_SAMSUNG_DOUBLE_TAP_TYPE &&
++	    data[1] == GOODIX_BERLIN_SAMSUNG_GESTURE_ID_WAKEUP) {
++		if (READ_ONCE(cd->double_tap))
++			goodix_berlin_report_wake(cd);
++	} else if (READ_ONCE(cd->lowpower)) {
++		dev_info_ratelimited(cd->dev, "unhandled gesture: %*ph\n",
++				     6, data);
++	}
++
++	return true;
++}
++
+ static void goodix_berlin_report_samsung_touch(struct goodix_berlin_core *cd,
+ 					       const u8 *data, bool *coordinate)
+ {
+@@ -790,10 +903,23 @@ static void goodix_berlin_report_samsung_touch(struct goodix_berlin_core *cd,
+ 	if (goodix_berlin_report_samsung_fod(cd, data))
+ 		return;
+ 
++	if (goodix_berlin_report_samsung_gesture(cd, data))
++		return;
++
+ 	if (FIELD_GET(GOODIX_BERLIN_SAMSUNG_EVENT_ID_MASK, data[0]) !=
+ 	    GOODIX_BERLIN_SAMSUNG_COORD_EVENT)
+ 		return;
+ 
++	/*
++	 * Contacts in gesture mode mean the controller did not take the gesture
++	 * command; Samsung sends it again after a few of them.
++	 */
++	if (READ_ONCE(cd->lowpower)) {
++		if (cd->lp_coord_events < GOODIX_BERLIN_LP_COORD_EVENT_LIMIT)
++			cd->lp_coord_events++;
++		return;
++	}
++
+ 	*coordinate = true;
+ 	id = FIELD_GET(GOODIX_BERLIN_SAMSUNG_TOUCH_ID_MASK, data[0]);
+ 	if (id >= GOODIX_BERLIN_MAX_TOUCH)
+@@ -864,6 +990,71 @@ static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
+ 	input_sync(cd->input_dev);
+ }
+ 
++/*
++ * Samsung's low-power entry (gsx_gesture_before_suspend()): the sponge mode
++ * byte with the double tap bit, the wall clock in seconds, then the gesture
++ * mode command.  Must be called with the IRQ disabled or from the IRQ thread.
++ */
++static int goodix_berlin_enter_lowpower_locked(struct goodix_berlin_core *cd)
++{
++	__le32 utc = cpu_to_le32(lower_32_bits(ktime_get_real_seconds()));
++	int error;
++
++	lockdep_assert_held(&cd->fod_lock);
++
++	if (!cd->lowpower) {
++		/* Release the contacts still down, as Samsung does. */
++		cd->fod_suppressed_slots = 0;
++		goodix_berlin_report_state(cd, 0);
++	}
++
++	error = goodix_berlin_write_double_tap_locked(cd);
++	if (error)
++		return error;
++
++	/* Only a timestamp for the firmware; Samsung ignores failures too. */
++	error = goodix_berlin_write_sponge_locked(cd, GOODIX_BERLIN_SPONGE_UTC,
++						  &utc, sizeof(utc));
++	if (error)
++		dev_dbg(cd->dev, "failed to write the sponge clock: %d\n", error);
++
++	error = goodix_berlin_send_cmd_locked(cd, GOODIX_BERLIN_CMD_GESTURE_MODE,
++					      NULL, 0);
++	if (error)
++		return error;
++
++	cd->lp_coord_events = 0;
++	WRITE_ONCE(cd->lowpower, true);
++
++	return 0;
++}
++
++/* Samsung's gsx_gesture_before_resume(): the coordinate mode command only. */
++static int goodix_berlin_exit_lowpower_locked(struct goodix_berlin_core *cd)
++{
++	lockdep_assert_held(&cd->fod_lock);
++
++	WRITE_ONCE(cd->lowpower, false);
++
++	return goodix_berlin_send_cmd_locked(cd, GOODIX_BERLIN_CMD_COORD_MODE,
++					     NULL, 0);
++}
++
++static void goodix_berlin_rearm_lowpower(struct goodix_berlin_core *cd)
++{
++	int error = 0;
++
++	cd->lp_coord_events = 0;
++
++	mutex_lock(&cd->fod_lock);
++	if (cd->lowpower)
++		error = goodix_berlin_enter_lowpower_locked(cd);
++	mutex_unlock(&cd->fod_lock);
++
++	if (error)
++		dev_warn(cd->dev, "failed to re-enter gesture mode: %d\n", error);
++}
++
+ static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
+ {
+ 	u8 touch_num;
+@@ -876,7 +1067,8 @@ static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
+ 		return;
+ 	}
+ 
+-	if (samsung_wacom_should_suppress_touch()) {
++	/* The pen does not hold back the wake gesture, as with Samsung. */
++	if (!READ_ONCE(cd->lowpower) && samsung_wacom_should_suppress_touch()) {
+ 		/* Also release slots which were active before proximity began. */
+ 		goodix_berlin_report_state(cd, 0);
+ 		return;
+@@ -900,11 +1092,14 @@ static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
+ 	}
+ 
+ 	goodix_berlin_report_state(cd, touch_num);
++
++	if (cd->lp_coord_events >= GOODIX_BERLIN_LP_COORD_EVENT_LIMIT)
++		goodix_berlin_rearm_lowpower(cd);
+ }
+ 
+ static int goodix_berlin_request_handle_reset(struct goodix_berlin_core *cd)
+ {
+-	int error;
++	int error, lp_error = 0;
+ 
+ 	gpiod_set_value_cansleep(cd->reset_gpio, 1);
+ 	usleep_range(2000, 2100);
+@@ -915,19 +1110,54 @@ static int goodix_berlin_request_handle_reset(struct goodix_berlin_core *cd)
+ 	mutex_lock(&cd->fod_lock);
+ 	error = cd->fod_enabled ?
+ 		goodix_berlin_set_fod_mode_locked(cd, true) : 0;
++	/* The reset also lost the gesture mode and the sponge contents. */
++	if (cd->lowpower)
++		lp_error = goodix_berlin_enter_lowpower_locked(cd);
+ 	mutex_unlock(&cd->fod_lock);
+ 	if (error)
+ 		dev_warn(cd->dev, "failed to restore FOD mode after reset: %d\n",
+ 			 error);
++	if (lp_error)
++		dev_warn(cd->dev, "failed to restore gesture mode after reset: %d\n",
++			 lp_error);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * With the gesture armed for system sleep, the I2C controller is unusable
++ * from its late suspend until its early resume, and every transfer fails.
++ * An IRQ thread that runs in that window parks the line instead and reports
++ * a hard wakeup event, which aborts a suspend still in progress; the event
++ * stays in the controller and resume_early reads it.  Samsung defers the
++ * thread to a work item that waits for its PM resume.
++ */
++static bool goodix_berlin_park_irq(struct goodix_berlin_core *cd)
++{
++	bool parked;
++
++	spin_lock(&cd->irq_lock);
++	parked = cd->suspended;
++	if (parked && !cd->irq_parked) {
++		cd->irq_parked = true;
++		disable_irq_nosync(cd->irq);
++	}
++	spin_unlock(&cd->irq_lock);
++
++	if (parked)
++		pm_wakeup_hard_event(cd->dev);
++
++	return parked;
++}
++
+ static irqreturn_t goodix_berlin_irq(int irq, void *data)
+ {
+ 	struct goodix_berlin_core *cd = data;
+ 	int error;
+ 
++	if (goodix_berlin_park_irq(cd))
++		return IRQ_HANDLED;
++
+ 	/*
+ 	 * First, read buffer with space for one touch event:
+ 	 * - GOODIX_BERLIN_HEADER_SIZE = 8 bytes
+@@ -991,11 +1221,251 @@ out:
+ 	return IRQ_HANDLED;
+ }
+ 
++/* Samsung's firmware extension carries the sponge that arms the gesture. */
++static bool goodix_berlin_has_double_tap(const struct goodix_berlin_core *cd)
++{
++	return cd->cmd_addr && cd->sponge_addr &&
++	       cd->sponge_len >= GOODIX_BERLIN_SPONGE_UTC + sizeof(__le32);
++}
++
++static int goodix_berlin_lid_is_closed(struct input_handle *handle, void *data)
++{
++	return test_bit(SW_LID, handle->dev->sw);
++}
++
++/*
++ * Any lid switch reporting closed counts, as for logind.  The switch state is
++ * read directly, so it is right even for a device another reader grabbed.
++ */
++static bool goodix_berlin_lid_closed(struct goodix_berlin_core *cd)
++{
++	return READ_ONCE(cd->lid_watch) &&
++	       input_handler_for_each_handle(&cd->lid_handler, NULL,
++					     goodix_berlin_lid_is_closed);
++}
++
++/*
++ * Samsung's gesture mode replaces scanning while nobody reads the
++ * touchscreen, if double tap to wake is on and no cover is closed over the
++ * glass (Samsung turns sensing off under a closed cover).  Otherwise the
++ * controller keeps scanning as it always has.
++ */
++static bool goodix_berlin_want_lowpower(struct goodix_berlin_core *cd)
++{
++	return !READ_ONCE(cd->opened) && READ_ONCE(cd->double_tap) &&
++	       !goodix_berlin_lid_closed(cd);
++}
++
++static void goodix_berlin_mode_work(struct work_struct *work)
++{
++	struct goodix_berlin_core *cd = container_of(work,
++						     struct goodix_berlin_core,
++						     mode_work);
++	bool lowpower = goodix_berlin_want_lowpower(cd);
++	bool reset = false;
++	int error = 0;
++
++	if (READ_ONCE(cd->lowpower) == lowpower)
++		return;
++
++	disable_irq(cd->irq);
++
++	mutex_lock(&cd->fod_lock);
++	if (cd->powered && cd->lowpower != lowpower) {
++		if (lowpower) {
++			error = goodix_berlin_enter_lowpower_locked(cd);
++		} else {
++			error = goodix_berlin_exit_lowpower_locked(cd);
++			reset = error && cd->reset_gpio;
++		}
++	}
++	mutex_unlock(&cd->fod_lock);
++
++	if (error)
++		dev_warn(cd->dev, "failed to %s gesture mode: %d\n",
++			 lowpower ? "enter" : "leave", error);
++
++	/* A reset is the other way back to coordinate mode. */
++	if (reset)
++		goodix_berlin_request_handle_reset(cd);
++
++	enable_irq(cd->irq);
++}
++
++/*
++ * Mode changes run from a freezable workqueue: off the opener's path, as a
++ * change takes several 20 ms commands, and never between the system sleep
++ * callbacks, which make their own change.
++ */
++static void goodix_berlin_queue_mode(struct goodix_berlin_core *cd)
++{
++	if (cd->wake_input)
++		queue_work(system_freezable_wq, &cd->mode_work);
++}
++
++static void goodix_berlin_cancel_mode_work(void *data)
++{
++	struct goodix_berlin_core *cd = data;
++
++	cancel_work_sync(&cd->mode_work);
++}
++
++/*
++ * The input core calls these when the first reader arrives and the last one
++ * leaves, and for the "inhibited" attribute.  GNOME closes the built-in
++ * touchscreen while the panel is blanked, which is Samsung's screen-off
++ * signal (goodix_ts_input_close()).
++ */
++static int goodix_berlin_input_open(struct input_dev *input_dev)
++{
++	struct goodix_berlin_core *cd = input_get_drvdata(input_dev);
++
++	WRITE_ONCE(cd->opened, true);
++	goodix_berlin_queue_mode(cd);
++
++	return 0;
++}
++
++static void goodix_berlin_input_close(struct input_dev *input_dev)
++{
++	struct goodix_berlin_core *cd = input_get_drvdata(input_dev);
++
++	WRITE_ONCE(cd->opened, false);
++	goodix_berlin_queue_mode(cd);
++}
++
++static void goodix_berlin_lid_event(struct input_handle *handle,
++				    unsigned int type, unsigned int code,
++				    int value)
++{
++	if (type == EV_SW && code == SW_LID)
++		goodix_berlin_queue_mode(handle->private);
++}
++
++static int goodix_berlin_lid_connect(struct input_handler *handler,
++				     struct input_dev *dev,
++				     const struct input_device_id *id)
++{
++	struct goodix_berlin_core *cd = container_of(handler,
++						     struct goodix_berlin_core,
++						     lid_handler);
++	struct input_handle *handle;
++	int error;
++
++	handle = kzalloc_obj(*handle);
++	if (!handle)
++		return -ENOMEM;
++
++	handle->dev = dev;
++	handle->handler = handler;
++	handle->name = "goodix-berlin-lid";
++	handle->private = cd;
++
++	error = input_register_handle(handle);
++	if (error)
++		goto err_free_handle;
++
++	/* Passive: does not count as a reader of the lid device. */
++	error = input_open_device(handle);
++	if (error)
++		goto err_unregister_handle;
++
++	goodix_berlin_queue_mode(cd);
++
++	return 0;
++
++err_unregister_handle:
++	input_unregister_handle(handle);
++err_free_handle:
++	kfree(handle);
++	return error;
++}
++
++static void goodix_berlin_lid_disconnect(struct input_handle *handle)
++{
++	struct goodix_berlin_core *cd = handle->private;
++
++	input_close_device(handle);
++	input_unregister_handle(handle);
++	kfree(handle);
++
++	goodix_berlin_queue_mode(cd);
++}
++
++static const struct input_device_id goodix_berlin_lid_ids[] = {
++	{
++		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
++			 INPUT_DEVICE_ID_MATCH_SWBIT,
++		.evbit = { BIT_MASK(EV_SW) },
++		.swbit = { [BIT_WORD(SW_LID)] = BIT_MASK(SW_LID) },
++	},
++	{ }
++};
++
++static void goodix_berlin_unwatch_lid(void *data)
++{
++	struct goodix_berlin_core *cd = data;
++
++	WRITE_ONCE(cd->lid_watch, false);
++	input_unregister_handler(&cd->lid_handler);
++}
++
++/*
++ * Follow every SW_LID switch so that the wake gesture is never armed under a
++ * closed cover.  Without the watch the gesture ignores covers, so a failure
++ * is not fatal.
++ */
++static void goodix_berlin_watch_lid(struct goodix_berlin_core *cd)
++{
++	int error;
++
++	cd->lid_handler.event = goodix_berlin_lid_event;
++	cd->lid_handler.connect = goodix_berlin_lid_connect;
++	cd->lid_handler.disconnect = goodix_berlin_lid_disconnect;
++	cd->lid_handler.passive_observer = true;
++	cd->lid_handler.name = "goodix-berlin-lid";
++	cd->lid_handler.id_table = goodix_berlin_lid_ids;
++
++	error = input_register_handler(&cd->lid_handler);
++	if (!error)
++		error = devm_add_action_or_reset(cd->dev,
++						 goodix_berlin_unwatch_lid, cd);
++	if (error) {
++		dev_warn(cd->dev, "cannot follow lid switches: %d\n", error);
++		return;
++	}
++
++	WRITE_ONCE(cd->lid_watch, true);
++}
++
++/*
++ * The wake gesture gets its own key-only device: GNOME closes the
++ * touchscreen while the panel is off but keeps key devices open, and treats
++ * any key as activity that turns the screen back on.
++ */
++static int goodix_berlin_wake_dev_config(struct goodix_berlin_core *cd,
++					 const struct input_id *id)
++{
++	struct input_dev *wake_input;
++
++	wake_input = devm_input_allocate_device(cd->dev);
++	if (!wake_input)
++		return -ENOMEM;
++
++	wake_input->name = "Goodix Berlin Capacitive TouchScreen Wake Gesture";
++	wake_input->phys = "input/wake";
++	wake_input->id.bustype = id->bustype;
++	input_set_capability(wake_input, EV_KEY, KEY_WAKEUP);
++
++	cd->wake_input = wake_input;
++
++	return 0;
++}
++
+ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
+ 					  const struct input_id *id)
+ {
+ 	struct input_dev *input_dev;
+-	int error;
+ 
+ 	input_dev = devm_input_allocate_device(cd->dev);
+ 	if (!input_dev)
+@@ -1009,6 +1479,11 @@ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
+ 
+ 	input_dev->id = *id;
+ 
++	if (goodix_berlin_has_double_tap(cd)) {
++		input_dev->open = goodix_berlin_input_open;
++		input_dev->close = goodix_berlin_input_close;
++	}
++
+ 	input_set_abs_params(cd->input_dev, ABS_MT_POSITION_X,
+ 			     0, SZ_64K - 1, 0, 0);
+ 	input_set_abs_params(cd->input_dev, ABS_MT_POSITION_Y,
+@@ -1025,25 +1500,25 @@ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
+ 	input_abs_set_res(cd->input_dev, ABS_MT_POSITION_X, 10);
+ 	input_abs_set_res(cd->input_dev, ABS_MT_POSITION_Y, 10);
+ 
+-	error = input_mt_init_slots(cd->input_dev, GOODIX_BERLIN_MAX_TOUCH,
+-				    INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
+-	if (error)
+-		return error;
+-
+-	error = input_register_device(cd->input_dev);
+-	if (error)
+-		return error;
+-
+-	return 0;
++	return input_mt_init_slots(cd->input_dev, GOODIX_BERLIN_MAX_TOUCH,
++				   INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
+ }
+ 
++/*
++ * With double tap to wake on, wakeups allowed (power/wakeup) and no cover
++ * closed, the controller stays powered in (or enters) Samsung's gesture mode
++ * and its IRQ is armed to wake the system, as Samsung's goodix_ts_suspend()
++ * does at screen off; otherwise it is powered off for the sleep.
++ */
+ static int goodix_berlin_suspend(struct device *dev)
+ {
+ 	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
+-	bool notify = false;
+-	int error = 0;
++	bool notify = false, wake;
++	int error = 0, lp_error = 0;
+ 
+ 	disable_irq(cd->irq);
++	wake = READ_ONCE(cd->double_tap) && device_may_wakeup(dev) &&
++	       !goodix_berlin_lid_closed(cd);
+ 	mutex_lock(&cd->fod_lock);
+ 	cd->fod_suppressed_slots = 0;
+ 	if (cd->fod_enabled) {
+@@ -1055,34 +1530,126 @@ static int goodix_berlin_suspend(struct device *dev)
+ 		cd->fod_sequence++;
+ 		notify = true;
+ 	}
++	if (wake && cd->powered && !cd->lowpower)
++		lp_error = goodix_berlin_enter_lowpower_locked(cd);
++	wake = wake && cd->lowpower;
++	if (!wake) {
++		WRITE_ONCE(cd->lowpower, false);
++		WRITE_ONCE(cd->powered, false);
++	}
+ 	mutex_unlock(&cd->fod_lock);
+ 	if (error)
+ 		dev_warn(dev, "failed to disable FOD mode at suspend: %d\n",
+ 			 error);
++	if (lp_error)
++		dev_warn(dev, "failed to enter gesture mode at suspend: %d\n",
++			 lp_error);
+ 	if (notify)
+ 		sysfs_notify(&dev->kobj, NULL, "fod_state");
+ 
++	if (wake) {
++		if (!enable_irq_wake(cd->irq)) {
++			cd->irq_wake = true;
++			enable_irq(cd->irq);
++			return 0;
++		}
++		dev_warn(dev, "irq %d cannot wake the system\n", cd->irq);
++
++		mutex_lock(&cd->fod_lock);
++		WRITE_ONCE(cd->lowpower, false);
++		WRITE_ONCE(cd->powered, false);
++		mutex_unlock(&cd->fod_lock);
++	}
++
+ 	goodix_berlin_power_off(cd);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * The I2C controller, an ancestor, stops working in its own late suspend,
++ * which runs after this.  Let a thread already woken finish reading, park
++ * any later one (see goodix_berlin_park_irq()), and wait once more for a
++ * thread that read the flag just before it was set.
++ */
++static int goodix_berlin_suspend_late(struct device *dev)
++{
++	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
++
++	if (!cd->irq_wake)
++		return 0;
++
++	synchronize_irq(cd->irq);
++
++	spin_lock(&cd->irq_lock);
++	cd->suspended = true;
++	spin_unlock(&cd->irq_lock);
++
++	synchronize_irq(cd->irq);
++
++	return 0;
++}
++
++/*
++ * The I2C controller's early resume has run by now.  Re-enable a parked
++ * line, and run the IRQ thread once, as Samsung's
++ * goodix_ts_handler_wait_resume_work() does, so that the gesture that woke
++ * the system is read even if the attention line no longer asserts it.
++ */
++static int goodix_berlin_resume_early(struct device *dev)
++{
++	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
++	bool parked;
++
++	if (!cd->irq_wake)
++		return 0;
++
++	spin_lock(&cd->irq_lock);
++	cd->suspended = false;
++	parked = cd->irq_parked;
++	cd->irq_parked = false;
++	spin_unlock(&cd->irq_lock);
++
++	if (parked)
++		enable_irq(cd->irq);
++
++	irq_wake_thread(cd->irq, cd);
++
++	return 0;
++}
++
+ static int goodix_berlin_resume(struct device *dev)
+ {
+ 	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
+ 	int error;
+ 
++	if (cd->irq_wake) {
++		/* Still in gesture mode; the mode work restores the rest. */
++		disable_irq_wake(cd->irq);
++		cd->irq_wake = false;
++		goodix_berlin_queue_mode(cd);
++		return 0;
++	}
++
+ 	error = goodix_berlin_power_on(cd);
+ 	if (error)
+ 		return error;
+ 
++	mutex_lock(&cd->fod_lock);
++	WRITE_ONCE(cd->powered, true);
++	mutex_unlock(&cd->fod_lock);
++
+ 	enable_irq(cd->irq);
++	goodix_berlin_queue_mode(cd);
+ 
+ 	return 0;
+ }
+ 
+-EXPORT_GPL_SIMPLE_DEV_PM_OPS(goodix_berlin_pm_ops,
+-			     goodix_berlin_suspend, goodix_berlin_resume);
++EXPORT_GPL_DEV_SLEEP_PM_OPS(goodix_berlin_pm_ops) = {
++	SYSTEM_SLEEP_PM_OPS(goodix_berlin_suspend, goodix_berlin_resume)
++	LATE_SYSTEM_SLEEP_PM_OPS(goodix_berlin_suspend_late,
++				 goodix_berlin_resume_early)
++};
+ 
+ static void goodix_berlin_power_off_act(void *data)
+ {
+@@ -1309,8 +1876,87 @@ static const struct attribute_group goodix_berlin_attr_group = {
+ 	.bin_attrs = goodix_berlin_bin_attrs,
+ };
+ 
++static ssize_t double_tap_to_wake_show(struct device *dev,
++				       struct device_attribute *attr, char *buf)
++{
++	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", READ_ONCE(cd->double_tap));
++}
++
++/*
++ * The user setting (Samsung's sec_cmd aot_enable), off by default as in the
++ * stock kernel.  The sponge bit is written at once, as Samsung does; the
++ * mode work applies the screen-off state.
++ */
++static ssize_t double_tap_to_wake_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
++	bool enable;
++	int error;
++
++	error = kstrtobool(buf, &enable);
++	if (error)
++		return error;
++
++	mutex_lock(&cd->fod_lock);
++	if (enable != cd->double_tap) {
++		WRITE_ONCE(cd->double_tap, enable);
++		error = cd->powered ?
++			goodix_berlin_write_double_tap_locked(cd) : 0;
++		if (error)
++			dev_warn(dev, "failed to set the gesture mode: %d\n",
++				 error);
++		dev_info(dev, "double tap to wake %s\n",
++			 enable ? "enabled" : "disabled");
++	}
++	mutex_unlock(&cd->fod_lock);
++
++	goodix_berlin_queue_mode(cd);
++
++	return count;
++}
++static DEVICE_ATTR_RW(double_tap_to_wake);
++
++static ssize_t power_state_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
++	const char *state = "off";
++
++	if (READ_ONCE(cd->lowpower))
++		state = "low-power";
++	else if (READ_ONCE(cd->powered))
++		state = "active";
++
++	return sysfs_emit(buf, "%s\n", state);
++}
++static DEVICE_ATTR_RO(power_state);
++
++static struct attribute *goodix_berlin_wake_attrs[] = {
++	&dev_attr_double_tap_to_wake.attr,
++	&dev_attr_power_state.attr,
++	NULL,
++};
++
++static umode_t goodix_berlin_wake_attr_visible(struct kobject *kobj,
++					       struct attribute *attr, int n)
++{
++	struct goodix_berlin_core *cd = dev_get_drvdata(kobj_to_dev(kobj));
++
++	return cd && cd->wake_input ? attr->mode : 0;
++}
++
++static const struct attribute_group goodix_berlin_wake_attr_group = {
++	.attrs = goodix_berlin_wake_attrs,
++	.is_visible = goodix_berlin_wake_attr_visible,
++};
++
+ const struct attribute_group *goodix_berlin_groups[] = {
+ 	&goodix_berlin_attr_group,
++	&goodix_berlin_wake_attr_group,
+ 	NULL,
+ };
+ EXPORT_SYMBOL_GPL(goodix_berlin_groups);
+@@ -1337,6 +1983,8 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
+ 	cd->ic_data = ic_data;
+ 	mutex_init(&cd->fod_lock);
+ 	cd->fod_property = 3;
++	INIT_WORK(&cd->mode_work, goodix_berlin_mode_work);
++	spin_lock_init(&cd->irq_lock);
+ 	dev_set_drvdata(dev, cd);
+ 
+ 	cd->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+@@ -1376,12 +2024,45 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
+ 		return error;
+ 	}
+ 
++	/*
++	 * Started for whoever opens the touchscreen first; the first close
++	 * applies the screen-off state.
++	 */
++	cd->powered = true;
++	cd->opened = true;
++
+ 	error = goodix_berlin_input_dev_config(cd, id);
+ 	if (error) {
+ 		dev_err(dev, "failed set input device");
+ 		return error;
+ 	}
+ 
++	if (goodix_berlin_has_double_tap(cd)) {
++		error = goodix_berlin_wake_dev_config(cd, id);
++		if (error)
++			return error;
++
++		/*
++		 * The DT cannot carry wakeup-source on this board, so the
++		 * device is made wakeup capable here; power/wakeup keeps its
++		 * meaning, whether an armed gesture may wake the system.  The
++		 * IRQ is armed only while the gesture is, never for a sleep
++		 * with the controller powered off, so drop the i2c core's
++		 * arming where the DT does have the property.
++		 */
++		if (device_can_wakeup(dev)) {
++			dev_pm_clear_wake_irq(dev);
++		} else {
++			error = devm_device_init_wakeup(dev);
++			if (error)
++				return error;
++		}
++	}
++
++	/*
++	 * Requested before the input devices are registered, so that open
++	 * and close, which can follow registration at once, find it in place.
++	 */
+ 	error = devm_request_threaded_irq(dev, cd->irq, NULL, goodix_berlin_irq,
+ 					  IRQF_ONESHOT, "goodix-berlin", cd);
+ 	if (error) {
+@@ -1389,6 +2070,26 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
+ 		return error;
+ 	}
+ 
++	/* Runs after the input devices are gone, before the IRQ is freed. */
++	error = devm_add_action_or_reset(dev, goodix_berlin_cancel_mode_work, cd);
++	if (error)
++		return error;
++
++	error = input_register_device(cd->input_dev);
++	if (error) {
++		dev_err(dev, "failed set input device");
++		return error;
++	}
++
++	if (cd->wake_input) {
++		error = input_register_device(cd->wake_input);
++		if (error)
++			return dev_err_probe(dev, error,
++					     "failed to register wake input\n");
++
++		goodix_berlin_watch_lid(cd);
++	}
++
+ 	dev_info(dev,
+ 		 "Goodix Berlin %s Touchscreen Controller, event layout %u/%u\n",
+ 		 cd->fw_version.patch_pid, cd->touch_data_head_len,

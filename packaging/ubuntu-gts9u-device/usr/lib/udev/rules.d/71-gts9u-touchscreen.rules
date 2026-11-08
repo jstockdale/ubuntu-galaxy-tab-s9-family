@@ -1,10 +1,13 @@
-# Let the desktop user switch the SM-X710 touchscreen's double tap to wake.
+# Let the desktop user switch the touchscreen's double tap to wake: the
+# SM-X710's FTS1BA90A (samsung_fts1ba90a) and the SM-X910's Goodix GT6936
+# (goodix-berlin-i2c, with this image's kernel patch).
 #
-# samsung_fts1ba90a creates double_tap_to_wake root-only; the setting is off
-# by default, as in the stock kernel, because armed it keeps the controller
+# Both drivers create double_tap_to_wake root-only; the setting is off by
+# default, as in the stock kernel, because armed it keeps the controller
 # scanning in low-power mode while the screen is off and powered through
 # system sleep.
 # Only that attribute is opened up: power/wakeup (whether an armed gesture may
 # also wake the system from sleep) stays with root.  The rule matches the
-# driver, so it does nothing on boards without this controller.
-ACTION!="remove", SUBSYSTEM=="i2c", DRIVER=="samsung_fts1ba90a", RUN+="/usr/libexec/ubuntu-gts9u-touch-permissions %p"
+# drivers, so it does nothing on boards without these controllers, and the
+# helper does nothing where the driver has no such attribute.
+ACTION!="remove", SUBSYSTEM=="i2c", DRIVER=="samsung_fts1ba90a|goodix-berlin-i2c", RUN+="/usr/libexec/ubuntu-gts9u-touch-permissions %p"

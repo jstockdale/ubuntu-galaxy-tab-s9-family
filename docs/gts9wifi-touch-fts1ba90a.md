@@ -218,6 +218,55 @@ polled every 30 s downstream), FOD and the other sponge gestures, and the
 pull-down suspend pin state (`fts1ba90a_attn_irq_suspend`; the IRQ is disabled
 whenever the controller is off).
 
+### SM-X910 (Goodix GT6936): the same switch, untested on hardware
+
+The Ultra's touchscreen is the Goodix GT6936 on mainline `goodix_berlin`, and
+until now its driver had no double tap to wake at all: no attribute (so no
+Touch page), no gesture mode, no wake key, and the controller is powered off
+for every system sleep.
+`kernel/patches/support-goodix-samsung-double-tap-wake.patch` adds it with the
+protocol of Samsung's GPL Goodix driver for the SM-X910
+(`drivers/input/touchscreen/goodix/berlin`) and the contract above.
+`scripts/build-mainline-kernel.sh` applies it after the FOD patches, in
+`FINGERPRINT_TOUCH_FOD=1` builds (the default), because it uses their sponge
+plumbing.  **None of it has run on hardware yet.**
+
+- The attribute is `double_tap_to_wake` on the Goodix I2C device
+  (`/sys/bus/i2c/drivers/goodix-berlin-i2c/*-005d/`).  It is 0/1, off at every
+  probe, and root-only until `71-gts9u-touchscreen.rules` and
+  `ubuntu-gts9u-desktop-user` hand it to the desktop user.  Next to it is a
+  read-only `power_state`: `active`, `low-power`, or `off` (only during
+  sleep).  Both exist only where the firmware publishes Samsung's sponge
+  (firmware PID 6936).
+- Armed, with the touchscreen closed and no `SW_LID` closed, the driver enters
+  Samsung's gesture mode (`gsx_gesture_before_suspend()`).  It sets sponge
+  mode bit 5 (bit 4 stays FOD's), writes the wall clock to sponge offset 0x10,
+  then sends command `0xa6`.  It leaves with `0xa7` when the touchscreen is
+  reopened.  Unlike the X710 there is no sense-off state: switched off, or
+  under a closed cover, the controller keeps scanning with the screen off, as
+  it always has.
+- System sleep follows the table under "System sleep" above.  The Ultra
+  suspends `deep` by default, so with the switch on, a double tap is a wake
+  source by default.  Root can write `disabled` to the device's
+  `power/wakeup`.  The pinned DTB cannot carry `wakeup-source`, so the driver
+  makes the device wakeup capable itself.  The IRQ is parked between late
+  suspend and early resume, as on the X710.  `resume_early` also runs the IRQ
+  thread once, so the gesture is read even if the attention line no longer
+  asserts it.
+- Type 1, id 1 gesture records become `KEY_WAKEUP`, with a hard wakeup event,
+  on "Goodix Berlin Capacitive TouchScreen Wake Gesture" (journal: "double tap
+  to wake").  The S Pen hover suppression does not apply in the gesture mode.
+  After five stray contacts in the gesture mode, the driver sends the gesture
+  command again, as Samsung does.
+
+Still to be checked on the tablet:
+
+- whether the GT6936 firmware emits the gesture;
+- whether GNOME closes this touchscreen when the screen blanks (`power_state`
+  reads `low-power` once it is dark);
+- whether the touch IRQ (TLMM 25, PDC 57) wakes the tablet from deep sleep;
+- what the gesture mode costs in standby.
+
 ## Integration snippets
 
 ### 1. DTS node for `kernel/dts/sm8550-samsung-gts9wifi.dts`

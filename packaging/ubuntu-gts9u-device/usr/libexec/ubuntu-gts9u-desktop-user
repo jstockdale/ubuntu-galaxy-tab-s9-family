@@ -121,10 +121,12 @@ if [ -e "$flash_brightness" ]; then
 		echo "ubuntu-gts9u: flash LED handed to $name"
 fi
 
-# The X710 touchscreen's double-tap-to-wake switch, for the same reason: the
-# touch IC binds about 4 s into boot, long before this file exists, so the
-# udev helper cannot know the owner on the boot the wizard creates them.
-for double_tap in /sys/bus/i2c/drivers/samsung_fts1ba90a/*/double_tap_to_wake; do
+# The touchscreen's double-tap-to-wake switch (the X710's FTS1BA90A, the
+# X910's Goodix), for the same reason: the touch IC binds seconds into boot,
+# long before this file exists, so the udev helper cannot know the owner on
+# the boot the wizard creates them.
+for double_tap in /sys/bus/i2c/drivers/samsung_fts1ba90a/*/double_tap_to_wake \
+		/sys/bus/i2c/drivers/goodix-berlin-i2c/*/double_tap_to_wake; do
 	[ -e "$double_tap" ] || continue
 	chown "$name" "$double_tap" && \
 		echo "ubuntu-gts9u: double-tap-to-wake switch handed to $name"

@@ -16,6 +16,14 @@ HARDWARE = PKG / "usr/libexec/tab-companion-hardware"
 WINDOW = PKG / "usr/lib/tab-companion/tab_companion/window.py"
 SCHEMA = PKG / "usr/share/glib-2.0/schemas/io.github.agcarbajo.TabCompanion.gschema.xml"
 DRIVER = ROOT / "kernel/drivers/samsung_fts1ba90a.c"
+GOODIX_PATCH = ROOT / "kernel/patches/support-goodix-samsung-double-tap-wake.patch"
+BUILD = ROOT / "scripts/build-mainline-kernel.sh"
+DEVICE = ROOT / "packaging/ubuntu-gts9u-device"
+RULES = DEVICE / "usr/lib/udev/rules.d/71-gts9u-touchscreen.rules"
+DESKTOP_USER = DEVICE / "usr/libexec/ubuntu-gts9u-desktop-user"
+# Both touch drivers, as the kernel names them (the Goodix one is mainline's
+# goodix_berlin_i2c.c).
+TOUCH_DRIVERS = ("samsung_fts1ba90a", "goodix-berlin-i2c")
 
 
 def read_text(path, fallback=""):
@@ -178,6 +186,84 @@ class SettingsAndWindowTests(unittest.TestCase):
         driver = DRIVER.read_text(encoding="utf-8")
         self.assertIn("static DEVICE_ATTR_RW(double_tap_to_wake);", driver)
         self.assertIn("&dev_attr_double_tap_to_wake.attr,", driver)
+
+
+class GoodixDoubleTapTests(unittest.TestCase):
+    """The SM-X910's Goodix patch keeps the SM-X710 driver's contract."""
+
+    def setUp(self):
+        lines = GOODIX_PATCH.read_text(encoding="utf-8").splitlines()
+        self.added = "\n".join(line[1:] for line in lines
+                               if line.startswith("+") and not line.startswith("+++"))
+
+    def test_patch_offers_the_attribute(self):
+        self.assertIn("static DEVICE_ATTR_RW(double_tap_to_wake);", self.added)
+        self.assertIn("&dev_attr_double_tap_to_wake.attr,", self.added)
+        self.assertIn('return sysfs_emit(buf, "%d\\n", READ_ONCE(cd->double_tap));', self.added)
+        self.assertIn("error = kstrtobool(buf, &enable);", self.added)
+
+    def test_off_by_default(self):
+        self.assertNotRegex(self.added, r"cd->double_tap\s*=\s*true")
+        self.assertNotRegex(self.added, r"WRITE_ONCE\(cd->double_tap, true\)")
+
+    def test_wakeup_capable_without_the_dt(self):
+        # The pinned DTB has no wakeup-source; power/wakeup must still exist
+        # and default to enabled, and the IRQ is armed only with the gesture.
+        self.assertIn("devm_device_init_wakeup(dev)", self.added)
+        self.assertNotIn("dev_pm_set_wake_irq", self.added)
+        self.assertIn("device_may_wakeup(dev)", self.added)
+        self.assertIn("enable_irq_wake(cd->irq)", self.added)
+        self.assertIn("disable_irq_wake(cd->irq)", self.added)
+
+    def test_wake_key_on_its_own_device(self):
+        self.assertIn("input_set_capability(wake_input, EV_KEY, KEY_WAKEUP);", self.added)
+        for value in (1, 0):
+            self.assertIn(f"input_report_key(cd->wake_input, KEY_WAKEUP, {value});", self.added)
+        self.assertIn("pm_wakeup_dev_event(cd->dev, GOODIX_BERLIN_WAKE_EVENT_MS, true);", self.added)
+        self.assertIn('dev_info(cd->dev, "double tap to wake\\n");', self.added)
+
+    def test_samsung_protocol(self):
+        # sec_input.h SEC_TS_MODE_SPONGE_DOUBLETAP_TO_WAKEUP, goodix_brl_hw.c
+        # brl_gesture(), goodix_ts_core.h gesture code and id.
+        for name, value in (("SPONGE_DOUBLE_TAP_BIT", r"BIT\(5\)"),
+                            ("SPONGE_UTC", "0x10"),
+                            ("CMD_GESTURE_MODE", "0xa6"),
+                            ("CMD_COORD_MODE", "0xa7"),
+                            ("SAMSUNG_DOUBLE_TAP_TYPE", "1"),
+                            ("SAMSUNG_GESTURE_ID_WAKEUP", "1")):
+            self.assertRegex(self.added, rf"#define GOODIX_BERLIN_{name}\s+{value}\n")
+
+    def test_build_applies_it_after_the_fod_patches(self):
+        build = BUILD.read_text(encoding="utf-8")
+        block = build[build.index('if [ "$fingerprint_touch" = 1 ]; then'):]
+        block = block[:block.index("\nfi\n") + 1]
+        patch = "support-goodix-samsung-double-tap-wake.patch"
+        self.assertIn(f"\t\t{patch}\n", block)
+        for earlier in ("support-goodix-samsung-fod.patch",
+                        "cleanup-goodix-fod-on-suspend.patch",
+                        "retain-goodix-fod-contact-until-release.patch"):
+            self.assertLess(block.index(earlier), block.index(patch))
+        # The apply_unless marker must be something the patch adds.
+        marker = re.search(r"apply_unless '([^']+)' \\\n\t\tdrivers/input/touchscreen/"
+                           r"goodix_berlin_core\.c \\\n\t\t" + re.escape(patch), block).group(1)
+        self.assertIn(marker, self.added)
+
+
+class TouchPermissionTests(unittest.TestCase):
+    def test_udev_rule_covers_both_drivers(self):
+        rules = [line for line in RULES.read_text(encoding="utf-8").splitlines()
+                 if line and not line.startswith("#")]
+        self.assertEqual(len(rules), 1)
+        match = re.search(r'DRIVER=="([^"]+)"', rules[0])
+        self.assertEqual(tuple(match.group(1).split("|")), TOUCH_DRIVERS)
+        self.assertIn('RUN+="/usr/libexec/ubuntu-gts9u-touch-permissions %p"', rules[0])
+        # power/wakeup stays with root.
+        self.assertNotIn("wakeup", rules[0])
+
+    def test_desktop_user_gets_both_switches(self):
+        source = DESKTOP_USER.read_text(encoding="utf-8")
+        for driver in TOUCH_DRIVERS:
+            self.assertIn(f"/sys/bus/i2c/drivers/{driver}/*/double_tap_to_wake", source)
 
 
 if __name__ == "__main__":

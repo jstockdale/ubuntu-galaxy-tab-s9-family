@@ -300,9 +300,11 @@ a quick settings toggle. See [dual-boot.md](dual-boot.md).
 ## Touch
 
 The Touch page (from 1.3.15) appears where the touchscreen's driver offers
-something to set, today the SM-X710's FTS1BA90A; the SM-X910's Goodix driver
-has no such switch, so there is no page there. Its one setting is **Double tap
-to wake**, off by default as in Samsung's kernel. On, the touchscreen keeps
+something to set: the SM-X710's FTS1BA90A, and the SM-X910's Goodix on kernels
+built with `support-goodix-samsung-double-tap-wake.patch` (not yet tested on
+hardware; see the SM-X910 note in the touch notes linked below). Kernels
+without that patch have no switch, so the SM-X910 shows no page there. Its
+one setting is **Double tap to wake**, off by default as in Samsung's kernel. On, the touchscreen keeps
 scanning while the screen is off (at a little battery cost), and a double tap
 turns the screen back on; with the cover closed it is off, as the controller
 stops scanning then.

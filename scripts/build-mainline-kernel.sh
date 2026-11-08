@@ -443,6 +443,14 @@ if [ "$fingerprint_touch" = 1 ]; then
 	apply_unless 'Keep suppressed contacts until their coordinate RELEASE' \
 		drivers/input/touchscreen/goodix_berlin_core.c \
 		retain-goodix-fod-contact-until-release.patch
+	# Double tap to wake arms Samsung's gesture through the same sponge: it
+	# needs the sponge address, the command helper and the lock that
+	# support-goodix-samsung-fod.patch adds, so it lives in this block.  The
+	# double_tap_to_wake attribute is off by default and is created only where
+	# the firmware publishes the sponge (the SM-X910's GT6936).
+	apply_unless 'double_tap_to_wake' \
+		drivers/input/touchscreen/goodix_berlin_core.c \
+		support-goodix-samsung-double-tap-wake.patch
 fi
 
 # Xorg only creates a PRIME GPU screen when MODE_GETRESOURCES succeeds.  Keep
