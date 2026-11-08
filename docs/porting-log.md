@@ -8215,3 +8215,30 @@ works with 10 ms. A power-up after a power-down taken mid-move can still
 fail. The stock data decoded so far shows no park or settle sequence to
 compare against (the actuator block has 13 init records and the power
 records, plus unidentified tuning words such as 7500 and 10000).
+
+### Device 2.60 with the Bluetooth self-heal, for squirtle (2026-11-08)
+
+`claude/x710-bt-bringup` (2.59, the Bluetooth self-heal) is merged into
+`claude/x710-cx-kit` (`870c6de`). 2.60 carries both changes: the
+bt-uart-recover unit, udev rule, system-sleep hook and helper, and the camera
+package pins. `tests.test_bt_uart_recover` and `tests.test_usb_runtime_pm`:
+43 tests OK.
+
+Built with `DEVICE=gts9wifi` against the CX kernel (the build-cxg5 object
+tree and `out/kernel-gts9wifi-cx`), which is what squirtle runs:
+- `ubuntu-gts9u-device_2.60_arm64.deb` `26229eab029274e65c4a3790b65da0c82a8a92440093cd32e3ee30a60295b9b5`.
+  Against the installed 2.58 (`99366b71…`) it differs only in the four
+  self-heal files and the Bluetooth address unit. Its `qcom_spss_irq.ko` is
+  the CX build's (`8e421c6e…`, the one in `/lib/modules` on squirtle), and
+  the camera labels are `gts9wifi`.
+- `libcamera-gts9u_0.7.2+53.g62d4bfc-gts9u10_arm64.deb` `3daa7bdabda11d4036ddfec185ca38326671661aa3ad52202071f2f0688ef4ea`
+- `libspa-0.2-libcamera-gts9u_1.0.5-gts9u11_arm64.deb` `79f7cc4e2ff431ba9a6c9fc9c19f6743c61d3d667e6e16fd117e01ef06045e58`
+
+squirtle, boot `9c0e3019`:
+- installed: device 2.58, libcamera gts9u9, libspa gts9u10, companion
+  1.3.15; `dpkg --audit` clean.
+- The set is staged in `~/device-2.60` and checksum-verified. A copy is in
+  `~/ubuntu-gts9u/backups/device-260-kit` on the build host.
+- `apt-get -s install` of the three: 3 upgraded, 0 new, 0 removed, nothing
+  unauthenticated.
+- Not installed yet.
