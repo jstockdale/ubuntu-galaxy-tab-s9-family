@@ -7326,3 +7326,33 @@ tables). That costs most when each burst carries little.
 
 Still to run: the 4 KB A/B, 30 minutes of mixed fio, 20 suspend cycles, idle
 drain and a reboot.
+
+#### Write speed and the WriteBooster cache
+
+At G5, KDiskMark's SEQ128K Q32T1 write came out about two thirds lower than on
+fix7-ice. The cause is the UFS part's SLC write cache (WriteBooster). The link
+is not involved.
+
+fio, 128 KB at QD32, one job, sampled each second (`attributes/wb_avail_buf`,
+`wb_on`, gear):
+
+- With the cache at 100 %, writes ran at 1884 MB/s. The cache emptied in
+  about 6 s.
+- With the cache at 0 %, 1 MB writes ran at 644 MB/s, the TLC write speed.
+- The link stayed at HS-G5, 300 MHz, with WriteBooster on.
+
+The cache is nominally 16 GiB (`wb_cur_buf` 0x1000 units of 4 MiB). About
+11 GB of it emptied in those 6 s. At idle it flushes back to 100 % in under
+15 s, but only while the link is in hibernate. Mainline turns WriteBooster on
+for HS gears of G3 and above (`clk_scaling.wb_gear`) and off at G1 and G2,
+when the clock scales down at idle. Flushing still runs then. So nothing here
+is specific to G5.
+
+The owner's KDiskMark profile uses an 8 GiB file and 5 loops, and its helper
+runs fio with `--size=8192m --runtime=<measuring time>` per loop. The SEQ1M
+write test alone therefore writes up to about 40 GiB, and the SEQ128K reads that
+follow keep the link out of hibernate. The SEQ128K write then starts with a
+mostly empty cache, and how empty depends on the timing of everything before
+it. The owner ran SEQ128K Q32T1 on its own after idling and confirmed the full
+speed. A fair G4/G5 comparison has to start each write test with the cache at
+100 %.
