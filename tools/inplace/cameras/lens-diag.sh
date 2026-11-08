@@ -9,6 +9,11 @@
 # module and moves the lens.  A reboot undoes everything (the camera switch
 # is per boot).
 #
+# PipeWire's libcamera keeps the lens open, and a rebind under an open file
+# would free the driver's state.  So, with the Camera app closed, it pauses
+# the owner's PipeWire (audio stops too) and the camera relays for the test,
+# then starts them again and reconnects the Bluetooth devices it found.
+#
 #   1. open the lens with the rail cold, as the first open after enabling did
 #   2. if that fails again: open it while the sensor streams, so the shared
 #      rear rail has been up for seconds
@@ -33,6 +38,38 @@ dev=/sys/bus/i2c/devices/$lens
 out=/var/log/gts9u-cameras-test/$(date +%Y%m%d-%H%M%S)-lens
 mkdir -p "$out"; chgrp adm "$out" 2>/dev/null; chmod 0750 "$out"
 log() { echo "$*" | tee -a "$out/summary.txt"; }
+owner=$(cat /run/ubuntu-gts9u/desktop-user 2>/dev/null || echo "${SUDO_USER:-}")
+uid=$(id -u "$owner" 2>/dev/null || :)
+as_owner() {
+	runuser -u "$owner" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+		DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+}
+holders() { # NODE: "pid command" of every process with NODE open
+	for f in /proc/[0-9]*/fd/*; do
+		[ "$(readlink "$f" 2>/dev/null)" = "$1" ] || continue
+		p=${f#/proc/}
+		p=${p%%/*}
+		echo "$p $(cat "/proc/$p/comm" 2>/dev/null)"
+	done | sort -u | tr '\n' ' '
+}
+pw_units='pipewire.socket pipewire-pulse.socket pipewire.service pipewire-pulse.service wireplumber.service'
+paused= relays= bt=
+resume_users() {
+	[ -n "$paused" ] || return 0
+	paused=
+	as_owner systemctl --user start $pw_units
+	[ "$relays" = active ] && systemctl start ubuntu-gts9u-camera-relays.service
+	sleep 5
+	for addr in $bt; do
+		if bluetoothctl connect "$addr" > /dev/null 2>&1; then
+			log "Bluetooth $addr connected again"
+		else
+			log "Bluetooth $addr did not reconnect"
+		fi
+	done
+	log "PipeWire and the camera relays started again"
+}
+trap resume_users EXIT
 subdev() { # the lens's v4l-subdev node
 	for s in "$dev"/video4linux/v4l-subdev*; do [ -e "$s" ] && echo "/dev/${s##*/}"; done | head -1
 }
@@ -66,6 +103,20 @@ try_open() { # label
 }
 
 log "kernel $(uname -r), boot $(cat /proc/sys/kernel/random/boot_id)"
+held=$(holders "$(subdev)")
+if [ -n "$held" ]; then
+	log "the lens is held open by: $held"
+	[ -n "$uid" ] || { log "no desktop user to pause: stop those and run again"; exit 1; }
+	relays=$(systemctl show -p ActiveState --value ubuntu-gts9u-camera-relays.service)
+	bt=$(bluetoothctl devices Connected 2>/dev/null | awk '$1 == "Device" {print $2}')
+	paused=1
+	systemctl stop ubuntu-gts9u-camera-relays.service
+	as_owner systemctl --user stop $pw_units
+	sleep 2
+	held=$(holders "$(subdev)")
+	[ -z "$held" ] || { log "still held open by: $held; nothing was tested"; exit 1; }
+	log "paused PipeWire and the camera relays for the test"
+fi
 log "before:"; state
 
 # 1: the rail cold, as on the first open.
