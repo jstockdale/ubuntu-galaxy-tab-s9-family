@@ -264,6 +264,12 @@ Known limits:
 - **The USB controller may runtime-suspend after that cycle** (device package
   2.58, not yet tested on hardware). It suspends 5 s after it is left
   unconnected. To keep it on, create `/etc/ubuntu-gts9u/usb-runtime-pm-off`.
+- **Bluetooth recovers from a UART IRQ storm by itself** (device package
+  2.59, not yet tested on hardware). A suspend, the boot-time cycle
+  included, can leave the BT UART with its IRQ disabled. After that cycle
+  and after every resume, `ubuntu-gts9u-bt-uart-recover` checks for this
+  and rebinds the UART once. To turn it off, create
+  `/etc/ubuntu-gts9u/bt-uart-recover-off`.
 
 ### Building the SM-X710 ZIP
 

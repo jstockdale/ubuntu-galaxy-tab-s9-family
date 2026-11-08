@@ -1,6 +1,13 @@
 [Unit]
 Description=Apply the native Samsung Bluetooth address from EFS
 Documentation=https://github.com/agcarbajo/postmarketos-galaxy-tab-s9-ultra
+# Started by udev for every hci0 that appears (70-gts9u-bluetooth-address.rules):
+# at boot, and again whenever the controller is created anew.  A new hci0 has
+# the NVM's null address and stays unconfigured, which bluetoothd ignores,
+# until this runs (the BT UART rebind of 2026-11-08).  Hence no RemainAfterExit,
+# which made every later start a no-op, and no [Install]: multi-user.target
+# would run it a second time at boot.
+#
 # Deliberately AFTER bluetooth.service, which is the opposite of the reference
 # postmarketOS port.  Measured on Ubuntu with BlueZ 5.72: btmgmt blocks
 # indefinitely when it runs before bluetoothd, and the unit then timed out at
@@ -16,10 +23,4 @@ ConditionPathExists=/dev/disk/by-partlabel/efs
 [Service]
 Type=oneshot
 ExecStart=/usr/libexec/ubuntu-gts9u-bluetooth-address
-RemainAfterExit=yes
 TimeoutStartSec=120
-
-[Install]
-# multi-user.target, not bluetooth.service: being wanted by the very unit it is
-# ordered after would be a dependency cycle.
-WantedBy=multi-user.target

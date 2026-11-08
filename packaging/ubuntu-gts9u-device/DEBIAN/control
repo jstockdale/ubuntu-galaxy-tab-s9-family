@@ -1,5 +1,5 @@
 Package: ubuntu-gts9u-device
-Version: 2.58
+Version: 2.59
 Section: admin
 Priority: optional
 Architecture: arm64
@@ -22,7 +22,9 @@ Description: Device support for the Samsung Galaxy Tab S9 Ultra and S9 Wi-Fi
     in front of a 16 GiB swapfile created on the internal UFS at first boot;
   * ANA38407 panel recovery after Samsung's cold-boot hand-off;
   * late audio DSP boot, which the ALSA card and the sensors both depend on;
-  * the native Bluetooth address, read read-only from the Samsung EFS;
+  * the native Bluetooth address, read read-only from the Samsung EFS and
+    applied to every new controller, and on the SM-X710 the recovery of a
+    Bluetooth UART whose IRQ the kernel disabled;
   * the UCM profile for the four CS35L45 speakers and the digital microphones;
   * the sensor recovery that hands the DSP accelerometer to the desktop, and
     the accelerometer mount matrix this panel needs;

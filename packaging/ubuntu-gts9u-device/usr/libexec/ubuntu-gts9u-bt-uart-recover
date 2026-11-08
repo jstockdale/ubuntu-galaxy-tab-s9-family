@@ -1,0 +1,438 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Bring the SM-X710's Bluetooth UART back after the kernel disabled its IRQ.
+#
+# docs/porting-log.md, "Bluetooth lost to a UART IRQ storm in the boot-time
+# cycle", has the incident.  In drivers/tty/serial/qcom_geni_serial.c,
+# qcom_geni_serial_isr() returns IRQ_NONE as soon as uport->suspended is set,
+# without clearing the serial engine's interrupt status, and
+# uart_suspend_port() sets that flag before stop_rx masks RX.  An HCI event
+# that lands in the window leaves the level-triggered interrupt asserted.  It
+# refires, "unhandled" every time, until the spurious-IRQ detector prints
+# "Disabling IRQ #N" and turns it off for good.  The UART then receives
+# nothing: every HCI command times out and hci_qca's own recovery fails.  It
+# hit 1 of 32 logged boots, in the boot-time panel cycle's pm_test=platform
+# suspend; every real suspend with Bluetooth on has the same window.
+#
+# Only a new request_irq() clears that state (__setup_irq() drops
+# IRQS_SPURIOUS_DISABLED for a first handler), and qcom_geni_serial requests
+# its IRQ at probe.  So the recovery is to rebind 898000.serial.  The BT serdev
+# re-probes and loads its firmware again.  The new hci0 has the NVM's null
+# address, and udev hands it to ubuntu-gts9u-bluetooth-address.service
+# (70-gts9u-bluetooth-address.rules); bluetoothd adopts it from there.
+#
+# The unit runs this after the boot-time panel cycle, and the system-sleep hook
+# starts the unit again after every resume.  It rebinds when either:
+#   - the kernel log has "Disabling IRQ #N", for the IRQ whose action is
+#     qcom_geni_serial_uart1, after the UART's last probe report (every bind
+#     prints "898000.serial: ttyHS1 at MMIO ... (irq = N, ...)");
+#   - hci0 is up and $PROBE_TRIES Read Local Version commands, $PROBE_GAP s
+#     apart, all time out.
+# It never rebinds:
+#   - on another board, or while /etc/ubuntu-gts9u/bt-uart-recover-off exists
+#     (a fault is still logged);
+#   - more than once per run, or more than $MAX_REBINDS times per boot: a
+#     rebind that does not bring the controller back is logged, not retried;
+#   - on the first boot after one that began a rebind and never finished it (a
+#     crash or hang between unbind and bind): the loop breaker.  The marker is
+#     on disk only for the seconds the unbind and bind take.
+#
+#   ubuntu-gts9u-bt-uart-recover run      what the unit runs (root)
+#   ubuntu-gts9u-bt-uart-recover check    what run would do now; changes nothing
+#   ubuntu-gts9u-bt-uart-recover status   the UART, hci0 and this boot's record
+#
+# Results go to the journal (journalctl -u ubuntu-gts9u-bt-uart-recover), a
+# rebind is also announced in the kernel log, and this boot's record is
+# /run/ubuntu-gts9u/bt-uart-recover (key=value, readable without root).
+set -u
+
+PLATFORM_DEVICES=/sys/bus/platform/devices
+DRIVER=/sys/bus/platform/drivers/qcom_geni_serial
+IRQ_SYSFS=/sys/kernel/irq
+PROC_IRQ=/proc/irq
+BLUETOOTH_CLASS=/sys/class/bluetooth
+DT_COMPATIBLE=/proc/device-tree/compatible
+SUSPEND_STATS=/sys/power/suspend_stats
+KMSG=/dev/kmsg
+BOOT_ID=/proc/sys/kernel/random/boot_id
+UPTIME=/proc/uptime
+STATE=/run/ubuntu-gts9u/bt-uart-recover
+PENDING=/var/lib/ubuntu-gts9u/bt-uart-recover.pending
+OFF_FILE=/etc/ubuntu-gts9u/bt-uart-recover-off
+
+BOARD=samsung,gts9wifi
+UART=898000.serial
+IRQ_ACTION=qcom_geni_serial_uart1
+HCI=hci0
+ADDRESS_UNIT=ubuntu-gts9u-bluetooth-address.service
+# Rebinds per boot, boot check and resumes together.
+MAX_REBINDS=3
+# A healthy controller answers in milliseconds, so three misses over 10 s are
+# not a busy moment.  hciconfig itself waits 1 s for each answer.
+PROBE_TRIES=3
+PROBE_GAP=5
+# Seconds for each step of a rebind.  unbind and bind are synchronous for this
+# driver, so their first poll normally passes; hci0 comes back with the
+# serdev's probe, and its address a few seconds after that.
+BIND_WAIT=10
+HCI_WAIT=30
+ADDRESS_WAIT=45
+
+me=ubuntu-gts9u-bt-uart-recover
+
+say() {
+	echo "$me: $*"
+}
+
+kmsg() {
+	[ -w "$KMSG" ] && printf '%s: %s\n' "$me" "$*" >> "$KMSG" 2>/dev/null || :
+}
+
+uptime_s() {
+	cut -d' ' -f1 "$UPTIME" 2>/dev/null || echo '?'
+}
+
+this_boot() {
+	cat "$BOOT_ID" 2>/dev/null
+}
+
+is_board() {
+	[ -r "$DT_COMPATIBLE" ] && tr '\0' '\n' < "$DT_COMPATIBLE" | grep -qx "$BOARD"
+}
+
+bound() {
+	link=$(readlink "$PLATFORM_DEVICES/$UART/driver" 2>/dev/null) || return 1
+	[ "${link##*/}" = "${DRIVER##*/}" ]
+}
+
+unbound() {
+	! bound
+}
+
+hci_present() {
+	[ -e "$BLUETOOTH_CLASS/$HCI" ]
+}
+
+# The IRQ whose action is the BT UART's; nothing while the UART is unbound.
+uart_irq() {
+	for d in "$IRQ_SYSFS"/*; do
+		[ "$(cat "$d/actions" 2>/dev/null)" = "$IRQ_ACTION" ] || continue
+		echo "${d##*/}"
+		return 0
+	done
+	return 1
+}
+
+# "disabled" when the kernel log has "Disabling IRQ #$1" after the UART's last
+# probe report, which every bind prints with the same IRQ; "clear" when it has
+# not; "unreadable" without the log (dmesg needs root).
+irq_log_verdict() {
+	dmesg 2>/dev/null | awk -v irq="$1" -v probe="$UART: " '
+		index($0, probe) && index($0, "(irq = " irq ",") { d = 0; next }
+		$0 ~ ("Disabling IRQ #" irq "$") { d = 1 }
+		END { print (NR == 0 ? "unreadable" : d ? "disabled" : "clear") }'
+}
+
+# ioctls, not HCI commands: they answer from the kernel and cannot block.
+hci_address() {
+	timeout 5 hciconfig "$HCI" 2>/dev/null |
+		sed -n 's/.*BD Address: \([0-9A-Fa-f:]*\).*/\1/p' | head -n 1
+}
+
+hci_flags() {
+	timeout 5 hciconfig "$HCI" 2>/dev/null |
+		awk '$1 == "UP" || $1 == "DOWN" { $1 = $1; print; exit }'
+}
+
+# No address, or the NVM's: QCA's default is 00:00:00:00:5A:AD.
+unset_address() {
+	case "${1:-}" in
+	''|00:00:00:00:*) return 0 ;;
+	esac
+	return 1
+}
+
+# Sets $probe to answers, silent (every try timed out while hci0 was up) or
+# skipped (no hci0, not up, or an error that says nothing about the UART), and
+# $probe_why.  Read Local Version is harmless and answered by any controller.
+probe_hci() {
+	probe=skipped
+	tries=0
+	while :; do
+		if ! hci_present; then
+			probe_why="no $HCI"
+			return
+		fi
+		flags=$(hci_flags)
+		case "$flags" in
+		UP*) ;;
+		*)
+			probe_why="$HCI is ${flags:-unreadable}, not asked"
+			return
+			;;
+		esac
+		if err=$(timeout 10 hciconfig "$HCI" version 2>&1 >/dev/null); then
+			probe=answers
+			probe_why="$HCI answers"
+			return
+		fi
+		case "$err" in
+		''|*'timed out'*) ;;
+		*)
+			probe_why="$HCI version: $err"
+			return
+			;;
+		esac
+		tries=$((tries + 1))
+		[ "$tries" -lt "$PROBE_TRIES" ] || break
+		sleep "$PROBE_GAP"
+	done
+	probe=silent
+	probe_why="$HCI is up but $tries Read Local Version commands timed out"
+}
+
+# Sets $irq, $irq_log, $probe, $probe_why, and $fault: why the UART needs a
+# rebind, or nothing.
+diagnose() {
+	fault=
+	irq=$(uart_irq) || irq=
+	if [ -n "$irq" ]; then
+		irq_log=$(irq_log_verdict "$irq")
+	else
+		irq_log="no IRQ with action $IRQ_ACTION"
+	fi
+	if [ "$irq_log" = disabled ]; then
+		probe=skipped
+		probe_why="$HCI not asked"
+		fault="the kernel disabled IRQ $irq ($IRQ_ACTION) after the UART's last probe"
+		return
+	fi
+	probe_hci
+	[ "$probe" = silent ] && fault=$probe_why
+	return 0
+}
+
+# This boot's rebind count, and why the loop breaker holds, if it does.
+load_state() {
+	rebinds=0
+	breaker=
+	[ -r "$STATE" ] || return 0
+	[ "$(sed -n 's/^boot_id=//p' "$STATE")" = "$(this_boot)" ] || return 0
+	rebinds=$(sed -n 's/^rebinds=//p' "$STATE")
+	case "$rebinds" in
+	''|*[!0-9]*) rebinds=0 ;;
+	esac
+	breaker=$(sed -n 's/^breaker=//p' "$STATE")
+}
+
+record() { # result reason
+	mkdir -p "${STATE%/*}" 2>/dev/null || return 0
+	{
+		echo "boot_id=$(this_boot)"
+		echo "uptime=$(uptime_s)"
+		echo "result=$1"
+		echo "reason=$2"
+		echo "rebinds=$rebinds"
+		echo "breaker=$breaker"
+		echo "irq=${irq:-}"
+		echo "address=$(hci_address)"
+	} > "$STATE.tmp" 2>/dev/null && chmod 0644 "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+}
+
+marker_boot() {
+	sed -n 's/^boot_id=//p' "$PENDING" 2>/dev/null | head -n 1
+}
+
+# A marker from another boot means that boot began a rebind and never got
+# through it.  This boot then rebinds nothing; a real run consumes the marker,
+# so only this boot is held.
+breaker_check() { # dry
+	[ -e "$PENDING" ] || return 0
+	prev=$(marker_boot)
+	if [ -n "$prev" ] && [ "$prev" = "$(this_boot)" ]; then
+		# An earlier run of this boot was killed during its rebind, and the
+		# kernel came through it.
+		[ "$1" = no ] && rm -f "$PENDING"
+		return 0
+	fi
+	at=$(sed -n 's/^uptime=//p' "$PENDING" 2>/dev/null | head -n 1)
+	breaker="boot $(printf '%s' "${prev:-?}" | cut -c1-8) began a rebind at ${at:-?} s and never finished it"
+	[ "$1" = no ] || return 0
+	rm -f "$PENDING"
+	kmsg "loop breaker: $breaker; no rebind this boot"
+}
+
+# Polls a test once a second, for at most $1 s.
+wait_until() { # seconds test...
+	limit=$1
+	shift
+	i=0
+	while ! "$@"; do
+		[ "$i" -lt "$limit" ] || return 1
+		sleep 1
+		i=$((i + 1))
+	done
+	return 0
+}
+
+address_restored() {
+	address=$(hci_address)
+	if unset_address "$address_before"; then
+		! unset_address "$address"
+	else
+		[ "$address" = "$address_before" ]
+	fi
+}
+
+# One rebind, then the controller's state.  Sets $outcome (recovered or
+# failed) and $outcome_why.
+rebind() {
+	address_before=$(hci_address)
+	rebinds=$((rebinds + 1))
+	mkdir -p "${PENDING%/*}" 2>/dev/null
+	printf 'boot_id=%s\nuptime=%s\n' "$(this_boot)" "$(uptime_s)" > "$PENDING" 2>/dev/null ||
+		say "note: cannot write $PENDING; the loop breaker cannot cover this rebind"
+	sync
+	say "rebinding $UART on ${DRIVER##*/} ($rebinds of $MAX_REBINDS this boot; $HCI address ${address_before:-none})"
+	kmsg "rebinding $UART: $fault"
+	if ! printf '%s' "$UART" > "$DRIVER/unbind" 2>/dev/null; then
+		rm -f "$PENDING"
+		outcome=failed
+		outcome_why="the unbind write failed; $UART is still bound"
+		return
+	fi
+	wait_until "$BIND_WAIT" unbound || say "note: $UART still reads bound after the unbind"
+	printf '%s' "$UART" > "$DRIVER/bind" 2>/dev/null || :
+	if ! wait_until "$BIND_WAIT" bound; then
+		# The kernel retries a deferred probe by itself; ask once more.
+		printf '%s' "$UART" > "$DRIVER/bind" 2>/dev/null || :
+		wait_until "$BIND_WAIT" bound || :
+	fi
+	# Whatever the result, the kernel came through the unbind and the bind.
+	rm -f "$PENDING"
+	if ! bound; then
+		outcome=failed
+		outcome_why="$UART did not bind again (bind it with: echo $UART > $DRIVER/bind)"
+		return
+	fi
+	if ! wait_until "$HCI_WAIT" hci_present; then
+		outcome=failed
+		outcome_why="$UART is bound again but no $HCI came back in $HCI_WAIT s"
+		return
+	fi
+	if ! wait_until "$ADDRESS_WAIT" address_restored; then
+		say "$HCI still reads ${address:-no address} after $ADDRESS_WAIT s; starting $ADDRESS_UNIT"
+		systemctl start --no-block "$ADDRESS_UNIT" 2>/dev/null || :
+		wait_until "$ADDRESS_WAIT" address_restored || :
+	fi
+	diagnose
+	if [ -n "$fault" ]; then
+		outcome=failed
+		outcome_why="still faulty after the rebind: $fault"
+	elif ! address_restored; then
+		outcome=failed
+		outcome_why="$HCI came back as ${address:-no address}, without its native address"
+	else
+		outcome=recovered
+		outcome_why="IRQ $irq, $probe_why, $HCI at $address"
+	fi
+}
+
+do_run() { # dry
+	dry=$1
+	if ! is_board; then
+		say "not $BOARD; nothing to do"
+		return 0
+	fi
+	if [ ! -e "$PLATFORM_DEVICES/$UART" ]; then
+		say "no $UART; nothing to do"
+		return 0
+	fi
+	load_state
+	breaker_check "$dry"
+	[ -n "$breaker" ] && say "loop breaker: $breaker"
+	if ! bound; then
+		irq=
+		say "HOLD: $UART has no driver; leaving it alone (bind it with: echo $UART > $DRIVER/bind)"
+		[ "$dry" = no ] && record held "$UART unbound"
+		return 0
+	fi
+	diagnose
+	stats="suspend_stats $(cat "$SUSPEND_STATS/success" 2>/dev/null || echo '?')/$(cat "$SUSPEND_STATS/fail" 2>/dev/null || echo '?')"
+	if [ -z "$fault" ]; then
+		say "healthy: IRQ ${irq:-?} log ${irq_log}; $probe_why ($stats)"
+		[ "$dry" = no ] && record healthy "$probe_why"
+		return 0
+	fi
+	say "FAULT: $fault ($stats)"
+	hold=
+	if [ -e "$OFF_FILE" ]; then
+		hold="$OFF_FILE exists"
+	elif [ -n "$breaker" ]; then
+		hold="loop breaker: $breaker"
+	elif [ "$rebinds" -ge "$MAX_REBINDS" ]; then
+		hold="$rebinds rebinds this boot already (limit $MAX_REBINDS)"
+	fi
+	if [ -n "$hold" ]; then
+		say "HOLD: $hold; not rebinding (by hand: echo $UART > $DRIVER/unbind, then the same to bind)"
+		if [ "$dry" = no ]; then
+			kmsg "fault left alone: $hold"
+			record held "$fault; $hold"
+		fi
+		return 0
+	fi
+	if [ "$dry" = yes ]; then
+		say "would rebind $UART on ${DRIVER##*/}"
+		return 0
+	fi
+	# rebind diagnoses again, which replaces $fault.
+	cause=$fault
+	rebind
+	say "$outcome: $outcome_why"
+	kmsg "$outcome: $outcome_why"
+	record "$outcome" "$cause; $outcome_why"
+	[ "$outcome" = recovered ]
+}
+
+do_status() {
+	is_board || echo "board: not $BOARD (this helper does nothing here)"
+	[ -e "$OFF_FILE" ] && echo "opted out: $OFF_FILE exists (faults are logged, not rebound)"
+	if bound; then
+		echo "$UART: bound to ${DRIVER##*/}"
+	else
+		echo "$UART: no driver bound"
+	fi
+	if irq=$(uart_irq); then
+		echo "IRQ $irq ($IRQ_ACTION): $(tr '\n' ' ' < "$PROC_IRQ/$irq/spurious" 2>/dev/null)"
+		echo "kernel log since the UART's last probe: $(irq_log_verdict "$irq")"
+	else
+		echo "no IRQ with action $IRQ_ACTION"
+	fi
+	if hci_present; then
+		echo "$HCI: $(hci_flags), address $(hci_address)"
+	else
+		echo "no $HCI"
+	fi
+	[ -e "$PENDING" ] &&
+		echo "loop breaker: a rebind marker from boot $(marker_boot | cut -c1-8) is waiting"
+	if [ -r "$STATE" ]; then
+		echo "--- $STATE"
+		cat "$STATE"
+	else
+		echo "--- no record this boot ($STATE)"
+	fi
+}
+
+case "${1:-run}" in
+run)
+	[ "$(id -u)" = 0 ] || { echo "$me: run needs root" >&2; exit 1; }
+	do_run no
+	;;
+check) do_run yes ;;
+status) do_status ;;
+*)
+	echo "usage: ${0##*/} [run|check|status]" >&2
+	exit 2
+	;;
+esac

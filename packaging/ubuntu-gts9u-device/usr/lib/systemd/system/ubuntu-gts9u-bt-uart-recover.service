@@ -1,0 +1,27 @@
+[Unit]
+Description=Recover the SM-X710's Bluetooth UART after the kernel disabled its IRQ
+Documentation=file:/usr/libexec/ubuntu-gts9u-bt-uart-recover
+# SM-X710 only: on the Ultra this is skipped before the helper even starts.
+ConditionFirmware=device-tree-compatible(samsung,gts9wifi)
+ConditionPathExists=/sys/bus/platform/devices/898000.serial
+# At boot: after the panel recovery's pm_test=platform cycle, where the IRQ was
+# lost on 2026-11-08, and after bluetoothd and the native address, so hci0 is
+# checked as the boot left it.  Ordering only: none of them is pulled in, and
+# the check runs whatever the cycle's result.  After every resume the
+# system-sleep hook ubuntu-gts9u-bt-uart-recover starts this unit again.
+After=ubuntu-gts9u-panel-coldboot-recover.service bluetooth.service ubuntu-gts9u-bluetooth-address.service
+# A suspend queued while this runs waits for it, so the UART never goes to
+# sleep unbound.
+Before=sleep.target
+
+[Service]
+# No RemainAfterExit: every start, at boot or after a resume, runs the check.
+Type=oneshot
+ExecStart=/usr/libexec/ubuntu-gts9u-bt-uart-recover run
+# A check takes about a second, or up to ~15 s with hci0 silent.  A rebind
+# waits up to 30 s for hci0 and twice 45 s for its address.
+TimeoutStartSec=300
+SyslogIdentifier=ubuntu-gts9u-bt-uart-recover
+
+[Install]
+WantedBy=multi-user.target
