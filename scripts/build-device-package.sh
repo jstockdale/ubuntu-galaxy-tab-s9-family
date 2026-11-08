@@ -2,8 +2,9 @@
 # Build the ubuntu-gts9u-device Debian package from packaging/.
 #
 # The tree under packaging/ubuntu-gts9u-device is the package layout verbatim,
-# so what ships is exactly what is versioned here, with two exceptions made
-# below: the sensor registry path follows DEVICE, and translations are compiled.
+# so what ships is exactly what is versioned here, with these exceptions made
+# below: the sensor registry path follows DEVICE, translations are compiled,
+# and the package's symlinks are created here rather than versioned.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -135,14 +136,21 @@ if [ -d "$extension/po" ]; then
 	[ "$compiled" -gt 0 ] || { echo 'no catalogues compiled' >&2; exit 1; }
 fi
 
+# --- modes, ownership and links -------------------------------------------
 # Normalise ownership and modes: a package must not inherit whatever the build
-# host happened to have.
+# host happened to have.  tests/test_device_package.py runs this section and
+# the next on a copy of the tree.
 chown -R root:root "$staging"
 find "$staging" -type d -exec chmod 0755 {} +
 find "$staging" -type f -exec chmod 0644 {} +
 find "$staging/usr/libexec" -type f -exec chmod 0755 {} + 2>/dev/null || true
 find "$staging/usr/bin" -type f -name 'gts9u-*' -exec chmod 0755 {} + 2>/dev/null || true
 find "$staging/usr/lib/systemd/system-sleep" -type f -exec chmod 0755 {} + \
+	2>/dev/null || true
+# systemd does not run a generator that is not executable, and the boot goes
+# on without it.  Device 2.56 shipped the fingerprint gate 0644, so fprintd was
+# never masked on the SM-X710 and the greeter waited 25 s for it.
+find "$staging/usr/lib/systemd/system-generators" -type f -exec chmod 0755 {} + \
 	2>/dev/null || true
 # initramfs-tools refuses to run a hook that is not executable, and silently
 # skips it rather than failing the build.
@@ -151,14 +159,35 @@ find "$staging/usr/share/initramfs-tools" -type f -exec chmod 0755 {} + \
 find "$staging/DEBIAN" -type f -name 'p*inst' -exec chmod 0755 {} + 2>/dev/null || true
 find "$staging/DEBIAN" -type f -name 'p*rm' -exec chmod 0755 {} + 2>/dev/null || true
 
-# Deterministic output: without a fixed mtime the .deb changes hash on every
-# build even when its contents do not.
+# The package's symlinks are made here rather than versioned: a checkout with
+# core.symlinks=false (Git for Windows' default) turns a git symlink into a
+# small text file holding the target, which would ship as a broken unit or a
+# dconf profile dconf cannot parse.
+# Masks for alsa-utils' state units: a late alsactl restore of a saved mixer
+# state can undo the UCM speaker sequence (upstream 4b07d7b, "Restore stereo
+# speaker routing after ALSA state recovery", met it on the SM-X910).  The UCM
+# profile and ubuntu-gts9u-speaker-cal set the mixer on every boot instead.
+# Every level is listed: install -d -m does not give its mode to the parents
+# it creates on the way, and those would keep the build host's umask.
+install -d -m0755 "$staging/etc" "$staging/etc/systemd" "$staging/etc/systemd/system" \
+	"$staging/usr/share/dconf" "$staging/usr/share/dconf/profile"
+ln -sfn /dev/null "$staging/etc/systemd/system/alsa-restore.service"
+ln -sfn /dev/null "$staging/etc/systemd/system/alsa-state.service"
+# The dconf user profile follows a file ubuntu-gts9u-suspend-mode writes under
+# /run, so the suspend-off defaults apply only while that mode is chosen.
+ln -sfn /run/ubuntu-gts9u/dconf/profile-user "$staging/usr/share/dconf/profile/user"
+
+# --- conffiles and timestamps ---------------------------------------------
+# Only regular files are conffiles; the links above are not.
 if [ -d "$staging/etc" ]; then
 	(cd "$staging" && find etc -type f | LC_ALL=C sort | sed 's|^|/|') \
 		> "$staging/DEBIAN/conffiles"
 fi
+# Deterministic output: without a fixed mtime the .deb changes hash on every
+# build even when its contents do not.
 find "$staging" -exec touch -h -d '@0' {} +
 
+# --- build ----------------------------------------------------------------
 dpkg-deb --root-owner-group --build "$staging" "$deb"
 dpkg-deb --contents "$deb"
 sha256sum "$deb"
