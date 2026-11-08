@@ -22,6 +22,10 @@ SM-X710 (Galaxy Tab S9) has its own matrix in
   the disk has been split, in `userdata` when it has not. Samsung's ABL loads
   `boot` and `init_boot`, and the DTB/cmdline from `vendor_boot`, off that same
   UFS. Up to v0.17 the root lived on an ext4 microSD.
+- The shared changes made with the SM-X710 port (the S Pen decode, tilt
+  included, the kernel configuration and patches, the panel, pogo, charger and
+  battery drivers, and the device package 2.56 units) have not yet been built
+  and booted on an SM-X910.
 
 For the first milestone **the same 7.2-rc3 kernel and the same DTS already
 proven** are used. Updating the kernel is postponed until parity is reached:
@@ -317,7 +321,10 @@ environment to disable writes.
 
 State on 2026-11-07, one SM-X710 with bootloader revision 5
 (`X710XXS5CYG1`), built with `DEVICE=gts9wifi` from this tree (kernel 7.2-rc3,
-device package 2.56). The evidence levels are the ones above. The SM-X710
+device package 2.56; this tree now builds 2.57, which fixes the fingerprint-gate generator's mode). The unit was first installed from an earlier gts9wifi
+ZIP and updated in place to this kernel and these packages; a ZIP built from
+this tree has not yet been flashed end to end. The evidence levels are the
+ones above. The SM-X710
 installs on the whole tablet only (`gts9u-split.zip` refuses it), and no
 SM-X710 ZIP is published.
 
@@ -325,23 +332,23 @@ SM-X710 ZIP is published.
 |---|---|---|---|
 | Boot with the root on the UFS | ✅ | confirmed | Installed from TWRP into `userdata`, label `UBTS9_UFS` |
 | Internal display 2560×1600 | ✅ | measured | AMSA10FA01 glass behind the Ultra's ANA38407 DDIC; 120 Hz and 60 Hz modes. The panel answers `80 00 04` only after the boot-time `pm_test=platform` cycle, as on the SM-X910; replacing that cycle in the kernel (DISP-5) is open ([display](gts9wifi-display.md)) |
-| Adreno 740 GPU | ✅ | measured | The lost writes (missing pixels, lattice specks) came from rpmhpd never reaching `sync_state`. With `videocc` built in it does, and the GPU test battery lost 0 of 296 frames, against 168 on a control boot (0 again on the first boot of the integrated set). No 719 MHz step: the GPU overlay is the Ultra's only ([display](gts9wifi-display.md)) |
+| Adreno 740 GPU | ✅ | measured | The lost writes (missing pixels, lattice specks) came from rpmhpd never reaching `sync_state`. With `videocc` built in it does, and the GPU test battery lost 0 of 296 frames, against 168 on a control boot (0 again on the first boot of the integrated set). Measured with Mesa 26.2.6 from the kisak PPA on the test unit; the image's Mesa 25.2.8 has not been rechecked since the fix. No 719 MHz step: the GPU overlay is the Ultra's only ([display](gts9wifi-display.md)) |
 | CPU frequency scaling | ✅ | measured | The prime core boosts to 3.36 GHz (`scaling_boost_frequencies` 3360000) once the CPU OPP overlay is 8-byte aligned |
 | FTS1BA90A touch | ✅ | confirmed | Port driver `samsung_fts1ba90a`. Double tap to wake is off by default (Tab Companion → Touch switches it); armed, it woke the blanked screen for the owner on 2026-11-07 with the keyboard cover detached (the driver's `double tap to wake` line, then the panel on 0.1 s later) ([touch](gts9wifi-touch-fts1ba90a.md)) |
-| S Pen | ✅ | confirmed | The owner drew with it in landscape and portrait on the pen test page (now Tab Companion's pen test): pressure (0 to 0.83 as the browser reports it), hover and the side button, which GNOME sends as a middle click by default (`buttons` 4 hovering, 5 with the tip down). Tilt was mis-decoded then (the height byte went out as tilt X); with the decode fixed (fix5) the owner checked tilt, the live hover height (0 at contact to about 100 at the edge of range) and the optional side button split, near tap = right click with a 36/44 band. Garage charging, dock and undock detection and the BLE pairing service work ([Tab Companion](tab-companion.md#the-pen-test)) |
+| S Pen | ✅ | confirmed | The owner drew with it in landscape and portrait on the pen test page (now Tab Companion's pen test): pressure (0 to 0.83 as the browser reports it), hover and the side button, which GNOME sends as a middle click by default (`buttons` 4 hovering, 5 with the tip down). Tilt was mis-decoded then (the height byte went out as tilt X); with the decode fixed (kernel commit `ebf16e7`) the owner checked tilt, the live hover height (0 at contact to about 100 at the edge of range) and the optional side button split, near tap = right click with a 36/44 band. Garage charging and dock and undock detection work, and the BLE pairing service starts; pairing a pen has not been recorded yet ([Tab Companion](tab-companion.md#the-pen-test)) |
 | Haptics | ✅ | confirmed | The same `gpio-vibrator` on TLMM GPIO18 as the SM-X910. The owner heard a 400 ms pulse sent through the hardware service's `Vibrate` method and felt the on-screen keyboard's 42 ms pulses |
 | EF-DX720 keyboard cover | ✅ | confirmed | Classified as a keyboard (no touchpad), with its switches on the separate `Samsung Book Cover Switch` device: typing posture keeps laptop mode; detaching or folding it back gives tablet mode, rotation and the on-screen keyboard, at the lock screen too (owner, 2026-11-07). The special-key codes are still the EF-DX920 defaults, unmeasured ([pogo keyboard](../packaging/ubuntu-gts9u-device/usr/share/doc/ubuntu-gts9u-device/pogo-keyboard.md)) |
-| WCN6855 Wi-Fi and Bluetooth / ath11k | ✅ | confirmed | Wi-Fi in daily use over SSH; the address comes from the EFS and stayed the same across reboots; the Bluetooth controller comes up (audio over Bluetooth not yet recorded). ath11k is built in ([Wi-Fi](gts9wifi-wifi.md)) |
+| WCN6855 Wi-Fi and Bluetooth / ath11k | ✅ | confirmed | Wi-Fi in daily use over SSH; the address comes from the EFS and stayed the same across reboots; the Bluetooth controller comes up (Bluetooth audio, AAC included, not yet tested). ath11k is built in ([Wi-Fi](gts9wifi-wifi.md)) |
 | Auto-rotation | ✅ | confirmed | SSC up through the ADSP; rotation confirmed with the keyboard detached. In typing posture GNOME does not rotate, by design ([sensors](gts9wifi-sensors.md)) |
 | Ambient light (VEML3328) | ✅ | measured | libssc's standard `ambient_light` stream; `iio-sensor-proxy` reports the light sensor to GNOME. The reading follows the room: 0 lux at night, 1 to 290 lux over a morning of handling on 2026-11-07 ([sensors](gts9wifi-sensors.md)) |
 | RTC and sleep statistics | ✅ | measured | `rtc-pm8xxx` and `qcom_stats` bound. An RTC alarm wake is not yet proven |
 | Suspend | ⚠️ | measured | Off by default (`ubuntu-gts9u-suspend-mode`): the power key locks and blanks the screen, the cover locks. On 2026-11-06 every `pm_test` level passed and one real s2idle and one real deep sleep resumed; repeated RTC-woken runs ([tools](../scripts/diagnostics/suspend/README.md)) must pass before a mode is enabled |
 | Interconnect | ⚠️ | measured | gem_noc and mc_virt keep their boot-time INT_MAX vote until `ubuntu-gts9u-icc-late-release` releases it after the boot cycle; releasing it before that cycle hung the cycle on every boot (Stage 3 and 3b). The DDR bandwidth monitor `icc_bwmon` is a module and blacklisted ([interconnect](gts9wifi-interconnect.md)) |
 | Early-boot journal | ✅ | measured | The first ~40 s of each boot's journal were lost to a backwards clock jump. Device package 2.56 restores the clock before journald; on its first boot the kernel journal starts at 0 s |
-| 4× CS35L45 speakers and DMICs | ✅ | confirmed | The amplifiers probe with Samsung's X710 firmware and tuning and the UCM profile loads. The owner recorded speech through the digital microphones (about 30 dB above the room's noise floor, peaks at −15 dBFS) and heard it played back on the speakers, with all four amplifiers enabled during playback (2026-11-07) |
+| 4× CS35L45 speakers and DMICs | ✅ | confirmed | The amplifiers probe and the UCM profile loads. The test image had Samsung's speaker-protection files (`cs35l45-dsp1-spk-prot.wmfw`, `.bin` and `-calib.bin`) copied into `FIRMWARE_DIR` by hand; they are not in the X710 manifest yet. The DSP loads them (`DSP1: Firmware: 4fa00 vendor: 0x2 v0.56.0`, tuning named TabS9), and a build without them has not been tested ([firmware manifests](../configs/firmware/README.md)). The owner recorded speech through the digital microphones (about 30 dB above the room's noise floor, peaks at −15 dBFS) and heard it played back on the speakers, with all four amplifiers enabled during playback (2026-11-07) |
 | Cameras | 🟡 | assumed | Two HI1337 (rear 13 MP with DW9808 focus, front 12 MP), described in the DTS but off unless enabled; not tested on hardware ([cameras](gts9wifi-cameras.md)) |
 | USB-C charging, USB host, DisplayPort | ❓ | assumed | Not yet assessed |
 | Bring-up flags | ⚠️ | measured | `clk_ignore_unused`, `pd_ignore_unused` and `regulator_ignore_unused` are still on the shared command line ([flags](gts9wifi-bringup-flags.md)) |
-| Fingerprint reader | ❌ | — | Not supported; the fingerprint services are skipped on this model |
+| Fingerprint reader | ❌ | — | Not supported. Device package 2.57 skips the fingerprint services on this model; 2.56, on the test unit, shipped the gate generator without its executable bit, so fprintd was not masked there and the greeter waited 25 s for it (2.57 not yet tested on hardware) |
 | NPU | ❌ | — | Not built for this model (`GTS9U_INCLUDE_NPU=0`) |
 | Hardware video decode | ❌ | — | Not supported |

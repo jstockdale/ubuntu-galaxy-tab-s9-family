@@ -245,6 +245,14 @@ and the same for `interconnect-1` (not `echo`).  `sudo grep -c 2147483647
 
 ## Weekend experiment
 
+This section is a record of the owner's experiment on the test unit, not a
+procedure to repeat as written.  The experiment script is in the repository,
+but two of the steps use things that are not published: `~/pmtest` (W0's
+pm_test runner) and the fix2-s2 and fix2-s3 image sets under `~/display-exp`
+(W3).  To repeat W0, run one `pm_test=platform` cycle after the late release.
+W3 needs images whose kernel syncs the interconnect early (Stage 3 in the
+timeline above), and the previous images to go back to.
+
 `tools/inplace/icc/weekend/icc-cycle-experiment.sh` (in the kit as
 `~/icc/weekend/`), as root: `sudo sh ~/icc/weekend/icc-cycle-experiment.sh
 <rung>`, and the runtime rungs through `sudo systemd-run

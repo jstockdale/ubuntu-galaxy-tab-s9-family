@@ -1,5 +1,8 @@
 # Panel cold-boot experiments (DISP-5), SM-X710 on fix2-s2
 
+A record of an experiment on one SM-X710 test unit, not an install path (see
+[`../README.md`](../README.md)).
+
 Four vendor_boot variants of the running fix2-s2 images, plus the scripts to
 flash, run and read them. Only the kernel command line differs from fix2-s2
 (same kernel, DTB, ramdisk; `make-images.sh` proves the repack is
@@ -55,7 +58,7 @@ survives.
 systemd.mask=ubuntu-gts9u-icc-late-release.service`: the boot-time cycle
 does not run, for that boot only (systemd 255 drops the mask with the boot;
 the next vendor_boot without it is a normal boot again). The icc mask keeps
-the interconnect floor at INT_MAX whether or not the overnight icc kit is
+the interconnect floor at INT_MAX whether or not the icc kit (`../icc`) is
 installed (its helper would keep it too, but the experiment should not
 depend on that).
 
@@ -67,22 +70,26 @@ come back hangs the boot: recovery below).
 
 ## Before you start (host, no sudo)
 
-    S=/tmp/claude-1000/-home-jstockdale-projects-ubuntu-galaxy-tab-s9-ultra/0b18c5c0-eba0-4cb6-977b-893306d69db3/scratchpad/overnight/panel
-    # the kit
-    git -C ~/projects/ubuntu-galaxy-tab-s9-ultra archive overnight/panel tools/inplace/panel |
-      ssh jstockdale@10.42.0.2 'rm -rf ~/panel && mkdir ~/panel && tar -x --strip-components=3 -C ~/panel'
-    # the four images (96 MiB each, mostly zeros)
-    scp -C -r "$S"/images/panel-ref "$S"/images/panel-e0 "$S"/images/panel-e1 "$S"/images/panel-e2 \
-      jstockdale@10.42.0.2:display-exp/
-    ssh jstockdale@10.42.0.2 'cd ~/panel && sha256sum -c SHA256SUMS && cd ~/display-exp && sha256sum -c ~/panel/IMAGES.sha256'
-    # a host copy of the rollback image, for TWRP (the scratchpad lives in /tmp)
-    scp jstockdale@10.42.0.2:display-exp/fix2-s2/vendor_boot.img ~/ubuntu-gts9u/fix2-s2-vendor_boot.img
+The commands run from this repository's top directory, at HEAD.  The images
+are built from the fix2-s2 `vendor_boot.img` on the test unit (unpublished;
+see [`../README.md`](../README.md)).  `make-images.sh` is reproducible and
+checks its result against `IMAGES.sha256`.
+
+    # a host copy of fix2-s2's vendor_boot: the base for the images, and the rollback for TWRP
+    scp <user>@10.42.0.2:display-exp/fix2-s2/vendor_boot.img ~/ubuntu-gts9u/fix2-s2-vendor_boot.img
     sha256sum ~/ubuntu-gts9u/fix2-s2-vendor_boot.img   # 0742866cbfb01da7...
+    # the four images (96 MiB each, mostly zeros)
+    S=/tmp/panel-images
+    tools/inplace/panel/make-images.sh ~/ubuntu-gts9u/fix2-s2-vendor_boot.img "$S"
+    # the kit
+    git archive HEAD tools/inplace/panel |
+      ssh <user>@10.42.0.2 'rm -rf ~/panel && mkdir ~/panel && tar -x --strip-components=3 -C ~/panel'
+    scp -C -r "$S"/panel-ref "$S"/panel-e0 "$S"/panel-e1 "$S"/panel-e2 \
+      <user>@10.42.0.2:display-exp/
+    ssh <user>@10.42.0.2 'cd ~/panel && sha256sum -c SHA256SUMS && cd ~/display-exp && sha256sum -c ~/panel/IMAGES.sha256'
 
-If the scratchpad is gone, rebuild the images (reproducible; the script
-checks the result against `IMAGES.sha256`):
-
-    tools/inplace/panel/make-images.sh ~/ubuntu-gts9u/fix2-s2-vendor_boot.img /tmp/panel-images
+The host copy of the rollback image lives outside `/tmp` so that it survives
+a host reboot; the image dir in `/tmp` is only needed until the copy.
 
 ## Procedure (on the tablet; `sudo` lines need your password)
 

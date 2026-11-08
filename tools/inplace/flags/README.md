@@ -1,5 +1,10 @@
 # Bring-up flag experiment (SM-X710, Stage 2)
 
+A record of an experiment on one SM-X710 test unit, not an install path (see
+[`../README.md`](../README.md)).  The sets are built from the unpublished
+fix2-s2 images, and `~/fix1/verify.sh` is the fix1 kit on that unit; neither
+is in this repository.
+
 Four `vendor_boot.img` images, each fix2-s2 with a different set of
 `clk_ignore_unused`, `pd_ignore_unused` and `regulator_ignore_unused`
 removed.  `boot.img` in every set is fix2-s2's kernel (sha256 `dcf88155…`), and
@@ -40,44 +45,47 @@ Files:
   (group adm, so readable over plain SSH), plus a verdict: `ok`, `CHECK` or
   `info` per line, compared with the newest `control` capture.
 
-## Morning plan
+## Procedure
 
-Starting point: the tablet as it was left, on fix2-s2 (Stage 2), reachable as
-`jstockdale@10.42.0.2`.  Take every capture with the screen on and unlocked,
-at least 60 s and preferably less than an hour after boot (the clk trace
-wraps after a few hours).  Stop at the first failing step and go to step 7.
-Each step takes about 10 minutes.
+Starting point: the test unit on fix2-s2 (Stage 2), reachable as
+`<user>@10.42.0.2` over the development USB gadget.  Take every capture with
+the screen on and unlocked, at least 60 s and preferably less than an hour
+after boot (the clk trace wraps after a few hours).  Stop at the first failing
+step and go to step 7.  Each step takes about 10 minutes.
 
-Run these steps before installing anything from the other overnight kits
-(interconnect release, suspend inhibitor, Wi-Fi, boot-hygiene units): the
-control capture describes plain fix2-s2, and `flags-check.sh` expects the
-Stage 2 interconnect pattern (gem_noc and mc_virt unsynced).  If something
+Run these steps before installing anything from the other kits in
+`tools/inplace` (interconnect release, suspend inhibitor, Wi-Fi, boot-hygiene
+units): the control capture describes plain fix2-s2, and `flags-check.sh`
+expects the Stage 2 interconnect pattern (gem_noc and mc_virt unsynced).  If something
 was installed first, take a new `control` capture after it; a released
 interconnect then shows as `CHECK  interconnect state is not the Stage 2
 pattern` on every capture, control included.
 
-### 0. Copy the sets and the kit (host, no sudo)
+### 0. Build the sets, then copy them and the kit (host, no sudo)
+
+`build-variants.sh` rebuilds the four sets from the fix2-s2 images in about
+10 s.  Its inputs come from the environment, as listed in the export block
+below.  Build outside `/tmp`: on the build host it is a quota-limited tmpfs,
+and a full quota fails the build with "Disk quota exceeded".
 
 ```sh
-S=/tmp/claude-1000/-home-jstockdale-projects-ubuntu-galaxy-tab-s9-ultra/0b18c5c0-eba0-4cb6-977b-893306d69db3/scratchpad
-rsync -a --sparse "$S"/overnight/flags/images/flags-nopd "$S"/overnight/flags/images/flags-noreg \
-	"$S"/overnight/flags/images/flags-noclk "$S"/overnight/flags/images/flags-none \
-	jstockdale@10.42.0.2:display-exp/
-rsync -a "$S"/overnight/flags/kit/ jstockdale@10.42.0.2:flags-kit/
+# from this repository's top directory
+git worktree add --detach ~/ubuntu-gts9u/build/flags-wt HEAD
+K=~/ubuntu-gts9u/build/flags-wt/tools/inplace/flags
+O=~/ubuntu-gts9u/out/flags-images
+export FIX2_DIR=<dir>          # fix2-s2 boot.img and vendor_boot.img
+export INITRAMFS=<file>        # the fix2-s2 initramfs
+export ANDROID_TOOLS=<dir>     # mkbootimg.py and avbtool.py
+export LINUX_MAINLINE=<dir>    # the kernel tree
+export KERNEL_META_DIR=<dir>   # config and kernel.release of the fix2-s2 kernel build
+"$K"/build-variants.sh "$O"
+diff "$O"/IMAGES-flags.sha256 "$K"/IMAGES-flags.sha256      # no output
+rsync -a --sparse "$O"/flags-nopd "$O"/flags-noreg "$O"/flags-noclk "$O"/flags-none \
+	<user>@10.42.0.2:display-exp/
+rsync -a "$K"/ <user>@10.42.0.2:flags-kit/
 ```
 
-Expected: no output.  `$S` is on tmpfs.  If the host has rebooted since, rebuild
-the sets first (about 10 s) and copy from there.  Build outside `/tmp`: it is a
-quota-limited tmpfs shared with the session scratch files, and a full quota
-fails the build with "Disk quota exceeded".
-
-```sh
-cd ~/projects/ubuntu-galaxy-tab-s9-ultra
-git worktree add --detach ~/ubuntu-gts9u/build/flags-wt overnight/flags
-~/ubuntu-gts9u/build/flags-wt/tools/inplace/flags/build-variants.sh ~/ubuntu-gts9u/out/flags-images
-diff ~/ubuntu-gts9u/out/flags-images/IMAGES-flags.sha256 ~/ubuntu-gts9u/build/flags-wt/tools/inplace/flags/IMAGES-flags.sha256   # no output
-# then: images from ~/ubuntu-gts9u/out/flags-images/, kit from ~/ubuntu-gts9u/build/flags-wt/tools/inplace/flags/
-```
+Expected: `diff` and both `rsync` commands print nothing.
 
 ### 1. Check the copies (tablet, no sudo)
 
@@ -118,10 +126,10 @@ Expected from `flash.sh` before the reboot:
 flags-nopd: flags in the image: clk_ignore_unused regulator_ignore_unused; other tokens: initcall_blacklist=bwmon_driver_init icc_core.dyndbg=+p
 boot partition now: fix2-s2/boot.img (dcf881554a27)
 vendor_boot partition now: fix2-s2/vendor_boot.img (0742866cbfb0)
-flashing flags-nopd with /home/jstockdale/display-exp/apply.sh
+flashing flags-nopd with /home/<user>/display-exp/apply.sh
 cmdline extras in image: initcall_blacklist=bwmon_driver_init icc_core.dyndbg=+p
-OK boot <- /home/jstockdale/display-exp/flags-nopd/boot.img (dcf881554a27)
-OK vendor_boot <- /home/jstockdale/display-exp/flags-nopd/vendor_boot.img (60f733b44c9a)
+OK boot <- /home/<user>/display-exp/flags-nopd/boot.img (dcf881554a27)
+OK vendor_boot <- /home/<user>/display-exp/flags-nopd/vendor_boot.img (60f733b44c9a)
 done: flags-nopd; reboot to apply
 done: flags-nopd; now: sudo reboot
 ```
@@ -221,7 +229,7 @@ tr ' ' '\n' < /proc/cmdline | grep ignore_unused      # all three listed
 sh ~/fix1/verify.sh
 ```
 
-Expected: `OK vendor_boot <- /home/jstockdale/display-exp/fix2-s2/vendor_boot.img
+Expected: `OK vendor_boot <- /home/<user>/display-exp/fix2-s2/vendor_boot.img
 (0742866cbfb0)`; `verify.sh` as in step 2.
 
 ### If a set does not come back
@@ -244,6 +252,6 @@ the restore command).  To clean up after reporting:
 `sudo rm -r /var/log/gts9u-flags /var/backups/gts9u-flags`.
 
 The captures to bring back are the directories
-`/var/log/gts9u-flags/<set>-<boot>/` (readable as jstockdale over SSH).
+`/var/log/gts9u-flags/<set>-<boot>/` (group adm, readable over plain SSH).
 `cmdline.txt` in the repo does not change until these pass on the X710 and the
 `control` capture has been taken on the Ultra too: the file is shared.

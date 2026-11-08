@@ -53,7 +53,10 @@ The evidence and limitations are documented in
 [waydroid.md](docs/waydroid.md) for the NPU, virtual machines and Waydroid.
 
 This table describes the current source tree; previously published installation
-ZIPs may not include the latest changes.
+ZIPs may not include the latest changes. The shared changes made with the
+SM-X710 port (the S Pen decode, tilt included, the kernel configuration and
+patches, the panel, pogo, charger and battery drivers, and the device package
+2.56 units) have not yet been built and booted on an SM-X910.
 
 ## Tab Companion
 <img width="2164" height="1764" alt="Screenshot from 2026-08-20 04-02-55" src="https://github.com/user-attachments/assets/df7cddca-46e8-438a-bcb8-be713cc93bed" />
@@ -196,7 +199,8 @@ SM-X710: updating from GitHub, the hidden repair action and
 `update-to-latest.py` only know SM-X910 releases. Update with a ZIP you built
 for the same model and bootloader revision, through Tab Companion → Updates →
 local ZIP, or with
-`sudo gts9u-update --zip ubuntu-24.04-sm-x710-bl5-vX.X.X.zip`.
+`sudo gts9u-update --zip ubuntu-24.04-sm-x710-bl5-vX.X.X.zip` (not yet tried
+on an SM-X710).
 
 ## Known issues
 
@@ -214,7 +218,8 @@ bootloader revision 5. Compared with the SM-X910:
 - **No published ZIP.** Build it as below.
 - **Whole-tablet install only.** No split, no Dualboot app, no switching.
 - **No GitHub updates.** Update with a ZIP you built (see
-  [Updating](#updating-an-existing-installation)).
+  [Updating](#updating-an-existing-installation)); a local-ZIP update has not
+  yet been tried on an SM-X710.
 
 ### Status (2026-11-07)
 
@@ -224,20 +229,23 @@ bootloader revision 5. Compared with the SM-X910:
 | GPU | ✅ | Adreno 740; the earlier lost pixels are fixed (`videocc` is built in, so `rpmhpd` reaches `sync_state` at boot). No 719 MHz step |
 | CPU | ✅ | Prime core up to 3.36 GHz |
 | Touchscreen | ✅ | STM FTS1BA90A; double tap to wake works, off by default (Tab Companion → Touch) |
-| S Pen | ✅ | Pressure, tilt, hover and the side button, in landscape and portrait; dock detection, charging and BLE pairing. Optionally a tap with the side button held near the screen is a right click. Tab Companion → S Pen → S Pen test checks a pen ([notes](docs/tab-companion.md#the-pen-test)) |
+| S Pen | ✅ | Pressure, tilt, hover and the side button, in landscape and portrait; dock detection and charging; the BLE pairing service starts (pairing a pen not yet recorded). Optionally a tap with the side button held near the screen is a right click. Tab Companion → S Pen → S Pen test checks a pen ([notes](docs/tab-companion.md#the-pen-test)) |
 | Vibration / haptics | ✅ | On-screen keyboard feedback |
 | Keyboard cover | ✅ | EF-DX720 tested, with the posture switch: typing posture keeps laptop mode; detaching or folding it back gives tablet mode and the on-screen keyboard |
-| Wi-Fi and Bluetooth | ✅ | WCN6855 / ath11k ([notes](docs/gts9wifi-wifi.md)) |
+| Wi-Fi and Bluetooth | ✅ | WCN6855 / ath11k; the Bluetooth controller comes up, Bluetooth audio (AAC included) not yet tested ([notes](docs/gts9wifi-wifi.md)) |
 | Rotation and light sensor | ✅ | Through the ADSP's sensor core, as on the SM-X910; the light reading follows the room ([notes](docs/gts9wifi-sensors.md)) |
 | RTC and sleep statistics | ✅ | PMIC RTC and `qcom_stats` |
 | Suspend / resume | 🟡 | Off by default until repeated RTC-woken runs pass; the power key locks and blanks the screen instead, and closing the cover locks it |
-| Speakers and microphones | ✅ | Four CS35L45 amplifiers and the digital microphones: recording and playback confirmed |
+| Speakers and microphones | ✅ | Four CS35L45 amplifiers and the digital microphones: recording and playback confirmed, with Samsung's speaker-protection files copied in by hand ([building](#building-the-sm-x710-zip)) |
 | Cameras | 🟡 | Two HI1337 (rear and front), off unless enabled; not yet tested on hardware ([notes](docs/gts9wifi-cameras.md)) |
 | USB-C charging, host and DisplayPort | ❓ | Not yet assessed |
 | Fingerprint reader | ❌ | Not supported yet; its services are skipped on this model |
 | NPU | ❌ | Not built for this model (`GTS9U_INCLUDE_NPU=0`) |
 
 The evidence is in [hardware-status.md](docs/hardware-status.md#sm-x710-galaxy-tab-s9).
+The tested tablet was first installed from an earlier gts9wifi ZIP and then
+updated in place to this tree's kernel and device package 2.56; a ZIP built
+from the current tree has not yet been flashed end to end.
 
 Known limits:
 
@@ -278,6 +286,12 @@ python3 scripts/stage-firmware.py stage \
 DEVICE=gts9wifi FIRMWARE_DIR=/root/ubuntu-gts9u/firmware/x710-bl5 \
     GTS9U_INCLUDE_NPU=0 bash scripts/build-release.sh
 ```
+
+The manifest does not stage the CS35L45 speaker-protection files yet. The
+tested image had `cs35l45-dsp1-spk-prot.wmfw`, `cs35l45-dsp1-spk-prot.bin` and
+`cs35l45-dsp1-spk-prot-calib.bin` copied into `FIRMWARE_DIR` by hand, from the
+same vendor image's `firmware/` directory, and the build installs them when
+they are there. Audio on a build without them has not been tested.
 
 [Firmware manifests](configs/firmware/README.md) explains the staging
 options. With `sudo` instead of a root shell, pass the variables through:
@@ -334,6 +348,8 @@ android/      The Dualboot app, which switches systems from the Android side
 configs/      System configuration, service overlays, the TWRP installers and
               per-revision firmware manifests (configs/firmware/README.md)
 scripts/      Reproducible build and validation tools
+tools/        In-place experiment kits for the SM-X710 test unit (records, not
+              an install path)
 docs/         Detailed documentation and engineering history
 artifacts/    Generated release files; not versioned
 work/         Scratch space for builds; not versioned

@@ -53,9 +53,9 @@ does not intrude into it.
   mixed. WSL is the author's environment, not a requirement: any x86-64 Linux
   host works with `UBUNTU_WORKDIR` set to a path without spaces (the SM-X710
   was built natively). `DEVICE=gts9wifi` selects the SM-X710; leaving it unset
-  keeps the SM-X910 build byte for byte. The kernel stage runs unprivileged;
-  the rootfs, image and release stages need root, with the same environment
-  passed through `sudo env` ([`ubuntu-userspace.md`](ubuntu-userspace.md#building-a-release)).
+  selects the SM-X910, and the device axis itself adds no SM-X910 difference.
+  The kernel stage runs unprivileged; the rootfs, image and release stages
+  need root, with the same environment passed through `sudo env` ([`ubuntu-userspace.md`](ubuntu-userspace.md#building-a-release)).
 - The WSL distribution called simply `Ubuntu` is a different environment and
   does **not** contain the right toolchain.
 - Heavy builds run on a Linux filesystem and in a path without spaces. Versioned

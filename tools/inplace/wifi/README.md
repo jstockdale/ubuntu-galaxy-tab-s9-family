@@ -1,8 +1,11 @@
 # In-place Wi-Fi kit for the SM-X710 (gts9wifi)
 
+A record of an experiment on one SM-X710 test unit, not an install path (see
+[`../README.md`](../README.md)).
+
 Brings three Wi-Fi fixes onto an installed X710 without a reflash, with one
-reboot. They are the same changes the next device package and the next
-vendor_boot carry (`docs/gts9wifi-wifi.md`):
+reboot. Device package 2.56 and the vendor_boot this branch builds carry the
+same changes (`docs/gts9wifi-wifi.md`):
 
 | fault (Stage 2, 2026-11-07) | fix | where |
 | --- | --- | --- |
@@ -37,31 +40,31 @@ Built on the host by `stage.sh` (nothing in the kit is hand-edited):
 * `files/`: the helpers and units from `packaging/ubuntu-gts9u-device`.
 * `install.sh`, `rollback.sh`, `verify.sh`, `SHA256SUMS`, `SOURCE`.
 
-## Morning test plan
+## Test plan
 
-`(host)` runs on the build PC as jstockdale, `(tablet)` in an SSH session on
-squirtle. **sudo** marks the steps that need it. The tablet's Wi-Fi address
-changes once at step 4 (new MAC, new DHCP lease), so use the USB link
-(`ssh jstockdale@10.42.0.2`) or `-o HostKeyAlias=10.42.0.2` with the new
-address.
+`(host)` runs on the build PC as your own user, from this repository's top
+directory; `(tablet)` runs in an SSH session on the test unit (squirtle).
+**sudo** marks the steps that need it. The tablet's Wi-Fi address changes
+once at step 4 (new MAC, new DHCP lease), so use the USB link
+(`ssh <user>@10.42.0.2`, which needs the development USB gadget) or
+`-o HostKeyAlias=10.42.0.2` with the new address.
 
-1. **(host) Stage the kit.** A staged copy built overnight is in
-   `/tmp/claude-1000/-home-jstockdale-projects-ubuntu-galaxy-tab-s9-ultra/0b18c5c0-eba0-4cb6-977b-893306d69db3/scratchpad/overnight/wifi/kit`.
-   To rebuild it (needs the fix2-s2 `vendor_boot.img`, sha256 `0742866c…`: the
-   host keeps it in
-   `~/ubuntu-gts9u/backups/x710-fix-integration-2026-11-06/fix2-images/fix2-s2/`,
-   the tablet in `~/display-exp/fix2-s2/`):
+1. **(host) Build the kit.** It needs the fix2-s2 `vendor_boot.img`
+   (sha256 `0742866c…`, unpublished), which the test unit keeps in
+   `~/display-exp/fix2-s2/`, and the X710 build's `FIRMWARE_DIR` and
+   `KERNEL_OUT_DIR` (see `stage.sh`):
 
    ```
+   scp <user>@10.42.0.2:display-exp/fix2-s2/vendor_boot.img ~/ubuntu-gts9u/fix2-s2-vendor_boot.img
    tools/inplace/wifi/stage.sh ~/ubuntu-gts9u/out/inplace-wifi \
-       ~/ubuntu-gts9u/backups/x710-fix-integration-2026-11-06/fix2-images/fix2-s2/vendor_boot.img
+       ~/ubuntu-gts9u/fix2-s2-vendor_boot.img
    ```
 
    Expected: `self-test: repack reproduces … (0742866cbfb0) exactly`, then the
    five added `usr/lib/firmware/ath11k/WCN6855/hw2.1/*` files, and an `IMAGES`
    line `0742866c… 03cc1ccb… images/vendor_boot-0742866cbfb0-wifi.img`.
 
-2. **(host) Copy it:** `scp -r <kit dir> jstockdale@10.42.0.2:wifi-kit`
+2. **(host) Copy it:** `scp -r ~/ubuntu-gts9u/out/inplace-wifi <user>@10.42.0.2:wifi-kit`
 
 3. **(tablet) Baseline:** `sh ~/wifi-kit/verify.sh`
    Expected now: `FAIL` for the rescan outcome, the EFS address, the Qualcomm
@@ -138,7 +141,7 @@ address.
   cd /data/var/backups/ubuntu-gts9u-wifi && sha256sum -c vendor_boot.sha256 &&
     dd if=vendor_boot.img of=/dev/block/by-name/vendor_boot bs=4M conv=fsync
   ```
-  (or the same `dd` from `/data/home/jstockdale/display-exp/fix2-s2/vendor_boot.img`,
+  (or the same `dd` from `/data/home/<user>/display-exp/fix2-s2/vendor_boot.img`,
   sha256 `0742866c…`), reboot, then `sudo sh ~/wifi-kit/rollback.sh`.
   `sudo sh ~/display-exp/apply.sh fix2-s2` is the same image route from a
   running system.

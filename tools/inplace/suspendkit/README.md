@@ -1,5 +1,9 @@
 # suspendkit: suspend reliability runs and the ADSP-start sleep lock (SM-X710)
 
+A record of an experiment on one SM-X710 test unit, not an install path (see
+[`../README.md`](../README.md)).  Device package 2.56 ships the ADSP-start
+sleep lock; the runners are also in `scripts/diagnostics/suspend/`.
+
 For a tablet on the Stage 2 kernel with device package 2.55 (suspend mode off,
 `sleep.target` and `suspend.target` masked). Nothing here changes the suspend
 policy, the masks, the kernel or a package version.
@@ -9,7 +13,7 @@ policy, the masks, the kernel or a package version.
 | `gts9u-suspend-cycles.sh` | no, runs from `~/suspendkit` | RTC-woken s2idle and deep cycles with a checklist, key wakes, RTC alarm test, `status` |
 | `x710-suspend-ladder.sh` | no | the step-by-step ladder for bisecting a failed cycle |
 | `files/ubuntu-gts9u-adsp-start-inhibit{,.service}` | `install.sh` | the ADSP-start sleep lock, as the next device package will ship it |
-| `install.sh`, `rollback.sh`, `verify.sh` | | in the style of `~/fix1` |
+| `install.sh`, `rollback.sh`, `verify.sh` | | in the style of the fix1 kit on the test unit (not published) |
 
 Background, the checklist and how to read results:
 `scripts/diagnostics/suspend/README.md` in the repository.
@@ -18,9 +22,12 @@ Background, the checklist and how to read results:
 
 ```
 sh tools/inplace/suspendkit/build-kit.sh /tmp/suspendkit
-tar -C /tmp/suspendkit -cf - . | ssh jstockdale@10.42.0.2 'mkdir -p ~/suspendkit && tar -C ~/suspendkit -xf -'
-ssh jstockdale@10.42.0.2 'cd ~/suspendkit && sha256sum -c --quiet SHA256SUMS && echo kit ok'
+tar -C /tmp/suspendkit -cf - . | ssh <user>@10.42.0.2 'mkdir -p ~/suspendkit && tar -C ~/suspendkit -xf -'
+ssh <user>@10.42.0.2 'cd ~/suspendkit && sha256sum -c --quiet SHA256SUMS && echo kit ok'
 ```
+
+`<user>` is the desktop user on the tablet; 10.42.0.2 is the development USB
+gadget's address (an image built with `GTS9U_USB_GADGET=1`).
 
 ## On the tablet, in this order
 

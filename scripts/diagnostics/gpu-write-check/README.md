@@ -5,10 +5,10 @@ No display, no root, no numpy: python3 plus the system libEGL, libGLESv2 and
 libgbm.  Written for the SM-X710 investigation of 2026-11-06
 (see docs/gts9wifi-display.md, "GPU write corruption").
 
-Copy the directory to the tablet and run as the desktop user:
+Copy the directory to the tablet and run as the desktop user (`<user>`):
 
-    scp -r scripts/diagnostics/gpu-write-check jstockdale@<tablet>:gputest
-    ssh jstockdale@<tablet> 'cd gputest && FD_MESA_DEBUG=noubwc python3 late-write-check.py 24'
+    scp -r scripts/diagnostics/gpu-write-check <user>@<tablet>:gputest
+    ssh <user>@<tablet> 'cd gputest && FD_MESA_DEBUG=noubwc python3 late-write-check.py 24'
 
 A healthy unit reports 0 frames with lost pixels (the SM-X910 Ultra does).
 

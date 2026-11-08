@@ -1,8 +1,13 @@
 # Boot hygiene kit (SM-X710, over ubuntu-gts9u-device 2.55)
 
-In-place install of the boot-hygiene changes from the `overnight/boothygiene`
-branch, until a device package newer than 2.55 carries them. No kernel, boot
-image, module or package change; one reboot to see the effect. Files only:
+A record of an experiment on one SM-X710 test unit, not an install path (see
+[`../README.md`](../README.md)).
+
+In-place install of the boot-hygiene changes on this branch over device
+package 2.55. Device package 2.56 carries them, except that it shipped the
+fingerprint-gate generator as `-rw-r--r--`, so fprintd still timed out after
+25 s at the greeter; 2.57 fixes that. No kernel, boot image, module or
+package change; one reboot to see the effect. Files only:
 units, helpers, a journald drop-in, a generator, the overlay extension, and
 the bring-up microSD logger where it is already installed.
 
@@ -75,10 +80,11 @@ the bring-up microSD logger where it is already installed.
 
 ## Use
 
-From the host (no sudo), copy the kit from the branch:
+From the host (no sudo), in this repository's top directory, copy the kit
+as committed at HEAD (`<user>@10.42.0.2` needs the development USB gadget):
 
-    git -C ~/projects/ubuntu-galaxy-tab-s9-ultra archive overnight/boothygiene tools/inplace/boothygiene |
-      ssh jstockdale@10.42.0.2 'rm -rf ~/boothygiene && mkdir ~/boothygiene && tar -x --strip-components=3 -C ~/boothygiene'
+    git archive HEAD tools/inplace/boothygiene |
+      ssh <user>@10.42.0.2 'rm -rf ~/boothygiene && mkdir ~/boothygiene && tar -x --strip-components=3 -C ~/boothygiene'
 
 On the tablet:
 

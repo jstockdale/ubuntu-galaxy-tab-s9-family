@@ -1,5 +1,9 @@
 # SM-X710 camera kit
 
+A record of an experiment on one SM-X710 test unit, not an install path (see
+[`../README.md`](../README.md)).  Phase A is for a tablet still on device
+package 2.55; the device package carries the same camera files from 2.56 on.
+
 Two things, for the Galaxy Tab S9 (SM-X710, `gts9wifi`):
 
 1. **Now, on the running system (no reboot, no new kernel):** stop the SM-X910
@@ -20,8 +24,11 @@ Background, wiring and the decoded sensor tables: `docs/gts9wifi-cameras.md`.
 
 ```sh
 sh tools/inplace/cameras/make-kit.sh /tmp/cameras-kit
-scp -r /tmp/cameras-kit jstockdale@10.42.0.2:cameras-kit
+scp -r /tmp/cameras-kit <user>@10.42.0.2:cameras-kit
 ```
+
+`<user>` is the desktop user on the tablet; 10.42.0.2 is the development USB
+gadget's address (an image built with `GTS9U_USB_GADGET=1`).
 
 `make-kit.sh` copies the files from `packaging/ubuntu-gts9u-device` exactly as a
 `DEVICE=gts9wifi` package build ships them (the WirePlumber labels rewritten

@@ -2,8 +2,8 @@
 #
 # DEVICE selects the board; everything that differs between family members is
 # looked up here and nowhere else, so adding a device is one new case below plus
-# its DTS, config fragment and firmware manifest.  Defaults keep the original
-# gts9uwifi build byte-for-byte unchanged when DEVICE is unset.
+# its DTS, config fragment and firmware manifest.  DEVICE unset selects
+# gts9uwifi; the device axis itself adds no gts9uwifi difference.
 #
 #   DEVICE            Ubuntu/pmOS codename: gts9uwifi (SM-X910), gts9wifi (SM-X710)
 #   DEVICE_MODEL      Samsung model as the bootloader and installer report it

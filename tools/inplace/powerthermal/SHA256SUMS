@@ -1,4 +1,4 @@
-eb8730090b4310837eadd5aa8081286374a47cfa01ca416bd04edc623a6a4fe6  README.md
+9a5e9cca8a6c7c5e3ee15eb7b37e5da57f1648f4d3644def6c4b8854a954642a  README.md
 3cc24dee8aeaad238fd2d1b69066fa822dca66279bb67f5d1a9156231d4bd85c  charge-watch.sh
 e5394c14e353c1ac5d6ce8cddb9400df91c2a5d48204806db2b6957a17dff892  files/greeter-wireplumber/bluetooth.lua.d/51-gts9u-greeter-no-bluez.lua
 781f8e10430710fabbbe9a15d8bbd98ce638a01760d7f7cc1b54251ba05d0670  files/greeter-wireplumber/wireplumber.conf.d/51-gts9u-greeter-no-bluez.conf

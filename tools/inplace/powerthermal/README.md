@@ -1,13 +1,18 @@
 # powerthermal kit (SM-X710 squirtle, also safe on the SM-X910)
 
-Overnight 2026-11-07 work on power, charging, thermal and audio userspace.
-This directory is the in-place half; the kernel half rides on the next kernel
-build from the `overnight/powerthermal` commits.
+A record of an experiment on one SM-X710 test unit, not an install path (see
+[`../README.md`](../README.md)).
 
-Copy it to the tablet and check it first (from the build host):
+The power, charging, thermal and audio userspace work of 2026-11-07 on this
+branch.  This directory is the in-place half; the kernel half is in the
+kernel this branch builds.
 
-    rsync -a tools/inplace/powerthermal/ jstockdale@10.42.0.2:powerthermal/
-    ssh jstockdale@10.42.0.2 'cd ~/powerthermal && sha256sum -c SHA256SUMS'
+Copy it to the tablet and check it first (from the build host, in this
+repository's top directory; `<user>@10.42.0.2` needs the development USB
+gadget):
+
+    rsync -a tools/inplace/powerthermal/ <user>@10.42.0.2:powerthermal/
+    ssh <user>@10.42.0.2 'cd ~/powerthermal && sha256sum -c SHA256SUMS'
 
 | file | runs as | what it does |
 | --- | --- | --- |
@@ -24,9 +29,10 @@ time the login screen starts (next boot).  For rtkit, see the next section.
 
 ## rtkit, linger and when PipeWire actually gets realtime
 
-The desktop user lingers (`loginctl show-user jstockdale -p Linger` is `yes`),
-so `pipewire`, `filter-chain` (the speaker DSP chain), `pipewire-pulse` and
-`wireplumber` run in the user manager from boot until shutdown:
+The desktop user lingers on the test unit (`loginctl show-user "$USER" -p
+Linger` is `yes`), so `pipewire`, `filter-chain` (the speaker DSP chain),
+`pipewire-pulse` and `wireplumber` run in the user manager from boot until
+shutdown:
 
 - logging out and back in does **not** restart them.  After `install.sh`,
   restart them by hand, as the desktop user, while logged in (a short audio
@@ -40,9 +46,10 @@ so `pipewire`, `filter-chain` (the speaker DSP chain), `pipewire-pulse` and
   and the stock rtkit policy says `allow_any=no`, so realtime is most likely
   refused for that whole boot.  `verify.sh` says when PipeWire started before
   the graphical session.  If the data loop is still `TS` after a reboot, the
-  optional rule lets members of the `audio` group (only `jstockdale` here)
-  ask rtkit from outside a session too; rtkit still caps the priority at 20,
-  requires RLIMIT_RTTIME and demotes everything if its canary starves:
+  optional rule lets members of the `audio` group (on the test unit, only
+  the desktop user) ask rtkit from outside a session too; rtkit still caps
+  the priority at 20, requires RLIMIT_RTTIME and demotes everything if its
+  canary starves:
 
       sudo install -m 0644 ~/powerthermal/files/optional/60-ubuntu-gts9u-rtkit-linger.rules /etc/polkit-1/rules.d/
       sudo rm /etc/polkit-1/rules.d/60-ubuntu-gts9u-rtkit-linger.rules   # undo (rollback.sh removes it too)

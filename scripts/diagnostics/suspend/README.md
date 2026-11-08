@@ -2,8 +2,10 @@
 
 Two root tools for deciding whether the X710 can be given a suspend mode.
 Suspend is off on this board (`ubuntu-gts9u-suspend-mode` writes
-`AllowSuspend=no`, and `sleep.target` and `suspend.target` are masked); both
-tools work in that state and leave it as they found it.
+`AllowSuspend=no`). On the test unit, `sleep.target` and `suspend.target` were
+also masked by hand; undo that (`sudo systemctl unmask sleep.target
+suspend.target`) before any mode can suspend. Both tools work in either state
+and leave it as they found it.
 
 | File | What it is for |
 |---|---|

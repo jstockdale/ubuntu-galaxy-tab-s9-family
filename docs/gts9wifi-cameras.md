@@ -160,14 +160,18 @@ the enable helper against a fake root for both boards.
 ## Test plan
 
 Phase A needs nothing but the running system; Phase B needs a kernel built
-from this tree.  The kit is `tools/inplace/cameras/` (README there).
+from this tree.  The kit is `tools/inplace/cameras/` (README there), a record
+of the tests on the test unit; Phase A applies to a tablet still on device
+package 2.55.  `<user>` is the desktop user on the tablet, and 10.42.0.2 is
+the development USB gadget's address (an image built with
+`GTS9U_USB_GADGET=1`).
 
 Phase A, no phantom cameras:
 
 ```sh
 # host
 sh tools/inplace/cameras/make-kit.sh /tmp/cameras-kit
-scp -r /tmp/cameras-kit jstockdale@10.42.0.2:cameras-kit
+scp -r /tmp/cameras-kit <user>@10.42.0.2:cameras-kit
 # tablet
 v4l2-ctl --list-devices                 # before: four GTS9U-* devices
 sudo sh ~/cameras-kit/install.sh        # "removed stale camera nodes", "0 camera(s)"

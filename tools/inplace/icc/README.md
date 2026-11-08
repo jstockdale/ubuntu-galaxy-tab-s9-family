@@ -1,5 +1,8 @@
 # In-place kit: interconnect late release (SM-X710)
 
+A record of an experiment on one SM-X710 test unit, not an install path (see
+[`../README.md`](../README.md)).  Device package 2.56 ships the unit.
+
 Puts `ubuntu-gts9u-icc-late-release` (helper and unit, exactly as the next
 `ubuntu-gts9u-device` ships them) on the running tablet, so every boot
 releases gem_noc and mc_virt from their INT_MAX boot floor once the panel
@@ -23,8 +26,11 @@ cannot be undone on a running kernel; a reboot always brings the floor back.
 ## Stage it (build host)
 
     tools/inplace/icc/make-kit.sh            # -> work/inplace-icc
-    ssh jstockdale@10.42.0.2 'rm -rf ~/icc'  # only if an older kit is there
-    scp -r work/inplace-icc jstockdale@10.42.0.2:icc
+    ssh <user>@10.42.0.2 'rm -rf ~/icc'      # only if an older kit is there
+    scp -r work/inplace-icc <user>@10.42.0.2:icc
+
+`<user>` is the desktop user on the tablet; 10.42.0.2 is the development USB
+gadget's address (an image built with `GTS9U_USB_GADGET=1`).
 
 ## Use it (tablet)
 

@@ -277,7 +277,7 @@ the build reads it through `FIRMWARE_DIR` (see
 | SM-X910 Wi-Fi, WCN7850 (official amss + QRD BDF in ELF) | `/lib/firmware/ath12k/WCN7850/hw2.0/` |
 | SM-X710 Wi-Fi, WCN6855/QCA6490 (linux-firmware amss and m3 for hw2.0, the IOE 04866.5 build for hw2.1, Samsung's board data by default; `GTS9WIFI_ATH11K_BOARD` and `GTS9WIFI_ATH11K_REGDB` switch it) | `/lib/firmware/ath11k/WCN6855/hw2.0/` and `hw2.1/` |
 | Bluetooth: `hmtbtfw20.tlv`, `hmtnv20.b21` (SM-X910); `hpbtfw21.tlv` and the `hpnv21[g].*` set (SM-X710) | `/lib/firmware/qca/` |
-| CS35L45 (protection, not loaded yet; only if staged by hand) | `/lib/firmware/` |
+| CS35L45 speaker protection (`cs35l45-dsp1-spk-prot.wmfw`, `.bin`, `-calib.bin`): outside the manifests, so only if copied into `FIRMWARE_DIR` by hand. Not loaded yet on the SM-X910; the SM-X710 test image had them and its DSP loads them | `/lib/firmware/` |
 | Keyboard cover MCU (`stm32_gts9family.bin`, both tablets) | `/lib/firmware/keyboard_stm/` |
 | Sensors' HexagonFS tree | `/usr/share/qcom/sm8550/Samsung/gts9uwifi/` (SM-X910), `.../Samsung/gts9wifi/` (SM-X710) |
 
@@ -358,7 +358,8 @@ without spaces. No script accepts a block device or writes to a partition.
   installed. Without `dwarves` (pahole) `olddefconfig` silently drops
   `CONFIG_DEBUG_INFO_BTF`, which the released kernels have.
   `scripts/check-build-deps.sh` checks only what `install-build-deps.sh`
-  installs, and it always exits 0: read its output.
+  installs, and exits 1 when any of it is missing (so `install-build-deps.sh`
+  fails too).
 - **The Android boot tools.** `scripts/stage-android-tools.sh` copies them
   from a postmarketOS chroot (`PMOS_ROOTFS_CHROOT`) and fails without one.
   Otherwise copy `mkbootimg.py` **with its `gki/` directory** from
@@ -436,9 +437,9 @@ Things that bite:
   ships a stale or missing bundle.
 - **Both tablets from one `UBUNTU_WORKDIR`.** Only the kernel paths are
   per device. Set `ROOTFS_DIR=$W/rootfs-$DEVICE` (it has to be inside
-  `UBUNTU_WORKDIR`) and a separate `ARTIFACTS_DIR` per device: the manifest's
-  name carries no model and its header says SM-X910 for every build, so two
-  builds at the same revision and version overwrite each other's manifest.
+  `UBUNTU_WORKDIR`). The ZIP and manifest names carry the model, so both
+  builds can share `ARTIFACTS_DIR`; `out/bundle` and the overlays are shared,
+  so the second build replaces the first's.
   Use `SKIP_ROOTFS=1` only when that rootfs was built for the same `DEVICE`
   and kernel: it is reused as it is and only stamped with the current
   `DEVICE`.
@@ -451,7 +452,7 @@ Things that bite:
 
 | Variable | Default | Use |
 |---|---|---|
-| `DEVICE` | `gts9uwifi` | `gts9uwifi` (SM-X910) or `gts9wifi` (SM-X710); unset keeps the SM-X910 build byte for byte |
+| `DEVICE` | `gts9uwifi` | `gts9uwifi` (SM-X910) or `gts9wifi` (SM-X710); unset selects the SM-X910, and the device axis itself adds no SM-X910 difference |
 | `UBUNTU_WORKDIR` | `/root/ubuntu-gts9u` | the build base |
 | `FIRMWARE_DIR` | the author's old Windows path | the `stage-firmware.py` staging; required |
 | `SKIP_KERNEL`, `SKIP_ROOTFS` | `0` | `1` reuses `out/kernel-$DEVICE` or the rootfs |

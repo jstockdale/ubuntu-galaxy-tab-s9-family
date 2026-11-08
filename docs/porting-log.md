@@ -6923,10 +6923,10 @@ order of events.
 `scripts/lib/device.sh` holds everything that differs between the tablets:
 model, artifact slug, root label, sound card, the codenames the installer
 accepts, Wi-Fi driver, Bluetooth files and sensor-registry directory. Every
-build script sources it. `DEVICE` unset keeps the SM-X910 build byte for byte;
-`DEVICE=gts9wifi` builds the SM-X710 from its own DTS
-(`kernel/dts/sm8550-samsung-gts9wifi.dts`), config fragment and firmware
-manifest (`configs/firmware/x710-bl5-X710XXS5CYG1.toml`). The root label is
+build script sources it. `DEVICE` unset selects the SM-X910, and the device
+axis itself adds no SM-X910 difference; `DEVICE=gts9wifi` builds the SM-X710
+from its own DTS (`kernel/dts/sm8550-samsung-gts9wifi.dts`), config fragment
+and firmware manifest (`configs/firmware/x710-bl5-X710XXS5CYG1.toml`). The root label is
 scoped per board (`UBTS9_UFS`), the ZIP carries a `DEVICE-IDENTITY` member,
 and the installer takes the model and the bootloader build id from the kernel
 command line, because a family TWRP's properties describe another board. The

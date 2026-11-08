@@ -158,7 +158,12 @@ The NPU set exists only for the SM-X910; build the SM-X710 with
 `GTS9U_INCLUDE_NPU=0`. Also outside the manifests: the CS35L45
 speaker-protection files (`cs35l45-dsp1-spk-prot.wmfw`, `.bin`,
 `-calib.bin`), which `build-rootfs-overlay.sh` installs only if they are
-present in `FIRMWARE_DIR`, so they are copied in by hand when wanted.
+present in `FIRMWARE_DIR`, so they are copied in by hand when wanted. The
+SM-X710 image that was tested had all three copied into its staging this way
+(they match `firmware/` in the X710XXS5CYG1 vendor image), and on that unit
+the DSP loads them (`DSP1: Firmware: 4fa00 vendor: 0x2 v0.56.0`, tuning named
+TabS9). An SM-X710 build without them has not been tested; adding them to the
+X710 manifest is a follow-up.
 
 A staging made before a manifest changed is stale: the X710 manifest gained
 `regdb.bin` on 2026-11-07, and the overlay requires it. Stage again rather

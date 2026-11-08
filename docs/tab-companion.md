@@ -484,9 +484,9 @@ the separate device. The owner then drew with the pen on the pen test in
 landscape and portrait: pressure, tilt, hover and the side button all arrive.
 The haptic motor runs the test pulse and the on-screen keyboard's pulses. The
 tilt shown then was wrong, though: the driver read the report's height byte as
-tilt X (see the porting log). With the decode fixed (fix5, 2026-11-07) the owner
-checked tilt, the hover height and the side button split, and chose the 36/44
-band. Not yet confirmed there: finger rejection while hovering.
+tilt X (see the porting log). With the decode fixed (kernel commit `ebf16e7`,
+2026-11-07) the owner checked tilt, the hover height and the side button
+split, and chose the 36/44 band. Not yet confirmed there: finger rejection while hovering.
 
 Still pending: feeling the motor physically, calibrating the pointer with real
 use, testing EF-DX900/910/915/925 and verifying their touchpads. BLE recovery
