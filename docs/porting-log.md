@@ -8194,3 +8194,41 @@ rewrote its input in place and dropped the appended signature:
   mistake. Each output tree now matches its kit's tar file for file; the
   CX one matches the installed `f7d38300…`.
 - Nothing on the tablet was affected.
+
+The kernel, rebuilt with the lens driver fix (2026-11-08). The owner asked
+for the kit to carry dcd0343 as well ("dw9808_vcm: power down cleanly when
+the park fails", built in). Until now that fix had only been compiled out
+of tree:
+- Source: snapshot `~/ubuntu-gts9u/snapshots/bt-07c4924110a9` of 07c4924,
+  the branch after merging `claude/x710-cx-kit`. Fresh worktree and build
+  directory in `gts9u-scratch/build-btirq2`, with the CX key pre-seeded as
+  before. Output: `~/ubuntu-gts9u/out/kernel-gts9wifi-btirq2`.
+- The tree differs from the CX build's in three files only:
+  - `qcom_geni_serial.c`;
+  - `drivers/media/i2c/dw9808_vcm.c`, which is dcd0343's;
+  - the X710 DTS, where comments aside the only change is
+    `startup-delay-us = <10000>`.
+- `.config`, the signing certificate and `Module.symvers` (17,610 symbols)
+  are identical to the CX build's.
+- Image.gz `7b8de34e…`, GNU build ID `e862f606ab39…`. The vmlinux has the
+  ISR without the `suspended` check and dcd0343's "lens not parked before
+  power-down" warning.
+- This build's own DTB is `164e1bf8…`, byte-identical to the lens kit's.
+- The registry recorded the build (`7b8de34ea2a69c72`) under key
+  `1ded767e…` and mirrored it to the external drive and Google Drive.
+- The 62 modules are all signed with the CX key.
+- Device package 2.60's `qcom_spss_irq.ko` is the CX build's copy
+  (`8e421c6e…`, the one squirtle has now), signed with the CX key, with
+  vermagic `7.2.0-rc3-dirty`. This kernel accepts it.
+
+Kit `~/ubuntu-gts9u/backups/bt-uart-lens-dw9808-kit`, staged on squirtle as
+`~/bt-uart` with checksums verified there:
+- `boot.img` `faa774ad…`: the kernel plus the lens DTB. Given the CX kernel,
+  the recipe reproduces the CX kit's and the lens kit's `boot.img`. The
+  header fields are the lens kit's.
+- modules tar `76d2a7a5…`, `BUILD_ID` `e862f606…`.
+- The same scripts. `vendor_boot` is not written; it stays `b18510f3…`.
+
+The previous kit moved to `~/bt-uart-lens-5b08b13`. After installing, rerun
+the lens kit's checks (`camera-test.sh rear`, `lens-diag.sh`), since this
+is the first kernel to carry dcd0343.

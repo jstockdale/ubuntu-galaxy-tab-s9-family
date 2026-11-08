@@ -6,11 +6,12 @@ Bluetooth UART interrupt storm that disabled IRQ 191 in the boot-time
 `pm_test=platform` cycle ([porting log](../../docs/porting-log.md#the-geni-uart-handler-ignored-its-interrupt-while-the-port-suspended-2026-11-08)):
 
 - **The kernel** is the CX kernel plus
-  `qcom-geni-serial-serve-irq-while-suspending.patch`, built from 5b08b13.
-  It keeps fix6's configuration. Like the lens kit's kernel (the CX one), it
-  does not carry dcd0343, the `dw9808_vcm` power-down fix.
+  `qcom-geni-serial-serve-irq-while-suspending.patch` and dcd0343, the
+  built-in `dw9808_vcm` power-down fix, which the lens kit's kernel (the CX
+  one) lacks. It is built from 07c4924 and keeps fix6's configuration.
 - **The DTB** is the lens kit's (`164e1bf8…`): the CX DTB with the rear lens
-  rail's 10 ms `startup-delay-us`. It is appended to the kernel in `boot`.
+  rail's 10 ms `startup-delay-us`. This build's DTS reproduces it byte for
+  byte. It is appended to the kernel in `boot`.
   `vendor_boot` stays the lens kit's image (`b18510f3…`), which carries the
   same DTB. The kit does not write it.
 - **The module tree** comes from this kernel build. The build reuses the CX
@@ -27,13 +28,13 @@ cp -p $CX/linux-gts9wifi/certs/{x509.genkey,signing_key.pem,.signing_key.pem.cmd
   $X/linux-gts9wifi/certs/          # CX=the CX build's scratch directory
 DEVICE=gts9wifi UBUNTU_WORKDIR=$HOME/ubuntu-gts9u \
   KERNEL_WORKTREE=$X/linux-src-gts9wifi KERNEL_BUILD_DIR=$X/linux-gts9wifi \
-  KERNEL_OUT_DIR=$HOME/ubuntu-gts9u/out/kernel-gts9wifi-btirq \
+  KERNEL_OUT_DIR=$HOME/ubuntu-gts9u/out/kernel-gts9wifi-btirq2 \
   bash scripts/build-mainline-kernel.sh
 bash tools/inplace/bt-uart/make-kit.sh \
-  $HOME/ubuntu-gts9u/out/kernel-gts9wifi-btirq \
+  $HOME/ubuntu-gts9u/out/kernel-gts9wifi-btirq2 \
   $HOME/ubuntu-gts9u/out/kernel-gts9wifi-cx \
-  $HOME/ubuntu-gts9u/out/dtb-lens-vdelay/sm8550-samsung-gts9wifi.dtb \
-  $HOME/ubuntu-gts9u/backups/bt-uart-lens-kit
+  $HOME/ubuntu-gts9u/out/kernel-gts9wifi-btirq2/sm8550-samsung-gts9wifi.dtb \
+  $HOME/ubuntu-gts9u/backups/bt-uart-lens-dw9808-kit
 ```
 
 Copy the key with its `.cmd` file and its times (`cp -p`), so that kbuild
@@ -128,7 +129,9 @@ Matrix:
 
    Afterwards, run `recover`.
 1. After installing and rebooting: `verify.sh`, with and without sudo. The
-   boot-time panel cycle has already run once on the new kernel.
+   boot-time panel cycle has already run once on the new kernel. The kernel
+   also carries the `dw9808_vcm` fix, so rerun the lens kit's checks:
+   `camera-test.sh rear`, `lens-diag.sh`, and focus in the Camera app.
 2. `platform 20`. Expect PASS, with `unhandled 0` in every cycle.
 3. `platform 10` with the headphones connected and playing audio, which is
    the most Bluetooth traffic there can be.
