@@ -8574,3 +8574,15 @@ on-device test waits for the build.
   (`962da80`), which gts9u11 lacked.
 - `libspa-0.2-libcamera-gts9u` 1.0.5-gts9u13.
 - `ubuntu-gts9u-device` 2.62.
+
+**Built and staged (21:00):**
+- Camera packages from snapshot `camaf2-13760d35c118` (commit `13760d3`,
+  tree `29473c08…`), patches 0001 to 0010:
+  - `libcamera-gts9u_0.7.2+53.g62d4bfc-gts9u12_arm64.deb` `ade742b65dc3665c1971a3eb9cafab9507e24bd2362c99920f6ae6f3641ed3a8`
+  - `libspa-0.2-libcamera-gts9u_1.0.5-gts9u13_arm64.deb` `cba303d22e3e1b0b32582cf683bf8fc0462f1ca61a938cfa19055baa5335879d`
+    (SPA binary unchanged)
+  - `ubuntu-gts9u-device_2.62_arm64.deb` `1a9e52bd0855ecf00bf14fc1c3de407cd1f0aad44e45483267c7a04d16c2b9d8`
+- Staged in squirtle's `~/device-2.62`, checksums verified there.
+  `apt-get -s`: 3 upgraded, none removed.
+- The lens-pads kit (`6fa3d29`, DTB `19de4789…`) is staged in `~/cam-pads`,
+  for the same reboot.
