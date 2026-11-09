@@ -8242,3 +8242,59 @@ squirtle, boot `9c0e3019`:
 - `apt-get -s install` of the three: 3 upgraded, 0 new, 0 removed, nothing
   unauthenticated.
 - Not installed yet.
+
+### Smooth continuous autofocus: libcamera-gts9u patch 0009 (2026-11-08)
+
+**Owner report, squirtle, boot `487f28bc`:** the rear camera works and
+focuses, but the lens clicks, and focus is periodic and jerky.
+
+**Cause:** the old software-IPA autofocus (patches 0002, 0006 and 0007):
+- jumped the DW9808 up to 600 codes per write;
+- measured each position on one statistics frame;
+- probed ±48 codes every 45 statistics, about 6 s, in a still scene too.
+
+Details are in [camera focus](camera-focus-and-enumeration.md#smooth-continuous-autofocus-patch-0009-2026-11-08).
+
+**Change:**
+- SoftAf replaces it (`src/ipa/simple/soft_af.{h,cpp}`):
+  - at most 24 codes per frame;
+  - samples taken while moving, each credited 3 frames back;
+  - a fine pass there and back with a least-squares fit;
+  - stillness when focused, then noise-adaptive change detection, a local
+    refocus, and bounded retries after a failure.
+- `soft.mojom`'s `init()` now also takes the lens range and position.
+  `CameraLens::focusPosition()` reads the position the driver holds.
+- `tests/test_soft_af.py` (14 tests) builds SoftAf from the patch against a
+  simulated lens and scene. `scripts/test-camera-autofocus.py` now runs it
+  (the old test read state that no longer exists).
+- Versions: `libcamera-gts9u` 0.7.2+53.g62d4bfc-gts9u11,
+  `libspa-0.2-libcamera-gts9u` 1.0.5-gts9u12 (the exact pin; the SPA binary
+  is repackaged, since the public libcamera API did not change), and
+  `ubuntu-gts9u-device` 2.61 pinning both.
+
+**Simulated:**
+- 480 random scenes, noise 3-8 %, latency 1-6 frames: no frame moved the lens
+  more than 24 codes.
+- At 3 % noise and latency 2-5, every run ended within 2 % of the best
+  sharpness, with a median of 3.3-3.7 s to focus.
+- A still scene held the lens still for 60 s in every one of the 240 runs at
+  3 % noise.
+
+**Build:**
+- Camera packages from snapshot `camaf-fdb8ed9e61ec` (commit `fdb8ed9`, tree
+  `865c3e91…`), log `~/ubuntu-gts9u/camera-af-build.log`, output
+  `~/ubuntu-gts9u/out/camera-af`; in progress.
+- `962da80` (the Failed retries) came after that snapshot: the next build
+  takes it, with new versions.
+- `ubuntu-gts9u-device_2.61_arm64.deb`
+  `6084d7082b6e56757d082b5b5bb618cfcc3970666644708334917ece2f677366`. Built
+  against the CX kernel tree like 2.60; it differs from 2.60 only in the
+  version and the two pins. A copy is in
+  `~/ubuntu-gts9u/backups/device-261-kit`.
+
+**Pending:**
+- the build's compile, the first of the IPA and pipeline changes;
+- on squirtle (now boot `cc67dab2`, after an owner reboot at 16:39):
+  install, `camera-test.sh rear`, the owner listening and focusing near and far
+  in Snapshot, and `lens-diag.sh`;
+- on the Ultra.

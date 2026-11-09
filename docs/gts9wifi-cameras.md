@@ -346,3 +346,10 @@ PipeWire stops or restarts. The failed resume is latched (`error`), so
 PipeWire's libcamera could not reopen the lens after the test: focus is off
 until the next boot, or until the driver fix lets the next open power up
 again.
+
+### Smooth focus (2026-11-08)
+
+With focus working, the owner heard the lens click, and saw focus move
+periodically and jerkily. The cause was the shared libcamera autofocus, not
+this board. It is replaced by SoftAf (libcamera-gts9u patch 0009); see
+[camera focus](camera-focus-and-enumeration.md#smooth-continuous-autofocus-patch-0009-2026-11-08).

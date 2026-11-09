@@ -2,6 +2,11 @@
 
 ## Status
 
+**2026-11-08:** the continuous autofocus described below (patches 0002, 0006
+and 0007) is replaced by SoftAf, patch 0009. See
+[Smooth continuous autofocus](#smooth-continuous-autofocus-patch-0009-2026-11-08)
+at the end. The history below is kept for its measurements.
+
 The stable-ID rule is installed; the user confirms OBS cameras work. The first
 AF candidate was rolled back after an optical false positive. A third candidate,
 combining confidence checks with a less noise-sensitive metric, passed the
@@ -237,3 +242,83 @@ pkexec bash /var/lib/gts9u-camera-backups/af-20260908.nGQtMMKM/transaction.sh ro
 
 This restores the previously accepted GPU runtime and restarts camera/audio
 services. No kernel reboot or change to the OBS/stable-ID fix is involved.
+
+## Smooth continuous autofocus (patch 0009, 2026-11-08)
+
+On the SM-X710 the owner heard the lens click while it focused. Focus also
+moved periodically and jerkily instead of smoothly. The old state machine
+explains all three:
+- Every scan position was one V4L2 write, a jump of 48 to 128 codes. The
+  final move to the best position could be over 600 codes. The DW9808 snapped
+  and rang.
+- Each position was measured on the next statistics frame but one.
+  Statistics come every fourth frame (`kStatPerNumFrames`). The lens was often
+  still ringing, and noisy scores triggered rescans.
+- Focused, it probed -48, +48 and back every 45 statistics, about 6 s at 30 fps,
+  in a still scene too. That was the periodic click.
+
+`src/ipa/simple/soft_af.{h,cpp}` (SoftAf) replaces it. The IPA calls it every
+frame, with the contrast score on the frames that carry statistics.
+
+| | |
+|---|---|
+| motion | at most 24 codes per frame (`moveStep`), every frame, never a jump |
+| attribution | a sample is credited to the position commanded 3 frames before its frame (`latencyFrames`) |
+| first focus | wait for a still score, glide to the nearer end of 96-960, sweep at 20 codes per frame |
+| early stop | only on a clear peak: 35 % over the sweep's median, then 12 % below it twice or 24 % once |
+| fine pass | ±48 codes around the coarse vertex, at 6 codes per frame, there and back |
+| estimate | least-squares parabola over the window; a vertex outside moves the window half a width, at most twice |
+| focused | still until a 4-sample mean leaves the reference by 10 % or 3 σ of the measured noise |
+| reference | measured over 4 samples on arrival, then follows a still scene slowly (1/16 per sample) |
+| change | wait for a still scene (5 samples in a row within 8 % or 3 σ of each other); unchanged, lock again |
+| refocus | local search ±224 at 8 codes per frame, turning back if the first two steps lose contrast; else one full scan |
+| flat scene | Failed, searched again after 2, 6 and 18 s, then only on a change |
+| start | the software ISP passes the lens range and the position the driver holds (`CameraLens::focusPosition()`) |
+
+Going there and back over the fine window is what makes the estimate robust to
+a wrong latency. A sample credited one frame late in one direction is credited
+one frame early in the other, and the fit sees both.
+
+### Tests
+
+`tests/test_soft_af.py` (14 tests, also run by `scripts/test-camera-autofocus.py`)
+takes `soft_af.h` and `soft_af.cpp` from the patch and builds them with
+`tests/soft_af_sim.cpp`:
+- The simulated lens applies commands 2 or 3 frames late.
+- The scene is a Gaussian contrast peak with noise; scene changes, shake, pans
+  and flat scenes come in segments.
+- It checks smoothness (never more than 24 codes in a frame), sharpness (at
+  least 98 % of the best possible, 95 % at 8 % noise) and time to focus.
+- It also checks that a still scene never moves the lens for 60 s, that a
+  scene change is refocused (locally when it is nearby), that a shake or a pan
+  does not move the lens, and that a flat scene fails quietly but is retried.
+- Last, it checks that AfModeAuto scans once per trigger, and that a lens left
+  elsewhere, or a restarted stream, starts without a jump.
+
+A wider sweep covered 480 random scenes: peaks at 110-940, widths 50-110
+codes, noise of 3, 6 and 8 %, simulated latencies of 1 to 6 frames, and lenses
+starting anywhere.
+- No frame ever moved the lens more than 24 codes.
+- At 3 % noise and latency 2 to 5, every run ended within 2 % of the best
+  sharpness.
+- Median time to focus was 3.3 to 3.7 s at 30 fps; the old state machine also
+  took about 3 s.
+- A still 60 s scene moved the lens in 0 of 240 runs at 3 % noise. At 8 % noise
+  there were a few local refocuses, most of them correcting a first lock that
+  was slightly off.
+
+These are simulations. The real latency, the score's noise, and what the coil
+sounds like at 20-24 codes per frame are not measured yet.
+
+### Pending
+
+- The first on-device build, `libcamera-gts9u` gts9u11 from `fdb8ed9`, has
+  everything except the Failed retries (`962da80`). The next build takes those
+  with new versions.
+- On the SM-X710:
+  - the owner listens for clicks;
+  - Snapshot opened and closed several times, focusing near and far;
+  - the journal's "Autofocus focused at … after … frames" lines;
+  - `lens-diag.sh`.
+- On the Ultra, the same package's rear-main lens. The change also reaches
+  every Ultra camera with a lens.
