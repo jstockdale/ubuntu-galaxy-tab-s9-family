@@ -13,16 +13,38 @@
 # host role untouched: switching would disconnect it, and a mounted drive
 # must not be pulled out from under its filesystem.
 #
-# GTS9U_SYSFS and GTS9U_RUN exist for the tests.
+# With such a device attached the tablet does sleep, but the xHC can come back
+# dead ("Host System Error", then "couldn't allocate usb_device"), and nothing
+# on the port works until the controller is reset.  After that resume a
+# transient unit watches the kernel log for about 10 s and, if the xHC died,
+# toggles the role (device, then host) as an unplug would, so the devices come
+# back on their own.
+#
+# GTS9U_SYSFS, GTS9U_RUN, GTS9U_KLOG, GTS9U_INLINE, GTS9U_TRIES and
+# GTS9U_TRACE exist for the tests.
 sys=${GTS9U_SYSFS:-/sys}
 run=${GTS9U_RUN:-/run/ubuntu-gts9u}
 stamp=$run/usb-role-before-sleep
+since=$run/usb-sleep-start
 
 role=
 for r in "$sys"/class/usb_role/*/role; do
 	[ -f "$r" ] && { role=$r; break; }
 done
 [ -n "$role" ] || exit 0
+
+set_role() {
+	echo "$1" > "$role"
+	[ -z "${GTS9U_TRACE:-}" ] || echo "$1" >> "$GTS9U_TRACE"
+}
+
+klog() {
+	if [ -n "${GTS9U_KLOG:-}" ]; then
+		cat "$GTS9U_KLOG"
+	else
+		journalctl -k --since "@$1" -o cat --no-pager 2>/dev/null
+	fi
+}
 
 # True when every USB device below the root hubs is a hub (09) or a
 # Billboard device (11), judged by the device class or, where that is 00,
@@ -53,10 +75,11 @@ only_hubs_and_billboards() {
 case $1 in
 pre)
 	[ "$(cat "$role")" = host ] || exit 0
-	only_hubs_and_billboards || exit 0
 	mkdir -p "$run"
+	date +%s > "$since"
+	only_hubs_and_billboards || exit 0
 	echo host > "$stamp"
-	echo device > "$role"
+	set_role device
 	# The controller goes away as it does on unplug; give it 3 s.
 	i=0
 	while [ $i -lt 30 ] && [ -n "$(ls -d "$sys"/bus/usb/devices/usb* 2>/dev/null)" ]; do
@@ -65,14 +88,40 @@ pre)
 	done
 	;;
 post)
-	[ -f "$stamp" ] || exit 0
-	rm -f "$stamp"
-	# Only if the partner is still attached; otherwise USB-C sets the role.
-	if [ -z "$(ls -d "$sys"/class/typec/port*-partner 2>/dev/null)" ] &&
-		[ -d "$sys/class/typec" ]; then
+	t=$(cat "$since" 2>/dev/null)
+	rm -f "$since"
+	if [ -f "$stamp" ]; then
+		rm -f "$stamp"
+		# Only if the partner is still attached; otherwise USB-C sets the role.
+		if [ -z "$(ls -d "$sys"/class/typec/port*-partner 2>/dev/null)" ] &&
+			[ -d "$sys/class/typec" ]; then
+			exit 0
+		fi
+		set_role host
 		exit 0
 	fi
-	echo host > "$role"
+	[ -n "$t" ] && [ "$(cat "$role")" = host ] || exit 0
+	# Off the resume path: the screen must not wait for this.
+	if [ -n "${GTS9U_INLINE:-}" ]; then
+		exec sh "$0" recover "$t"
+	fi
+	systemd-run --no-block --collect --quiet --unit=ubuntu-gts9u-usb-recover \
+		/bin/sh "$0" recover "$t" 2>/dev/null || :
+	;;
+recover)
+	t=${2:?start time}
+	i=0
+	while [ $i -lt "${GTS9U_TRIES:-100}" ]; do
+		if klog "$t" | grep -q -E "Host System Error|couldn't allocate usb_device"; then
+			set_role device
+			sleep 2
+			set_role host
+			echo "ubuntu-gts9u-usb-role: reset the USB host controller, which resumed dead"
+			exit 0
+		fi
+		sleep 0.1
+		i=$((i + 1))
+	done
 	;;
 esac
 exit 0
