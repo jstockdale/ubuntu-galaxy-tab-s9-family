@@ -322,3 +322,23 @@ sounds like at 20-24 codes per frame are not measured yet.
   - `lens-diag.sh`.
 - On the Ultra, the same package's rear-main lens. The change also reaches
   every Ultra camera with a lens.
+
+### On the SM-X710 (squirtle, boot `cc67dab2`, 2026-11-08 18:07)
+
+Installed `libcamera-gts9u` gts9u11 (`9ced46af…`) and SPA 1.0.5-gts9u12
+(`c155ea30…`), the SPA binary unchanged, plus device 2.61 (`6084d708…`). The
+owner's PipeWire restarted and loaded the new library; no old mapping was left.
+Then `camera-test.sh rear` ran, and the owner used GNOME Camera.
+
+- Owner: "Autofocus is much much better".
+- PipeWire's IPA logged seven completed searches in 40 s, at lens positions
+  298-439, each after 92 to 140 frames (3.1-4.7 s at 30 fps). That is the
+  simulated range.
+- The lens's first power-up after the camera was enabled failed once more,
+  even with the 10 ms delay (`master 0 queue 0 timeout`, `register 0x02 write
+  failed`, 18:08:08). The `dw9808_vcm` fix let the next open succeed:
+  PipeWire and WirePlumber both hold the lens, and it focuses.
+- Still to look at: whether any click is left, the occasional power-up failure
+  (the stock pad settings are the next suspect, now for back-powering an
+  unpowered lens through the CCI pull-ups), and the freeze on open.
+  `cam-watch.sh` logs the csid0 rate meanwhile.

@@ -8516,3 +8516,13 @@ Details are in [camera focus](camera-focus-and-enumeration.md#smooth-continuous-
   install, `camera-test.sh rear`, the owner listening and focusing near and far
   in Snapshot, and `lens-diag.sh`;
 - on the Ultra.
+
+**On squirtle, boot `cc67dab2` (18:07):**
+- The three packages installed: 3 upgraded, none removed; `dpkg --audit`
+  clean. The owner's PipeWire and WirePlumber restarted with no old libcamera
+  mapped; Bluetooth (the S Pen and the Beats) reconnected.
+- `camera-test.sh rear`: the sensor and lens bound.
+- The lens's first power-up timed out once (18:08:08). The driver fix let the
+  next open succeed.
+- The owner used GNOME Camera: "Autofocus is much much better". The IPA logged
+  seven searches in 40 s, each focused after 92-140 frames.
