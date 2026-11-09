@@ -78,11 +78,21 @@ class UsbRoleSleepHookTests(unittest.TestCase):
         self.assertEqual(self.hook("pre"), "device")
         self.assertEqual(self.hook("post"), "device")
 
+    def test_partner_missing_but_port_still_host_returns_to_host(self):
+        # blastoise, cycle 3: no port0-partner after the resume, but the
+        # port still reported data_role "[host] device".
+        self.role.write_text("host\n")
+        self.belkin_hub()
+        (self.sys / "class/typec/port0/data_role").write_text("[host] device\n")
+        self.assertEqual(self.hook("pre"), "device")
+        self.assertEqual(self.hook("post"), "host")
+
     def test_unplugged_during_sleep_is_not_forced_back_to_host(self):
         self.role.write_text("host\n")
         self.belkin_hub()
         self.assertEqual(self.hook("pre"), "device")
-        # No port0-partner: the hub went away while the tablet slept.
+        # No port0-partner and the port back to UFP: the hub went away.
+        (self.sys / "class/typec/port0/data_role").write_text("host [device]\n")
         self.assertEqual(self.hook("post"), "device")
         self.assertFalse((self.run_dir / "usb-role-before-sleep").exists())
 

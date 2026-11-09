@@ -43,9 +43,14 @@ pre)
 post)
 	[ -f "$stamp" ] || exit 0
 	rm -f "$stamp"
-	# Only if the partner is still attached; otherwise USB-C sets the role.
-	if [ -z "$(ls -d "$sys"/class/typec/port*-partner 2>/dev/null)" ] &&
-		[ -d "$sys/class/typec" ]; then
+	# Back to host if the USB-C partner is attached or the port still holds
+	# the host data role: after a deep sleep the partner can be missing
+	# while the port, still DFP, has not re-detected it (blastoise,
+	# 2026-11-08).  Only a port that has really gone back to UFP is left to
+	# USB-C to set.
+	if [ -d "$sys/class/typec" ] &&
+		[ -z "$(ls -d "$sys"/class/typec/port*-partner 2>/dev/null)" ] &&
+		! grep -qs '\[host\]' "$sys"/class/typec/port*/data_role; then
 		exit 0
 	fi
 	echo host > "$role"
