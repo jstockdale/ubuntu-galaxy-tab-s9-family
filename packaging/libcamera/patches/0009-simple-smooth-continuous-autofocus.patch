@@ -40,10 +40,10 @@ index 2f9f15f4a..bca3e55b1 100644
  
 diff --git a/src/ipa/simple/soft_af.cpp b/src/ipa/simple/soft_af.cpp
 new file mode 100644
-index 000000000..e2072a21c
+index 000000000..9a961fb0e
 --- /dev/null
 +++ b/src/ipa/simple/soft_af.cpp
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,753 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast-detection autofocus for the software ISP
@@ -612,6 +612,7 @@ index 000000000..e2072a21c
 +
 +		if (startup_) {
 +			fullAfterLocal_ = false;
++			failedRetries_ = 0;
 +			startFullScan();
 +			return;
 +		}
@@ -691,7 +692,10 @@ index 000000000..e2072a21c
 +			noise_ = std::clamp(std::sqrt(std::max(variance, 0.0)) / mean, 0.01, 0.25);
 +		phase_ = Phase::Locked;
 +		lockedRecent_.clear();
++		lockedSamples_ = 0;
 +		lastLockedScore_ = 0;
++		if (found_)
++			failedRetries_ = 0;
 +		return;
 +	}
 +
@@ -702,6 +706,24 @@ index 000000000..e2072a21c
 +		if (!reference_) {
 +			reference_ = score;
 +			return;
++		}
++
++		/*
++		 * Nothing to focus on: a subject that appears far out of focus
++		 * can look as flat as the blank scene did.  Search again a few
++		 * times, less and less often, then only on a change.
++		 */
++		lockedSamples_++;
++		if (state_ == State::Failed && failedRetries_ < tuning_.failedRetries) {
++			unsigned int wait = tuning_.failedRetrySamples;
++			for (unsigned int i = 0; i < failedRetries_; ++i)
++				wait *= 3;
++			if (lockedSamples_ >= wait) {
++				failedRetries_++;
++				fullAfterLocal_ = true;
++				startFullScan();
++				return;
++			}
 +		}
 +
 +		/*
@@ -730,6 +752,8 @@ index 000000000..e2072a21c
 +
 +		double ratio = mean / static_cast<double>(reference_);
 +		if (std::abs(ratio - 1.0) > changeRatio()) {
++			/* A new scene: it gets its own retries. */
++			failedRetries_ = 0;
 +			waitStable(false);
 +			return;
 +		}
@@ -775,10 +799,10 @@ index 000000000..e2072a21c
 +} /* namespace libcamera */
 diff --git a/src/ipa/simple/soft_af.h b/src/ipa/simple/soft_af.h
 new file mode 100644
-index 000000000..d8c871102
+index 000000000..b48f3484b
 --- /dev/null
 +++ b/src/ipa/simple/soft_af.h
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,231 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast-detection autofocus for the software ISP
@@ -863,6 +887,11 @@ index 000000000..d8c871102
 +		double noiseMargin = 3.0;
 +		/* Focused, the reference follows a still scene this slowly. */
 +		unsigned int referenceTrack = 16;
++		/* Failed (nothing to focus on), search again after this many
++		 * samples, three times longer each time, this often; then wait
++		 * for the scene to change. */
++		unsigned int failedRetrySamples = 15;
++		unsigned int failedRetries = 3;
 +		/* Samples to wait for a still scene before searching anyway. */
 +		unsigned int startupTimeout = 2;
 +		unsigned int stableTimeout = 24;
@@ -990,6 +1019,8 @@ index 000000000..d8c871102
 +	double referenceSquares_ = 0;
 +	unsigned int referenceSamples_ = 0;
 +	std::deque<uint64_t> lockedRecent_;
++	unsigned int lockedSamples_ = 0;
++	unsigned int failedRetries_ = 0;
 +	/* Relative noise of one sample, measured while focused. */
 +	double noise_ = 0.03;
 +	uint64_t lastLockedScore_ = 0;
