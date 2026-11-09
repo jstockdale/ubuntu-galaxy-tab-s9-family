@@ -250,6 +250,18 @@ class SoftAfTest(unittest.TestCase):
                 self.assertSmooth(r, start=start)
                 self.assertSharp(r, 400)
 
+    def test_reconfigured_stream_keeps_focus(self):
+        # A photo, or a recording starting, reconfigures the stream; the scene
+        # is the same, so the lens must not move.
+        for restart in (400, 700):
+            with self.subTest(restart=restart):
+                r = self.run_sim(scene="0:420:1000:1.0:70", frames=1200, restart=restart)
+                focused = r.first({FOCUSED})
+                self.assertLess(focused, restart)
+                self.assertEqual(r.commands_between(focused + 1), [],
+                                 "a reconfiguration restarted the search")
+                self.assertSharp(r, 420)
+
     def test_restarted_stream(self):
         r = self.run_sim(scene="0:400:1000:1.0:70,500:650:1000:1.0:70", frames=1200,
                          restart=500)
