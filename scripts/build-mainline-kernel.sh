@@ -258,12 +258,11 @@ apply_unless '!of_machine_is_compatible("samsung,gts9wifi")' \
 	drivers/mailbox/qcom-ipcc.c ipcc-mask-summary-during-suspend-gts9wifi.patch
 # SM8550's top UFS OPP has a 300 MHz UniPro clock, which mainline maps to
 # HS-G4; the UFS 4.0 part, the controller and the PHY all do HS-G5, as the
-# Kalama driver runs it at 300 MHz.  X710 experiment first: the Ultra gets it
-# once the X710 has passed the link, suspend and power checks.
-if [ "$DEVICE" = gts9wifi ]; then
-	apply_unless 'it runs HS-G5' \
-		drivers/ufs/host/ufs-qcom.c ufs-qcom-hs-g5-at-300mhz-sm8550.patch
-fi
+# Kalama driver runs it at 300 MHz.  On the SM-X710 it ran G5 Rate-A at
+# 3.48 GB/s and passed a 30-minute stress run (2026-11-07); the SM-X910 is
+# being tried with it, together with its UFS PCS reset (2026-11-08).
+apply_unless 'it runs HS-G5' \
+	drivers/ufs/host/ufs-qcom.c ufs-qcom-hs-g5-at-300mhz-sm8550.patch
 apply_unless 'Users may open the misc device as soon as it is registered' \
 	drivers/misc/fastrpc.c fastrpc-publish-after-session-init.patch
 apply_unless 'qcom,early-tx-intent' \

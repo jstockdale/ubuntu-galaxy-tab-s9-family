@@ -16,11 +16,11 @@ original = Path(sys.argv[1]).read_text()
 patch = repo / "kernel/patches/ufs-qcom-hs-g5-at-300mhz-sm8550.patch"
 
 script = (repo / "scripts/build-mainline-kernel.sh").read_text()
-gate = re.search(r'if \[ "\$DEVICE" = gts9wifi \]; then\n'
-                 r"\tapply_unless 'it runs HS-G5' \\\n"
-                 r"\t\tdrivers/ufs/host/ufs-qcom.c ufs-qcom-hs-g5-at-300mhz-sm8550.patch\n"
-                 r"fi\n", script)
-assert gate, "build script must apply the patch for gts9wifi only"
+# Both boards share the SoC and the UFS host; the patch applies to every
+# build, unconditionally.
+gate = re.search(r"\napply_unless 'it runs HS-G5' \\\n"
+                 r"\tdrivers/ufs/host/ufs-qcom.c ufs-qcom-hs-g5-at-300mhz-sm8550.patch\n", script)
+assert gate, "build script must apply the patch for every device"
 
 with tempfile.TemporaryDirectory(prefix="gts9u-ufs-g5-test-") as tmp:
     source = Path(tmp) / "drivers/ufs/host/ufs-qcom.c"
