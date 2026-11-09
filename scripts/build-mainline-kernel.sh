@@ -301,6 +301,17 @@ apply_unless 'Match the SM-X910 Samsung kernel at standard mode' \
 apply_unless "Samsung's SM8550 driver cancels first" \
 	drivers/i2c/busses/i2c-qcom-geni.c \
 	qcom-geni-cancel-before-abort.patch
+# The geni UART's handler returned IRQ_NONE, its status uncleared, from the
+# moment uart_suspend_port() marked the port suspended, before RX and TX
+# were stopped.  On the X710 the Bluetooth UART's level-triggered interrupt
+# stormed in the boot-time pm_test cycle and was disabled, and every HCI
+# command timed out until a rebind.  X710 first: the Ultra's Bluetooth UART
+# has the same window, and gets this once the X710 has passed its matrix.
+if [ "$DEVICE" = gts9wifi ]; then
+	apply_unless 'Serve the interrupt even once uart_suspend_port()' \
+		drivers/tty/serial/qcom_geni_serial.c \
+		qcom-geni-serial-serve-irq-while-suspending.patch
+fi
 apply_unless 'sc8280xp_snd_startup' \
 	sound/soc/qcom/sc8280xp.c set-mi2s-codec-dai-format.patch
 apply_unless 'ret != -ENODEV && ret != -EPROBE_DEFER' \

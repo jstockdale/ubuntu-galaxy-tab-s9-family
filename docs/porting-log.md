@@ -8216,6 +8216,224 @@ fail. The stock data decoded so far shows no park or settle sequence to
 compare against (the actuator block has 13 init records and the power
 records, plus unidentified tuning words such as 7500 and 10000).
 
+### The geni UART handler ignored its interrupt while the port suspended (2026-11-08)
+
+The cause of the storm in "Bluetooth lost to a UART IRQ storm in the
+boot-time cycle", and its fix.
+
+Measured on squirtle, still on boot `0824d1f3`:
+- The report's stack ends `_raw_spin_unlock_irq+0x1c (P)` over
+  `qcom_geni_serial_suspend+0x60`, in the panel cycle's task
+  (`ubuntu-gts9u-pa`, PID 1325) on CPU 0.
+  - In the CX vmlinux, `+0x60` is the return address of the
+    `bl uart_suspend_port`.
+  - `_raw_spin_unlock_irq+0x1c` is the first instruction after
+    `msr DAIFClr`.
+  - So the interrupt became pending inside a port-locked section of
+    `uart_suspend_port()` and was taken the instant interrupts came back on.
+  - For a non-console port, the only such section is the one that runs
+    `stop_tx()`, `set_mctrl(0)` and `stop_rx()`.
+- IRQ 191 (hwirq 493, GIC SPI 461 from the UART's DT node) has
+  `effective_affinity_list` 0. There is no irqbalance, so it always goes to
+  CPU 0.
+
+Mechanism (7.2-rc3; mainline master read on 2026-11-08 is the same):
+- `uart_suspend_port()` sets `uport->suspended` first. Then, under the port
+  lock, it stops TX and RX. `shutdown()` disables the IRQ later still.
+- From the moment the flag is set, `qcom_geni_serial_isr()` returns
+  `IRQ_NONE` without reading or clearing the M, S or DMA status. The line
+  is level-triggered, so whatever latched in that window keeps it asserted:
+  received data, or the cancel status from `stop_rx_dma()`.
+  `stop_rx_dma()` clears `RX_EOT`, but it leaves the S sequencer's status to
+  the handler. `S_CMD_CANCEL_EN` is in the enabled S interrupts
+  (`geni_se_init()`), and `geni_se_io_set_mode()` routes all four sources
+  to the line.
+- If the IRQ's CPU is not the suspending task's, the storm lasts until
+  `shutdown()` masks it, a few microseconds. If it is the same CPU, the CPU
+  takes the interrupt again at every unlock and the task makes almost no
+  progress. After 100,000 unhandled interrupts the kernel disables the IRQ.
+- That the window opens only when the panel-cycle task happens to run on
+  CPU 0 fits 1 boot in 32, but it is a hypothesis. So is the claim that the
+  cancel alone asserts the line. The kit's test measures both.
+- The window dates from b1f84dd32166 (2018), which moved this driver's
+  system suspend out of the noirq phase. a4ced376fed0 then kept RFR ready
+  during suspend on purpose, so that the BT SoC can send wake bytes, so
+  traffic in the window is expected.
+
+Upstream: none of the 25 driver commits since 7.2-rc3 (GitHub's mirror of
+mainline, to 2026-10-13) touches this. Web searches found no posted fix.
+lore's search sits behind a bot check and was not read.
+
+The fix, `kernel/patches/qcom-geni-serial-serve-irq-while-suspending.patch`:
+the early return is gone, and the handler keeps serving the engine until
+`shutdown()` masks it.
+- Acking the status and returning `IRQ_HANDLED` while suspended was
+  rejected. It would drop a TX DMA completion, and `start_tx_dma()` does
+  nothing while `tx_dma_addr` is set, so TX would stall after resume.
+  Bluetooth would die the same way.
+- The handler cannot reach an unclocked engine:
+  - `shutdown()` disables and synchronises the IRQ before
+    `uart_change_pm(OFF)` drops the runtime PM reference;
+  - on resume, power comes back before `startup()` enables the IRQ;
+  - the wakeup path (`device_may_wakeup()`) never sets the flag.
+- The patch applies at fuzz 0 to the X710 tree and at fuzz 1 to mainline.
+  checkpatch `--strict` is clean.
+- `build-mainline-kernel.sh` applies it to gts9wifi builds only for now. The
+  Ultra's BT UART has the same window.
+
+The build (2026-11-08):
+- Source: snapshot `~/ubuntu-gts9u/snapshots/bt-5b08b136e713` of commit
+  5b08b13, whose `SNAPSHOT` file names its commit and tree. A fresh worktree
+  of `linux-mainline` at a13c140cc and a fresh build directory, both in
+  `gts9u-scratch/build-btirq`. Output: `~/ubuntu-gts9u/out/kernel-gts9wifi-btirq`.
+- The kernel tree differs from the CX build's (`build-cxg5/linux-src-gts9wifi`)
+  in `drivers/tty/serial/qcom_geni_serial.c` only. The `.config` is
+  byte-identical: `c17980f0…`, fix6's.
+- Image.gz `bc68d1a4…`, DTB `290a5395…` (the CX DTB), release
+  `7.2.0-rc3-dirty`, GNU build ID `82260a22e285…`. In the CX vmlinux,
+  `qcom_geni_serial_isr()` opens with `ldrb w8, [x1, #0x174]` (`suspended`)
+  and returns 0. In this one it goes straight to `_raw_spin_lock`.
+- Exported symbols: `Module.symvers` is identical to the CX build's
+  (17,610 symbols, the same CRCs).
+- The signing key is the CX build's, ID `1ded767e…` (certificate
+  byte-identical). Its key, `x509.genkey` and `.signing_key.pem.cmd` were
+  copied into the new build directory with their times, and kbuild kept
+  them (no `GENKEY`). This keeps device package 2.58's
+  `qcom_spss_irq.ko`, signed for the CX kernel, loadable under lockdown.
+  The registry recorded the build (`bc68d1a4ace2ee76`) under that key and
+  mirrored it to the external drive and to `gdrive:gts9u-kernel-keys`.
+- Modules: the same 62, every one signed with the CX key. None is
+  byte-identical to the CX build's. Code, data and BTF match. The rest
+  differs only by the build directory's absolute path, which is one
+  character longer: the path itself in the debug info, and the `__FILE__`
+  strings of the out-of-tree modules' BUG/WARN and dynamic-debug entries,
+  which are therefore laid out at shifted offsets.
+
+First kit, `~/ubuntu-gts9u/backups/bt-uart-kit` (`tools/inplace/bt-uart/`),
+on top of the CX kit (superseded by the repack below):
+- `boot.img` `061befd0…`. The recipe, given the CX kernel and DTB,
+  reproduces the CX kit's `boot.img` (`47f7df27…`) byte for byte. In the new
+  image every header field is the CX kit's, and the kernel is exactly
+  `Image.gz` plus the CX DTB.
+- `vendor_boot` is not written; it stays the CX kit's `be06a00f…`.
+- `modules-7.2.0-rc3-dirty.tar` `9c2f05b0…`, root-owned.
+- `BUILD_ID`, the install, rollback and verify scripts, the test
+  `suspend-bt.sh`, and a copy of `gts9u-suspend-cycles.sh` for the real
+  sleeps.
+
+Not flashed.
+
+Checks run (host, and read-only on squirtle):
+- The patch applies at fuzz 0 to the X710 tree. The build log shows it
+  applied ("patching file drivers/tty/serial/qcom_geni_serial.c").
+- `bash -n` and `sh -n` pass on the kit's scripts.
+- `verify.sh`, run non-root on the current CX boot, flags this boot's
+  "nobody cared" and HCI timeouts, as it should, and reads hci0 as up with
+  its EFS address.
+- `suspend-bt.sh`'s discovery, run on squirtle, finds `898000.serial`,
+  `hci0`, IRQ 191, hwirq 493 and CPU 0. On a sample trace its parser counts
+  handler results inside and outside the UART's suspend callback correctly.
+  The first run of the discovery picked `hci0:3`, a connection entry; it is
+  fixed to `hciN` names.
+
+The owner's test (`tools/inplace/bt-uart/README.md`, "The test"):
+- The test pins the suspending task to the Bluetooth IRQ's CPU (CPU 0), so
+  that every cycle is the case that killed boot `0824d1f3`.
+- 0, optional, before installing, on the CX kernel: `platform 5 --no-scan`.
+  This measures the window on the old handler: `unhandled` above 0 while
+  the port is suspending, and whether the cancels alone assert the line.
+  Run `recover` afterwards.
+- 1 to 6, on the kit:
+  - `verify.sh`, with and without sudo;
+  - `platform 20`;
+  - `platform 10` with A2DP audio playing;
+  - `platform 10 --no-pin`;
+  - `s2idle 3`, then `deep 3`;
+  - several reboots, each followed by `verify.sh`.
+- Expected on the kit: `unhandled 0` in every cycle, no "nobody cared", and
+  hci0 answering HCI Read Local Version after every resume.
+
+Not yet run: everything on the kit, and the CX-kernel baseline. The
+mechanism's last steps are inferred from the code and the one stack trace,
+not yet measured: which status latched, and why 1 boot in 32. Step 0
+measures them.
+
+The kit, repacked for the lens kit (2026-11-08). squirtle now runs the lens
+power-up kit over the CX kit (boot `9c0e3019`), and the first kit's
+`install.sh` refuses there. The owner asked for a repack that keeps the
+lens fix:
+- `boot.img` `39ecad3d…` is the same kernel (Image.gz `bc68d1a4…`, build ID
+  `82260a22…`) with the lens kit's DTB (`164e1bf8…`) appended.
+  - `dtc` shows that this DTB differs from the CX DTB only by
+    `startup-delay-us = <10000>` on `rear_cam_vio`.
+  - Given the CX kernel, the recipe reproduces the CX kit's `boot.img` with
+    the CX DTB, and the lens kit's (`57406c80…`) with the lens DTB.
+  - The new image's header fields are the lens kit's.
+- `vendor_boot` is not written. It stays the lens kit's `b18510f3…`, which
+  carries the same DTB.
+- `install.sh` checks:
+  - the CX and lens markers;
+  - `boot` = `57406c80…` and `vendor_boot` = `b18510f3…`.
+
+  It saves `boot-lens.img`, and `rollback.sh` writes it back. Roll back in
+  reverse order: this kit, then the lens kit, then the CX kit.
+- The kernel is still the one built from 5b08b13. Like the lens kit's
+  kernel (the CX one), it does not carry dcd0343, the built-in `dw9808_vcm`
+  power-down fix. The branch now merges `claude/x710-cx-kit` (5f4a517), so
+  its DTS matches the kit's DTB.
+- Modules tar `deb1b8ef…`. Its content is the first pack's; only one
+  file's time differs, see below.
+- Staged on squirtle at `~/bt-uart`, with checksums verified there. The
+  first kit moved to `~/bt-uart-cx-only`.
+
+A mistake on the host, repaired. During the module comparison, one
+`llvm-objcopy --dump-section` call had no output path, so llvm-objcopy
+rewrote its input in place and dropped the appended signature:
+- It hit `updates/qcom_sp_hlos_heap.ko` in both `out/kernel-gts9wifi-btirq`
+  and `out/kernel-gts9wifi-cx`.
+- Both copies were restored from the kits' module tars, which predate the
+  mistake. Each output tree now matches its kit's tar file for file; the
+  CX one matches the installed `f7d38300…`.
+- Nothing on the tablet was affected.
+
+The kernel, rebuilt with the lens driver fix (2026-11-08). The owner asked
+for the kit to carry dcd0343 as well ("dw9808_vcm: power down cleanly when
+the park fails", built in). Until now that fix had only been compiled out
+of tree:
+- Source: snapshot `~/ubuntu-gts9u/snapshots/bt-07c4924110a9` of 07c4924,
+  the branch after merging `claude/x710-cx-kit`. Fresh worktree and build
+  directory in `gts9u-scratch/build-btirq2`, with the CX key pre-seeded as
+  before. Output: `~/ubuntu-gts9u/out/kernel-gts9wifi-btirq2`.
+- The tree differs from the CX build's in three files only:
+  - `qcom_geni_serial.c`;
+  - `drivers/media/i2c/dw9808_vcm.c`, which is dcd0343's;
+  - the X710 DTS, where comments aside the only change is
+    `startup-delay-us = <10000>`.
+- `.config`, the signing certificate and `Module.symvers` (17,610 symbols)
+  are identical to the CX build's.
+- Image.gz `7b8de34e…`, GNU build ID `e862f606ab39…`. The vmlinux has the
+  ISR without the `suspended` check and dcd0343's "lens not parked before
+  power-down" warning.
+- This build's own DTB is `164e1bf8…`, byte-identical to the lens kit's.
+- The registry recorded the build (`7b8de34ea2a69c72`) under key
+  `1ded767e…` and mirrored it to the external drive and Google Drive.
+- The 62 modules are all signed with the CX key.
+- Device package 2.60's `qcom_spss_irq.ko` is the CX build's copy
+  (`8e421c6e…`, the one squirtle has now), signed with the CX key, with
+  vermagic `7.2.0-rc3-dirty`. This kernel accepts it.
+
+Kit `~/ubuntu-gts9u/backups/bt-uart-lens-dw9808-kit`, staged on squirtle as
+`~/bt-uart` with checksums verified there:
+- `boot.img` `faa774ad…`: the kernel plus the lens DTB. Given the CX kernel,
+  the recipe reproduces the CX kit's and the lens kit's `boot.img`. The
+  header fields are the lens kit's.
+- modules tar `76d2a7a5…`, `BUILD_ID` `e862f606…`.
+- The same scripts. `vendor_boot` is not written; it stays `b18510f3…`.
+
+The previous kit moved to `~/bt-uart-lens-5b08b13`. After installing, rerun
+the lens kit's checks (`camera-test.sh rear`, `lens-diag.sh`), since this
+is the first kernel to carry dcd0343.
+
 ### Device 2.60 with the Bluetooth self-heal, for squirtle (2026-11-08)
 
 `claude/x710-bt-bringup` (2.59, the Bluetooth self-heal) is merged into
