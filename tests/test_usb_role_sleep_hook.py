@@ -62,18 +62,16 @@ class UsbRoleSleepHookTests(unittest.TestCase):
         self.assertEqual(self.hook("pre"), "device")
         self.assertEqual(self.hook("post"), "host")
 
-    def test_a_keyboard_behind_the_hub_keeps_host(self):
+    def test_real_devices_leave_host_for_the_sleep_too(self):
+        # With a device attached the xHC resumed dead and then could not be
+        # restarted (blastoise, Beats Studio Pro on the Belkin hub), so every
+        # host session leaves host role for the sleep.
         self.role.write_text("host\n")
         self.belkin_hub()
-        self.device("1-1.2", "00", ["03"])
+        self.device("1-1.1", "00", ["01", "01", "01", "03"])
         self.partner()
-        self.assertEqual(self.hook("pre"), "host")
-        self.assertFalse((self.run_dir / "usb-role-before-sleep").exists())
-
-    def test_a_drive_keeps_host(self):
-        self.role.write_text("host\n")
-        self.device("1-1", "00", ["08"])
-        self.assertEqual(self.hook("pre"), "host")
+        self.assertEqual(self.hook("pre"), "device")
+        self.assertEqual(self.hook("post"), "host")
 
     def test_device_role_is_left_alone(self):
         self.role.write_text("device\n")
@@ -92,40 +90,6 @@ class UsbRoleSleepHookTests(unittest.TestCase):
         self.role.write_text("host\n")
         self.partner()
         self.assertEqual(self.hook("post"), "host")
-
-    def resume_with_klog(self, text):
-        klog = Path(self.tmp.name) / "klog"
-        klog.write_text(text)
-        trace = Path(self.tmp.name) / "trace"
-        env = dict(os.environ, GTS9U_SYSFS=str(self.sys), GTS9U_RUN=str(self.run_dir),
-                   GTS9U_KLOG=str(klog), GTS9U_INLINE="1", GTS9U_TRIES="3",
-                   GTS9U_TRACE=str(trace))
-        subprocess.run(["sh", str(HOOK), "post", "suspend"], env=env, check=True, timeout=20)
-        return trace.read_text().split() if trace.exists() else []
-
-    def test_a_dead_xhc_after_resume_is_reset_with_the_devices_attached(self):
-        # blastoise, 2026-11-08: Beats Studio Pro behind the Belkin hub; the
-        # tablet slept, and the xHC came back with a Host System Error.
-        self.role.write_text("host\n")
-        self.belkin_hub()
-        self.device("1-1.1", "00", ["01", "01", "01", "03"])
-        self.partner()
-        self.assertEqual(self.hook("pre"), "host")
-        self.assertTrue((self.run_dir / "usb-sleep-start").exists())
-        trace = self.resume_with_klog(
-            "xhci-hcd xhci-hcd.2.auto: WARNING: Host System Error\n"
-            "usb usb1-port1: couldn't allocate usb_device\n")
-        self.assertEqual(trace, ["device", "host"])
-        self.assertEqual(self.role.read_text().strip(), "host")
-        self.assertFalse((self.run_dir / "usb-sleep-start").exists())
-
-    def test_a_clean_resume_with_devices_attached_is_left_alone(self):
-        self.role.write_text("host\n")
-        self.device("1-1", "00", ["03"])
-        self.partner()
-        self.hook("pre")
-        self.assertEqual(self.resume_with_klog("PM: suspend exit\n"), [])
-        self.assertEqual(self.role.read_text().strip(), "host")
 
     def test_no_role_switch_at_all(self):
         self.role.unlink(missing_ok=True)
