@@ -43,11 +43,12 @@ If the project is useful to you, consider supporting its author:
 | Desktop | ✅ | ✅ | — | GNOME 46 on Wayland with GDM |
 | GPU | ✅ | ✅ | — | Adreno 740 with Mesa freedreno and turnip; X910 up to 719 MHz. On the X710 the stray pixels seen during bring-up are fixed: with `videocc` built in, `rpmhpd` reaches `sync_state` at boot ([display notes](docs/gts9wifi-display.md)) |
 | CPU | ✅ | ✅ | — | Prime core up to 3.36 GHz |
-| Touchscreen | ✅ | ✅ | — | X910 Goodix; X710 STM FTS1BA90A, with double tap to wake (off by default). X710 units with the Goodix GT9916 are not yet described ([touch notes](docs/gts9wifi-touch-fts1ba90a.md)) |
-| S Pen writing | ✅ | ✅ | — | Hover, pressure, tilt, side button and palm rejection |
+| Internal storage (UFS 4.0) | ✅ | ✅ | — | HS-G5 on both lanes: 3.60 GB/s sequential read on the X910, 3.48 GB/s on the X710, against about 300 MB/s before (the inline crypto engine's clock was left at 19.2 MHz). The X710 passed a 30-minute G5 stress run, and the X910 stays at G5 across deep suspend ([porting log](docs/porting-log.md#storage-at-300-mbs-the-inline-crypto-engines-clock-2026-11-07)) |
+| Touchscreen | ✅ | ✅ | — | X910 Goodix; X710 STM FTS1BA90A. Double tap to wake on both, off by default; on the X910 it also wakes the tablet from deep suspend. Two- and three-finger taps can be a right or middle click on both (Tab Companion → Touch). X710 units with the Goodix GT9916 are not yet described ([touch notes](docs/gts9wifi-touch-fts1ba90a.md)) |
+| S Pen writing | ✅ | ✅ | — | Hover with height, 12-bit pressure, tilt, side button and palm rejection. An optional side-button split makes button-and-tap near the glass a right click. Tab Companion has a pen test sheet. The corrected tilt and height decode is checked by hand on the X710, not yet on the X910 |
 | S Pen dock | ✅ | ✅ | — | Insertion, orientation and charging |
 | S Pen BLE | ✅ | 🟡 | — | Pairing, battery, air gestures and pointer mode on the X910; on the X710 the pairing service starts, pairing a pen is not yet recorded |
-| Tab Companion | ✅ | ✅ | — | Device settings, S Pen, keyboard and touch; fingerprint and dual boot are X910 features |
+| Tab Companion | ✅ | ✅ | — | Device settings, S Pen, keyboard and touch (double tap to wake, multi-finger taps); fingerprint and dual boot are X910 features |
 | Keyboard cover | ✅ | ✅ | — | EF-DX920 on the X910; EF-DX720 on the X710 with the posture switch (laptop vs tablet mode) |
 | Cover switch | ✅ | ✅ | — | X910 suspends on close; X710 locks on close |
 | Power and volume buttons | ✅ | ✅ | — | On the X710 the power key locks and blanks instead of suspending |
@@ -59,10 +60,10 @@ If the project is useful to you, consider supporting its author:
 | Ambient light sensor | ✅ | ✅ | — | Automatic screen brightness |
 | Battery telemetry | ✅ | ✅ | — | Charge, voltage, current and temperature |
 | USB-PD charging | ✅ | 🟡 | — | X910 up to 25 W measured; X710 charges at 9 V from a PD charger, PPS not assessed |
-| RTC and sleep statistics | ✅ | ✅ | — | PMIC RTC and `qcom_stats` |
-| Suspend / resume | ✅ | 🟡 | — | X910 deep sleep with storage recovery; on the X710 suspend is off by default until repeated RTC-woken runs pass ([tools](scripts/diagnostics/suspend/README.md)) |
+| RTC and sleep statistics | ✅ | ✅ | — | PMIC RTC, with timed wake (`rtcwake`, `WakeSystem=` timers) and the clock restored from the offset saved at the last NTP sync; `qcom_stats` sleep statistics. On the X910 the RTC exists since this branch's v1.2.3: its driver had been an unshipped module |
+| Suspend / resume | ✅ | 🟡 | — | X910 deep sleep with storage recovery. With a USB-C hub or dock, the port leaves host role for the sleep and its devices reconnect after resume, because in host role the xHCI does not yet survive suspend. On the X710 suspend is off by default until repeated RTC-woken runs pass ([tools](scripts/diagnostics/suspend/README.md)) |
 | microSD | ✅ | 🟡 | — | Detected and mounted on the X710; not exercised further |
-| USB host | ✅ | ❓ | — | HID and storage on the X910 |
+| USB host | ✅ | ❓ | — | HID, storage and USB audio on the X910, directly or through a USB-C hub, and across suspend (see above) |
 | USB-C DisplayPort | ✅ | ❓ | — | [DisplayPort notes](docs/gts9u-displayport.md) |
 | Cameras and flash | ✅ | 🟡 | — | X910 four cameras with autofocus; X710 two HI1337 described, off unless enabled, not yet tested ([camera notes](docs/gts9wifi-cameras.md)) |
 | Fingerprint reader | ✅ | ❌ | — | EL721 under-display reader works on the X910; not supported on the X710 yet, its services are skipped there |
@@ -70,20 +71,21 @@ If the project is useful to you, consider supporting its author:
 | Virtual machines | 🟡 | ❓ | — | Gunyah host support on the X910; guests still in development |
 | Waydroid | ✅ | ❓ | — | Android with Google Play, GPU acceleration and network on the X910 |
 | Dual boot with Android | ✅ | ❌ | — | X910 only: the split installer refuses other models |
+| In-place update from a local ZIP | ✅ | ❓ | — | `gts9u-update --zip`: an X910 updated in place from v1.2.0 to v1.2.3 with its data kept; not yet tried on the X710 |
 
 The SM-X910 column describes the upstream tree; its evidence and limitations
 are in [hardware-status.md](docs/hardware-status.md), with
 [npu-status.md](docs/npu-status.md), [gunyah.md](docs/gunyah.md) and
 [waydroid.md](docs/waydroid.md) for the NPU, virtual machines and Waydroid.
-The SM-X710 column describes this branch as of 2026-11-07, tested on one
+The SM-X710 column describes this branch as of 2026-11-09, tested on one
 tablet with bootloader revision 5; its evidence is in
 [hardware-status.md](docs/hardware-status.md#sm-x710-galaxy-tab-s9). The
 tested unit was first installed from an earlier gts9wifi ZIP and updated in
 place; a ZIP built from the current tree has not yet been flashed end to end.
-The changes shared with the SM-X710 port (S Pen decode with tilt, kernel
-configuration and patches, the panel, pogo, charger and battery drivers, and
-the device package 2.56 units) have not yet been built and booted on an
-SM-X910.
+The SM-X910 column now also covers this branch's own SM-X910 builds
+(v1.2.1 to v1.2.3), which run on a bootloader revision 5 unit updated in
+place from the upstream v1.2.0 ZIP. Storage, touch, RTC and suspend above
+come from those builds.
 
 ## Tab Companion
 
@@ -250,6 +252,13 @@ SM-X910 (upstream):
 - Guest virtual machines remain under development; initial Gunyah host support
   is included.
 - Sometimes returning from deep suspend might need a hard reset.
+
+SM-X910 (this branch's builds):
+
+- On a USB-C hub or dock, attached USB devices disconnect for each sleep and
+  reconnect after it (a USB drive is unmounted with them). The sleep hook
+  does this on purpose, because in host role the xHCI does not yet survive
+  suspend. The kernel cause is open.
 
 SM-X710 (this branch):
 
