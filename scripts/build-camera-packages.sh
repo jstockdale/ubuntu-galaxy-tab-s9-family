@@ -16,9 +16,9 @@ suite=${UBUNTU_SUITE:-noble}
 mirror=${UBUNTU_MIRROR:-http://ports.ubuntu.com/ubuntu-ports}
 
 libcamera_commit=62d4bfc450798cbd57722fa349a245b93b11d1cd
-libcamera_version=0.7.2+53.g62d4bfc-gts9u10
+libcamera_version=0.7.2+53.g62d4bfc-gts9u11
 pipewire_commit=a2287be601710eea0d073261223ec34b92384c8a
-pipewire_version=1.0.5-gts9u11
+pipewire_version=1.0.5-gts9u12
 skip_build=${SKIP_CAMERA_BUILD:-0}
 skip_libcamera_build=${SKIP_LIBCAMERA_BUILD:-$skip_build}
 skip_pipewire_build=${SKIP_PIPEWIRE_BUILD:-$skip_build}
@@ -153,7 +153,8 @@ git apply \
 	/build/camera-inputs/libcamera/0005-release-gpu-context-on-camera-stop.patch \
 	/build/camera-inputs/libcamera/0006-center-gpu-metering-and-track-focus.patch \
 	/build/camera-inputs/libcamera/0007-reduce-noise-in-software-focus-metric.patch \
-	/build/camera-inputs/libcamera/0008-stream-formats-offer-the-range-maximum.patch
+	/build/camera-inputs/libcamera/0008-stream-formats-offer-the-range-maximum.patch \
+	/build/camera-inputs/libcamera/0009-simple-smooth-continuous-autofocus.patch
 meson setup build \
 	--buildtype=release \
 	--prefix=/usr \

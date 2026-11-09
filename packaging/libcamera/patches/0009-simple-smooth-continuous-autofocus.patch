@@ -1,0 +1,1425 @@
+diff --git a/include/libcamera/internal/camera_lens.h b/include/libcamera/internal/camera_lens.h
+index f347c5e0a..600ab4c7b 100644
+--- a/include/libcamera/internal/camera_lens.h
++++ b/include/libcamera/internal/camera_lens.h
+@@ -28,6 +28,7 @@ public:
+ 
+ 	int init();
+ 	int setFocusPosition(int32_t position);
++	int focusPosition(int32_t *position);
+ 
+ 	const std::string &model() const { return model_; }
+ 
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index 69c083b15..00e070af1 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -18,7 +18,10 @@ interface IPASoftInterface {
+ 	     libcamera.SharedFD fdParams,
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+ 	     libcamera.ControlInfoMap sensorControls,
+-	     bool hasFocus)
++	     bool hasFocus,
++	     int32 lensMin,
++	     int32 lensMax,
++	     int32 lensPosition)
+ 		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
+ 	start() => (int32 ret);
+ 	stop();
+diff --git a/src/ipa/simple/meson.build b/src/ipa/simple/meson.build
+index 2f9f15f4a..bca3e55b1 100644
+--- a/src/ipa/simple/meson.build
++++ b/src/ipa/simple/meson.build
+@@ -7,6 +7,7 @@ ipa_name = 'ipa_soft_simple'
+ 
+ soft_simple_sources = files([
+     'ipa_context.cpp',
++    'soft_af.cpp',
+     'soft_simple.cpp',
+ ])
+ 
+diff --git a/src/ipa/simple/soft_af.cpp b/src/ipa/simple/soft_af.cpp
+new file mode 100644
+index 000000000..e2072a21c
+--- /dev/null
++++ b/src/ipa/simple/soft_af.cpp
+@@ -0,0 +1,729 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Contrast-detection autofocus for the software ISP
++ */
++
++#include "soft_af.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <map>
++
++namespace libcamera {
++
++namespace ipa::soft {
++
++namespace {
++
++constexpr int32_t kReferenceRange = 1023;
++
++int32_t scaleCodes(int32_t codes, int32_t range)
++{
++	return static_cast<int32_t>((static_cast<int64_t>(codes) * range +
++				     kReferenceRange / 2) / kReferenceRange);
++}
++
++} /* namespace */
++
++/*
++ * The defaults are tuned for a 10-bit lens control (0-1023, the DW9808):
++ * scale every position and speed to another range.
++ */
++SoftAf::Tuning SoftAf::tuningForRange(int32_t minPosition, int32_t maxPosition)
++{
++	Tuning t;
++	int32_t range = maxPosition - minPosition;
++	if (range <= 0)
++		return t;
++
++	t.minPosition = minPosition;
++	t.maxPosition = maxPosition;
++	t.scanLow = minPosition + scaleCodes(t.scanLow, range);
++	t.scanHigh = minPosition + scaleCodes(t.scanHigh, range);
++	t.moveStep = std::max(1, scaleCodes(t.moveStep, range));
++	t.coarseStep = std::max(1, scaleCodes(t.coarseStep, range));
++	t.localStep = std::max(1, scaleCodes(t.localStep, range));
++	t.fineStep = std::max(1, scaleCodes(t.fineStep, range));
++	t.fineHalfWidth = std::max(2 * t.fineStep, scaleCodes(t.fineHalfWidth, range));
++	t.localRange = std::max(2 * t.localStep, scaleCodes(t.localRange, range));
++	return t;
++}
++
++SoftAf::SoftAf()
++	: SoftAf(Tuning())
++{
++}
++
++SoftAf::SoftAf(const Tuning &tuning)
++	: tuning_(tuning),
++	  position_((tuning.minPosition + tuning.maxPosition + 1) / 2),
++	  target_(position_), speed_(tuning.moveStep), basePosition_(position_)
++{
++}
++
++int32_t SoftAf::clampPosition(int32_t position) const
++{
++	return std::clamp(position, tuning_.minPosition, tuning_.maxPosition);
++}
++
++void SoftAf::setPosition(int32_t position)
++{
++	position_ = clampPosition(position);
++	target_ = position_;
++	basePosition_ = position_;
++	history_.clear();
++}
++
++void SoftAf::reset()
++{
++	/* Frame numbers restart with the stream; the lens stays where it is. */
++	history_.clear();
++	basePosition_ = position_;
++	target_ = position_;
++	moved_ = false;
++	samples_.clear();
++	result_.reset();
++
++	if (mode_ == Mode::Continuous)
++		waitStable(true);
++	else
++		stop();
++}
++
++void SoftAf::stop()
++{
++	phase_ = Phase::Idle;
++	state_ = State::Idle;
++	target_ = position_;
++}
++
++void SoftAf::setMode(Mode mode)
++{
++	if (mode == mode_)
++		return;
++
++	mode_ = mode;
++	if (mode_ == Mode::Continuous)
++		waitStable(true);
++	else
++		stop();
++}
++
++void SoftAf::trigger()
++{
++	if (mode_ == Mode::Manual)
++		return;
++
++	startFullScan();
++}
++
++void SoftAf::cancel()
++{
++	if (mode_ == Mode::Auto)
++		stop();
++}
++
++std::optional<SoftAf::Result> SoftAf::takeResult()
++{
++	std::optional<Result> result = result_;
++	result_.reset();
++	return result;
++}
++
++void SoftAf::waitStable(bool startup)
++{
++	phase_ = Phase::WaitStable;
++	startup_ = startup;
++	recent_.clear();
++	waitSamples_ = 0;
++	target_ = position_;
++	if (startup)
++		state_ = State::Scanning;
++}
++
++void SoftAf::startFullScan()
++{
++	search_ = Search::Full;
++	state_ = State::Scanning;
++	searchStartFrame_ = lastFrame_;
++	searchStartPosition_ = position_;
++
++	/* Start from the nearer end: the least travel. */
++	bool up = position_ - tuning_.scanLow <= tuning_.scanHigh - position_;
++	sweepFrom_ = up ? tuning_.scanLow : tuning_.scanHigh;
++	sweepTo_ = up ? tuning_.scanHigh : tuning_.scanLow;
++	sweepStep_ = tuning_.coarseStep;
++	sweepMayReverse_ = false;
++	approach(sweepFrom_);
++}
++
++void SoftAf::startLocalScan()
++{
++	search_ = Search::Local;
++	state_ = State::Scanning;
++	searchStartFrame_ = lastFrame_;
++	searchStartPosition_ = position_;
++
++	int32_t low = std::max(tuning_.scanLow, position_ - tuning_.localRange);
++	int32_t high = std::min(tuning_.scanHigh, position_ + tuning_.localRange);
++	int32_t start = std::clamp(position_, low, high);
++
++	int direction = lastDirection_;
++	if (start >= high)
++		direction = -1;
++	else if (start <= low)
++		direction = 1;
++
++	sweepFrom_ = start;
++	sweepTo_ = direction > 0 ? high : low;
++	sweepOther_ = direction > 0 ? low : high;
++	sweepStep_ = tuning_.localStep;
++	sweepMayReverse_ = sweepOther_ != start;
++	approach(sweepFrom_);
++}
++
++void SoftAf::startFine(int32_t peak)
++{
++	search_ = Search::Fine;
++
++	int32_t low = clampPosition(peak - tuning_.fineHalfWidth);
++	int32_t high = clampPosition(peak + tuning_.fineHalfWidth);
++	fineLow_ = low;
++	fineHigh_ = high;
++
++	/* Enter the window from the side the lens is on. */
++	bool up = std::abs(position_ - low) <= std::abs(position_ - high);
++	sweepFrom_ = up ? low : high;
++	sweepTo_ = up ? high : low;
++	sweepStep_ = tuning_.fineStep;
++	sweepMayReverse_ = false;
++	fineReturn_ = true;
++	approach(sweepFrom_);
++}
++
++void SoftAf::approach(int32_t position)
++{
++	phase_ = Phase::Approach;
++	target_ = clampPosition(position);
++	speed_ = tuning_.moveStep;
++}
++
++void SoftAf::beginSweep()
++{
++	phase_ = Phase::Sweep;
++	samples_.clear();
++
++	/*
++	 * A sweep first measures where it starts: a local search to tell
++	 * whether its first steps lead away from focus, a fine pass to hold
++	 * still at its turn, where a wrong latency would credit samples to
++	 * the wrong side.  Only the full scan's sweep moves on at once.
++	 */
++	sweepMoving_ = search_ == Search::Full;
++	if (sweepMoving_) {
++		target_ = sweepTo_;
++		speed_ = sweepStep_;
++	}
++}
++
++void SoftAf::reverseSweep()
++{
++	/*
++	 * Contrast fell on the way out: go back to the start and search the
++	 * other side instead.
++	 */
++	sweepMayReverse_ = false;
++	std::swap(sweepTo_, sweepOther_);
++	lastDirection_ = -lastDirection_;
++	approach(sweepFrom_);
++}
++
++void SoftAf::finishSweep()
++{
++	auto best = std::max_element(samples_.begin(), samples_.end(),
++				     [](const Sample &a, const Sample &b) {
++					     return a.score < b.score;
++				     });
++	bool contrast = best != samples_.end() &&
++			static_cast<double>(best->score) >=
++				static_cast<double>(median()) * (1.0 + tuning_.minContrast);
++
++	switch (search_) {
++	case Search::Full:
++		if (contrast && samples_.size() >= 3) {
++			fineRetries_ = 0;
++			fineSamples_.clear();
++			startFine(coarsePeak());
++			return;
++		}
++		/* A flat scene has no focus to find: stay on the best. */
++		settleAt(best != samples_.end() ? best->position : position_, false);
++		return;
++
++	case Search::Local:
++		if (contrast && samples_.size() >= 3) {
++			fineRetries_ = 0;
++			fineSamples_.clear();
++			startFine(coarsePeak());
++			return;
++		}
++		/*
++		 * Nothing sharper nearby: the new scene's focus is further
++		 * away, or it has none.  Search everywhere, once per change.
++		 */
++		if (!fullAfterLocal_) {
++			fullAfterLocal_ = true;
++			startFullScan();
++			return;
++		}
++		settleAt(best != samples_.end() ? best->position : position_, found_);
++		return;
++
++	case Search::Fine: {
++		fineSamples_.insert(fineSamples_.end(), samples_.begin(), samples_.end());
++
++		/* Back across the window, from where the lens is. */
++		if (fineReturn_) {
++			fineReturn_ = false;
++			std::swap(sweepFrom_, sweepTo_);
++			approach(sweepFrom_);
++			return;
++		}
++
++		if (fineSamples_.empty()) {
++			settleAt(position_, true);
++			return;
++		}
++		/*
++		 * Fit the whole window, with every pass's samples in it.  A
++		 * vertex beyond an edge means the peak lies outside: move the
++		 * window towards it.  Without a vertex (a flat or noisy window)
++		 * keep the best measurement.
++		 */
++		int32_t low = fineLow_ - tuning_.fineStep;
++		int32_t high = fineHigh_ + tuning_.fineStep;
++		std::optional<double> vertex = fitVertex(low, high);
++
++		int32_t measured = position_;
++		double measuredScore = -1;
++		for (const Sample &sample : fineSamples_) {
++			if (sample.position >= low && sample.position <= high &&
++			    static_cast<double>(sample.score) > measuredScore) {
++				measuredScore = static_cast<double>(sample.score);
++				measured = sample.position;
++			}
++		}
++
++		bool outside = vertex &&
++			       ((*vertex < fineLow_ && fineLow_ > tuning_.minPosition) ||
++				(*vertex > fineHigh_ && fineHigh_ < tuning_.maxPosition));
++		if (outside && fineRetries_ < tuning_.fineRetries) {
++			/* Half a window towards it: the windows overlap. */
++			fineRetries_++;
++			int32_t centre = (fineLow_ + fineHigh_) / 2;
++			int32_t half = tuning_.fineHalfWidth;
++			int32_t next = static_cast<int32_t>(std::lround(std::clamp(
++				*vertex, static_cast<double>(centre - half),
++				static_cast<double>(centre + half))));
++			startFine(next);
++			return;
++		}
++
++		int32_t peak = vertex ? static_cast<int32_t>(std::lround(
++						std::clamp(*vertex, static_cast<double>(low),
++							   static_cast<double>(high))))
++				      : measured;
++		settleAt(peak, true);
++		return;
++	}
++	}
++}
++
++void SoftAf::settleAt(int32_t position, bool found)
++{
++	found_ = found;
++	phase_ = Phase::Settle;
++	target_ = clampPosition(position);
++	speed_ = tuning_.moveStep;
++	referenceSum_ = 0;
++	referenceSquares_ = 0;
++	referenceSamples_ = 0;
++
++	if (target_ != searchStartPosition_)
++		lastDirection_ = target_ > searchStartPosition_ ? 1 : -1;
++}
++
++bool SoftAf::settledFor(uint32_t frame) const
++{
++	return !moved_ || frame - lastMoveFrame_ >= tuning_.latencyFrames;
++}
++
++int32_t SoftAf::positionAt(uint32_t frame) const
++{
++	if (frame < tuning_.latencyFrames)
++		return basePosition_;
++
++	uint32_t commanded = frame - tuning_.latencyFrames;
++	int32_t position = basePosition_;
++	for (const auto &[f, p] : history_) {
++		if (f > commanded)
++			break;
++		position = p;
++	}
++	return position;
++}
++
++/*
++ * The coarse samples are too far apart to centre the fine pass on the best
++ * one: put it at the vertex of the parabola through the best and its
++ * neighbours, which is within a sample spacing of it.
++ */
++int32_t SoftAf::coarsePeak() const
++{
++	std::map<int32_t, std::pair<double, unsigned int>> merged;
++	for (const Sample &s : samples_) {
++		auto &[sum, count] = merged[s.position];
++		sum += static_cast<double>(s.score);
++		count++;
++	}
++
++	std::vector<std::pair<double, double>> points;
++	for (const auto &[position, value] : merged)
++		points.emplace_back(position, value.first / value.second);
++	if (points.empty())
++		return position_;
++
++	size_t best = 0;
++	for (size_t i = 1; i < points.size(); ++i) {
++		if (points[i].second > points[best].second)
++			best = i;
++	}
++	if (best == 0 || best + 1 >= points.size())
++		return static_cast<int32_t>(points[best].first);
++
++	const auto [x0, y0] = points[best - 1];
++	const auto [x1, y1] = points[best];
++	const auto [x2, y2] = points[best + 1];
++	double num = (x1 - x0) * (x1 - x0) * (y1 - y2) -
++		     (x1 - x2) * (x1 - x2) * (y1 - y0);
++	double den = (x1 - x0) * (y1 - y2) - (x1 - x2) * (y1 - y0);
++	if (std::abs(den) < 1e-9)
++		return static_cast<int32_t>(x1);
++
++	double x = std::clamp(x1 - 0.5 * num / den, (x0 + x1) / 2, (x1 + x2) / 2);
++	return static_cast<int32_t>(std::lround(x));
++}
++
++uint64_t SoftAf::median() const
++{
++	std::vector<uint64_t> scores;
++	scores.reserve(samples_.size());
++	for (const Sample &s : samples_)
++		scores.push_back(s.score);
++	if (scores.empty())
++		return 0;
++
++	auto middle = scores.begin() + scores.size() / 2;
++	std::nth_element(scores.begin(), middle, scores.end());
++	return *middle;
++}
++
++bool SoftAf::peakPassed() const
++{
++	/* A fine pass measures its whole window, for the fit. */
++	if (search_ == Search::Fine || samples_.size() < 3)
++		return false;
++
++	size_t best = 0;
++	for (size_t i = 1; i < samples_.size(); ++i) {
++		if (samples_[i].score > samples_[best].score)
++			best = i;
++	}
++
++	/* Only a clear peak ends a sweep early, never a noise spike. */
++	double peak = static_cast<double>(samples_[best].score);
++	if (peak < static_cast<double>(median()) * (1.0 + tuning_.earlyContrast))
++		return false;
++
++	size_t after = samples_.size() - 1 - best;
++	double last = static_cast<double>(samples_.back().score);
++	if (after >= 1 && last < peak * (1.0 - 2.0 * tuning_.peakDrop))
++		return true;
++	if (after >= 2 &&
++	    last < peak * (1.0 - tuning_.peakDrop) &&
++	    static_cast<double>(samples_[samples_.size() - 2].score) <
++		    peak * (1.0 - tuning_.peakDrop))
++		return true;
++	return false;
++}
++
++/*
++ * Near the peak a sample differs from its neighbours by less than the noise,
++ * so fit a parabola by least squares to every fine sample in [low, high],
++ * from all fine passes, rather than through three.  Returns its vertex,
++ * unclamped, or nothing if the samples are too few or not a peak.
++ */
++std::optional<double> SoftAf::fitVertex(int32_t low, int32_t high) const
++{
++	/* Average repeated positions, ordered by position. */
++	std::map<int32_t, std::pair<double, unsigned int>> merged;
++	for (const Sample &s : fineSamples_) {
++		if (s.position < low || s.position > high)
++			continue;
++		auto &[sum, count] = merged[s.position];
++		sum += static_cast<double>(s.score);
++		count++;
++	}
++	if (merged.size() < 3)
++		return std::nullopt;
++
++	/* Centre x for conditioning: y = a x^2 + b x + c. */
++	double x0 = (low + high) / 2.0;
++	double s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, t0 = 0, t1 = 0, t2 = 0;
++	for (const auto &[position, value] : merged) {
++		double x = position - x0;
++		double x2 = x * x;
++		double y = value.first / value.second;
++		s0 += 1;
++		s1 += x;
++		s2 += x2;
++		s3 += x2 * x;
++		s4 += x2 * x2;
++		t0 += y;
++		t1 += y * x;
++		t2 += y * x2;
++	}
++
++	/* Normal equations, by Cramer's rule. */
++	double det = s4 * (s2 * s0 - s1 * s1) - s3 * (s3 * s0 - s1 * s2) +
++		     s2 * (s3 * s1 - s2 * s2);
++	if (std::abs(det) < 1e-12)
++		return std::nullopt;
++
++	double a = (t2 * (s2 * s0 - s1 * s1) - s3 * (t1 * s0 - s1 * t0) +
++		    s2 * (t1 * s1 - s2 * t0)) / det;
++	double b = (s4 * (t1 * s0 - s1 * t0) - t2 * (s3 * s0 - s1 * s2) +
++		    s2 * (s3 * t0 - t1 * s2)) / det;
++	if (a >= 0)
++		return std::nullopt;
++
++	return x0 - b / (2 * a);
++}
++
++double SoftAf::changeRatio() const
++{
++	/*
++	 * A mean of changeSamples samples against the slowly tracked
++	 * reference: its deviation is about noise / sqrt(changeSamples),
++	 * the reference's adds a tenth.
++	 */
++	double deviation = noise_ * 1.1 / std::sqrt(static_cast<double>(tuning_.changeSamples));
++	return std::max(tuning_.changeRatio, tuning_.noiseMargin * deviation);
++}
++
++double SoftAf::stableRatio() const
++{
++	/* Successive samples differ by noise * sqrt(2). */
++	return std::max(tuning_.stableRatio, tuning_.noiseMargin * noise_ * std::sqrt(2.0));
++}
++
++void SoftAf::onSample(uint32_t frame, uint64_t score)
++{
++	switch (phase_) {
++	case Phase::Idle:
++	case Phase::Approach:
++		return;
++
++	case Phase::WaitStable: {
++		/* Only a still lens tells whether the scene is still. */
++		if (!settledFor(frame))
++			return;
++
++		recent_.push_back(score);
++		while (recent_.size() > tuning_.stableSamples)
++			recent_.pop_front();
++		waitSamples_++;
++
++		double mean = 0;
++		for (uint64_t s : recent_)
++			mean += static_cast<double>(s);
++		mean /= static_cast<double>(recent_.size());
++
++		/* Still: every sample close to the one before it. */
++		bool still = recent_.size() >= tuning_.stableSamples;
++		for (size_t i = 1; i < recent_.size(); ++i) {
++			double previous = static_cast<double>(recent_[i - 1]);
++			double current = static_cast<double>(recent_[i]);
++			if (std::abs(current - previous) > previous * stableRatio())
++				still = false;
++		}
++
++		unsigned int timeout = startup_ ? tuning_.startupTimeout
++						: tuning_.stableTimeout;
++		if (!still && waitSamples_ < timeout)
++			return;
++
++		if (startup_) {
++			fullAfterLocal_ = false;
++			startFullScan();
++			return;
++		}
++
++		/* The scene came back as it was: nothing to refocus. */
++		if (reference_ && recent_.size() >= tuning_.changeSamples &&
++		    std::abs(mean - static_cast<double>(reference_)) <=
++			    static_cast<double>(reference_) * changeRatio()) {
++			phase_ = Phase::Locked;
++			lockedRecent_.clear();
++			return;
++		}
++
++		fullAfterLocal_ = false;
++		startLocalScan();
++		return;
++	}
++
++	case Phase::Sweep: {
++		if (!sweepMoving_) {
++			/* Measure the start before leaving it. */
++			if (!settledFor(frame))
++				return;
++			samples_.push_back({ position_, score });
++			if (position_ == sweepTo_) {
++				finishSweep();
++				return;
++			}
++			sweepMoving_ = true;
++			target_ = sweepTo_;
++			speed_ = sweepStep_;
++			return;
++		}
++
++		samples_.push_back({ positionAt(frame), score });
++
++		/* Heading out of focus: the first two steps were both worse. */
++		if (sweepMayReverse_ && samples_.size() == 3 &&
++		    samples_[1].score < samples_[0].score &&
++		    static_cast<double>(samples_[2].score) <
++			    static_cast<double>(samples_[0].score) *
++				    (1.0 - tuning_.peakDrop / 2.0)) {
++			reverseSweep();
++			return;
++		}
++
++		if (peakPassed() ||
++		    (position_ == sweepTo_ && settledFor(frame)))
++			finishSweep();
++		return;
++	}
++
++	case Phase::Settle: {
++		if (position_ != target_)
++			return;
++
++		/* On the peak: report it now, measure the reference meanwhile. */
++		if (state_ == State::Scanning) {
++			state_ = found_ ? State::Focused : State::Failed;
++			result_ = Result{ position_, found_, frame - searchStartFrame_ };
++		}
++		if (!settledFor(frame))
++			return;
++
++		referenceSum_ += score;
++		referenceSquares_ += static_cast<double>(score) * static_cast<double>(score);
++		if (++referenceSamples_ < tuning_.changeSamples)
++			return;
++
++		reference_ = referenceSum_ / referenceSamples_;
++
++		/* The still lens's samples also tell how noisy this scene is. */
++		double n = static_cast<double>(referenceSamples_);
++		double mean = static_cast<double>(referenceSum_) / n;
++		double variance = (referenceSquares_ - n * mean * mean) / (n - 1);
++		if (mean > 0)
++			noise_ = std::clamp(std::sqrt(std::max(variance, 0.0)) / mean, 0.01, 0.25);
++		phase_ = Phase::Locked;
++		lockedRecent_.clear();
++		lastLockedScore_ = 0;
++		return;
++	}
++
++	case Phase::Locked: {
++		if (mode_ != Mode::Continuous || !settledFor(frame))
++			return;
++
++		if (!reference_) {
++			reference_ = score;
++			return;
++		}
++
++		/*
++		 * Learn the noise from a still lens: the mean absolute difference
++		 * of two samples is 2 / sqrt(pi) times their deviation.
++		 */
++		if (lastLockedScore_) {
++			double diff = std::abs(static_cast<double>(score) -
++					       static_cast<double>(lastLockedScore_)) /
++				      static_cast<double>(lastLockedScore_);
++			double sample = std::min(diff * std::sqrt(M_PI) / 2.0, 0.25);
++			noise_ = 0.9 * noise_ + 0.1 * sample;
++		}
++		lastLockedScore_ = score;
++
++		lockedRecent_.push_back(score);
++		while (lockedRecent_.size() > tuning_.changeSamples)
++			lockedRecent_.pop_front();
++		if (lockedRecent_.size() < tuning_.changeSamples)
++			return;
++
++		double mean = 0;
++		for (uint64_t s : lockedRecent_)
++			mean += static_cast<double>(s);
++		mean /= static_cast<double>(lockedRecent_.size());
++
++		double ratio = mean / static_cast<double>(reference_);
++		if (std::abs(ratio - 1.0) > changeRatio()) {
++			waitStable(false);
++			return;
++		}
++
++		/* Still the same scene: follow its slow drift (light, noise). */
++		double track = static_cast<double>(tuning_.referenceTrack);
++		reference_ = static_cast<uint64_t>(std::llround(
++			static_cast<double>(reference_) +
++			(static_cast<double>(score) - static_cast<double>(reference_)) / track));
++		return;
++	}
++	}
++}
++
++std::optional<int32_t> SoftAf::process(uint32_t frame, std::optional<uint64_t> score)
++{
++	lastFrame_ = frame;
++
++	if (score)
++		onSample(frame, *score);
++
++	if (phase_ == Phase::Approach && position_ == target_)
++		beginSweep();
++
++	int32_t previous = position_;
++	if (position_ != target_) {
++		position_ += std::clamp(target_ - position_, -speed_, speed_);
++		lastMoveFrame_ = frame;
++		moved_ = true;
++	}
++
++	history_.emplace_back(frame, position_);
++	while (history_.size() > kHistoryFrames)
++		history_.pop_front();
++
++	if (position_ != previous)
++		return position_;
++	return std::nullopt;
++}
++
++} /* namespace ipa::soft */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/soft_af.h b/src/ipa/simple/soft_af.h
+new file mode 100644
+index 000000000..d8c871102
+--- /dev/null
++++ b/src/ipa/simple/soft_af.h
+@@ -0,0 +1,224 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Contrast-detection autofocus for the software ISP
++ *
++ * The lens only ever moves a few codes per frame, so a voice coil motor
++ * glides instead of jumping: it neither clicks nor rings while the image is
++ * measured.  Contrast is sampled while the lens moves; each sample is
++ * credited to the position the lens held when that frame was exposed, a
++ * fixed number of frames after the command.  Once focused the lens stays
++ * still until the contrast changes for good, there is no periodic probing.
++ *
++ * Plain C++ without libcamera dependencies, so the state machine can be
++ * exercised against a simulated lens and scene off the target.
++ */
++
++#pragma once
++
++#include <deque>
++#include <optional>
++#include <stdint.h>
++#include <utility>
++#include <vector>
++
++namespace libcamera {
++
++namespace ipa::soft {
++
++class SoftAf
++{
++public:
++	enum class Mode {
++		Manual,
++		Auto,
++		Continuous,
++	};
++
++	enum class State {
++		Idle,
++		Scanning,
++		Focused,
++		Failed,
++	};
++
++	struct Tuning {
++		/* Range of the lens control, and the part of it worth searching. */
++		int32_t minPosition = 0;
++		int32_t maxPosition = 1023;
++		int32_t scanLow = 96;
++		int32_t scanHigh = 960;
++		/* Frames from a lens command to the first frame exposed with it. */
++		unsigned int latencyFrames = 3;
++		/* Lens speeds, in codes per frame. */
++		int32_t moveStep = 24;
++		int32_t coarseStep = 20;
++		int32_t localStep = 8;
++		int32_t fineStep = 6;
++		/* The fine pass covers the coarse peak +- this, there and back:
++		 * the two directions' latency errors cancel in the fit. */
++		int32_t fineHalfWidth = 48;
++		/* A fine pass whose peak lies outside moves on, half a window
++		 * at a time, at most this often. */
++		unsigned int fineRetries = 2;
++		/* A refocus first searches the lens position +- this. */
++		int32_t localRange = 224;
++		/* A sweep has passed the peak once contrast fell this far below it. */
++		double peakDrop = 0.12;
++		/* ... and may stop early if the peak beats its median by this. */
++		double earlyContrast = 0.35;
++		/* A sweep found a peak if it beat its median by this much. */
++		double minContrast = 0.15;
++		/* Focused, a scene changed when the mean of this many samples
++		 * moved this far from the focused contrast (also measured over
++		 * this many samples). */
++		double changeRatio = 0.10;
++		unsigned int changeSamples = 4;
++		/* A scene is still when this many samples in a row each differ
++		 * from the previous one by less than this ratio. */
++		double stableRatio = 0.08;
++		unsigned int stableSamples = 5;
++		/* Both ratios grow with the measured noise: at least this many
++		 * standard deviations of what they compare. */
++		double noiseMargin = 3.0;
++		/* Focused, the reference follows a still scene this slowly. */
++		unsigned int referenceTrack = 16;
++		/* Samples to wait for a still scene before searching anyway. */
++		unsigned int startupTimeout = 2;
++		unsigned int stableTimeout = 24;
++	};
++
++	struct Result {
++		int32_t position = 0;
++		bool found = false;
++		uint32_t frames = 0;
++	};
++
++	/* The defaults, scaled to a lens control of another range. */
++	static Tuning tuningForRange(int32_t minPosition, int32_t maxPosition);
++
++	SoftAf();
++	explicit SoftAf(const Tuning &tuning);
++
++	/* Where the lens actually is, before the first frame. */
++	void setPosition(int32_t position);
++	/* The camera was (re)configured; statistics restart. */
++	void reset();
++	void setMode(Mode mode);
++	/* AfTriggerStart and AfTriggerCancel. */
++	void trigger();
++	void cancel();
++
++	/*
++	 * Call once per frame, in frame order, with the contrast score of the
++	 * frames that carry statistics.  Returns the lens position to command
++	 * when it changes.
++	 */
++	std::optional<int32_t> process(uint32_t frame, std::optional<uint64_t> score);
++
++	Mode mode() const { return mode_; }
++	State state() const { return state_; }
++	int32_t position() const { return position_; }
++	/* The last completed search, and whether it is new since last asked. */
++	std::optional<Result> takeResult();
++
++private:
++	enum class Phase {
++		Idle,
++		WaitStable,
++		Approach,
++		Sweep,
++		Settle,
++		Locked,
++	};
++
++	enum class Search {
++		Full,
++		Local,
++		Fine,
++	};
++
++	struct Sample {
++		int32_t position;
++		uint64_t score;
++	};
++
++	static constexpr size_t kHistoryFrames = 64;
++
++	int32_t clampPosition(int32_t position) const;
++	void stop();
++	void waitStable(bool startup);
++	void startFullScan();
++	void startLocalScan();
++	void startFine(int32_t peak);
++	void approach(int32_t position);
++	void beginSweep();
++	void reverseSweep();
++	void finishSweep();
++	void settleAt(int32_t position, bool found);
++	void onSample(uint32_t frame, uint64_t score);
++	int32_t positionAt(uint32_t frame) const;
++	bool settledFor(uint32_t frame) const;
++	bool peakPassed() const;
++	std::optional<double> fitVertex(int32_t low, int32_t high) const;
++	int32_t coarsePeak() const;
++	uint64_t median() const;
++	double changeRatio() const;
++	double stableRatio() const;
++
++	Tuning tuning_;
++	Mode mode_ = Mode::Continuous;
++	State state_ = State::Idle;
++	Phase phase_ = Phase::Idle;
++	Search search_ = Search::Full;
++
++	/* The lens: commanded position, where it is heading, how fast. */
++	int32_t position_;
++	int32_t target_;
++	int32_t speed_;
++	/* Position before the first command since reset(). */
++	int32_t basePosition_;
++	bool moved_ = false;
++	uint32_t lastMoveFrame_ = 0;
++	uint32_t lastFrame_ = 0;
++	/* (frame, commanded position after that frame), oldest first. */
++	std::deque<std::pair<uint32_t, int32_t>> history_;
++
++	/* The sweep in progress, and the search it belongs to. */
++	int32_t sweepFrom_ = 0;
++	int32_t sweepTo_ = 0;
++	int32_t sweepOther_ = 0;
++	int32_t sweepStep_ = 0;
++	bool sweepMayReverse_ = false;
++	bool sweepMoving_ = false;
++	std::vector<Sample> samples_;
++	/* Every fine pass of this search, for the fit. */
++	std::vector<Sample> fineSamples_;
++	uint32_t searchStartFrame_ = 0;
++	int32_t searchStartPosition_ = 0;
++	int lastDirection_ = 1;
++	bool fullAfterLocal_ = false;
++	unsigned int fineRetries_ = 0;
++	bool fineReturn_ = false;
++	int32_t fineLow_ = 0;
++	int32_t fineHigh_ = 0;
++
++	/* Focused, and waiting for a still scene. */
++	bool found_ = false;
++	uint64_t reference_ = 0;
++	uint64_t referenceSum_ = 0;
++	double referenceSquares_ = 0;
++	unsigned int referenceSamples_ = 0;
++	std::deque<uint64_t> lockedRecent_;
++	/* Relative noise of one sample, measured while focused. */
++	double noise_ = 0.03;
++	uint64_t lastLockedScore_ = 0;
++	bool startup_ = false;
++	unsigned int waitSamples_ = 0;
++	std::deque<uint64_t> recent_;
++
++	std::optional<Result> result_;
++};
++
++} /* namespace ipa::soft */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 71c61679a..98b355d78 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -34,6 +34,7 @@
+ #include "libipa/camera_sensor_helper.h"
+ 
+ #include "module.h"
++#include "soft_af.h"
+ 
+ namespace libcamera {
+ LOG_DEFINE_CATEGORY(IPASoft)
+@@ -61,6 +62,9 @@ public:
+ 		 const IPACameraSensorInfo &sensorInfo,
+ 		 const ControlInfoMap &sensorControls,
+ 		 bool hasFocus,
++		 int32_t lensMin,
++		 int32_t lensMax,
++		 int32_t lensPosition,
+ 		 ControlInfoMap *ipaControls,
+ 		 bool *ccmEnabled) override;
+ 	int configure(const IPAConfigInfo &configInfo) override;
+@@ -78,39 +82,15 @@ protected:
+ 
+ private:
+ 	void updateExposure(double exposureMSV);
+-	void startFocusScan(bool retry = false);
+-	std::optional<int32_t> processFocusStats(uint64_t score);
+ 
+ 	DebayerParams *params_;
+ 	SwIspStats *stats_;
+ 	std::unique_ptr<CameraSensorHelper> camHelper_;
+ 	ControlInfoMap sensorInfoMap_;
+ 
+-	enum class AfPhase {
+-		Idle,
+-		Coarse,
+-		Fine,
+-		Probe,
+-		Locked,
+-	};
+ 	bool hasFocus_ = false;
+-	int32_t afMode_ = controls::AfModeContinuous;
+-	int32_t afState_ = controls::AfStateIdle;
+-	AfPhase afPhase_ = AfPhase::Idle;
+-	std::array<int32_t, 7> afPositions_{};
+-	unsigned int afPositionCount_ = 0;
+-	unsigned int afPositionIndex_ = 0;
+-	unsigned int afSettleStats_ = 0;
+-	unsigned int afLockedStats_ = 0;
+-	unsigned int afDropStats_ = 0;
+-	int32_t afPosition_ = 512;
+-	int32_t afBestPosition_ = 512;
+-	uint64_t afBestScore_ = 0;
+-	uint64_t afLockedScore_ = 0;
+-	int32_t afProbePosition_ = 512;
+-	uint64_t afProbeScore_ = 0;
+-	uint64_t afMinScore_ = 0;
+-	unsigned int afFailedScans_ = 0;
++	SoftAf af_;
++	uint64_t afScore_ = 0;
+ 
+ 	/* Local parameter storage */
+ 	struct IPAContext context_;
+@@ -130,6 +110,9 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 			const IPACameraSensorInfo &sensorInfo,
+ 			const ControlInfoMap &sensorControls,
+ 			bool hasFocus,
++			int32_t lensMin,
++			int32_t lensMax,
++			int32_t lensPosition,
+ 			ControlInfoMap *ipaControls,
+ 			bool *ccmEnabled)
+ {
+@@ -213,6 +196,11 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 
+ 	hasFocus_ = hasFocus;
+ 	if (hasFocus_) {
++		if (lensMax > lensMin)
++			af_ = SoftAf(SoftAf::tuningForRange(lensMin, lensMax));
++		/* Start from where the lens is, or the first command jumps it. */
++		if (lensPosition >= lensMin && lensPosition <= lensMax)
++			af_.setPosition(lensPosition);
+ 		context_.ctrlMap.emplace(&controls::AfMode,
+ 					 ControlInfo(controls::AfModeValues,
+ 						     controls::AfModeContinuous));
+@@ -299,7 +287,7 @@ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ 	}
+ 
+ 	if (hasFocus_)
+-		startFocusScan();
++		af_.reset();
+ 
+ 	LOG(IPASoft, Info)
+ 		<< "Exposure " << context_.configuration.agc.exposureMin << "-"
+@@ -327,26 +315,24 @@ void IPASoftSimple::queueRequest(const uint32_t frame, const ControlList &contro
+ 
+ 	if (hasFocus_) {
+ 		if (std::optional<int32_t> mode = controls.get(controls::AfMode)) {
+-			if (*mode != afMode_) {
+-				afMode_ = *mode;
+-				if (afMode_ == controls::AfModeContinuous)
+-					startFocusScan();
+-				else {
+-					afPhase_ = AfPhase::Idle;
+-					afState_ = controls::AfStateIdle;
+-				}
++			switch (*mode) {
++			case controls::AfModeManual:
++				af_.setMode(SoftAf::Mode::Manual);
++				break;
++			case controls::AfModeAuto:
++				af_.setMode(SoftAf::Mode::Auto);
++				break;
++			default:
++				af_.setMode(SoftAf::Mode::Continuous);
++				break;
+ 			}
+ 		}
+ 
+-		if (afMode_ == controls::AfModeAuto) {
+-			if (std::optional<int32_t> trigger = controls.get(controls::AfTrigger)) {
+-				if (*trigger == controls::AfTriggerStart)
+-					startFocusScan();
+-				else {
+-					afPhase_ = AfPhase::Idle;
+-					afState_ = controls::AfStateIdle;
+-				}
+-			}
++		if (std::optional<int32_t> trigger = controls.get(controls::AfTrigger)) {
++			if (*trigger == controls::AfTriggerStart)
++				af_.trigger();
++			else if (*trigger == controls::AfTriggerCancel)
++				af_.cancel();
+ 		}
+ 	}
+ 
+@@ -383,17 +369,40 @@ void IPASoftSimple::processStats(const uint32_t frame,
+ 
+ 	std::optional<int32_t> focusPosition;
+ 	if (hasFocus_) {
+-		uint64_t score = 0;
+-		if (stats_->valid && stats_->luminance)
+-			score = stats_->focus * 65536 / stats_->luminance;
+-
+-		if (stats_->valid)
+-			focusPosition = processFocusStats(score);
++		/* Statistics come every few frames; the lens moves every frame. */
++		std::optional<uint64_t> score;
++		if (stats_->valid && stats_->luminance) {
++			afScore_ = stats_->focus * 65536 / stats_->luminance;
++			score = afScore_;
++		}
++		focusPosition = af_.process(frame, score);
++
++		if (std::optional<SoftAf::Result> result = af_.takeResult())
++			LOG(IPASoft, Info)
++				<< "Autofocus " << (result->found ? "focused" : "found no peak")
++				<< " at " << result->position << " after "
++				<< result->frames << " frames";
++
++		int32_t afState = controls::AfStateIdle;
++		switch (af_.state()) {
++		case SoftAf::State::Idle:
++			afState = controls::AfStateIdle;
++			break;
++		case SoftAf::State::Scanning:
++			afState = controls::AfStateScanning;
++			break;
++		case SoftAf::State::Focused:
++			afState = controls::AfStateFocused;
++			break;
++		case SoftAf::State::Failed:
++			afState = controls::AfStateFailed;
++			break;
++		}
+ 
+ 		metadata.set(controls::FocusFoM,
+ 			     static_cast<int32_t>(std::min<uint64_t>(
+-				     score, std::numeric_limits<int32_t>::max())));
+-		metadata.set(controls::AfState, afState_);
++				     afScore_, std::numeric_limits<int32_t>::max())));
++		metadata.set(controls::AfState, afState);
+ 	}
+ 	metadataReady.emit(frame, metadata);
+ 	if (focusPosition)
+@@ -415,139 +424,6 @@ void IPASoftSimple::processStats(const uint32_t frame,
+ 	setSensorControls.emit(ctrls);
+ }
+ 
+-void IPASoftSimple::startFocusScan(bool retry)
+-{
+-	if (!retry)
+-		afFailedScans_ = 0;
+-	afPhase_ = AfPhase::Coarse;
+-	afState_ = controls::AfStateScanning;
+-	afPositions_ = { 128, 256, 384, 512, 640, 768, 896 };
+-	afPositionCount_ = afPositions_.size();
+-	afPositionIndex_ = 0;
+-	afSettleStats_ = 1;
+-	afLockedStats_ = 0;
+-	afDropStats_ = 0;
+-	afBestPosition_ = 512;
+-	afBestScore_ = 0;
+-	afMinScore_ = std::numeric_limits<uint64_t>::max();
+-}
+-
+-std::optional<int32_t> IPASoftSimple::processFocusStats(uint64_t score)
+-{
+-	if (afPhase_ == AfPhase::Idle)
+-		return std::nullopt;
+-
+-	if (afPhase_ == AfPhase::Locked) {
+-		/* A single-shot AF request must remain locked until retriggered. */
+-		if (afMode_ != controls::AfModeContinuous)
+-			return std::nullopt;
+-		if (afSettleStats_) {
+-			afSettleStats_--;
+-			return std::nullopt;
+-		}
+-		afLockedStats_++;
+-		/* Contrast can rise as well as fall after a scene change. */
+-		if (afLockedScore_ &&
+-		    (score * 4 < afLockedScore_ * 3 ||
+-		     score * 4 > afLockedScore_ * 5))
+-			afDropStats_++;
+-		else
+-			afDropStats_ = 0;
+-
+-		if (afState_ == controls::AfStateFailed &&
+-		    afLockedStats_ >= 15 && afFailedScans_ < 3)
+-			startFocusScan(true);
+-		else if (afDropStats_ >= 3)
+-			startFocusScan();
+-		else if (afLockedStats_ >= 45) {
+-			/* Periodically check nearby focus without a full-range hunt.
+-			 * This also detects depth changes with similar scene contrast.
+-			 * Statistics arrive only while capture is running.
+-			 */
+-			afPhase_ = AfPhase::Probe;
+-			afProbePosition_ = afPosition_;
+-			afPositions_[0] = afPosition_;
+-			afPositions_[1] = std::max(afPosition_ - 48, 0);
+-			afPositions_[2] = std::min(afPosition_ + 48, 1023);
+-			afPositionCount_ = 3;
+-			afPositionIndex_ = 0;
+-			afBestScore_ = 0;
+-			afBestPosition_ = afPosition_;
+-		}
+-		else
+-			return std::nullopt;
+-	}
+-
+-	if (afSettleStats_) {
+-		afSettleStats_--;
+-		if (afPosition_ != afPositions_[afPositionIndex_]) {
+-			afPosition_ = afPositions_[afPositionIndex_];
+-			afSettleStats_ = 1;
+-			return afPosition_;
+-		}
+-		return std::nullopt;
+-	}
+-
+-	if (afPhase_ == AfPhase::Probe && !afPositionIndex_)
+-		afProbeScore_ = score;
+-	if (afPhase_ != AfPhase::Probe)
+-		afMinScore_ = std::min(afMinScore_, score);
+-
+-	if (score > afBestScore_) {
+-		afBestScore_ = score;
+-		afBestPosition_ = afPosition_;
+-	}
+-
+-	afPositionIndex_++;
+-	if (afPositionIndex_ < afPositionCount_) {
+-		afSettleStats_ = 1;
+-		afPosition_ = afPositions_[afPositionIndex_];
+-		return afPosition_;
+-	}
+-
+-	if (afPhase_ == AfPhase::Probe) {
+-		if (afBestScore_ > afProbeScore_ + afProbeScore_ / 10) {
+-			startFocusScan();
+-			return std::nullopt;
+-		}
+-		/* No clear improvement: retain the original focus, not noise. */
+-		afBestPosition_ = afProbePosition_;
+-		afBestScore_ = afProbeScore_;
+-	}
+-
+-	if (afPhase_ == AfPhase::Coarse) {
+-		afPhase_ = AfPhase::Fine;
+-		afPositionCount_ = 5;
+-		afPositionIndex_ = 0;
+-		afBestScore_ = 0;
+-		for (unsigned int i = 0; i < afPositionCount_; ++i) {
+-			int32_t offset = (static_cast<int32_t>(i) - 2) * 48;
+-			afPositions_[i] = std::clamp(afBestPosition_ + offset, 0, 1023);
+-		}
+-		afSettleStats_ = 1;
+-		afPosition_ = afPositions_[0];
+-		return afPosition_;
+-	}
+-
+-	/* A nearly flat contrast curve is not evidence of optical focus.
+-	 * Motion or noise can otherwise select an arbitrary lens position and
+-	 * keep it indefinitely. Retry uncertain scans, with a bounded budget.
+-	 */
+-	bool focused = afPhase_ == AfPhase::Probe
+-		? afState_ == controls::AfStateFocused
+-		: afBestScore_ > afMinScore_ + afMinScore_ / 12;
+-	if (afPhase_ != AfPhase::Probe && !focused)
+-		afFailedScans_++;
+-	afPhase_ = AfPhase::Locked;
+-	afState_ = focused ? controls::AfStateFocused : controls::AfStateFailed;
+-	afLockedScore_ = afBestScore_;
+-	afLockedStats_ = 0;
+-	afDropStats_ = 0;
+-	afPosition_ = afBestPosition_;
+-	afSettleStats_ = 1;
+-	return afPosition_;
+-}
+-
+ std::string IPASoftSimple::logPrefix() const
+ {
+ 	return "IPASoft";
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index ccc2a6a65..bca9c864e 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "libcamera/internal/camera_lens.h"
+ 
++#include <array>
++
+ #include <libcamera/base/utils.h>
+ 
+ #include "libcamera/internal/v4l2_subdevice.h"
+@@ -95,6 +97,26 @@ int CameraLens::setFocusPosition(int32_t position)
+ 	return 0;
+ }
+ 
++/**
++ * \brief Retrieve the focal point the lens was last set to
++ * \param[out] position The focal point of the lens
++ *
++ * The lens driver reports the position it holds, also when it was set
++ * before this CameraLens was created.
++ *
++ * \return 0 on success or -EINVAL otherwise
++ */
++int CameraLens::focusPosition(int32_t *position)
++{
++	static constexpr std::array<uint32_t, 1> ids{ V4L2_CID_FOCUS_ABSOLUTE };
++	ControlList ctrls = subdev_->getControls(ids);
++	if (!ctrls.contains(V4L2_CID_FOCUS_ABSOLUTE))
++		return -EINVAL;
++
++	*position = ctrls.get(V4L2_CID_FOCUS_ABSOLUTE).get<int32_t>();
++	return 0;
++}
++
+ int CameraLens::validateLensDriver()
+ {
+ 	int ret = 0;
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index 321d05d46..4a06ac863 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -15,6 +15,8 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
++#include <linux/v4l2-controls.h>
++
+ #include <libcamera/base/log.h>
+ #include <libcamera/base/thread.h>
+ #include <libcamera/base/utils.h>
+@@ -24,6 +26,7 @@
+ #include <libcamera/stream.h>
+ 
+ #include "libcamera/internal/bayer_format.h"
++#include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/framebuffer.h"
+ #include "libcamera/internal/software_isp/debayer_params.h"
+ 
+@@ -158,12 +161,31 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, CameraSensor *sensor,
+ 		return;
+ 	}
+ 
++	/* The lens range, and where it is: the IPA moves it from there. */
++	CameraLens *lens = sensor->focusLens();
++	int32_t lensMin = 0, lensMax = 0, lensPosition = -1;
++	if (lens) {
++		const ControlInfoMap &lensControls = lens->controls();
++		auto info = lensControls.find(V4L2_CID_FOCUS_ABSOLUTE);
++		if (info != lensControls.end()) {
++			lensMin = info->second.min().get<int32_t>();
++			lensMax = info->second.max().get<int32_t>();
++			lensPosition = info->second.def().get<int32_t>();
++		}
++		int32_t current;
++		if (!lens->focusPosition(&current))
++			lensPosition = current;
++	}
++
+ 	ret = ipa_->init(IPASettings{ ipaTuningFile, sensor->model() },
+ 			 debayer_->getStatsFD(),
+ 			 sharedParams_.fd(),
+ 			 sensorInfo,
+ 			 sensor->controls(),
+-			 sensor->focusLens() != nullptr,
++			 lens != nullptr,
++			 lensMin,
++			 lensMax,
++			 lensPosition,
+ 			 ipaControls,
+ 			 &ccmEnabled_);
+ 	if (ret) {
