@@ -1,0 +1,82 @@
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index e5fa0070b..fb89e6258 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1007,8 +1007,21 @@ void SimpleCameraData::tryCompleteRequest(Request *request)
+ 		return;
+ 	}
+ 
+-	if (info->metadataRequired && !info->metadataProcessed)
+-		return;
++	if (info->metadataRequired && !info->metadataProcessed) {
++		/*
++		 * A frame that failed or was cancelled gets no statistics, so
++		 * its metadata never comes: complete the request without it.
++		 * Waiting would leave it queued, and stop() asserts on that,
++		 * aborting the process that hosts the camera.
++		 */
++		bool failed = false;
++		for (const auto &[stream, buffer] : request->buffers()) {
++			if (buffer->metadata().status != FrameMetadata::FrameSuccess)
++				failed = true;
++		}
++		if (!failed)
++			return;
++	}
+ 
+ 	frameInfo_.destroy(info->frame);
+ 	pipe()->completeRequest(request);
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index c6d5d1e18..f76e49451 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -1063,6 +1063,9 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	if (!in.isValid() || !out.isValid()) {
+ 		LOG(Debayer, Error) << "mmap-ing buffer(s) failed";
+ 		metadata.status = FrameMetadata::FrameError;
++		/* Hand both buffers back, failed, as DebayerEGL does. */
++		outputBufferReady.emit(output);
++		inputBufferReady.emit(input);
+ 		return;
+ 	}
+ 
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 82d1b80bf..1b0122df3 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -657,6 +657,12 @@ void DebayerEGL::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ error:
+ 	bench_.finishFrame();
+ 	metadata.status = FrameMetadata::FrameError;
++	/*
++	 * Hand both buffers back, failed: kept, their request would never
++	 * complete and the pipeline would assert in stop().
++	 */
++	outputBufferReady.emit(output);
++	inputBufferReady.emit(input);
+ 	return;
+ }
+ 
+@@ -719,10 +725,19 @@ SizeRange DebayerEGL::sizes(PixelFormat inputFormat, const Size &inputSize)
+ 		return {};
+ 	}
+ 
+-	return SizeRange(Size(patternSize.width, patternSize.height),
++	/*
++	 * The output is imported as a dma-buf for rendering, and Mesa's
++	 * freedreno (Adreno 740) rejects heights that are not a multiple of 4:
++	 * 1400x1050, 640x482 and 1920x1082 failed on every frame while 484,
++	 * 900 and 1080 worked.  Step heights by 4, so validate() adjusts such
++	 * a request instead of a stream that never delivers.
++	 */
++	unsigned int vStep = std::max(patternSize.height, 4u);
++
++	return SizeRange(Size(patternSize.width, vStep),
+ 			 Size((inputSize.width - 2 * patternSize.width) & ~(patternSize.width - 1),
+-			      (inputSize.height - 2 * borderHeight) & ~(patternSize.height - 1)),
+-			 patternSize.width, patternSize.height);
++			      (inputSize.height - 2 * borderHeight) & ~(vStep - 1)),
++			 patternSize.width, vStep);
+ }
+ 
+ } /* namespace libcamera */
