@@ -618,15 +618,22 @@ fi
 # (or /sys, /dev) mounted inside the rootfs.  Everything downstream assumes a
 # plain directory tree -- the summary du dies racing live procfs churn, and
 # stage 4's tar would image a mounted /proc wholesale -- so settle the mounts
-# here and refuse to continue if one will not go.
+# here and refuse to continue if one will not go.  The straggler can outlive
+# 10 s (v1.2.4, 2026-11-09: a 72-minute rootfs was lost to a /proc that was
+# free again a minute later), so wait up to 2 minutes and name the holders.
 for sub in proc sys dev/pts dev; do
 	mountpoint -q "$rootfs/$sub" 2>/dev/null || continue
-	for attempt in 1 2 3 4 5; do
+	for attempt in $(seq 1 60); do
 		umount "$rootfs/$sub" 2>/dev/null && break
+		if [ "$attempt" = 1 ]; then
+			echo "$rootfs/$sub is busy; waiting for:" >&2
+			fuser -vm "$rootfs/$sub" >&2 || true
+		fi
 		sleep 2
 	done
 	if mountpoint -q "$rootfs/$sub" 2>/dev/null; then
 		echo "refusing to continue: $rootfs/$sub is still mounted" >&2
+		fuser -vm "$rootfs/$sub" >&2 || true
 		exit 1
 	fi
 done
