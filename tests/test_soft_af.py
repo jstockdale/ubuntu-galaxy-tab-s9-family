@@ -11,7 +11,8 @@ frame, what an owner would see and hear:
 * it finds the peak, quickly, wherever it is, with noise;
 * a still scene never moves it again (no periodic hunting);
 * a new scene is refocused, a nearby one with a local search;
-* a shake or a pan does not move it, and a flat scene ends Failed, still;
+* a shake or a pan does not move it, and a flat scene ends Failed, still,
+  until detail appears;
 * AfModeAuto scans once per trigger;
 * a lens left elsewhere, or a restarted stream, starts without a jump.
 
@@ -205,12 +206,33 @@ class SoftAfTest(unittest.TestCase):
         self.assertSharp(r, 600)
 
     def test_flat_scene_fails_quietly(self):
-        r = self.run_sim(scene="0:400:1000:0.0:70", frames=1500, noise=0.03)
+        # Three bounded retries (after 2, 6 and 18 s), then stillness.
+        r = self.run_sim(scene="0:400:1000:0.0:70", frames=2400, noise=0.03)
         self.assertSmooth(r)
         failed = r.first({FAILED})
         self.assertIsNotNone(failed, "a flat scene did not end Failed")
-        self.assertEqual(r.commands_between(failed + 1), [])
+        self.assertEqual(r.commands_between(1500), [], "still searching after 50 s")
         self.assertEqual(r.state[-1], FAILED)
+
+    def test_failed_then_textured_scene(self):
+        # Pointing at a subject from a blank wall adds contrast, even
+        # out of focus: that is a scene change.
+        r = self.run_sim(scene="0:400:1000:0.0:70,600:550:1300:1.5:70", frames=1500)
+        self.assertSmooth(r)
+        self.assertEqual(r.state[599], FAILED, "a featureless scene did not fail")
+        refocused = r.first({FOCUSED}, after=600)
+        self.assertIsNotNone(refocused, "a scene with detail after a failure never focused")
+        self.assertLessEqual(refocused - 600, 300, "slower than 10 s")
+        self.assertSharp(r, 550, amp=1.5)
+
+    def test_failed_retries_find_a_silent_subject(self):
+        # A subject whose blur looks exactly as flat as the wall did: only
+        # the bounded retries (2, 6 and 18 s after each failure) find it.
+        r = self.run_sim(scene="0:400:1000:0.0:70,600:550:1000:1.5:70", frames=1800)
+        refocused = r.first({FOCUSED}, after=600)
+        self.assertIsNotNone(refocused)
+        self.assertLessEqual(refocused, 1500, "not found within 50 s")
+        self.assertSharp(r, 550, amp=1.5)
 
     def test_auto_mode_scans_once_per_trigger(self):
         r = self.run_sim(scene="0:300:1000:1.0:70,600:700:1000:1.0:70", frames=1200,
