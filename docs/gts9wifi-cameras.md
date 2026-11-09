@@ -353,3 +353,44 @@ With focus working, the owner heard the lens click, and saw focus move
 periodically and jerkily. The cause was the shared libcamera autofocus, not
 this board. It is replaced by SoftAf (libcamera-gts9u patch 0009); see
 [camera focus](camera-focus-and-enumeration.md#smooth-continuous-autofocus-patch-0009-2026-11-08).
+
+### CCI timeouts: two problems, not one (2026-11-08)
+
+On boot `cc67dab2` the kernel logged two CCI timeouts.
+
+**1. The lens's first write after a power-up**, 18:08:08.840. It came 0.35 s
+after the sensor's probe had switched the shared rail on and off. Thousands of
+autofocus writes on a powered lens went through today without one timeout.
+Only a write right after a power-up fails, and mostly when the power-down
+before it was recent or taken mid-move. So this is the chip's state after a
+quick power cycle, not the bus.
+- Leading hypothesis: the dtsi's strong 2.2 kOhm CCI pull-ups to the SoC's
+  1.8 V back-power the unpowered module through its I/O pins (L4B, its VIO,
+  goes off with it: use count 0), so the DW9808 never fully resets. Stock's
+  weak pull-up would not do that.
+- Test: the stock pad settings (4 mA, weak pull-up) on CCI1 master 0 as a
+  DTB-only kit, then `lens-diag.sh`'s quick cycles.
+
+**2. The sensor's stream-off write, during a restart burst**, 18:30:38.862.
+This was the Snapshot freeze, reproduced by the full-resolution-photos
+session's replica of stock GNOME Camera:
+- `qcom-camss acb7000.isp: Received wm done for unmapped index`, then 0.6 ms
+  later `i2c-qcom-cci ac15000.cci: master 1 queue 0 timeout`, then
+  `hi1337-gts9u 13-0021: disabling streaming failed (-110)`;
+- frames stopped (csid0 flat from 18:30:47) until a new stream at 18:31:28.
+
+The stale capture interrupt and the I2C timeout were handled within a
+millisecond of each other, about 100 ms (`CCI_TIMEOUT`) after the write
+started. That fits interrupts on that CPU being held up, rather than a stuck
+bus, but it is not proven.
+
+Every device interrupt on squirtle is handled on CPU0, a Cortex-A510:
+irqbalance is not installed. That covers the display, the GPU, the BT UART
+(about 90/s), RPMh, both CCIs, VFE and CSID.
+
+- Test: log the CCI's interrupt status when a transfer times out (a debug
+  patch to `i2c-qcom-cci`). Separately, move the camera interrupts to a big
+  core.
+
+Snapshot patched not to reconfigure while shooting avoids the bursts: 30 of
+30 full-resolution photos in three runs, with no camera kernel error.
