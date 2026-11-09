@@ -8526,3 +8526,51 @@ Details are in [camera focus](camera-focus-and-enumeration.md#smooth-continuous-
   next open succeed.
 - The owner used GNOME Camera: "Autofocus is much much better". The IPA logged
   seven searches in 40 s, each focused after 92-140 frames.
+
+### A 1400x1050 stream killed PipeWire, and the audio with it (2026-11-08)
+
+**Observed:**
+- Measuring for full-resolution photos, the Snapshot session asked the rear
+  camera for 1400x1050, which the node offers. It did so three times
+  (18:20:51, 18:21:26, 18:24:11).
+- Each time PipeWire logged "debayerGPU failed" on every frame.
+- About 10 s later, at stop: `FATAL ... pipeline_handler.cpp:398 assertion
+  "data->queuedRequests_.empty()" failed in stop()`. The pipewire daemon
+  aborted, and the owner's audio and the Beats went with it.
+- With `cam`, in its own process, 8-16 frames each:
+  - heights that leave 2 when divided by 4 fail on every frame: 1050 (at
+    widths 1400, 1408 and 1680), 482 and 1082;
+  - 484, 540, 900, 1048, 1056 and 1080 work;
+  - widths are already aligned by validate() (642 became 640).
+- Separately, 1400x1056 stalls after 5 frames with no error, while 1400x1048
+  and 1416x1056 work. That one is not understood, and is not an offered size.
+
+**Causes:**
+1. `DebayerEGL::sizes()` steps heights by the Bayer pattern, 2. The output
+   is imported as a dma-buf for rendering, and Mesa's freedreno rejects
+   heights that are not a multiple of 4: `eglCreateImageKHR` fails, which is
+   logged only at Debug.
+2. On that error `DebayerEGL::process()` returned without handing back the
+   buffers or the statistics. `SoftwareIsp::stop()` returns the buffers
+   cancelled, but `SimpleCameraData::tryCompleteRequest()` still waits for
+   metadata that never comes. `clearIncompleteRequests()` only cancels
+   requests not yet sent to the ISP, so `PipelineHandler::stop()` asserts.
+   `DebayerCpu` has the same early return on a failed mapping.
+
+**Fix, `libcamera-gts9u` patch 0010:**
+- `DebayerEGL::sizes()` steps heights by 4 (the minimum height too), so
+  1400x1050 and 1680x1050 are no longer offered, and a request for one is
+  adjusted.
+- Both debayers hand back the buffers of a failed frame, marked FrameError.
+- `tryCompleteRequest()` does not wait for metadata when a buffer failed or
+  was cancelled.
+
+The three files pass an aarch64 clang `-fsyntax-only -Wall -Wextra` check
+against the build tree's generated headers, with no errors or warnings. The
+on-device test waits for the build.
+
+**Versions:**
+- `libcamera-gts9u` gts9u12. It also carries SoftAf's Failed retries
+  (`962da80`), which gts9u11 lacked.
+- `libspa-0.2-libcamera-gts9u` 1.0.5-gts9u13.
+- `ubuntu-gts9u-device` 2.62.
