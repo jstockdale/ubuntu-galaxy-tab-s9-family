@@ -222,11 +222,9 @@ class CompanionWindow(Adw.ApplicationWindow):
         self.view_stack.add_titled_with_icon(
             self._haptics_page(), "haptics", _("Haptics"), "phone-symbolic"
         )
-        # Only where the touchscreen's driver offers something to set.
-        if glob(DOUBLE_TAP_ATTRIBUTE):
-            self.view_stack.add_titled_with_icon(
-                self._touch_page(), "touch", _("Touch"), "hand-open-symbolic"
-            )
+        self.view_stack.add_titled_with_icon(
+            self._touch_page(), "touch", _("Touch"), "hand-open-symbolic"
+        )
         if boot_sets.available():
             self.view_stack.add_titled_with_icon(
                 self._system_page(), "dualboot", _("Dualboot"), "drive-multidisk-symbolic"
@@ -916,6 +914,20 @@ class CompanionWindow(Adw.ApplicationWindow):
 
     def _touch_page(self):
         page = self._page()
+        taps = Adw.PreferencesGroup(
+            title=_("Multi-finger taps"),
+            description=_("A short tap with several fingers at once clicks between them."),
+        )
+        taps.add(self._tap_row(
+            "touch-two-finger-tap", _("Two-finger tap"), "input-touchpad-symbolic"
+        ))
+        taps.add(self._tap_row(
+            "touch-three-finger-tap", _("Three-finger tap"), "input-touchpad-symbolic"
+        ))
+        page.add(taps)
+        # Only where the touchscreen's driver offers it.
+        if not glob(DOUBLE_TAP_ATTRIBUTE):
+            return page
         group = Adw.PreferencesGroup(title=_("Touchscreen"))
         double_tap = Adw.SwitchRow(
             title=_("Double tap to wake"),
@@ -929,6 +941,34 @@ class CompanionWindow(Adw.ApplicationWindow):
         group.add(double_tap)
         page.add(group)
         return page
+
+    def _tap_row(self, setting, title, icon_name):
+        # The Shell extension tab-companion-touch@agcarbajo reads these.
+        choices = (
+            ("nothing", _("Off")),
+            ("secondary-click", _("Right click")),
+            ("middle-click", _("Middle click")),
+        )
+        ids = [choice[0] for choice in choices]
+        row = Adw.ComboRow(
+            title=title,
+            model=Gtk.StringList.new([label for _id, label in choices]),
+        )
+        row.add_prefix(Gtk.Image(icon_name=icon_name))
+
+        def show(*_args):
+            value = self.settings.get_string(setting)
+            row.set_selected(ids.index(value) if value in ids else 0)
+
+        def store(*_args):
+            value = ids[row.get_selected()]
+            if self.settings.get_string(setting) != value:
+                self.settings.set_string(setting, value)
+
+        show()
+        self.settings.connect("changed::" + setting, show)
+        row.connect("notify::selected", store)
+        return row
 
     def _haptics_page(self):
         page = self._page()

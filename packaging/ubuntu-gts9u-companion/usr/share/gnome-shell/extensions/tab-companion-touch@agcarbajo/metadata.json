@@ -1,0 +1,7 @@
+{
+  "uuid": "tab-companion-touch@agcarbajo",
+  "name": "Tab Companion touch taps",
+  "description": "Two- and three-finger taps on the touchscreen as right or middle clicks, set in Tab Companion",
+  "shell-version": ["46"],
+  "version": 1
+}

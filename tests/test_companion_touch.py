@@ -178,8 +178,11 @@ class SettingsAndWindowTests(unittest.TestCase):
         consts = {t.id: n.value.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
                   for t in n.targets if isinstance(t, ast.Name) and isinstance(n.value, ast.Constant)}
         self.assertEqual(consts["DOUBLE_TAP_ATTRIBUTE"], "/sys/bus/i2c/devices/*/double_tap_to_wake")
-        self.assertRegex(source, r"if glob\(DOUBLE_TAP_ATTRIBUTE\):\n\s+self\.view_stack\.add_titled_with_icon\(\n\s+self\._touch_page\(\)")
-        page = source[source.index("    def _touch_page(self):"):source.index("    def _haptics_page(self):")]
+        # The page is there on every model; only the double tap row depends
+        # on the touchscreen's driver.
+        self.assertRegex(source, r"self\.view_stack\.add_titled_with_icon\(\n\s+self\._touch_page\(\), \"touch\"")
+        page = source[source.index("    def _touch_page(self):"):source.index("    def _tap_row(self, setting, title, icon_name):")]
+        self.assertIn("if not glob(DOUBLE_TAP_ATTRIBUTE):\n            return page", page)
         self.assertIn('"double-tap-to-wake", double_tap, "active"', page)
 
     def test_driver_offers_the_attribute(self):
@@ -264,6 +267,64 @@ class TouchPermissionTests(unittest.TestCase):
         source = DESKTOP_USER.read_text(encoding="utf-8")
         for driver in TOUCH_DRIVERS:
             self.assertIn(f"/sys/bus/i2c/drivers/{driver}/*/double_tap_to_wake", source)
+
+
+EXTENSION = PKG / "usr/share/gnome-shell/extensions/tab-companion-touch@agcarbajo"
+ENABLER = PKG / "usr/libexec/tab-companion-enable-haptics"
+
+
+class MultiFingerTapTests(unittest.TestCase):
+    """The Touch page's tap rows and the Shell extension that acts on them
+    must agree on the settings keys and the action identifiers."""
+
+    def extension(self):
+        return (EXTENSION / "extension.js").read_text(encoding="utf-8")
+
+    def test_schema_defaults(self):
+        schema = SCHEMA.read_text(encoding="utf-8")
+        self.assertIn("""<key name="touch-two-finger-tap" type="s"><default>'secondary-click'</default></key>""", schema)
+        self.assertIn("""<key name="touch-three-finger-tap" type="s"><default>'nothing'</default></key>""", schema)
+
+    def test_extension_reads_the_schema_keys(self):
+        source = self.extension()
+        self.assertIn("const KEYS = {2: 'touch-two-finger-tap', 3: 'touch-three-finger-tap'};", source)
+        self.assertIn("const SCHEMA = 'io.github.agcarbajo.TabCompanion';", source)
+
+    def test_every_offered_click_is_one_the_extension_performs(self):
+        window = WINDOW.read_text(encoding="utf-8")
+        row = window[window.index("    def _tap_row(self, setting, title, icon_name):"):window.index("    def _haptics_page(self):")]
+        offered = set(re.findall(r'\("([a-z-]+)", _\("', row))
+        performed = set(re.findall(r"'([a-z-]+)': Clutter\.BUTTON_", self.extension()))
+        self.assertEqual(offered, {"nothing"} | performed)
+        self.assertEqual(performed, {"secondary-click", "middle-click"})
+        for key in ("touch-two-finger-tap", "touch-three-finger-tap"):
+            self.assertIn('"%s"' % key, window)
+
+    def test_metadata_matches_the_directory_and_the_other_extension(self):
+        import json
+        meta = json.loads((EXTENSION / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["uuid"], EXTENSION.name)
+        haptics = json.loads((PKG / "usr/share/gnome-shell/extensions/tab-companion-haptics@agcarbajo/metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["shell-version"], haptics["shell-version"])
+
+    def test_enabled_at_login_with_the_haptics(self):
+        enabler = ENABLER.read_text(encoding="utf-8")
+        self.assertIn('"tab-companion-touch@agcarbajo"', enabler)
+        self.assertIn('"tab-companion-haptics@agcarbajo"', enabler)
+
+    def test_tap_thresholds_leave_multi_touch_alone(self):
+        # Tight enough that a pinch, a scroll or staggered fingers never
+        # count as a tap (agreed with the owner, 2026-11-08).
+        source = self.extension()
+        for line in ("const LAND_MS = 100;", "const LIFT_MS = 150;",
+                     "const TAP_MS = 800;", "const SLOP = 24;"):
+            self.assertIn(line, source)
+
+    def test_taps_never_swallow_the_touches(self):
+        # The client must keep every touch event: the extension only adds a
+        # click once the last finger has lifted.
+        source = self.extension()
+        self.assertNotIn("EVENT_STOP", source)
 
 
 if __name__ == "__main__":

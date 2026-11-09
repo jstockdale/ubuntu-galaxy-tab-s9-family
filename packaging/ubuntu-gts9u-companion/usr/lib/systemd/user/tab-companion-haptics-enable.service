@@ -1,5 +1,5 @@
 [Unit]
-Description=Enable Tab Companion on-screen keyboard haptics
+Description=Enable the Tab Companion Shell extensions (keyboard haptics, touch taps)
 After=graphical-session.target
 PartOf=graphical-session.target
 

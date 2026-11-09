@@ -39,6 +39,8 @@
          Off by default, as in the stock kernel: armed, the touch IC keeps scanning while the
          screen is off. -->
     <key name="double-tap-to-wake" type="b"><default>false</default></key>
+    <key name="touch-two-finger-tap" type="s"><default>'secondary-click'</default></key>
+    <key name="touch-three-finger-tap" type="s"><default>'nothing'</default></key>
     <key name="spen-side-button-near-height" type="i"><range min="0" max="255"/><default>36</default></key>
     <key name="spen-side-button-far-height" type="i"><range min="0" max="255"/><default>44</default></key>
     <key name="pen-dock-popup" type="b"><default>true</default></key>
