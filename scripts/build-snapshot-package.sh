@@ -92,6 +92,7 @@ deb=gnome-snapshot_${snapshot_version}${suffix}_arm64.deb
 rm -f "$out"/gnome-snapshot_*"$suffix"_arm64.deb
 cp "$buildroot/build/gnome-snapshot/$deb" "$out/"
 test "$(dpkg-deb -f "$out/$deb" Version)" = "${snapshot_version}${suffix}"
-dpkg-deb -c "$out/$deb" | grep -q ' ./usr/bin/snapshot$'
+# Not grep -q: it stops reading, and pipefail then fails on dpkg-deb's SIGPIPE.
+dpkg-deb -c "$out/$deb" | grep ' ./usr/bin/snapshot$' >/dev/null
 ls -l "$out/$deb"
 sha256sum "$out/$deb"
