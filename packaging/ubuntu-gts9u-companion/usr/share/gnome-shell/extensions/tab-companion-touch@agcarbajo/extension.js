@@ -63,7 +63,7 @@ export default class TabCompanionTouch extends Extension {
     }
 
     _reset() {
-        this._touches = new Map();  // sequence -> where it landed
+        this._touches = new Map();  // touch slot -> where it landed
         this._points = [];          // every landing point of this touch
         this._start = 0;
         this._firstLift = 0;
@@ -83,7 +83,11 @@ export default class TabCompanionTouch extends Extension {
         if (device?.get_device_type() !== Clutter.InputDeviceType.TOUCHSCREEN_DEVICE)
             return Clutter.EVENT_PROPAGATE;
 
-        const sequence = event.get_event_sequence();
+        // Each call can hand back a new wrapper for the same sequence, so
+        // touches are told apart by slot, as Shell's own keyboard does.
+        const slot = event.get_event_sequence()?.get_slot();
+        if (slot === undefined || slot === null)
+            return Clutter.EVENT_PROPAGATE;
         const [x, y] = event.get_coords();
         const time = event.get_time();
 
@@ -94,13 +98,13 @@ export default class TabCompanionTouch extends Extension {
                 this._start = time;
             else if (time - this._start > LAND_MS)
                 this._spoiled = true;
-            this._touches.set(sequence, {x, y});
+            this._touches.set(slot, {x, y});
             this._points.push({x, y});
             this._peak = Math.max(this._peak, this._touches.size);
             return Clutter.EVENT_PROPAGATE;
         }
 
-        const landed = this._touches.get(sequence);
+        const landed = this._touches.get(slot);
         if (!landed)
             return Clutter.EVENT_PROPAGATE;
 
@@ -116,7 +120,7 @@ export default class TabCompanionTouch extends Extension {
             this._firstLift = time;
         else if (time - this._firstLift > LIFT_MS)
             this._spoiled = true;
-        this._touches.delete(sequence);
+        this._touches.delete(slot);
         if (this._touches.size > 0)
             return Clutter.EVENT_PROPAGATE;
 
@@ -129,9 +133,11 @@ export default class TabCompanionTouch extends Extension {
     }
 
     _tap(fingers) {
-        const button = BUTTONS[this._settings.get_string(KEYS[fingers])];
+        const action = this._settings.get_string(KEYS[fingers]);
+        const button = BUTTONS[action];
         if (!button || this._clickId)
             return;
+        console.log(`tab-companion-touch: ${fingers}-finger tap, ${action}`);
 
         let x = 0, y = 0;
         for (const point of this._points) {

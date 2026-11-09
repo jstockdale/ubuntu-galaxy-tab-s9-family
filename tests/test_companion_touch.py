@@ -320,6 +320,15 @@ class MultiFingerTapTests(unittest.TestCase):
                      "const TAP_MS = 800;", "const SLOP = 24;"):
             self.assertIn(line, source)
 
+    def test_touches_are_told_apart_by_slot(self):
+        # GJS can wrap one ClutterEventSequence in a new object per call, so
+        # a Map keyed by the sequence never finds the finger again (1.3.16).
+        source = self.extension()
+        self.assertIn("const slot = event.get_event_sequence()?.get_slot();", source)
+        for use in ("this._touches.set(slot,", "this._touches.get(slot)", "this._touches.delete(slot)"):
+            self.assertIn(use, source)
+        self.assertNotIn("this._touches.get(sequence)", source)
+
     def test_taps_never_swallow_the_touches(self):
         # The client must keep every touch event: the extension only adds a
         # click once the last finger has lifted.
