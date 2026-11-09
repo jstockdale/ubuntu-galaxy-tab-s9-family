@@ -38,6 +38,7 @@ cite their procedures and results.  They are not an install or update path.
 | [`cam-lens/`](cam-lens/README.md) | the rear lens rail's 10 ms power-up delay, a DTB-only change (on top of the CX kit) | [`docs/gts9wifi-cameras.md`](../../docs/gts9wifi-cameras.md) |
 | [`bt-uart/`](bt-uart/README.md) | the geni UART interrupt served while the port suspends, and the Bluetooth suspend test (on top of the lens kit) | [`docs/porting-log.md`](../../docs/porting-log.md#the-geni-uart-handler-ignored-its-interrupt-while-the-port-suspended-2026-11-08) |
 | [`cam-pads/`](cam-pads/README.md) | stock's pad settings on the rear lens's CCI pins, a DTB-only test of the lens's power-up failures (on top of the BT UART kit) | [`docs/gts9wifi-cameras.md`](../../docs/gts9wifi-cameras.md#cci-timeouts-two-problems-not-one-2026-11-08) |
+| [`cam-bus/`](cam-bus/README.md) | the rear camera's two buses as stock sets them (400 kHz, 4 mA, weak pull-up), replacing `cam-pads` (on top of the BT UART kit) | [`docs/gts9wifi-cameras.md`](../../docs/gts9wifi-cameras.md#cci-timeouts-two-problems-not-one-2026-11-08) |
 | [`suspendkit/`](suspendkit/README.md) | suspend reliability runs, the ADSP-start sleep lock | [`scripts/diagnostics/suspend/README.md`](../../scripts/diagnostics/suspend/README.md) |
 | [`wifi/`](wifi/README.md) | the Wi-Fi address from EFS, firmware at the first probe, the L1 substates | [`docs/gts9wifi-wifi.md`](../../docs/gts9wifi-wifi.md) |
 

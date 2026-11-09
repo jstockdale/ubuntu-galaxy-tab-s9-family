@@ -394,3 +394,19 @@ irqbalance is not installed. That covers the display, the GPU, the BT UART
 
 Snapshot patched not to reconfigure while shooting avoids the bursts: 30 of
 30 full-resolution photos in three runs, with no camera kernel error.
+
+**The lens-pads test (boot `e2c815b8`, 2026-11-08 21:53):**
+- The lens's first power-up after the camera was enabled still timed out,
+  0.43 s after the sensor's probe.
+- With the weak pull-up at 1 MHz, opens failed with "Device or resource busy"
+  in 3 of 20 settled power cycles, plus 1 timeout, and in quick cycle 5. That
+  means `dw9808_set_position()`'s status reads came back "busy".
+
+So the lens bus's pads alone do not cure the power-up failure, and stock's
+weak pull-up needs stock's 400 kHz. The likelier feed into the off module is
+the sensor's bus: CCI0, with the dtsi's strong pull-ups, on the HI1337, whose
+I/O shares `rear_cam_vio` with the lens. Stock also puts the CCI pins in a
+no-pull suspend state when idle; the mainline CCI driver never selects one.
+
+Next: the [`cam-bus`](../tools/inplace/cam-bus/README.md) kit, stock's bus
+settings on both rear buses. Then the idle pin state.

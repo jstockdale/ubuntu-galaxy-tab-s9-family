@@ -2363,6 +2363,8 @@
 };
 
 &cci0_i2c1 {
+	clock-frequency = <400000>;
+
 	gts9_rear_cam: camera@21 {
 		compatible = "hynix,hi1337-gts9u-rear";
 		reg = <0x21>;
@@ -2407,15 +2409,27 @@
 };
 
 /*
- * CCI1 master 0 (the rear DW9808 lens and its EEPROM): stock's pad settings,
- * 4 mA and the TLMM's weak pull-up.  sm8550.dtsi gives 2 mA and the strong
- * 2.2 kOhm I2C pull-up, to the SoC's 1.8 V, which stays up while the module's
- * own rail and VIO (L4B) are off: the pull-ups can then feed the unpowered
- * lens through its pins, so that it never quite resets.  After a power-down
- * that was recent, or taken mid-move, the lens's first write timed out
- * (squirtle, 2026-11-08), with the 10 ms power-up delay too.
+ * The rear camera's two buses as stock sets them: 400 kHz (i2c-freq-mode 1),
+ * 4 mA and the TLMM's weak pull-up.  sm8550.dtsi runs them at 1 MHz with 2 mA
+ * and the strong 2.2 kOhm pull-up.  The two go together: with the weak
+ * pull-up at 1 MHz the lens's status reads failed ("busy"), and with the
+ * strong one the lens's first write after a quick power-down timed out now
+ * and then (squirtle, 2026-11-08).  The front camera's bus keeps the dtsi's
+ * until that camera is tested.
  */
-&cci1_0_default {
+&cci0_1_default {	/* CCI0 master 1: the rear HI1337 */
+	sda-pins {
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+
+	scl-pins {
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+};
+
+&cci1_0_default {	/* CCI1 master 0: the rear DW9808 lens and its EEPROM */
 	sda-pins {
 		drive-strength = <4>;
 		bias-pull-up;
@@ -2428,6 +2442,8 @@
 };
 
 &cci1_i2c0 {
+	clock-frequency = <400000>;
+
 	/* Stock actuator0: slave-addr 0x18 (8-bit), CCI1 master 0. */
 	gts9_rear_focus: lens@c {
 		compatible = "dongwoon,dw9808-vcm";

@@ -53,3 +53,12 @@ Roll back in reverse order: this kit first, then the BT UART kit's
 - in `lens-diag.sh`, the quick cycles pass: 6 of 6, where the lens kit failed
   on the second.
 - If they still fail, the pads are not the cause: roll back.
+
+**Result (boot `e2c815b8`):**
+- The lens's probe-time power-up still timed out.
+- The weak pull-up at the dtsi's 1 MHz broke the lens's status reads:
+  `lens-diag.sh` opens failed with "Device or resource busy" in 3 of 20
+  settled cycles and in quick cycle 5.
+
+The pull-up belongs with stock's 400 kHz. Superseded by
+[`cam-bus`](../cam-bus/README.md); roll this kit back.
