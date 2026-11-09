@@ -74,15 +74,17 @@ done
 } > debian/changelog.gts9u
 mv debian/changelog.gts9u debian/changelog
 # The package's own test target covers only the application crate and times
-# out under emulation; aperture's caps tests run on their own below.
-DEB_BUILD_OPTIONS='nocheck parallel=8' dpkg-buildpackage -b -uc -us
-# debian/rules creates this vendored placeholder only for the build.
+# out under emulation, so aperture's caps tests run here, on the patched tree:
+# dpkg-buildpackage unapplies the series, vendored-crates config included,
+# when it finishes.  debian/rules creates the placeholder only for its build.
+dpkg-source --before-build .
 placeholder=debian/missing-sources/system-deps/src/tests/lib
 mkdir -p "$placeholder"
 touch "$placeholder/libteststatic.a"
 cargo test --offline --manifest-path aperture/Cargo.toml \
     --target-dir "$work/aperture-tests"
-rm -rf "$placeholder"
+rm -rf "$placeholder" aperture/Cargo.lock
+DEB_BUILD_OPTIONS='nocheck parallel=8' dpkg-buildpackage -b -uc -us
 cp ../*.deb /build/gnome-snapshot/
 ls /build/gnome-snapshot/*.deb
 EOF2
