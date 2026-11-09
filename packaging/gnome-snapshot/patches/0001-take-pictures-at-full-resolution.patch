@@ -1,0 +1,345 @@
+Description: Take pictures at the camera's full resolution
+ Snapshot takes pictures from its viewfinder stream, which aperture keeps at
+ the largest height up to 1080.  For a 4128x3096 sensor behind libcamera's
+ software ISP that is 1280x1080, so every picture was 1280x1080.
+ .
+ In picture mode the viewfinder now streams the camera's largest raw size,
+ and a picture is the next frame of that stream.  Video mode keeps the
+ 1080p-class size used for recording.  Switching mode restarts the stream
+ once.
+ .
+ A camerabin still capture at a larger size was not used: wrappercamerabinsrc
+ would renegotiate the source twice per picture and keep the first frame
+ after the first restart, and libcamera's software IPA resets white balance
+ and autofocus on every configure.
+ .
+ pipewiresrc 1.0 restarts the camera for every RECONFIGURE event, and
+ camerabin sends several per picture without changing the format.  A probe
+ on the source's capsfilter drops those whose preferred caps are the caps in
+ use, as pipewiresrc itself does from PipeWire 1.1.81 (e2e8cf79), so a
+ picture no longer restarts the camera at all.
+Author: Ubuntu gts9uwifi port contributors <noreply@example.invalid>
+Forwarded: not-needed
+Last-Update: 2026-11-08
+---
+--- a/aperture/src/utils.rs
++++ b/aperture/src/utils.rs
+@@ -48,6 +48,39 @@
+             })
+     }
+ 
++    fn sizes(caps: &gst::Caps) -> Vec<(i32, i32)> {
++        caps.iter()
++            .filter_map(|s| Some((s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?)))
++            .filter(|(w, h)| *w > 0 && *h > 0)
++            .collect()
++    }
++
++    /// The largest size, by area, among the fixed sizes in `caps`.
++    pub fn largest_size(caps: &gst::Caps) -> Option<(i32, i32)> {
++        sizes(caps)
++            .into_iter()
++            .max_by_key(|(w, h)| i64::from(*w) * i64::from(*h))
++    }
++
++    /// Caps for streaming at the camera's largest uncompressed size, so that
++    /// a picture taken from the stream has the camera's full resolution.
++    /// Empty if the camera offers no raw format.
++    pub(crate) fn best_resolution_for_stills(caps: &gst::Caps) -> gst::Caps {
++        let raw = caps.intersect_with_mode(
++            &gst::Caps::builder("video/x-raw").build(),
++            gst::CapsIntersectMode::First,
++        );
++        let Some((width, height)) = largest_size(&raw) else {
++            return gst::Caps::new_empty();
++        };
++        let fixed_res = gst_video::VideoCapsBuilder::for_encoding("video/x-raw")
++            .width(width)
++            .height(height)
++            .build();
++
++        raw.intersect_with_mode(&fixed_res, gst::CapsIntersectMode::First)
++    }
++
+     pub(crate) fn best_resolution_for_fps(caps: &gst::Caps, framerate: gst::Fraction) -> gst::Caps {
+         // There are multiple aspect rations for 1080p. Therefore, we look for
+         // height rather than width.
+@@ -207,4 +240,54 @@
+             assert_eq!(caps::best_height(&cap, 1080), Some(720));
+         }
+     }
++
++    // Raw caps without a framerate, as the PipeWire libcamera node offers them.
++    fn raw_sizes(sizes: &[(i32, i32)]) -> gst::Caps {
++        sizes
++            .iter()
++            .map(|(w, h)| {
++                gst::Caps::builder("video/x-raw")
++                    .field("format", "RGBA")
++                    .field("width", *w)
++                    .field("height", *h)
++                    .build()
++            })
++            .collect()
++    }
++
++    fn first_size(caps: &gst::Caps) -> (i32, i32) {
++        let s = caps.structure(0).expect("empty caps");
++        (s.get::<i32>("width").unwrap(), s.get::<i32>("height").unwrap())
++    }
++
++    #[test]
++    fn test_stills_resolution() {
++        gst::init().expect("Failed to initalize gst");
++
++        // A 4128x3096 sensor through libcamera's software ISP.
++        let caps = caps::limit_fps(&raw_sizes(&[
++            (640, 480),
++            (1280, 1080),
++            (1920, 1080),
++            (1600, 1200),
++            (3840, 1080),
++            (4120, 3096),
++        ]));
++
++        assert_eq!(caps::largest_size(&caps), Some((4120, 3096)));
++        let stills = caps::best_resolution_for_stills(&caps);
++        assert_eq!(stills.size(), 1);
++        assert_eq!(first_size(&stills), (4120, 3096));
++
++        // Video keeps the largest height up to 1080p.
++        let fps = gst::Fraction::new(crate::MAXIMUM_RATE, 1);
++        assert_eq!(first_size(&caps::best_resolution_for_fps(&caps, fps)), (1280, 1080));
++
++        // No raw format: no full-resolution stream.
++        let jpeg = gst::Caps::builder("image/jpeg")
++            .field("width", 1920)
++            .field("height", 1080)
++            .build();
++        assert!(caps::best_resolution_for_stills(&jpeg).is_empty());
++    }
+ }
+--- a/aperture/src/camera.rs
++++ b/aperture/src/camera.rs
+@@ -140,18 +140,70 @@
+         glib::Object::builder().property("device", device).build()
+     }
+ 
++    /// The caps the camera's source is filtered with. In picture mode the
++    /// camera's largest raw size comes first, so that pictures, which are
++    /// taken from the stream, have its full resolution.
++    pub(crate) fn source_caps(&self, picture_mode: bool) -> gst::Caps {
++        source_caps(&self.device(), picture_mode)
++    }
++
++    /// Returns the wrapper source, the device source and the capsfilter, or
++    /// `None` if `previous` was reconfigured for this camera.
+     pub(crate) fn source_element(
+         &self,
+         previous: Option<&gst::Element>,
+-    ) -> Result<Option<(gst::Element, gst::Element)>, glib::BoolError> {
++        picture_mode: bool,
++    ) -> Result<Option<(gst::Element, gst::Element, gst::Element)>, glib::BoolError> {
+         let device = self.device();
+         let Some(previous) = previous else {
+-            return create_element(&device);
++            return create_element(&device, picture_mode);
+         };
+         match device.reconfigure_element(previous) {
+             Ok(_) => Ok(None),
+-            Err(_) => create_element(&device),
++            Err(_) => create_element(&device, picture_mode),
++        }
++    }
++}
++
++fn source_caps(device: &gst::Device, picture_mode: bool) -> gst::Caps {
++    let caps = caps(device);
++    log::debug!("Found caps: {caps}");
++    let mut source_caps = if picture_mode {
++        utils::caps::best_resolution_for_stills(&caps)
++    } else {
++        gst::Caps::new_empty()
++    };
++    source_caps.merge(filter_caps(&caps));
++    log::debug!("Using caps: {source_caps}");
++    source_caps
++}
++
++/// pipewiresrc 1.0 restarts the camera for every RECONFIGURE event, and
++/// camerabin sends several for each picture without changing the format.
++/// Drop those whose preferred caps match the caps in use, as pipewiresrc
++/// itself does from PipeWire 1.1.81 (commit e2e8cf79).
++fn drop_redundant_reconfigure(pad: &gst::Pad, info: &mut gst::PadProbeInfo) -> gst::PadProbeReturn {
++    use gst::prelude::*;
++
++    if !info
++        .event()
++        .is_some_and(|event| event.type_() == gst::EventType::Reconfigure)
++    {
++        return gst::PadProbeReturn::Ok;
++    }
++    let Some(current) = pad.current_caps() else {
++        return gst::PadProbeReturn::Ok;
++    };
++
++    // What the source would negotiate: its caps, filtered downstream.
++    let source = pad.peer().map(|peer| peer.query_caps(None));
++    let caps = pad.query_caps(source.as_ref());
++    match caps.structure(0) {
++        Some(preferred) if gst::Caps::from(preferred.to_owned()).can_intersect(&current) => {
++            log::debug!("Skipping a reconfiguration that keeps {current}");
++            gst::PadProbeReturn::Drop
+         }
++        _ => gst::PadProbeReturn::Ok,
+     }
+ }
+ 
+@@ -201,7 +253,8 @@
+ 
+ fn create_element(
+     device: &gst::Device,
+-) -> Result<Option<(gst::Element, gst::Element)>, glib::BoolError> {
++    picture_mode: bool,
++) -> Result<Option<(gst::Element, gst::Element, gst::Element)>, glib::BoolError> {
+     use gst::prelude::*;
+ 
+     let bin = gst::Bin::new();
+@@ -209,13 +262,13 @@
+     let device_src = device.create_element(None)?;
+     device_src.set_property("client-name", crate::APP_ID.get().unwrap());
+ 
+-    let caps = caps(device);
+-    log::debug!("Found caps: {caps}");
+-    let highest_res_caps = filter_caps(&caps);
+-    log::debug!("Using caps: {highest_res_caps}");
+     let capsfilter = gst::ElementFactory::make("capsfilter")
+-        .property("caps", &highest_res_caps)
++        .property("caps", source_caps(device, picture_mode))
+         .build()?;
++    capsfilter
++        .static_pad("sink")
++        .unwrap()
++        .add_probe(gst::PadProbeType::EVENT_UPSTREAM, drop_redundant_reconfigure);
+     let decodebin3 = gst::ElementFactory::make("decodebin3").build()?;
+ 
+     let videoflip = gst::ElementFactory::make("videoflip")
+@@ -243,5 +296,5 @@
+         .build()
+         .expect("Missing GStreamer Bad Plug-ins");
+ 
+-    Ok(Some((wrapper, device_src)))
++    Ok(Some((wrapper, device_src, capsfilter)))
+ }
+--- a/aperture/src/viewfinder.rs
++++ b/aperture/src/viewfinder.rs
+@@ -35,6 +35,8 @@
+         pub zbar_branch: RefCell<Option<gst::Element>>,
+         pub devices: OnceCell<crate::DeviceProvider>,
+         pub camera_src: RefCell<Option<gst::Element>>,
++        pub capsfilter: RefCell<Option<gst::Element>>,
++        pub picture_mode: Cell<bool>,
+         pub camerabin: OnceCell<gst::Element>,
+         pub sink_paintable: OnceCell<gst::Element>,
+         pub tee: OnceCell<crate::PipelineTee>,
+@@ -143,13 +145,19 @@
+ 
+                 // TODO This is incredibly not idiomatic.
+                 let guard = self.camera_src.borrow();
+-                match camera.source_element(guard.as_ref()) {
+-                    Ok(Some((bin, camera_src))) => {
++                match camera.source_element(guard.as_ref(), self.picture_mode.get()) {
++                    Ok(Some((bin, camera_src, capsfilter))) => {
+                         drop(guard);
+                         self.camerabin().set_property("camera-source", &bin);
+                         self.camera_src.replace(Some(camera_src));
++                        self.capsfilter.replace(Some(capsfilter));
++                    }
++                    Ok(None) => {
++                        drop(guard);
++                        // The source now targets this camera; filter it with
++                        // this camera's caps.
++                        self.update_source_caps();
+                     }
+-                    Ok(None) => (),
+                     Err(err) => {
+                         log::error!("Could not get source element: {err}");
+                         self.set_state(ViewfinderState::Error);
+@@ -167,6 +175,24 @@
+ 
+             obj.notify_camera();
+         }
++
++        /// Filters the source for the current camera and mode. A change
++        /// restarts the stream, so it waits for a capture to finish.
++        pub(crate) fn update_source_caps(&self) {
++            if self.is_taking_picture.get() || self.is_recording_video.borrow().is_some() {
++                return;
++            }
++            let (Some(camera), Some(capsfilter)) =
++                (self.camera.borrow().clone(), self.capsfilter.borrow().clone())
++            else {
++                return;
++            };
++
++            let caps = camera.source_caps(self.picture_mode.get());
++            if capsfilter.property::<gst::Caps>("caps") != caps {
++                capsfilter.set_property("caps", &caps);
++            }
++        }
+     }
+ 
+     #[glib::object_subclass]
+@@ -461,6 +487,22 @@
+         }
+     }
+ 
++    /// Sets whether the viewfinder streams for pictures.
++    ///
++    /// Pictures are taken from the viewfinder's stream. In picture mode it
++    /// streams at the camera's largest resolution, so that pictures are taken
++    /// at full resolution without restarting the camera. Otherwise it streams
++    /// at the size used for recording, at most 1080p.
++    ///
++    /// Changing the mode restarts the stream once; during a capture, the
++    /// change waits for the capture to finish.
++    pub fn set_picture_mode(&self, picture_mode: bool) {
++        let imp = self.imp();
++        if imp.picture_mode.replace(picture_mode) != picture_mode {
++            imp.update_source_caps();
++        }
++    }
++
+     /// Takes a picture.
+     ///
+     /// The recording will be saved to `location`. This method throws an error
+@@ -660,6 +702,7 @@
+         self.imp().is_taking_picture.set(false);
+ 
+         self.emit_picture_done(Some(file));
++        self.imp().update_source_caps();
+     }
+ 
+     fn on_video_done(&self) {
+@@ -669,6 +712,7 @@
+             let file = gio::File::for_path(path);
+             self.emit_recording_done(Some(&file));
+         }
++        self.imp().update_source_caps();
+     }
+ 
+     fn on_barcode_detected(&self, data_type: crate::CodeType, data: &str) {
+--- a/src/widgets/camera.rs
++++ b/src/widgets/camera.rs
+@@ -340,6 +340,11 @@
+         if matches!(shutter_mode, crate::ShutterMode::Picture) {
+             self.stop_recording();
+         }
++        // Pictures are taken from the viewfinder's stream: stream at full
++        // resolution for pictures, at the recording size for video.
++        self.imp()
++            .viewfinder
++            .set_picture_mode(matches!(shutter_mode, crate::ShutterMode::Picture));
+         self.imp()
+             .camera_controls_horizontal
+             .set_shutter_mode(shutter_mode);

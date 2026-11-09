@@ -88,3 +88,30 @@ sudo reboot                                        # undo: sudo rm /etc/ubuntu-g
 
 If a test hangs or resets the tablet, that is the result: a reboot comes back
 without the cameras (the switch does not persist, the DTB keeps them disabled).
+
+## GNOME Camera's picture path (no root)
+
+Two read-only tools, run as the desktop user while the camera is enabled.
+Copy them over yourself (`make-kit.sh` does not include them):
+
+```sh
+scp tools/inplace/cameras/{camerabin-photos,measure-stream}.py <user>@<tablet>:
+python3 ~/measure-stream.py 1280x1080 4120x3096+gl     # fps, CPU, GPU MHz, csid0 rate
+python3 ~/camerabin-photos.py --mode stock --pictures 10
+python3 ~/camerabin-photos.py --mode patched --pictures 10
+```
+
+- `measure-stream.py` streams one size at a time through pipewiresrc, with a
+  headless GL upload for `+gl`. Stick to sizes known to work: on
+  libcamera-gts9u10/11, 1400x1050 makes the GPU debayer fail and the
+  libcamera node then aborts the whole PipeWire daemon, the user's audio with
+  it.
+- `camerabin-photos.py` rebuilds Snapshot 46.2's picture pipeline (camerabin,
+  wrappercamerabinsrc around `pipewiresrc ! capsfilter ! decodebin3 !
+  videoflip`) with a fakesink viewfinder. It takes pictures as aperture
+  does, then reports each JPEG's size, the libcamera configurations in the
+  user journal, and the longest viewfinder stall. `--mode patched`
+  reproduces `packaging/gnome-snapshot`'s caps and its RECONFIGURE probe in
+  Python.
+- Both fail with "Pipeline handler in use by another process" while
+  another libcamera client, such as `cam`, holds the camera.

@@ -407,6 +407,22 @@ if [ ! -f "$base/out/packages/libspa-0.2-bluetooth_${pipewire_aac_version}_arm64
 	printf '%s\n' "$pipewire_aac_fingerprint" > "$pipewire_aac_stamp"
 fi
 
+# GNOME Camera rebuilt to take pictures at the camera's full resolution.
+snapshot_stamp=$base/out/packages/.gts9u-snapshot-inputs.sha256
+snapshot_fingerprint=$(
+	{
+		sha256sum "$repo/scripts/build-snapshot-package.sh"
+		find "$repo/packaging/gnome-snapshot" -type f -print0 |
+			sort -z | xargs -0 sha256sum
+	} | sha256sum | awk '{print $1}'
+)
+if ! ls "$base"/out/packages/gnome-snapshot_*+gts9u*_arm64.deb >/dev/null 2>&1 || \
+   [ "$(cat "$snapshot_stamp" 2>/dev/null || true)" != "$snapshot_fingerprint" ]; then
+	echo 'GNOME Camera package inputs changed or the package is missing; rebuilding it'
+	bash "$repo/scripts/build-snapshot-package.sh" >/dev/null
+	printf '%s\n' "$snapshot_fingerprint" > "$snapshot_stamp"
+fi
+
 # Newest build of each, so repeated builds do not accumulate stale versions.
 stage_debs=$base/out/local-debs
 rm -rf -- "$stage_debs"
@@ -418,7 +434,7 @@ for pkg in libssc hexagonrpcd iio-sensor-proxy \
     gnome-settings-daemon gnome-settings-daemon-common $npu_package \
     pipewire pipewire-bin pipewire-audio pipewire-pulse pipewire-alsa \
     libpipewire-0.3-0t64 libpipewire-0.3-modules libspa-0.2-modules \
-    libspa-0.2-bluetooth gstreamer1.0-pipewire; do
+    libspa-0.2-bluetooth gstreamer1.0-pipewire gnome-snapshot; do
 	deb=$(ls -t "$base"/out/packages/${pkg}_*.deb 2>/dev/null | head -1 || true)
 	if [ -z "$deb" ]; then
 		echo "missing local package: $pkg" >&2

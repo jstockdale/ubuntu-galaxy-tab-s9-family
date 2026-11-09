@@ -84,7 +84,11 @@ The device package also installs the udev rule for `/dev/udmabuf`, needed so
 the software ISP can allocate buffers without privileges. The kernel includes a
 pinned, signed `v4l2loopback` to create four capture nodes, and
 `v4l2-relayd-gts9u` feeds them on demand from the PipeWire sources. The desktop
-image includes GNOME Camera and `gstreamer1.0-gl`. A clean build therefore
+image includes GNOME Camera and `gstreamer1.0-gl`. GNOME Camera is Noble's
+Snapshot 46.2 rebuilt by `scripts/build-snapshot-package.sh`
+(`46.2-1ubuntu2+gts9u1`) so that it takes pictures at the camera's full
+resolution instead of 1280x1080
+([`gts9wifi-cameras.md`](gts9wifi-cameras.md)). A clean build therefore
 offers the four named cameras to browsers and V4L2 applications with no scenes
 and no per-user setup. That is the SM-X910: the camera table is per board
 (`ubuntu-gts9u-camera-profile`). The SM-X710 gets a node only for a sensor
@@ -484,7 +488,7 @@ to the microSD card on every boot); `GTS9U_EXTRA_CMDLINE` and
 | 0 | `stage-android-tools.sh` | `mkbootimg.py` with `gki/`, `mkdtboimg.py` and `avbtool.py` in `$W/tools` |
 | 0 | `stage-firmware.py stage` | the verified `FIRMWARE_DIR` and its `PROVENANCE.json` |
 | 1 | `build-mainline-kernel.sh` (no root) | in `$W/out/kernel-$DEVICE`: `Image.gz`, `sm8550-samsung-$DEVICE.dtb`, `config`, `kernel.release`, `SHA256SUMS`, `fingerprint.layers`, and `modules-root/` (about 60 signed modules: ath12k, qcomtee, snvm, the SPSS stack, netfilter, `v4l2loopback`, and `icc-bwmon` on the SM-X710) |
-| 2 | `build-ubuntu-rootfs.sh` (root) | builds or reuses every local `.deb` (companion, device, libfprint, gnome-settings-daemon, fingerprint owner, SPSS IRQ module, NPU, fprintd, sensors, camera, extras, PipeWire AAC) into `$W/out/packages`, then runs `mmdebstrap` into the rootfs |
+| 2 | `build-ubuntu-rootfs.sh` (root) | builds or reuses every local `.deb` (companion, device, libfprint, gnome-settings-daemon, fingerprint owner, SPSS IRQ module, NPU, fprintd, sensors, camera, extras, PipeWire AAC, GNOME Camera) into `$W/out/packages`, then runs `mmdebstrap` into the rootfs |
 | 2 | `sanitize-release-rootfs.py` | refuses personal data in the rootfs and removes the build's SSH host keys |
 | 3 | `build-rootfs-overlay.sh` | the module and firmware overlay `$W/out/rootfs-overlay`, and `$W/out/initramfs-overlay` for the `vendor_boot` fragment |
 | 4 | `build-ufs-image.sh` (root) | Ubuntu's initramfs and the root's ext4 image `$W/out/ubuntu-$DEVICE[-bl<rev>]-v<version>-ufs.img`, with no partition table |
