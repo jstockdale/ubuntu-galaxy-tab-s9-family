@@ -8586,3 +8586,34 @@ on-device test waits for the build.
   `apt-get -s`: 3 upgraded, none removed.
 - The lens-pads kit (`6fa3d29`, DTB `19de4789…`) is staged in `~/cam-pads`,
   for the same reboot.
+
+### Device 2.67 and full-resolution GNOME Camera on squirtle (2026-11-09)
+
+The camera packages were built once for both tablets, by the X910 release
+build, from `feature/sm-x710-gts9wifi` `eda9c92`. Its camera files are
+byte-identical to `claude/x710-cx-kit` `711c0fa`; `build-camera-packages.sh`
+now matches `eda9c92`'s exactly.
+- `libcamera-gts9u` gts9u13 `508b44281d67cb854c835beee22fa1e835ab78b726a2a4c59f16191fbe2d1326`:
+  `ipa_soft_simple.so` changed from gts9u12's (SoftAf keeps its focus across
+  stream reconfigurations); the file list is unchanged.
+- `libspa-0.2-libcamera-gts9u` 1.0.5-gts9u14 `f4c04298c2102e2ada7f7d9a767d54f0ed9d4334c77e82e0eec5b27322468fa6`:
+  the SPA binary is unchanged; only the pin is new.
+- `ubuntu-gts9u-device_2.67_arm64.deb` `d0344d9cc0179cea8b449138db651b40b800a7a95597dbce1948eede6305554b`
+  (`4d4d243`, built against the CX kernel tree): the contents are 2.62's,
+  with only the version and the pins changed. 2.63 to 2.66 belong to X910
+  builds.
+- `gnome-snapshot_46.2-1ubuntu2+gts9u1_arm64.deb` `278cd56392e2c70a…`: the
+  copy the full-resolution session validated and staged
+  (`claude/x710-snapshot-stills` `79abfeb`).
+
+Installed on boot `1883367c`:
+- 4 upgraded, 0 removed; `dpkg --audit` clean;
+- PipeWire and WirePlumber restarted (15:58:56) with no old libcamera mapped;
+- the Beats were not connected at the time and did not reconnect.
+The kit is in `~/ubuntu-gts9u/backups/device-267-kit`, and staged on squirtle
+in `~/device-2.67`.
+
+**Pending, owner:**
+- photos at 4120x3096;
+- 10 photos in a row;
+- a recording that starts without a focus sweep.
