@@ -40,10 +40,10 @@ index 2f9f15f4a..bca3e55b1 100644
  
 diff --git a/src/ipa/simple/soft_af.cpp b/src/ipa/simple/soft_af.cpp
 new file mode 100644
-index 000000000..9a961fb0e
+index 000000000..c659a31d0
 --- /dev/null
 +++ b/src/ipa/simple/soft_af.cpp
-@@ -0,0 +1,753 @@
+@@ -0,0 +1,771 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast-detection autofocus for the software ISP
@@ -131,10 +131,28 @@ index 000000000..9a961fb0e
 +	samples_.clear();
 +	result_.reset();
 +
-+	if (mode_ == Mode::Continuous)
-+		waitStable(true);
-+	else
++	if (mode_ != Mode::Continuous) {
 +		stop();
++		return;
++	}
++
++	/*
++	 * A new configuration of the same camera (an application taking a
++	 * photo, or starting a recording) restarts the stream, not the scene.
++	 * Keep the focus and its reference, and search again only if the
++	 * contrast says the scene changed: a full scan here wandered through
++	 * the whole range at the start of every video.  The statistics come
++	 * from the raw frame, so the score does not depend on the output size.
++	 */
++	if (reference_ && (state_ == State::Focused || state_ == State::Failed)) {
++		phase_ = Phase::Locked;
++		lockedRecent_.clear();
++		lockedSamples_ = 0;
++		lastLockedScore_ = 0;
++		return;
++	}
++
++	waitStable(true);
 +}
 +
 +void SoftAf::stop()
