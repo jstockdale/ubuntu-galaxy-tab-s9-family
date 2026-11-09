@@ -2406,6 +2406,27 @@
 	};
 };
 
+/*
+ * CCI1 master 0 (the rear DW9808 lens and its EEPROM): stock's pad settings,
+ * 4 mA and the TLMM's weak pull-up.  sm8550.dtsi gives 2 mA and the strong
+ * 2.2 kOhm I2C pull-up, to the SoC's 1.8 V, which stays up while the module's
+ * own rail and VIO (L4B) are off: the pull-ups can then feed the unpowered
+ * lens through its pins, so that it never quite resets.  After a power-down
+ * that was recent, or taken mid-move, the lens's first write timed out
+ * (squirtle, 2026-11-08), with the 10 ms power-up delay too.
+ */
+&cci1_0_default {
+	sda-pins {
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+
+	scl-pins {
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+};
+
 &cci1_i2c0 {
 	/* Stock actuator0: slave-addr 0x18 (8-bit), CCI1 master 0. */
 	gts9_rear_focus: lens@c {
