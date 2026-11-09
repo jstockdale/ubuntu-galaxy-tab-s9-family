@@ -10,8 +10,8 @@ Depends: alsa-utils, systemd, kmod, e2fsprogs, gdisk, parted, util-linux, cloud-
  fprintd, libpam-fprintd,
  libfprint-2-2 (>= 1:1.94.7+tod1-0ubuntu5~24.04.9+gts9u48),
  hexagonrpcd, libssc, iio-sensor-proxy,
- libcamera-gts9u (= 0.7.2+53.g62d4bfc-gts9u10),
- libspa-0.2-libcamera-gts9u (= 1.0.5-gts9u11),
+ libcamera-gts9u (= 0.7.2+53.g62d4bfc-gts9u11),
+ libspa-0.2-libcamera-gts9u (= 1.0.5-gts9u12),
  v4l2-relayd-gts9u (= 0.1.2-gts9u16)
 Description: Device support for the Samsung Galaxy Tab S9 Ultra and S9 Wi-Fi
  Board-specific integration for the SM-X910 (gts9uwifi) running an Ubuntu
