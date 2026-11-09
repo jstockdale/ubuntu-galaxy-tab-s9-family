@@ -368,6 +368,12 @@ apply_unless 'consume_retained_sink_dfp' \
 apply_unless 'Re-probe driverless partner alternate modes' \
 	drivers/usb/typec/class.c \
 	typec-reprobe-partner-altmodes-on-role-change.patch
+# In USB host role the xHCI refuses system suspend (-EINVAL: root hubs not
+# suspended).  ubuntu-gts9u-usb-role (a system-sleep hook) works around it
+# for hubs and docks with nothing attached; this logs the root hub states
+# whenever it still happens, to find the cause.
+apply_unless 'suspend refused: root hub states' \
+	drivers/usb/host/xhci.c xhci-say-why-suspend-is-refused.patch
 apply_unless 'disable_irq_nosync(irq)' \
 	drivers/remoteproc/qcom_q6v5.c \
 	qcom-q6v5-mask-completed-handover-irq.patch

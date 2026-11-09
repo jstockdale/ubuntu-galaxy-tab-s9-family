@@ -268,3 +268,13 @@ CONFIG_GUNYAH_IOEVENTFD=y
 # Rust is not needed for the bring-up kernel and would couple the build to a
 # newer toolchain than Ubuntu 24.04 currently ships.
 # CONFIG_RUST is not set
+
+# PMK8550 RTC, as on the SM-X710 (config-gts9wifi.fragment): the alarm that
+# wakes a timed suspend (rtcwake, systemd WakeSystem= timers).  Under
+# Samsung's firmware it is a free-running counter, not the wall clock, so the
+# kernel must not copy it into the system clock at boot;
+# ubuntu-gts9u-rtc-restore.service sets the clock from the counter plus the
+# offset saved at the last NTP synchronisation.  Until 2026-11-08 the Ultra
+# had the driver only as an unshipped module, so it had no /dev/rtc0.
+CONFIG_RTC_DRV_PM8XXX=y
+# CONFIG_RTC_HCTOSYS is not set

@@ -1,0 +1,29 @@
+From: Ubuntu gts9uwifi port contributors <gts9uwifi@example.com>
+Subject: [PATCH] usb: xhci: say why a system suspend is refused
+
+On the SM-X910 in USB host role, xhci_suspend() returns -EINVAL because
+its root hubs are not in HC_STATE_SUSPENDED, and the only trace is the PM
+core's "platform_pm_suspend returns -22".  Log both root hub states
+when that happens, to find out why they were not suspended.
+
+Signed-off-by: Ubuntu gts9uwifi port contributors <gts9uwifi@example.com>
+
+---
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -960,8 +960,14 @@
+ 		return 0;
+ 
+ 	if (hcd->state != HC_STATE_SUSPENDED ||
+-	    (xhci->shared_hcd && xhci->shared_hcd->state != HC_STATE_SUSPENDED))
++	    (xhci->shared_hcd && xhci->shared_hcd->state != HC_STATE_SUSPENDED)) {
++		/* Name the culprit: the caller only sees -EINVAL. */
++		xhci_warn(xhci, "suspend refused: root hub states %d/%d (want %d)\n",
++			  hcd->state,
++			  xhci->shared_hcd ? xhci->shared_hcd->state : -1,
++			  HC_STATE_SUSPENDED);
+ 		return -EINVAL;
++	}
+ 
+ 	/* Clear root port wake on bits if wakeup not allowed. */
+ 	xhci_disable_hub_port_wake(xhci, &xhci->usb3_rhub, do_wakeup);

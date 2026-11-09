@@ -1,0 +1,78 @@
+#!/bin/sh
+# systemd-sleep hook: $1 is pre or post.
+#
+# With the USB-C port in host role, the xHCI controller refuses system
+# suspend: its root hubs are not suspended when its own callback runs, so
+# xhci_suspend() returns -EINVAL and every suspend fails (SM-X910, kernel
+# 7.2, 2026-11-08).  Leaving host role first works, as unplugging does: the
+# controller is removed and the tablet sleeps.  So for the sleep, and only
+# when nothing below the root hubs matters -- hubs and USB Billboard devices
+# (a dock's or a hub's own controller and its alt-mode descriptor) -- the
+# port switches to device role, and back to host after resume if the USB-C
+# partner is still there.  A keyboard, a drive or any other device keeps
+# host role untouched: switching would disconnect it, and a mounted drive
+# must not be pulled out from under its filesystem.
+#
+# GTS9U_SYSFS and GTS9U_RUN exist for the tests.
+sys=${GTS9U_SYSFS:-/sys}
+run=${GTS9U_RUN:-/run/ubuntu-gts9u}
+stamp=$run/usb-role-before-sleep
+
+role=
+for r in "$sys"/class/usb_role/*/role; do
+	[ -f "$r" ] && { role=$r; break; }
+done
+[ -n "$role" ] || exit 0
+
+# True when every USB device below the root hubs is a hub (09) or a
+# Billboard device (11), judged by the device class or, where that is 00,
+# by every interface.
+only_hubs_and_billboards() {
+	for d in "$sys"/bus/usb/devices/*; do
+		n=${d##*/}
+		case $n in
+		usb* | *:*) continue ;;
+		esac
+		[ -f "$d/bDeviceClass" ] || continue
+		case $(cat "$d/bDeviceClass") in
+		09 | 11) continue ;;
+		00) ;;
+		*) return 1 ;;
+		esac
+		for i in "$d":*; do
+			[ -f "$i/bInterfaceClass" ] || continue
+			case $(cat "$i/bInterfaceClass") in
+			09 | 11) ;;
+			*) return 1 ;;
+			esac
+		done
+	done
+	return 0
+}
+
+case $1 in
+pre)
+	[ "$(cat "$role")" = host ] || exit 0
+	only_hubs_and_billboards || exit 0
+	mkdir -p "$run"
+	echo host > "$stamp"
+	echo device > "$role"
+	# The controller goes away as it does on unplug; give it 3 s.
+	i=0
+	while [ $i -lt 30 ] && [ -n "$(ls -d "$sys"/bus/usb/devices/usb* 2>/dev/null)" ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	;;
+post)
+	[ -f "$stamp" ] || exit 0
+	rm -f "$stamp"
+	# Only if the partner is still attached; otherwise USB-C sets the role.
+	if [ -z "$(ls -d "$sys"/class/typec/port*-partner 2>/dev/null)" ] &&
+		[ -d "$sys/class/typec" ]; then
+		exit 0
+	fi
+	echo host > "$role"
+	;;
+esac
+exit 0
