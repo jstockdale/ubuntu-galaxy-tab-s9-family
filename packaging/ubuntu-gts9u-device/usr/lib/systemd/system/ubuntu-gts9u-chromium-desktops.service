@@ -1,6 +1,12 @@
 [Unit]
 Description=Apply SM-X910 rendering defaults to native Chromium app launchers
 After=local-fs.target
+# The .path unit starts this on every change to /usr/share/applications,
+# and an apt transaction writes many launchers a second: the default limit
+# (5 starts in 10 s) failed it, and the watcher with it, until the next
+# boot (100 packages on both tablets, 2026-11-09).  It is idempotent and
+# cheap, so it is never limited.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

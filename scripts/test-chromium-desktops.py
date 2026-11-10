@@ -47,4 +47,8 @@ with tempfile.TemporaryDirectory() as directory:
         refresh(True); assert not generated.exists()
         (source / 'example.desktop').write_text(text + 'X-GTS9U-Chromium-Defaults=false\n')
         refresh(); assert not generated.exists()
-print('PASS: discovery, clean install, updates, arguments, explicit flags, opt-out and safe removal')
+units = base.parent / 'lib/systemd/system'
+assert 'Unit=ubuntu-gts9u-chromium-desktops.service' in (units / 'ubuntu-gts9u-chromium-desktops.path').read_text()
+# A package transaction triggers it in bursts; a start limit would fail the watcher.
+assert 'StartLimitIntervalSec=0' in (units / 'ubuntu-gts9u-chromium-desktops.service').read_text()
+print('PASS: discovery, clean install, updates, arguments, explicit flags, opt-out, safe removal and burst triggers')
