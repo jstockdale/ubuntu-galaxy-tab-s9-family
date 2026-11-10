@@ -76,8 +76,10 @@ and staging errors are reported without starting the installation.
 The updater never executes the TWRP installer, writes `rootfs.img`, formats
 storage, or writes `userdata`, `linuxroot`, `super`, `recovery` or `vbmeta`.
 It installs Debian packages through APT with removal and unauthenticated
-packages disallowed. Port configuration files use Debian conffile handling:
-modified settings are retained; new defaults can be left as `.dpkg-dist`.
+packages disallowed, and without `Recommends`: a fresh image has none, so
+an updated installation ends with the same packages as a fresh one. Port
+configuration files use Debian conffile handling: modified settings are
+retained; new defaults can be left as `.dpkg-dist`.
 Home directories, dconf settings, application data, accounts, fingerprints,
 SSH identity, Wi-Fi connections and Android storage are not replaced by the
 fresh image. Normal package migrations can add required services or groups.

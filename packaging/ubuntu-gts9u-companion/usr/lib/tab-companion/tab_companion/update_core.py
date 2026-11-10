@@ -179,7 +179,9 @@ def cache_local_packages(transaction, plan):
 
 def apt_args(transaction, download=False):
     plan = json.loads((transaction / "plan.json").read_text())
-    return ["apt-get", "-y", "--no-remove", "--reinstall",
+    # No Recommends: a fresh image gets none (mmdebstrap), so an update that
+    # pulled them would leave updated and freshly flashed devices different.
+    return ["apt-get", "-y", "--no-remove", "--reinstall", "--no-install-recommends",
             "--download-only" if download else "--no-download",
             "-o", "Dpkg::Options::=--force-confold",
             "-o", "Dpkg::Options::=--force-confdef",

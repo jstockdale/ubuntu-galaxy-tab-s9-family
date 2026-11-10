@@ -142,6 +142,7 @@ class PayloadTests(unittest.TestCase):
         args = c.apt_args(self.root)
         self.assertIn("--no-remove", args)
         self.assertIn("--no-download", args)
+        self.assertIn("--no-install-recommends", args)
         self.assertIn("Dpkg::Options::=--force-confold", args)
         self.assertNotIn("--allow-unauthenticated", args)
         self.assertNotIn("--allow-downgrades", args)
