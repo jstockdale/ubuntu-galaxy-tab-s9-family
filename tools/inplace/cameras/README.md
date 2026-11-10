@@ -88,3 +88,18 @@ sudo reboot                                        # undo: sudo rm /etc/ubuntu-g
 
 If a test hangs or resets the tablet, that is the result: a reboot comes back
 without the cameras (the switch does not persist, the DTB keeps them disabled).
+
+## Before a risky camera test
+
+An untested stream size hung squirtle on 2026-11-10 (30+ tasks in D state,
+the disk stalled). Before trying a new size, start
+[`hang-capture.sh`](hang-capture.sh) on the host, in two terminals: `log`
+streams the kernel log to a file there, and `shell` keeps a root shell open
+that can trigger sysrq without the disk. With the
+[hang-log kit](../hang-log/README.md#before-a-risky-test-hang-capturesh-host)
+installed, `netconsole` adds a channel that does not depend on sshd.
+
+```sh
+sh tools/inplace/cameras/hang-capture.sh log <user>@<tablet>
+sh tools/inplace/cameras/hang-capture.sh shell <user>@<tablet>
+```
