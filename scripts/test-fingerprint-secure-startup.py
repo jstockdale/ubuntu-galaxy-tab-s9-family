@@ -105,6 +105,32 @@ class Startup(unittest.TestCase):
             with patch.object(startup.time, 'monotonic', side_effect=lambda: real() + 30):
                 startup.wait_ready()
 
+    def test_refused_duplicate_keeps_the_running_record(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(startup, 'STATE', Path(directory)), \
+             patch.object(startup, 'protected'), patch.object(startup.os, 'geteuid', return_value=0), \
+             patch.object(startup, 'runtime_preflight'), patch.object(startup, 'command') as command:
+            # The running startup's ready lease, its owner alive.
+            ready = dict(state='ready', expires=startup.time.monotonic() + 5, owner_pid=os.getpid(),
+                         writer_pid=os.getppid(), written=startup.time.monotonic())
+            (Path(directory) / 'status.json').write_text(json.dumps(ready))
+            (Path(directory) / 'attempt').touch()
+            with self.assertRaisesRegex(RuntimeError, 'already attempted'):
+                startup.boot()  # the real fresh_preflight refuses
+            command.assert_not_called()
+            self.assertEqual(json.loads((Path(directory) / 'status.json').read_text()), ready)
+
+    def test_real_fresh_preflight_refusal_is_published(self):
+        # No running startup left (its record's writer is gone): publish.
+        with tempfile.TemporaryDirectory() as directory, patch.object(startup, 'STATE', Path(directory)), \
+             patch.object(startup, 'protected'), patch.object(startup.os, 'geteuid', return_value=0), \
+             patch.object(startup, 'runtime_preflight'):
+            self.failed_record(directory, self.dead_pid(), startup.time.monotonic() - 100)
+            (Path(directory) / 'attempt').touch()
+            with self.assertRaisesRegex(RuntimeError, 'already attempted'):
+                startup.boot()
+            record = json.loads((Path(directory) / 'status.json').read_text())
+            self.assertEqual((record['state'], record['writer_pid']), ('failed', os.getpid()))
+
     def test_retry_that_fails_again_is_immediate(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(startup, 'STATE', Path(directory)), \
              patch.object(startup, 'protected'), patch.object(startup.time, 'sleep') as sleep:
