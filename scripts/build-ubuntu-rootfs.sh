@@ -117,6 +117,10 @@ strace,tree
 #                      system-config-printer-common.  The per-vendor
 #                      printer-driver-* and hplip stay out: IPP Everywhere
 #                      and AirPrint printers need none.
+#   libnss-mdns        avahi-daemon finds printers and hosts, but without its
+#                      NSS module nothing resolves a .local name: cupsd
+#                      could not reach EPSON40EF69.local, so adding a
+#                      discovered printer failed (2026-11-09).
 desktop_packages='
 ubuntu-desktop-minimal,gdm3,gnome-shell,gnome-session,gnome-control-center,
 gnome-initial-setup,
@@ -127,6 +131,7 @@ yaru-theme-icon,yaru-theme-gtk,yaru-theme-sound,yaru-theme-gnome-shell,
 gnome-keyring,libpam-gnome-keyring,
 cups,cups-bsd,cups-client,cups-filters,cups-browsed,ipp-usb,
 cups-pk-helper,system-config-printer-common,system-config-printer-udev,
+libnss-mdns,
 mesa-utils,mesa-vulkan-drivers,libgl1-mesa-dri,vulkan-tools,
 libdrm-tests,edid-decode,
 pipewire,pipewire-pulse,pipewire-audio,wireplumber,rtkit,
