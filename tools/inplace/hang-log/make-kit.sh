@@ -63,7 +63,8 @@ fix6_config=c17980f07ca04461e67dba7e1b3d58f9719d079f65bcc3d45b723fc2c27ccf5a
 # config-gts9wifi.fragment's hang-evidence lines ask for, and what Kconfig
 # derives from them (NETPOLL and NET_POLL_CONTROLLER from NETCONSOLE,
 # PRINTK_EXECUTION_CTX selected by NETCONSOLE_DYNAMIC, the lockup core and
-# the buddy hard-lockup detector, the new panic switches at their defaults).
+# the buddy hard-lockup detector, the new panic switches at their defaults;
+# PSTORE_COMPRESS off, so that a decayed panic record stays legible).
 expected_config_diff() {
 	cat <<'EOF'
 CONFIG_BOOTPARAM_HARDLOCKUP_PANIC	-	n
@@ -85,6 +86,7 @@ CONFIG_NETCONSOLE_EXTENDED_LOG	-	n
 CONFIG_NETPOLL	-	y
 CONFIG_NET_POLL_CONTROLLER	-	y
 CONFIG_PRINTK_EXECUTION_CTX	-	y
+CONFIG_PSTORE_COMPRESS	y	n
 CONFIG_PSTORE_FTRACE	n	y
 CONFIG_SOFTLOCKUP_DETECTOR	n	y
 CONFIG_SOFTLOCKUP_DETECTOR_INTR_STORM	-	n
