@@ -14,6 +14,13 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 . "$repo/scripts/lib/device.sh"
 base=${UBUNTU_WORKDIR:-/root/ubuntu-gts9u}
 rootfs=${ROOTFS_DIR:-$base/rootfs}
+# A desktop indexer (GNOME LocalSearch) set to index $HOME recursively walks
+# a workdir under $HOME, and into the rootfs's mounted /proc too: the
+# directory it held open there kept /proc busy after mmdebstrap and stopped
+# the v1.2.4 SM-X910 release twice (2026-11-09).  .trackerignore is in its
+# default ignored-directories-with-content.
+mkdir -p "$base"
+touch "$base/.trackerignore"
 profile=${GTS9U_PROFILE:-desktop}
 suite=${UBUNTU_SUITE:-noble}
 mirror=${UBUNTU_MIRROR:-http://ports.ubuntu.com/ubuntu-ports}
