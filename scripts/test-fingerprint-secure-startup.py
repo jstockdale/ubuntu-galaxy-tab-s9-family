@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -55,6 +56,71 @@ class Startup(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'startup failed'):
                     startup.wait_ready()
                 sleep.assert_not_called()
+
+    def dead_pid(self):
+        child = startup.subprocess.Popen(['true'])
+        child.wait()
+        return child.pid
+
+    def failed_record(self, directory, writer_pid, written):
+        (Path(directory) / 'status.json').write_text(json.dumps(dict(
+            state='failed', expires=written + 5, owner_pid=0,
+            writer_pid=writer_pid, written=written)))
+
+    def test_stale_preflight_failure_does_not_block_a_retry(self):
+        # Boot-time preflight failed and exited; the owner fixed the cause, and
+        # fprintd's Requires= is now retrying.  --wait must wait for the retry.
+        import threading
+        with tempfile.TemporaryDirectory() as directory, patch.object(startup, 'STATE', Path(directory)), \
+             patch.object(startup, 'protected'):
+            self.failed_record(directory, self.dead_pid(), startup.time.monotonic() - 100)
+            retry = threading.Timer(0.3, startup.publish, ('ready', Mock(pid=os.getpid())))
+            retry.start()
+            self.addCleanup(retry.cancel)
+            startup.wait_ready()
+
+    def test_published_preflight_failure_from_an_exited_run_is_stale(self):
+        # End to end through publish(): the failed boot-time run is another
+        # process, long gone, when the retry and --wait start.
+        import threading
+        with tempfile.TemporaryDirectory() as directory, patch.object(startup, 'STATE', Path(directory)), \
+             patch.object(startup, 'protected'):
+            child = ("import importlib.machinery, importlib.util, sys\n"
+                     "from pathlib import Path\n"
+                     "loader = importlib.machinery.SourceFileLoader('s', sys.argv[1])\n"
+                     "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('s', loader))\n"
+                     "loader.exec_module(m)\n"
+                     "m.STATE = Path(sys.argv[2])\n"
+                     "m.publish('failed')\n")
+            startup.subprocess.run([sys.executable, '-c', child, str(SCRIPT), directory], check=True)
+            record = json.loads((Path(directory) / 'status.json').read_text())
+            self.assertEqual(record['state'], 'failed')
+            self.assertIsInstance(record['writer_pid'], int)
+            with patch.object(startup.time, 'monotonic', return_value=record['written'] + 30):
+                self.assertFalse(startup.current_failure(record, record['written'] + 30))
+            retry = threading.Timer(0.3, startup.publish, ('ready', Mock(pid=os.getpid())))
+            retry.start()
+            self.addCleanup(retry.cancel)
+            real = startup.time.monotonic
+            with patch.object(startup.time, 'monotonic', side_effect=lambda: real() + 30):
+                startup.wait_ready()
+
+    def test_retry_that_fails_again_is_immediate(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(startup, 'STATE', Path(directory)), \
+             patch.object(startup, 'protected'), patch.object(startup.time, 'sleep') as sleep:
+            self.failed_record(directory, self.dead_pid(), startup.time.monotonic())
+            with self.assertRaisesRegex(RuntimeError, 'startup failed'):
+                startup.wait_ready()
+            sleep.assert_not_called()
+
+    def test_failure_after_startup_always_counts(self):
+        # The writer of a post-startup failure stays alive for the whole boot.
+        with tempfile.TemporaryDirectory() as directory, patch.object(startup, 'STATE', Path(directory)), \
+             patch.object(startup, 'protected'), patch.object(startup.time, 'sleep') as sleep:
+            self.failed_record(directory, os.getpid(), startup.time.monotonic() - 1000)
+            with self.assertRaisesRegex(RuntimeError, 'startup failed'):
+                startup.wait_ready()
+            sleep.assert_not_called()
 
     def test_valid_lease(self):
         self.assertTrue(startup.ready_record(dict(state='ready', expires=105, owner_pid=20), 100))

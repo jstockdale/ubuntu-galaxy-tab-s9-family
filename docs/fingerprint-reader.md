@@ -2546,7 +2546,18 @@ Device 2.71 makes an unprovisioned board cost nothing:
   failing.
 - As a second line, `--wait` fails at once when the runtime is missing, and
   `--boot` publishes `failed` when a preflight check fails, so `--wait` never
-  polls for a start that did not happen. A provisioned tablet is unchanged.
+  polls for a start that did not happen.
+- A preflight failure starts nothing, so fprintd's `Requires=` can retry it
+  in the same boot once the cause is fixed. Every record therefore names its
+  writer and when it was written, and `--wait` lets a `failed` record count
+  only if:
+  - its writer is still alive (a failure after the secure startup began, as
+    before); or
+  - it was written for this wait (the retry failed too).
+
+  A stale preflight failure from an exited run no longer fails the first
+  prompt after the fix; review found that case. A provisioned tablet is
+  otherwise unchanged.
 
 The gate is decided at every boot and `daemon-reload`, so installing the
 runtime takes effect at the next reboot, which the secure startup needs

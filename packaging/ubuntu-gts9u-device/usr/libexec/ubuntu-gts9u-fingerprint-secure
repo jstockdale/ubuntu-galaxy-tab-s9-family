@@ -81,13 +81,35 @@ def ready_record(record, now):
             and now < record['expires'] <= now + 6
             and isinstance(record.get('owner_pid'), int) and record['owner_pid'] > 1)
 
+def current_failure(record, started):
+    """Whether a 'failed' record still speaks for the secure startup.
+
+    A failure after the secure startup began keeps its writer alive for the
+    whole boot, and always counts.  A preflight failure exits at once and
+    starts nothing, and fprintd's Requires= starts the unit again: that retry
+    can still succeed, so such a record counts only if it was written for
+    this wait (the retry failed too), not before it.  The 2 s cover
+    fprintd's start reaching --wait.  A record without these fields predates
+    them and counts."""
+    pid, written = record.get('writer_pid'), record.get('written')
+    if not isinstance(pid, int) or pid <= 1 or not isinstance(written, (int, float)):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return written >= started - 2
+    except PermissionError:
+        pass
+    return True
+
 def wait_ready():
     # Without the runtime --boot can only fail, and before it publishes
     # anything: waiting would hold fprintd, and GDM's fingerprint request,
     # for the whole minute (blastoise, 2026-11-10).
     if not RUNTIME.exists():
         raise RuntimeError('secure runtime not installed; password remains available')
-    deadline = time.monotonic() + 60
+    started = time.monotonic()
+    deadline = started + 60
     while time.monotonic() < deadline:
         try:
             protected(STATE)
@@ -96,7 +118,7 @@ def wait_ready():
             record = json.loads(path.read_text())
             if not isinstance(record, dict):
                 raise RuntimeError('invalid secure readiness record')
-            if record.get('state') == 'failed':
+            if record.get('state') == 'failed' and current_failure(record, started):
                 raise RuntimeError('secure startup failed; password remains available')
             if ready_record(record, time.monotonic()):
                 os.kill(record['owner_pid'], 0)
@@ -107,8 +129,9 @@ def wait_ready():
     raise RuntimeError('secure readiness timed out; password remains available')
 
 def publish(state, owner=None):
-    record = dict(state=state, expires=time.monotonic() + 5,
-                  owner_pid=owner.pid if owner else 0)
+    now = time.monotonic()
+    record = dict(state=state, expires=now + 5, owner_pid=owner.pid if owner else 0,
+                  writer_pid=os.getpid(), written=now)
     temporary = STATE / 'status.tmp'
     temporary.write_text(json.dumps(record) + '\n')
     os.chmod(temporary, 0o600)
