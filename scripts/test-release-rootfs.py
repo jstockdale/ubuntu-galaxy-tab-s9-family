@@ -33,6 +33,33 @@ class ShippingRootTests(unittest.TestCase):
         module.sanitize(self.root)
         self.assertFalse(list((self.root / 'etc/ssh').glob('ssh_host_*')))
 
+    def add_snakeoil(self, enabled=True):
+        for name in ('etc/ssl/private/ssl-cert-snakeoil.key',
+                     'etc/ssl/certs/ssl-cert-snakeoil.pem',
+                     'usr/lib/systemd/system/ssl-cert.service'):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('build-only fixture', encoding='utf-8')
+        if enabled:
+            wants = self.root / 'etc/systemd/system/multi-user.target.wants/ssl-cert.service'
+            wants.parent.mkdir(parents=True)
+            # Absolute, as deb-systemd-helper writes it: dangling outside the image.
+            wants.symlink_to('/usr/lib/systemd/system/ssl-cert.service')
+
+    def test_removes_build_snakeoil_pair(self):
+        self.add_snakeoil()
+        module.sanitize(self.root)
+        self.assertFalse((self.root / 'etc/ssl/private/ssl-cert-snakeoil.key').exists())
+        self.assertFalse((self.root / 'etc/ssl/certs/ssl-cert-snakeoil.pem').exists())
+        self.assertTrue((self.root / 'usr/lib/systemd/system/ssl-cert.service').is_file())
+
+    def test_snakeoil_without_enabled_generation_unit_is_rejected_unmodified(self):
+        self.add_snakeoil(enabled=False)
+        with self.assertRaisesRegex(ValueError, 'snakeoil generation unit'):
+            module.sanitize(self.root)
+        self.assertTrue((self.root / 'etc/ssl/private/ssl-cert-snakeoil.key').exists())
+        self.assertTrue((self.root / 'etc/ssh/ssh_host_ed25519_key').exists())
+
     def test_rejects_personal_account_before_modifying_image(self):
         with (self.root / 'etc/passwd').open('a', encoding='utf-8') as file:
             file.write('owner:x:1000:1000:Owner:/home/owner:/bin/bash\n')

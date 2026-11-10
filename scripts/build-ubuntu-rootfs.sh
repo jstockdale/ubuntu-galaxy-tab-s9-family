@@ -92,8 +92,9 @@ usbutils,pciutils,ethtool,evtest,i2c-tools,v4l-utils,
 strace,tree
 '
 
-# Three things ubuntu-desktop-minimal or pipewire only recommends, and that a
-# build without them gets wrong in ways that look like distro bugs:
+# Things ubuntu-desktop-minimal, gnome-control-center or pipewire only
+# recommend, and that a build without them gets wrong in ways that look like
+# distro bugs:
 #
 #   yaru-theme-icon    without it only yaru-theme-gnome-shell arrives, the icon
 #                      theme falls back to Adwaita, and the Ubuntu-specific
@@ -109,6 +110,13 @@ strace,tree
 #                      org.freedesktop.DBus.Error.ServiceUnknown", and the
 #                      PipeWire data loops and Mutter's KMS thread run as
 #                      ordinary SCHED_OTHER threads.
+#   cups and friends   without them Settings > Printers says "No Print
+#                      Service" (SM-X910, 2026-11-09).  cups-browsed and
+#                      ipp-usb pick up driverless network and USB printers;
+#                      the panel adds printers through cups-pk-helper and
+#                      system-config-printer-common.  The per-vendor
+#                      printer-driver-* and hplip stay out: IPP Everywhere
+#                      and AirPrint printers need none.
 desktop_packages='
 ubuntu-desktop-minimal,gdm3,gnome-shell,gnome-session,gnome-control-center,
 gnome-initial-setup,
@@ -117,6 +125,8 @@ gnome-snapshot,gstreamer1.0-gl,
 mutter,xdg-desktop-portal-gnome,xdg-user-dirs,
 yaru-theme-icon,yaru-theme-gtk,yaru-theme-sound,yaru-theme-gnome-shell,
 gnome-keyring,libpam-gnome-keyring,
+cups,cups-bsd,cups-client,cups-filters,cups-browsed,ipp-usb,
+cups-pk-helper,system-config-printer-common,system-config-printer-udev,
 mesa-utils,mesa-vulkan-drivers,libgl1-mesa-dri,vulkan-tools,
 libdrm-tests,edid-decode,
 pipewire,pipewire-pulse,pipewire-audio,wireplumber,rtkit,

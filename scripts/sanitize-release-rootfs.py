@@ -48,10 +48,23 @@ def sanitize(root):
     unit = root / 'usr/lib/systemd/system/ubuntu-gts9u-ssh-host-keys.service'
     if not unit.is_file():
         raise ValueError('missing first-boot SSH host-key generation unit')
+    # ssl-cert, which CUPS pulls in, generates a snakeoil TLS pair while it
+    # installs.  Fresh images must not share that either; ssl-cert's own
+    # enabled ssl-cert.service generates a missing pair on the device.
+    snakeoil = (root / 'etc/ssl/private/ssl-cert-snakeoil.key',
+                root / 'etc/ssl/certs/ssl-cert-snakeoil.pem')
+    if any(path.is_file() or path.is_symlink() for path in snakeoil):
+        wants = root / 'etc/systemd/system/multi-user.target.wants/ssl-cert.service'
+        if not ((root / 'usr/lib/systemd/system/ssl-cert.service').is_file()
+                and wants.is_symlink()):
+            raise ValueError('missing first-boot snakeoil generation unit')
     for path in (root / 'etc/ssh').glob('ssh_host_*_key*'):
         if path.is_file() or path.is_symlink():
             path.unlink()
-    print('Release rootfs: no personal accounts/data; build SSH identities removed.')
+    for path in snakeoil:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+    print('Release rootfs: no personal accounts/data; build SSH and TLS identities removed.')
 
 
 if __name__ == '__main__':
