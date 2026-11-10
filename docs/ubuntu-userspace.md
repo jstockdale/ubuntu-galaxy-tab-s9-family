@@ -69,6 +69,25 @@ WirePlumber, BlueZ, `iio-sensor-proxy` and the bring-up tools (`strace`,
 `libdrm-tests`, `edid-decode`) are all in it. `linux-firmware` is not
 installed: every blob comes from the staged firmware overlay.
 
+**Recommends are listed, never implied.** mmdebstrap installs no
+`Recommends`, so whatever a stock Ubuntu desktop gets through them is missing
+unless it is listed. Builds up to v1.2.4 listed only a few, and the gaps
+looked like distro bugs:
+- Settings > Printers said "No Print Service", because there was no CUPS.
+- `.local` names did not resolve, because `libnss-mdns` was missing.
+- The Wi-Fi hotspot, captive-portal detection, network places and MTP
+  phones in Files, image thumbnails, the screen reader and CJK text did not
+  work either.
+
+A 2026-11-09 audit of every dropped `Recommends` added those, with Ubuntu's
+small standard applications: about 100 packages and 250 MiB installed. The
+comments in `build-ubuntu-rootfs.sh` list what stays out on purpose and why.
+Telemetry, cloud-init, fwupd, vendor printer drivers, plymouth, brltty and
+ModemManager stay out. `ntfs-3g` stays out too: its initramfs hook would
+spend half of init_boot's remaining 1 MB, and the kernel's NTFS3 already
+mounts NTFS. The updater installs the same list, so existing installations
+get the additions with their next update.
+
 `v4l-utils` is still the CAMSS diagnostic tool, but the normal path no longer
 ends at RAW10. `scripts/build-camera-packages.sh` pins and packages
 `libcamera` 0.7.2 (`62d4bfc`) with the `simple` pipeline, the software ISP,

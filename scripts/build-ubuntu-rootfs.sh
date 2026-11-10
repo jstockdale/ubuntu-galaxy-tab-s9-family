@@ -73,8 +73,19 @@ esac
 # rootfs without it, and `apt install firefox` then fails: in Ubuntu that
 # package exists only to install a snap.  apparmor userspace matters now that
 # the kernel enables the LSM, or the profiles Ubuntu ships never load.
+#
+# mmdebstrap installs no Recommends at all, so what ubuntu-standard and
+# openssh-server recommend arrives only when listed (audited 2026-11-09).
+# Listed: what a stock Ubuntu has and nothing here replaces.  Left out on
+# purpose: plymouth and friendly-recovery (the boot path, and the init_boot
+# budget), sysstat (a collector every 10 minutes), and ntfs-3g, whose
+# initramfs hook copies 0.5 MB into an initramfs with 1 MB to spare while
+# the kernel's built-in NTFS3 already mounts NTFS.
 base_packages='
 ubuntu-minimal,ubuntu-standard,
+bash-completion,command-not-found,manpages,uuid-runtime,ufw,iptables,
+iputils-tracepath,mtr-tiny,tcpdump,telnet,trace-cmd,numactl,
+ncurses-term,ssh-import-id,
 systemd,systemd-sysv,systemd-resolved,udev,dbus,
 initramfs-tools,busybox-initramfs,
 e2fsprogs,dosfstools,parted,gdisk,
@@ -121,6 +132,32 @@ strace,tree
 #                      NSS module nothing resolves a .local name: cupsd
 #                      could not reach EPSON40EF69.local, so adding a
 #                      discovered printer failed (2026-11-09).
+#
+# The rest of what ubuntu-desktop-minimal, gnome-shell, gnome-control-center,
+# nautilus, gnome-terminal and network-manager recommend was audited on
+# 2026-11-09.  Listed, because a stock Ubuntu desktop has them and features
+# quietly fail without them: dnsmasq-base (Wi-Fi hotspot and shared
+# connections), the connectivity check (captive portals), libproxy's plugins
+# (the system proxy), OpenVPN, Bluetooth file sending and printers,
+# gvfs-backends and gvfs-fuse (network places and MTP phones in Files),
+# libgdk-pixbuf2.0-bin (image thumbnails), xdg-utils (xdg-open), "Open in
+# Terminal", desktop privileges for mounting, password quality checks, event
+# sounds through PipeWire's Pulse server, the screen reader (orca,
+# speech-dispatcher) and accessibility themes, Noto and Liberation fonts
+# (CJK and many other scripts were empty boxes), and Ubuntu's small standard
+# applications: document and image viewers, calculator, clocks, system
+# monitor, disks, disk usage, characters, fonts, logs, passwords and keys,
+# and power statistics.
+# Left out on purpose: crash and usage reporting (apport-gtk, whoopsie,
+# kerneloops, ubuntu-report), cloud-init, laptop-detect, pcmciautils,
+# libpam-sss, fwupd (no LVFS firmware for these tablets), hplip and the
+# printer-driver-* set, plymouth, brltty (it claims USB serial adapters),
+# ModemManager and ppp (no modem, and ModemManager probes serial ports),
+# PPTP, bolt, switcheroo-control, gamemode, Xorg and Xephyr, rygel,
+# nautilus-sendto and the offline help.  Not yet, each needing its own test
+# on this hardware: ibus (input methods next to the on-screen keyboard),
+# systemd-oomd, GNOME Online Accounts with evolution-data-server, and
+# gnome-remote-desktop.
 desktop_packages='
 ubuntu-desktop-minimal,gdm3,gnome-shell,gnome-session,gnome-control-center,
 gnome-initial-setup,
@@ -132,6 +169,18 @@ gnome-keyring,libpam-gnome-keyring,
 cups,cups-bsd,cups-client,cups-filters,cups-browsed,ipp-usb,
 cups-pk-helper,system-config-printer-common,system-config-printer-udev,
 libnss-mdns,
+dnsmasq-base,network-manager-config-connectivity-ubuntu,
+libproxy1-plugin-gsettings,libproxy1-plugin-networkmanager,
+network-manager-openvpn-gnome,bluez-cups,gnome-bluetooth-sendto,
+gvfs-backends,gvfs-fuse,libgdk-pixbuf2.0-bin,xdg-utils,
+nautilus-extension-gnome-terminal,policykit-desktop-privileges,
+gsettings-ubuntu-schemas,cracklib-runtime,libcanberra-pulse,
+apt-config-icons-hidpi,xcursor-themes,
+orca,speech-dispatcher,mousetweaks,gnome-accessibility-themes,
+fonts-liberation,fonts-noto-core,fonts-noto-cjk,
+evince,eog,gnome-calculator,gnome-clocks,gnome-system-monitor,
+gnome-disk-utility,baobab,gnome-characters,gnome-font-viewer,gnome-logs,
+seahorse,gnome-power-manager,
 mesa-utils,mesa-vulkan-drivers,libgl1-mesa-dri,vulkan-tools,
 libdrm-tests,edid-decode,
 pipewire,pipewire-pulse,pipewire-audio,wireplumber,rtkit,
