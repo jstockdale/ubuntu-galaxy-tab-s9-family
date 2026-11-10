@@ -147,6 +147,120 @@ class PayloadTests(unittest.TestCase):
         self.assertNotIn("--allow-unauthenticated", args)
         self.assertNotIn("--allow-downgrades", args)
 
+    POLICY = """cups:
+  Installed: 2.4.7-1.2ubuntu7.14
+  Candidate: 2.4.7-1.2ubuntu7.14
+  Version table:
+ *** 2.4.7-1.2ubuntu7.14 500
+        500 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 Packages
+        100 /var/lib/dpkg/status
+     2.4.7-1.2ubuntu7 500
+        500 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 Packages
+libnss-mdns:
+  Installed: (none)
+  Candidate: 0.15.1-4build1
+  Version table:
+     0.15.1-4build1 500
+        500 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 Packages
+evince:
+  Installed: 46.0-1
+  Candidate: 46.3.1-0ubuntu1.1
+  Version table:
+     46.3.1-0ubuntu1.1 500
+        500 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 Packages
+ *** 46.0-1 100
+        100 /var/lib/dpkg/status"""
+
+    def test_policy_names_only_packages_installed_at_their_candidate(self):
+        self.assertEqual(c.current_packages(self.POLICY), {"cups"})
+        self.assertEqual(c.current_packages(""), set())
+
+    def test_update_names_only_missing_or_older_packages(self):
+        plan = {"apt_packages": ["cups", "libnss-mdns", "evince", "not-in-any-archive"]}
+        with patch.object(c, "run", return_value=self.POLICY) as run:
+            names = c.apt_install_list(plan, False)
+        self.assertEqual(run.call_args.args[0][:2], ["apt-cache", "policy"])
+        # Missing, older and unknown names stay; APT reports the unknown one.
+        self.assertEqual(names, ["libnss-mdns", "evince", "not-in-any-archive"])
+
+    def test_repair_names_the_whole_release(self):
+        plan = {"apt_packages": ["cups", "libnss-mdns"]}
+        with patch.object(c, "run") as run:
+            self.assertEqual(c.apt_install_list(plan, True), ["cups", "libnss-mdns"])
+            self.assertEqual(c.apt_install_list({"apt_packages": []}, False), [])
+        run.assert_not_called()
+
+    def test_apt_reinstalls_local_debs_and_names_only_the_planned_packages(self):
+        plan = {"files": {"UPDATE/debs/test.deb": {}}, "apt_packages": ["cups", "evince"],
+                "apt_install": ["evince"]}
+        (self.root / "plan.json").write_text(json.dumps(plan))
+        args = c.apt_args(self.root)
+        self.assertIn("--reinstall", args)
+        self.assertEqual(args[args.index("install") + 1:],
+                         [str(self.root / "UPDATE/debs/test.deb"), "evince"])
+        # A transaction prepared by an older Companion has no apt_install.
+        del plan["apt_install"]
+        (self.root / "plan.json").write_text(json.dumps(plan))
+        self.assertEqual(c.apt_args(self.root)[-2:], ["cups", "evince"])
+
+    def test_unavailable_package_stays_for_apt_to_report(self):
+        # Neither installed nor in any archive: APT must still be asked, so
+        # the transaction fails loudly instead of skipping the package.
+        policy = "virtual-only:\n  Installed: (none)\n  Candidate: (none)\n  Version table:"
+        self.assertEqual(c.current_packages(policy), set())
+
+    def test_names_are_chosen_after_the_indexes_refresh(self):
+        transaction = self.root / "transaction"
+        transaction.mkdir()
+        manifest = {"files": {}, "apt_packages": ["cups", "libnss-mdns", "evince"]}
+        calls = []
+        def run(argv, capture=False, offline=False):
+            calls.append(argv[:2])
+            return self.POLICY if argv[:2] == ["apt-cache", "policy"] else ""
+        with patch.object(c, "TRANSACTION", transaction), patch.object(c, "run", run):
+            c.resolve_dependencies(manifest, False)
+        self.assertEqual(calls, [["apt-get", "update"], ["apt-cache", "policy"],
+                                 ["apt-get", "-y"], ["apt-get", "check"]])
+        plan = json.loads((transaction / "plan.json").read_text())
+        self.assertEqual(plan["apt_install"], ["libnss-mdns", "evince"])
+        self.assertEqual(plan["apt_packages"], ["cups", "libnss-mdns", "evince"])
+
+    def prepared_repair_flag(self, args):
+        """Run prepare() up to dependency resolution; return its repair flag."""
+        class Stop(Exception):
+            pass
+        manifest = {"files": {"boot.img": {"size": 1}}, "tag": "v1.2.4",
+                    "apt_packages": ["cups"]}
+        space = shutil._ntuple_diskusage(10**13, 0, 10**13)
+        def download(info, archive, callback):
+            archive.write_bytes(b"zip")
+        with patch.object(c, "STATE", self.root), \
+                patch.object(c, "TRANSACTION", self.root / "transaction"), \
+                patch.object(c, "MARKER", self.root / "system-update"), \
+                patch.object(c, "status", return_value={"state": "idle"}), \
+                patch.object(c, "set_status"), patch.object(c, "device_check"), \
+                patch.object(c, "power_check"), patch.object(c, "validate_packages"), \
+                patch.object(c, "cache_local_packages"), patch.object(c, "emit"), \
+                patch.object(c, "run", return_value=""), \
+                patch.object(c.shutil, "disk_usage", return_value=space), \
+                patch.object(b, "inspect", return_value=dict(manifest)), \
+                patch.object(b, "extract", return_value=dict(manifest)), \
+                patch.object(b, "current", return_value={"tag": "v1.2.4"}), \
+                patch.object(b, "release", return_value={"tag": "v1.2.4", "size": 3}), \
+                patch.object(b, "release_state", return_value="current"), \
+                patch.object(b, "download", download), \
+                patch.object(c, "resolve_dependencies", side_effect=Stop) as resolve:
+            with self.assertRaises(Stop):
+                c.prepare(args)
+        return resolve.call_args.args[1]
+
+    def test_prepare_passes_the_repair_choice_on(self):
+        local = self.root / "build.zip"
+        local.write_bytes(b"zip")
+        import argparse
+        self.assertIs(self.prepared_repair_flag(argparse.Namespace(zip=str(local), repair=False)), False)
+        self.assertIs(self.prepared_repair_flag(argparse.Namespace(zip=None, repair=True)), True)
+
     def test_unknown_current_build(self):
         with patch.object(b, "IDENTITY", self.root / "absent"):
             self.assertEqual(b.current(), {})

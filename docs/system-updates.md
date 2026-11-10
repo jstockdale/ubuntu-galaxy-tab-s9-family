@@ -37,8 +37,8 @@ with the new images; Android's saved set is preserved.
 Hold **Check for updates** for three seconds or Shift-click it to access
 the hidden repair action. A confirmation appears only if the recorded build's exact GitHub tag
 has a downloadable ZIP and a published SHA-256 digest. It reinstalls that
-build's packages and boot images while retaining configuration; it is not a
-factory reset. Installations without release metadata cannot infer their
+build's packages, the port's and every Ubuntu package in its list, and its
+boot images while retaining configuration; it is not a factory reset. Installations without release metadata cannot infer their
 version from the kernel or the app version, so repair stays unavailable until
 their first update.
 
@@ -77,7 +77,15 @@ The updater never executes the TWRP installer, writes `rootfs.img`, formats
 storage, or writes `userdata`, `linuxroot`, `super`, `recovery` or `vbmeta`.
 It installs Debian packages through APT with removal and unauthenticated
 packages disallowed, and without `Recommends`: a fresh image has none, so
-an updated installation ends with the same packages as a fresh one. Port
+an updated installation ends with the same packages as a fresh one. The
+port's own packages from the ZIP are always reinstalled, as they can repeat
+a version. Of the release's Ubuntu package list, an update installs only
+what is missing or older than the archive's candidate (Companion 1.3.18).
+Earlier, every listed package was downloaded and reinstalled on every
+update: measured for v1.2.5 on an up-to-date SM-X910, 155 packages and
+229 MB, against none now. The installed Companion prepares an update, so
+this applies from the first update prepared by 1.3.18 itself. The repair
+action still reinstalls the whole list. Port
 configuration files use Debian conffile handling: modified settings are
 retained; new defaults can be left as `.dpkg-dist`.
 Home directories, dconf settings, application data, accounts, fingerprints,

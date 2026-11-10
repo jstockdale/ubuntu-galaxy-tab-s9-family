@@ -177,6 +177,38 @@ def cache_local_packages(transaction, plan):
             raise ValueError("Conflicting cached package: " + filename)
 
 
+def current_packages(policy):
+    """Names `apt-cache policy` shows installed at their candidate version."""
+    current, name, installed = set(), None, None
+    for line in policy.splitlines():
+        if line and not line[0].isspace() and line.endswith(":"):
+            name, installed = line[:-1], None
+        elif line.strip().startswith("Installed:"):
+            installed = line.split(":", 1)[1].strip()
+        elif line.strip().startswith("Candidate:") and name:
+            candidate = line.split(":", 1)[1].strip()
+            if installed not in (None, "(none)") and installed == candidate:
+                current.add(name)
+    return current
+
+
+def apt_install_list(plan, repair):
+    """The release's Ubuntu packages this transaction names to APT.
+
+    --reinstall covers every name on the command line, and each transaction
+    starts with an empty archive cache, so naming the whole release list made
+    every update download and reinstall all of it again (219 MB by v1.2.5).
+    Only the port's own DEBs need --reinstall, as they can repeat a version.
+    Leave out what is already installed at its candidate version: missing
+    packages are still installed and older ones upgraded, as before.  A
+    repair names everything, so it reinstalls the whole build."""
+    names = plan["apt_packages"]
+    if repair or not names:
+        return list(names)
+    current = current_packages(run(["apt-cache", "policy", *names], True))
+    return [name for name in names if name not in current]
+
+
 def apt_args(transaction, download=False):
     plan = json.loads((transaction / "plan.json").read_text())
     # No Recommends: a fresh image gets none (mmdebstrap), so an update that
@@ -187,7 +219,17 @@ def apt_args(transaction, download=False):
             "-o", "Dpkg::Options::=--force-confdef",
             "-o", "Dir::Cache::archives=" + str(transaction / "archives"),
             "install", *[str(transaction / n) for n in plan["files"] if n.endswith(".deb")],
-            *plan["apt_packages"]]
+            *plan.get("apt_install", plan["apt_packages"])]
+
+
+def resolve_dependencies(manifest, repair):
+    """Refresh the indexes, choose the names for APT and download for them."""
+    run(["apt-get", "update"])
+    # Decided once, with fresh indexes; the offline install reads the same.
+    manifest["apt_install"] = apt_install_list(manifest, repair)
+    write_json(TRANSACTION / "plan.json", manifest)
+    run(apt_args(TRANSACTION, download=True))
+    run(["apt-get", "check"])
 
 
 def validate_packages(transaction, plan):
@@ -321,9 +363,7 @@ def prepare(args):
         progress("dependencies")
         if run(["dpkg", "--audit"], True):
             raise ValueError("Repair the existing package installation before updating")
-        run(["apt-get", "update"])
-        run(apt_args(TRANSACTION, download=True))
-        run(["apt-get", "check"])
+        resolve_dependencies(manifest, getattr(args, "repair", False))
         backup_bytes = sum(int(line.split()[0]) for line in run(
             ["du", "-sx", "--block-size=1", "/usr/lib/modules", "/etc"], True).splitlines())
         if shutil.disk_usage(STATE).free < backup_bytes + 2 * 1024**3:
