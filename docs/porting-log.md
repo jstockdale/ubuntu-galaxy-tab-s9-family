@@ -8633,3 +8633,45 @@ upgrade.
   throw-away launcher 30 times in about 8 s: 56 service starts, no
   start-limit message, neither unit failed: PASS. Before the fix, the sixth
   start within 10 s failed both units until the next boot.
+
+### Full-resolution photos on squirtle, and a hang on an untested size (2026-11-10)
+
+The owner's first test of gnome-snapshot `46.2-1ubuntu2+gts9u1` with
+libcamera gts9u13, SPA gts9u14 and device 2.69 (boot `1883367c`):
+- Photos: 7 out of 7 at 4120x3096, taken from 00:00:13 to 00:00:51, about
+  7.5 to 7.9 MB each. The kernel logged no CCI, camss or csid errors.
+- Video: `Recording from 2026-11-10 00-00-58…webm` is 4120x3096 VP8 with
+  `framerate=0/1`. It has 214 frames in 19.9 s (about 10.7 fps), with gaps
+  of up to 433 ms. The 2026-11-08 recording, from before the install, was
+  1280x1080 at 30 fps. Video mode is meant to keep stock's 1280x1080, so the
+  switch to Video didn't restore the caps. The bug is in the Snapshot patch
+  (branch `claude/x710-snapshot-stills`).
+
+At about 00:19 squirtle hung: a black screen and no input, though it still
+answered ping and an SSH session that was already open.
+- The Snapshot session's headless camerabin replica had just asked for
+  2048x1536, a size that had never streamed on this camera.
+- Over SSH it saw a load of 40 to 46, with 30+ tasks in D state:
+  - storage: `ufs_clk_gating`, kblockd and flush-8:0;
+  - power and cpufreq: `pm`, and `sugov:0`, `sugov:3` and `sugov:7`;
+  - IRQ threads: touch (fts1ba90a) and pogo;
+  - GPU: `ring0` and `ring2`.
+- The owner force-restarted it (boot `3aa21a6a`, 00:24:35). The new boot is
+  healthy:
+  - CCI at 400 kHz;
+  - Bluetooth powered;
+  - audio sink up;
+  - no failed units.
+- Nothing about the stall was saved:
+  - the journal stops at 00:18:57, because the disk had stalled;
+  - the kernel log from 00:10 has only ath11k `msdu_done` lines;
+  - the kernel has no hung-task detector, no netconsole and no ramoops
+    region, and nobody captured dmesg before the restart.
+- Lead, unconfirmed: every task in that D-state set votes through
+  `icc_set_bw` (cpufreq-hw votes DDR and L3 on each frequency step). That
+  points to the interconnect lock, or an RPMh write that never completed,
+  with the camss clock and bandwidth vote for a new size as the trigger.
+- Before streaming any untested size again:
+  - keep `sudo dmesg -w` streaming to the host;
+  - keep a root shell open, so that `echo w > /proc/sysrq-trigger` can dump
+    the blocked tasks without touching the disk.
