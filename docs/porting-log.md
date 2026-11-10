@@ -8617,3 +8617,19 @@ in `~/device-2.67`.
 - photos at 4120x3096;
 - 10 photos in a row;
 - a recording that starts without a focus sweep.
+
+### Device 2.69 on squirtle: the launcher watcher survives a burst (2026-11-09)
+
+`ubuntu-gts9u-device_2.69_arm64.deb` `e23894e4f7ada95a662c6e3aba2396158da9ac4541919c070ba2a38d01bed976`
+(`c591713`) is 2.67 plus the X910 branch's `f52fadb` (`StartLimitIntervalSec=0`
+on `ubuntu-gts9u-chromium-desktops.service`), carried as `3946da0`. Its
+postinst also resets both Chromium units and restarts the `.path` unit on
+upgrade.
+- Before: both units were failed on squirtle, from that day's ~100-package
+  install.
+- Installed (boot `1883367c`): 1 upgraded, `dpkg --audit` clean. The `.path`
+  unit came back active, with `StartLimitIntervalUSec=0`.
+- `scripts/test-chromium-desktops-burst.sh` (`9a7868e`) wrote and removed a
+  throw-away launcher 30 times in about 8 s: 56 service starts, no
+  start-limit message, neither unit failed: PASS. Before the fix, the sixth
+  start within 10 s failed both units until the next boot.
