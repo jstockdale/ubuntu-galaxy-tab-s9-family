@@ -2,7 +2,7 @@
 # Hang-log kit, on top of the camera-bus kit (itself on top of the BT UART
 # kit): the BT UART kernel rebuilt with the hung-task, lockup and workqueue
 # detectors, netconsole as a module and pstore ftrace, and the camera-bus DTB
-# with a reorganised ramoops region (pmsg and ftrace zones, ECC 64), in boot
+# with a reorganised ramoops region (pmsg and ftrace zones, ECC 96), in boot
 # (appended) and vendor_boot; its module tree; and a sysctl drop-in.
 #
 #   sudo sh ~/hang-log/install.sh      then reboot

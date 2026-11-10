@@ -9,8 +9,8 @@ evidence. It changes nothing the camera-bus kit set: the 400 kHz CCI pads,
 stream ran ([porting log](../../docs/porting-log.md#the-0019-hang-left-a-console-record-2026-11-10)):
 - 30+ tasks were in D state;
 - the disk had stalled, so the journal kept nothing;
-- the console record in ramoops survived the forced restart, but it was
-  decayed, and it held err-level lines only.
+- the console record in ramoops survived the forced restart, but it held
+  err-level lines only, and about 10 % of its bytes had decayed.
 
 Its last line is the interconnect BCM voter's `Error sending AMC RPMH
 requests (-110)`. The WARN backtrace printed just before it never reached the
@@ -24,14 +24,19 @@ console.
   - the soft-lockup detector, the buddy hard-lockup detector and the
     workqueue watchdog;
   - netconsole as a module, with configfs targets;
-  - pstore ftrace.
+  - pstore ftrace;
+  - pstore compression off, so that a panic record stays legible when ECC
+    cannot repair every block.
 - **The ramoops region:** the same address, `sec-pmsg@880900000`, which is
   stock's pmsg carve-out. The DTS comment explains why it stays.
-  - six 128 KiB oops/panic records, a 1 MiB console, 128 KiB of pmsg
-    (`/dev/pmsg0`) and 128 KiB of ftrace;
-  - ECC 64 instead of 16. At the decay measured after the forced restart
-    (about 10 % of bytes), ECC 16 recovered 3 blocks of about 96. A Poisson
-    model puts ECC 64 at 99.7 %.
+  - three 256 KiB oops/panic records (plain text), a 1 MiB console, 128 KiB
+    of pmsg (`/dev/pmsg0`) and 128 KiB of ftrace;
+  - ECC 96 instead of 16, because every reset decays this RAM, clean
+    reboots too. Aligned against the journal, five boots' records had 7 to
+    20 % of their bytes changed, mostly by cleared bits, evenly through each
+    record. ECC 16 left 77 to 99 % of blocks unrecoverable. A Poisson model
+    keeps 99.9 % of blocks at 13.5 % with ECC 96, and two thirds at 20 %.
+    The parity takes 43 % of each zone.
   - The first boot on the new layout reads the old contents as noise.
 - **`/etc/sysctl.d/60-gts9u-hang-log.conf`:**
   - `kernel.watchdog = 1`. ABL appends `nowatchdog`, which would leave both
@@ -152,10 +157,19 @@ sh tools/inplace/cameras/hang-capture.sh shell <user>@<tablet>
 ```
 
 - **`log`** streams `dmesg -w` over SSH into `DIR/hang-<tablet>-<time>.log`,
-  with a tick every 30 s that shows userspace is still alive. While it runs,
-  it raises the console loglevel to 7, so that hung-task stacks and sysrq
-  dumps (KERN_INFO) also reach ramoops, and it turns on all-CPU backtraces
-  for hung-task reports. Ctrl-C restores both.
+  with a tick every 30 s that shows userspace is still alive. While it runs:
+  - it raises the console loglevel to 7, so that hung-task stacks and sysrq
+    dumps (KERN_INFO) also reach ramoops;
+  - it turns on all-CPU backtraces for hung-task reports;
+  - it traces RPMh requests and completions (`rpmh_send_msg`,
+    `rpmh_tx_done`), interconnect votes (`icc_set_bw`, `icc_set_bw_end`) and
+    GMU frequency changes (`msm_gmu_freq_change`) into a 16 KB-per-CPU
+    ftrace buffer. The 00:19 hang ended in an interconnect RPMh timeout,
+    after a day of GMU bandwidth-vote timeouts. A request with no completion,
+    or a vote with no end, is the stuck one. Sysrq `z` prints the buffer,
+    and so does a panic (`ftrace_dump_on_oops`). `--no-trace` skips this.
+
+  Ctrl-C restores all of it.
 - **`shell`** opens a root shell with no profile, in `/`, ready before the
   hang. During the 00:19 hang, ping and an open SSH session kept working, but
   anything that needs the disk (sudo, a new login, `ls`) would have blocked.
@@ -165,13 +179,15 @@ sh tools/inplace/cameras/hang-capture.sh shell <user>@<tablet>
   ```sh
   echo w > /proc/sysrq-trigger     # blocked tasks with stacks
   echo l > /proc/sysrq-trigger     # every CPU's backtrace
+  echo z > /proc/sysrq-trigger     # the RPMh/interconnect/GMU trace
   echo 'what you saw' > /dev/pmsg0 # a note the next boot keeps
   echo c > /proc/sysrq-trigger     # last: panic, pstore gets the log, reset after 10 s
   ```
 
-  Prefer `c` to holding the power key. The forced restart decayed about 10 %
-  of the ramoops RAM. The 2026-11-07 checks found warm reboots and watchdog
-  resets left the record intact, and a panic resets the same way (`panic=10`).
+  Prefer `c` to holding the power key, because the panic writes the log's
+  tail, sysrq output included, to a plain pstore record. Both resets decay
+  the RAM alike, and ECC 96 repairs most of it. If the warm-reset test below
+  passed, type `echo warm > /sys/kernel/reboot/mode` before `c`.
 
 Each mode asks for the tablet's sudo password once. `HANG_SSH_OPTS` adds ssh
 options, for example `-o HostKeyAlias=<USB address>` to check the known key
@@ -224,5 +240,18 @@ default) into `DIR/netconsole-<tablet>-<time>.log`.
 4. Optional, once, to prove the whole chain. On a healthy tablet with nothing
    unsaved, run `sync` in the shell, then `echo c > /proc/sysrq-trigger`.
    - Expect a reset within about 10 s.
-   - On the next boot, expect a `dmesg-ramoops-0` holding `sysrq: Trigger a
-     crash`, and a console record with few or no unrecoverable blocks.
+   - On the next boot, expect a plain `dmesg-ramoops-0` holding `sysrq:
+     Trigger a crash`.
+   - Expect a console record with few unrecoverable blocks. The ECC line at
+     its end says how many.
+5. The warm-reset test: does `SYSTEM_RESET2` keep DDR refreshed?
+   - Linux resets with PSCI `SYSTEM_RESET`: `/sys/kernel/reboot/mode` reads
+     `cold`, and the firmware is PSCI v1.1.
+   - Run `echo warm | sudo tee /sys/kernel/reboot/mode`, then `sudo reboot`.
+     The setting lasts until that reboot.
+   - Compare the archived record's ECC line, and `ramoops: error in header`
+     in the boot log, with a cold reboot's.
+   - Untested: Samsung's bootloader might take a warm reset for a crash and
+     show upload mode. Power + Volume Down restarts from there.
+   - If the warm reset keeps the record intact, a persistent `reboot=warm`
+     is the next step.
