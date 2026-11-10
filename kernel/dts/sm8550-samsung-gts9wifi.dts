@@ -160,6 +160,28 @@
 		 * to move or shrink the region.  systemd-pstore's copies are kept
 		 * per boot by ubuntu-gts9u-pstore-archive.service (the device
 		 * package).
+		 *
+		 * Rechecked for the hang-log kit (2026-11-10): the address stays.
+		 * Stock's overlay keeps this carve-out for samsung,pstore_pmsg and
+		 * disables the vendor DTB's dynamic ramoops_region; sm8550.dtsi
+		 * reserves nothing above 4 GiB; ABL's /memory puts it in the bank
+		 * at 0x880000000; and it is boxed in by carve-outs, sec-debug-bl
+		 * ending at its base and google-debug-kinfo starting at its end.
+		 * A new address could be DDR that XBL or ABL writes, which no DT
+		 * would show.
+		 *
+		 * The forced restart after the 2026-11-10 hang kept the console
+		 * record, decayed: about 10 % of its bytes changed, mostly by
+		 * cleared bits, and ECC 16 (8 bytes per 128-byte block) recovered
+		 * 3 blocks of about 96, as a Poisson model at that rate predicts
+		 * (5 %).  ECC 64 corrects 32 bytes per block, which the model puts
+		 * at 99.7 % of blocks; the parity costs a third of each zone.
+		 * Zones, in ramoops' order: six 128 KiB oops/panic records, the
+		 * 1 MiB console (now at offset 768 KiB), 128 KiB of pmsg
+		 * (/dev/pmsg0, for test markers) and 128 KiB of ftrace (off; see
+		 * config-gts9wifi.fragment).  Sizes are powers of two, as ramoops
+		 * requires.  The first boot after a layout change reads the old
+		 * contents as noise.
 		 */
 		sec_pmsg_mem: sec-pmsg@880900000 {
 			compatible = "ramoops";
@@ -167,7 +189,9 @@
 			no-map;
 			record-size = <0x20000>;
 			console-size = <0x100000>;
-			ecc-size = <16>;
+			pmsg-size = <0x20000>;
+			ftrace-size = <0x20000>;
+			ecc-size = <64>;
 		};
 
 		google_debug_kinfo_mem: google-debug-kinfo@880b00000 {

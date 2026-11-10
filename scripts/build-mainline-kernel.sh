@@ -875,6 +875,10 @@ apply_fragment() {
 				value=${value%\"}
 				"$kernel_tree/scripts/config" --file "$build_dir/.config" \
 					--set-str "${symbol#CONFIG_}" "$value" ;;
+			CONFIG_*=[0-9]*|CONFIG_*=-[0-9]*)
+				symbol=${setting%%=*}
+				"$kernel_tree/scripts/config" --file "$build_dir/.config" \
+					--set-val "${symbol#CONFIG_}" "${setting#*=}" ;;
 			'# CONFIG_'*' is not set')
 				symbol=${setting#\# CONFIG_}
 				symbol=${symbol% is not set}
@@ -934,6 +938,9 @@ for fragment in "${fragments[@]}"; do
 				symbol=${setting%%=*}
 				grep -q "^$symbol=" "$build_dir/.config" || \
 					missing="$missing $symbol" ;;
+			CONFIG_*=[0-9]*|CONFIG_*=-[0-9]*)
+				grep -qxF "$setting" "$build_dir/.config" || \
+					missing="$missing ${setting%%=*}" ;;
 		esac
 	done < "$fragment"
 done
@@ -1013,13 +1020,14 @@ if [ "${BUILD_WIFI_MODULES:-1}" = 1 ]; then
 	# Only Image.gz and the isolated M= trees are built, so an in-tree =m
 	# option is silently left out; the payload check below fails the build
 	# for any the fragments ask for.  An in-tree driver a fragment keeps
-	# modular on purpose (an experiment switch) is listed here and built as
-	# a single target: M=drivers/soc/qcom would also build that directory's
+	# modular on purpose (an experiment switch, or netconsole, loaded only
+	# for a test) is listed here and built as a single target: M=drivers/soc/qcom would also build that directory's
 	# other =m objects, and pmic_glink_altmode needs DRM bridge symbols this
 	# build never produces.  Keyed on the fragments, not on .config: the
 	# inherited base config leaves many options at =m that no board here
 	# ships, the bandwidth monitor among them on the Ultra.
-	for single in CONFIG_QCOM_ICC_BWMON:drivers/soc/qcom/icc-bwmon.ko; do
+	for single in CONFIG_QCOM_ICC_BWMON:drivers/soc/qcom/icc-bwmon.ko \
+		CONFIG_NETCONSOLE:drivers/net/netconsole.ko; do
 		symbol=${single%%:*}
 		object=${single#*:}
 		case " ${requested_m[*]} " in
