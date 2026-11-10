@@ -8666,7 +8666,9 @@ answered ping and an SSH session that was already open.
   - the journal stops at 00:18:57, because the disk had stalled;
   - the kernel log from 00:10 has only ath11k `msdu_done` lines;
   - the kernel has no hung-task detector, no netconsole and no ramoops
-    region, and nobody captured dmesg before the restart.
+    region, and nobody captured dmesg before the restart. (Wrong about
+    ramoops: the region exists, and it kept a console record of the hang;
+    see [the next entry](#the-0019-hang-left-a-console-record-2026-11-10).)
 - Lead, unconfirmed: every task in that D-state set votes through
   `icc_set_bw` (cpufreq-hw votes DDR and L3 on each frequency step). That
   points to the interconnect lock, or an RPMh write that never completed,
@@ -8675,3 +8677,163 @@ answered ping and an SSH session that was already open.
   - keep `sudo dmesg -w` streaming to the host;
   - keep a root shell open, so that `echo w > /proc/sysrq-trigger` can dump
     the blocked tasks without touching the disk.
+
+### The 00:19 hang left a console record (2026-11-10)
+
+The previous entry said nothing survived the 00:19 hang. That was wrong.
+- The X710 DTS has had a ramoops region since 0cfa883: `sec-pmsg@880900000`,
+  with a 1 MiB console, ECC 16.
+- At boot `3aa21a6a`, ubuntu-gts9u-pstore-archive kept the hung boot's console
+  record: `/var/lib/ubuntu-gts9u/pstore/000015-20261110T082437Z-boot-1883367c/console-ramoops-0`
+  (12292 bytes, sha256 `3ff78807…`).
+
+**What the record holds.** After sysctl the console loglevel was 4, so the
+record has err-level lines and above only:
+- from 5398 s on: repeated `a6xx_hfi_wait_for_msg_interrupt … Message
+  HFI_H2F_MSG_GX_BW_PERF_VOTE id N timed out waiting for response`, each
+  followed by `Unexpected message id N on the response queue` (the GMU). The
+  same pairs appear in earlier boots.
+- at 86376 s: `geni_i2c a90000.i2c: geni_i2c_gpi_xfer: I2C timeout` and `GPI
+  transfer failed: -110`;
+- **the last line before the forced restart, at 94599.6 s: `Error sending AMC
+  RPMH requests (-110)`**. This is `qcom_icc_bcm_voter_commit()`
+  (`drivers/interconnect/qcom/bcm-voter.c`): an interconnect BCM vote's
+  active-only RPMh write got no completion within `RPMH_TIMEOUT_MS` (10 s).
+  If the boot never suspended, 94599 s after the 22:03:13 boot is about
+  00:19:50, a minute after the journal's last line.
+- `rpmh_write_batch()` WARNs just before returning that error. A WARN prints
+  at KERN_WARNING, and a console at loglevel 4 drops that, so the backtrace,
+  which would name the task and the path, is not in the record.
+
+**Hypothesis, not measured.** It fits the lead in the previous entry.
+- `icc_set_bw()` holds `icc_lock` across the commit.
+- `rpmh_rsc_send_data()` waits without a timeout for a free TCS, and
+  `claim_tcs_for_req()` also waits while a write to the same address is still
+  in flight.
+- So if the timed-out TCS never completes, the next vote for that BCM blocks
+  for good, still holding `icc_lock`. Everything that votes bandwidth then
+  queues behind it in D state: UFS clock gating, cpufreq, the I2C and touch
+  threads, the GPU.
+- That matches one error line followed by silence.
+
+**Why the records decay.** Measured on all 10 archived records, five of them
+against their boot's journal:
+- **Every reset decays the region, not only the forced restart.** Nine of the
+  10 boots ended in a clean `reboot: Restarting system`, and ECC 16 left 77 to
+  99 % of blocks unrecoverable in every one.
+- Aligned against `journalctl -k -p 0..3` (boots 9c0e3019, 487f28bc,
+  cc67dab2, e2c815b8, 1883367c):
+  - 7.2, 20.4, 10.1, 13.5 and 9.8 % of bytes changed;
+  - 81 to 86 % of the changes only cleared bits;
+  - the rate is flat from the oldest tenth of each record to the newest, and
+    does not grow with uptime (35 minutes gave 20 %, 26 hours gave 10 %).
+- So it is DRAM retention loss across the reset. It is not an overwrite by the
+  bootloader, not decay at runtime, and not an ECC or layout bug.
+- ECC 16 corrects 8 bytes per 128-byte block. For the hung boot, a Poisson
+  model at its rate predicts 5 % of blocks recoverable, and 3 of 96 were.
+- **The records are complete.** Each one is, to within one line, exactly the
+  journal's err-level text after about 17 s.
+  - When systemd-pstore unlinks `console-ramoops-0` (16.9 s),
+    `ramoops_pstore_erase()` zaps the live console zone.
+  - The console loglevel is 4 after sysctl.
+  - So the hung boot's 12 KB is everything that was written, not a fragment
+    of 1 MiB.
+- Linux resets with PSCI `SYSTEM_RESET`: `/sys/kernel/reboot/mode` reads
+  `cold`, and the firmware is PSCI v1.1. Whether a warm reset (`SYSTEM_RESET2`)
+  keeps DDR refreshed is untested. The kit README has it as an owner test.
+
+**The hang-log kit** (`tools/inplace/hang-log`, branch
+`claude/x710-hang-capture`, on top of the camera-bus kit) makes the next hang
+leave more:
+- **Kernel config** (`config-gts9wifi.fragment`):
+  - the hung-task detector at 60 s, with the blocker dump, which names the
+    owner of the mutex a hung task waits for, i.e. `icc_lock`'s holder;
+  - the soft-lockup, buddy hard-lockup and workqueue watchdogs, none of them
+    panicking;
+  - netconsole (=m, configfs targets);
+  - pstore ftrace;
+  - pstore compression off: a deflated panic record is unreadable from the
+    first block ECC cannot repair.
+  - `build-mainline-kernel.sh` now applies integer fragment values (no
+    fragment had one before) and ships netconsole as a single-target module.
+- **DTS:** the ramoops region keeps its address, stock's own pmsg carve-out
+  (the DTS comment explains why).
+  - It gets three 256 KiB plain oops/panic records, a 1 MiB console, 128 KiB
+    of pmsg and 128 KiB of ftrace.
+  - ECC goes to 96, which the model puts at 99.9 % of blocks recovered at
+    13.5 % decay and two thirds at 20 %, for 43 % of each zone.
+- **A sysctl drop-in:**
+  - `kernel.watchdog = 1`, because ABL appends `nowatchdog`, which would
+    leave both lockup detectors off;
+  - `kernel.printk = 5 4 1 7`, so that WARN backtraces reach ramoops. The
+    busiest minute on 2026-11-09 had 16 warning lines for the 115200 UART.
+- **`tools/inplace/cameras/hang-capture.sh`** runs on the host, before a
+  risky test:
+  - `log` streams `dmesg -w` to a host file, with the console loglevel at 7
+    and all-CPU backtraces for hung-task reports. It also traces
+    `rpmh_send_msg`/`rpmh_tx_done`, `icc_set_bw`/`icc_set_bw_end` and
+    `msm_gmu_freq_change` into a 16 KB-per-CPU buffer, which sysrq `z` or a
+    panic prints.
+  - `shell` opens a root shell that needs only builtins, for sysrq `w`, `l`,
+    `z`, a note to `/dev/pmsg0`, then `c`.
+  - `netconsole` adds a UDP channel. It refuses Wi-Fi by default.
+
+**Build:**
+- Source: commit 2718d1d (tree `eeaf4fc3…`), built from a detached worktree.
+  The kernel inputs differ from the BT UART kernel's (2d573f9) only in the
+  camera-bus DTS commits and this branch's.
+- The module key is new, `eb0ca8f0a5e7b22e41ae5244bf7c4f0294d9b26a` (serial `42:66:D5:87…`), archived and mirrored by the build. The
+  configuration moves `task_struct` and `net_device` and the kernel has no
+  MODVERSIONS, so a module from another build must not load. Under lockdown
+  the new key makes the kernel refuse it.
+- Kernel build ID `68d243e908c0…`, Image.gz `3cb91f34…`, DTB `5ff2495f…`,
+  config `4cd636e1…`. The module payload ships all 21 fragment =m requests
+  (63 modules).
+
+`make-kit.sh` self-tests, byte for byte, with the changes dropped:
+- the BT UART kernel plus the camera-bus DTB gives the camera-bus `boot.img`
+  (`5529f6e7…`);
+- the camera-bus `vendor_boot` repacked with its own DTB gives itself
+  (`51777e20…`);
+- 52cb2fc's DTS, compiled in this build's tree, gives the camera-bus DTB
+  (`4ed9c1d9…`).
+
+It then checks that every change is intended:
+- the configuration differs in 24 symbols, all listed;
+- the DTB differs only in the ramoops node;
+- the modules are the BT UART set plus netconsole, all signed with the new
+  key;
+- in `boot`, only the kernel and its appended DTB differ; in `vendor_boot`,
+  only the DTB.
+
+**Kit:** `~/ubuntu-gts9u/backups/hang-log-kit`:
+```
+d583546b5e5c33dbc48fbafc99b7eb039df33f64b0316e498d3f158f834ee968  boot.img
+9165f42917a8ee4069b878fc0c0660391b39087fc6f3ea2b607f626821a7dbd4  vendor_boot.img
+33ed5c41c7531f997889e040f7ad3f0a1d41453ed2ca28363f6b6aa506a26918  modules-7.2.0-rc3-dirty.tar
+36d2f689fb181c983bb9ac38d9192fe0b41577c20f1f2cba39074b9cf96b81f5  BUILD_ID
+4cd087c8d9509cf865cea8aa39e3019dd5a0fbf01dff1b96764186e659611868  KEY_ID
+63cabf5c18e8a1b2afe0db8173289febc984b98815cd7c3694c02c926a4b67dd  SIGNER
+7db518a3fab3f7117138fe1facad7a1f4a81a992e835939cb3c0c976ee8bb028  CONFIG.diff
+f99519c184d007f3ed73d32a19ff3954f1b9d88298cdf26b189de8623db72f52  DTB.diff
+342eb0e681d3dcdcd36346b62bf25cf5f9c96bd1e3573fdb1d195204cb272c8e  install.sh
+9e04a4ddc3ef98e5a378b807e75aad6f006c7f8f333faae22a3d87346254fe4f  rollback.sh
+ca5a896975ca59805f7ab01338cccfabdfba6a9e4e6578318aadc881fe6be2c5  verify.sh
+fd9d1ea2a88382be2692e13bfc8cb7c75a6ddefc4dff07522d622098a0d02d78  60-gts9u-hang-log.conf
+b85de5bfa477350a66bb09252451a27e4474a8d54ab2b4a7d04e9080f9daa41e  README.md
+```
+
+To install it, copy the kit to the tablet's `~/hang-log` and run `sudo sh
+~/hang-log/install.sh`, then reboot. Its preconditions and the checks that
+follow are in the kit README.
+
+**Not done:**
+- Not flashed, not on the tablet: the owner installs it.
+- No physical check has run. The kit README lists them: `verify.sh`, the
+  `hung-test` (a write blocked on a frozen loop file system), the camera,
+  audio and Wi-Fi rechecks, a dry run of `hang-capture.sh`, an optional
+  sysrq-`c` panic to prove the chain, and the warm-reset test.
+- netconsole over ath11k is untested.
+- The kernel was not rebuilt with the changes dropped to compare `Image.gz`
+  byte for byte, because a new key changes the image anyway. The
+  configuration comparison stands in for it.
