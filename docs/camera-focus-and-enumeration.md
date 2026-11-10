@@ -320,5 +320,44 @@ sounds like at 20-24 codes per frame are not measured yet.
   - Snapshot opened and closed several times, focusing near and far;
   - the journal's "Autofocus focused at … after … frames" lines;
   - `lens-diag.sh`.
-- On the Ultra, the same package's rear-main lens. The change also reaches
-  every Ultra camera with a lens.
+- On the Ultra: hand-held focusing near and far in GNOME Camera, on a lit,
+  textured scene (see below).
+
+### On the Ultra (SM-X910, 2026-11-09)
+
+Blastoise (bootloader revision 5) ran the same checks before and after the
+camera fixes were ported, with `~/x910-camera-baseline.sh`. "Before" is
+v1.2.3 with `libcamera-gts9u` gts9u9 and the SPA gts9u10. "After" is v1.2.4
+with gts9u13 (patches 0008-0010, including 711c0fa's keep-focus change), the
+SPA gts9u14, GNOME Camera `+gts9u1` and the DW9808 power-down fix.
+
+| | before | after |
+|---|---|---|
+| largest size PipeWire offers: rear main | 4096x2160 | 4120x3096 |
+| rear ultra-wide | 3200x2400 | 3256x2448 |
+| front main | 3200x2400 | 3400x2556 |
+| front ultra-wide | 3840x2400 | 3992x3000 |
+| four cameras stream with `cam` | yes | yes |
+| rear lens power cycles | 20/20 | 20/20 |
+| opens after a mid-stream kill | 5/5 | 5/5 |
+| CCI timeouts, DW9808 or CAMSS errors | 0 | 0 |
+
+PipeWire now offers every sensor's full size, as `cam` lists it.
+
+The X710's lens faults do not reproduce on the Ultra before the port either,
+so the DW9808 change is defensive there. Its warning never fired.
+
+The 150-frame AF traces are not a focus test. Both were taken with the
+exposure (46.7 ms) and gain (16x) at their maximum, so the rear camera saw
+almost no light. In the evening trace the contrast score stayed at
+982-1007, within 1.3 %, which is sensor noise. SoftAf did what it is
+designed to do on a flat scene: it scanned (64 frames), reported Failed
+(72), and started the 2 s retry (14). The old state machine reported
+Focused in a similar dark scene. Focus quality needs a lit, textured scene,
+by hand.
+
+The Ultra's device tree was left as it is. Stock X910 r03 runs the actuator's
+bus at 400 kHz with 4 mA pads, where this DTB runs every CCI bus at 1 MHz.
+Nothing fails at 1 MHz, and the Ultra's base DTB is pinned, so any change
+would have to go through the runtime overlay. Without a symptom, there is
+nothing to tune.
