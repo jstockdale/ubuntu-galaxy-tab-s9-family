@@ -19,6 +19,43 @@ startup = importlib.util.module_from_spec(spec)
 loader.exec_module(startup)
 
 class Startup(unittest.TestCase):
+    def setUp(self):
+        # A provisioned device unless a test says otherwise.
+        runtime = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
+        patcher = patch.object(startup, 'RUNTIME', Path(runtime.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_wait_without_runtime_is_immediate(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(startup, 'RUNTIME', Path(directory) / 'absent'), \
+             patch.object(startup.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError, 'not installed'):
+                startup.wait_ready()
+            sleep.assert_not_called()
+
+    def test_preflight_failure_is_published_for_wait(self):
+        for error in (FileNotFoundError(2, 'No such file or directory'),
+                      RuntimeError('runtime hash mismatch: bin/spdaemon'),
+                      RuntimeError('startup already attempted this boot')):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(startup, 'STATE', Path(directory) / 'state'), \
+                 patch.object(startup, 'protected'), \
+                 patch.object(startup.os, 'geteuid', return_value=0), \
+                 patch.object(startup, 'runtime_preflight', side_effect=error), \
+                 patch.object(startup, 'command') as command, \
+                 patch.object(startup.time, 'sleep') as sleep:
+                with self.assertRaises(type(error)):
+                    startup.boot()
+                command.assert_not_called()  # no modprobe: nothing was started
+                self.assertFalse((Path(directory) / 'state/attempt').exists())
+                record = json.loads((Path(directory) / 'state/status.json').read_text())
+                self.assertEqual(record['state'], 'failed')
+                with self.assertRaisesRegex(RuntimeError, 'startup failed'):
+                    startup.wait_ready()
+                sleep.assert_not_called()
+
     def test_valid_lease(self):
         self.assertTrue(startup.ready_record(dict(state='ready', expires=105, owner_pid=20), 100))
 

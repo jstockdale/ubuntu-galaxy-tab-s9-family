@@ -1,6 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# Mask fprintd for this boot on every board but the Galaxy Tab S9 Ultra.
+# Mask fprintd for this boot on every board but the Galaxy Tab S9 Ultra, and
+# on an Ultra whose EL721 secure runtime is not installed.
 #
 # The only fingerprint path this port has is the Ultra's EL721 (QTEE, the K250A
 # secure element and Goodix FOD); its units carry
@@ -25,8 +26,15 @@ dir=${1:-}
 [ -n "$dir" ] && [ -d "$dir" ] || exit 0
 
 compatible=/proc/device-tree/compatible
+# Android's sec_nvm and spdaemon, which ubuntu-gts9u-fingerprint-secure runs
+# at boot.  Without them fprintd can never become ready: its readiness wait
+# held boot completion for 60 s, and GDM's fingerprint request with it, on
+# every boot of an unprovisioned SM-X910 (blastoise, 2026-11-10).  /var is on
+# the root filesystem, so the path is visible to generators.
+runtime=/var/lib/ubuntu-gts9u/android-secnvm-root
 if [ -r "$compatible" ] &&
-	tr '\0' '\n' < "$compatible" | grep -qx 'samsung,gts9uwifi'; then
+	tr '\0' '\n' < "$compatible" | grep -qx 'samsung,gts9uwifi' &&
+	[ -d "$runtime" ]; then
 	exit 0
 fi
 

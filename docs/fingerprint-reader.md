@@ -2521,3 +2521,41 @@ this physical confirmation, not long-run stability or general crash-recovery
 safety. Fresh-image builders must still provide the
 validated private runtime at the manifest's documented location; this feature
 does not fetch or copy Android credentials or user biometric data.
+
+## An unprovisioned Ultra no longer waits for the fingerprint (2026-11-10)
+
+The secure startup needs Android's `sec_nvm`, `spdaemon` and their libraries
+in `/var/lib/ubuntu-gts9u/android-secnvm-root`. Those are proprietary, so no
+public package ships them, and only a provisioned tablet has them. On any
+other SM-X910 (blastoise, v1.2.5, device 2.68) every boot paid for that:
+- `ubuntu-gts9u-fingerprint-secure --boot` failed in 0.1 s on the missing
+  runtime. It failed in preflight, before anything published a state.
+- GDM's activation of fprintd at 50 s ran the `--wait` prerequisite, which
+  polled for a readiness record that never came. It gave up after 60 s
+  ("secure readiness timed out"), so fprintd failed at 110 s.
+- systemd reported the boot unfinished until then, and the secure unit was
+  listed as failed twice: once at boot and once when fprintd's `Requires=`
+  pulled it in again.
+
+Device 2.71 makes an unprovisioned board cost nothing:
+- The fingerprint gate generator also masks fprintd on an Ultra without the
+  runtime, as it already did on every other board. Activation fails at once,
+  and GDM falls back to the password.
+- `ubuntu-gts9u-fingerprint-secure.service` has
+  `ConditionPathExists=` the runtime: such a board skips it rather than
+  failing.
+- As a second line, `--wait` fails at once when the runtime is missing, and
+  `--boot` publishes `failed` when a preflight check fails, so `--wait` never
+  polls for a start that did not happen. A provisioned tablet is unchanged.
+
+The gate is decided at every boot and `daemon-reload`, so installing the
+runtime takes effect at the next reboot, which the secure startup needs
+anyway.
+
+`multi-user.target` itself was not waiting for the fingerprint, despite what
+`systemd-analyze critical-chain` showed for the failed unit. The holder was
+`ubuntu-gts9u-sensors-resume.service`. It starts after the display manager
+by design and keeps a health window of about 30 s after the SSC is ready
+(48.9 s start, ready at 53.2 s, finished at 83.3 s). It does not delay the
+greeter. It does delay units ordered after `multi-user.target`, among them
+the speaker calibration.

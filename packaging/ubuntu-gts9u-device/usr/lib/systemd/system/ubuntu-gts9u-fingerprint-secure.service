@@ -7,6 +7,10 @@ ConditionPathExists=/sys/bus/platform/devices/egis-el721
 # exists on the SM-X910 alone.  egis_el721 registers a fallback device on
 # the X710 too, so the path condition alone let this fail on every boot.
 ConditionFirmware=device-tree-compatible(samsung,gts9uwifi)
+# Android's sec_nvm and spdaemon, imported per device.  Without them --boot
+# can only fail, so an unprovisioned Ultra skips the unit instead of listing
+# it as failed; the fingerprint gate masks fprintd for the same reason.
+ConditionPathExists=/var/lib/ubuntu-gts9u/android-secnvm-root
 # The secure firmware can retain DMA addresses. Only a full OS reboot may
 # replace this owner; neither package upgrades nor failure should restart it.
 RefuseManualStop=yes

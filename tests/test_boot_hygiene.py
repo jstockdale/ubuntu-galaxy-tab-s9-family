@@ -11,6 +11,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 PKG = REPO / "packaging/ubuntu-gts9u-device"
 RTC = PKG / "usr/libexec/ubuntu-gts9u-rtc-offset"
 GATE = PKG / "usr/lib/systemd/system-generators/ubuntu-gts9u-fingerprint-gate"
+RUNTIME = "/var/lib/ubuntu-gts9u/android-secnvm-root"
 ARCHIVE = PKG / "usr/libexec/ubuntu-gts9u-pstore-archive"
 SDLOG = REPO / "scripts/bringup-sdlog/gts9u-bringup-sdlog"
 UNITS = PKG / "usr/lib/systemd/system"
@@ -72,7 +73,7 @@ date() {{ [ "$1" = +%s ] && echo {now} && return 0; command date "$@"; }}
 
 
 class FingerprintGate(unittest.TestCase):
-    def gate(self, compatible):
+    def gate(self, compatible, provisioned=True):
         with tempfile.TemporaryDirectory() as d:
             root = pathlib.Path(d)
             out = root / "normal"
@@ -80,7 +81,12 @@ class FingerprintGate(unittest.TestCase):
             compat = root / "compatible"
             if compatible is not None:
                 compat.write_bytes(compatible)
+            runtime = root / "android-secnvm-root"
+            if provisioned:
+                runtime.mkdir()
             script = GATE.read_text().replace("/proc/device-tree/compatible", str(compat))
+            self.assertIn(RUNTIME, script)
+            script = script.replace(RUNTIME, str(runtime))
             r = run_sh(f"set -- {out} {root}/early {root}/late\n" + script)
             self.assertEqual(r.returncode, 0, r.stderr)
             link = out / "fprintd.service"
@@ -88,6 +94,12 @@ class FingerprintGate(unittest.TestCase):
 
     def test_x710_masks_fprintd(self):
         self.assertEqual(self.gate(X710), "/dev/null")
+        self.assertEqual(self.gate(X710, provisioned=False), "/dev/null")
+
+    def test_unprovisioned_ultra_masks_fprintd(self):
+        # Without Android's sec_nvm and spdaemon fprintd can never become
+        # ready; masked, GDM's activation fails at once instead of waiting.
+        self.assertEqual(self.gate(X910, provisioned=False), "/dev/null")
 
     def test_no_device_tree_masks_fprintd(self):
         self.assertEqual(self.gate(None), "/dev/null")
@@ -102,6 +114,10 @@ class FingerprintGate(unittest.TestCase):
             with self.subTest(unit=name):
                 self.assertIn("ConditionFirmware=device-tree-compatible(samsung,gts9uwifi)",
                               (UNITS / name).read_text())
+
+    def test_secure_transport_needs_the_runtime(self):
+        unit = (UNITS / "ubuntu-gts9u-fingerprint-secure.service").read_text()
+        self.assertIn("ConditionPathExists=" + RUNTIME, unit)
 
 
 class PstoreArchive(unittest.TestCase):

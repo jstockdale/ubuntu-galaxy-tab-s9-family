@@ -82,6 +82,11 @@ def ready_record(record, now):
             and isinstance(record.get('owner_pid'), int) and record['owner_pid'] > 1)
 
 def wait_ready():
+    # Without the runtime --boot can only fail, and before it publishes
+    # anything: waiting would hold fprintd, and GDM's fingerprint request,
+    # for the whole minute (blastoise, 2026-11-10).
+    if not RUNTIME.exists():
+        raise RuntimeError('secure runtime not installed; password remains available')
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         try:
@@ -112,8 +117,16 @@ def publish(state, owner=None):
 def boot():
     if os.geteuid() != 0:
         raise RuntimeError('root required')
-    runtime_preflight()
-    fresh_preflight()
+    try:
+        runtime_preflight()
+        fresh_preflight()
+    except Exception:
+        # Nothing was started, so there is nothing to wait for: say so, or
+        # --wait polls for a record that never comes until its deadline.
+        STATE.mkdir(mode=0o700, exist_ok=True)
+        protected(STATE)
+        publish('failed')
+        raise
     STATE.mkdir(mode=0o700, exist_ok=True)
     protected(STATE)
     # Preserved across service stops, but removed by the next full boot.
