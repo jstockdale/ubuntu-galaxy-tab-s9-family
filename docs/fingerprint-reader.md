@@ -2563,6 +2563,15 @@ The gate is decided at every boot and `daemon-reload`, so installing the
 runtime takes effect at the next reboot, which the secure startup needs
 anyway.
 
+Measured on blastoise with 2.71 (2026-11-10):
+- Boot finished at 1 min 23.5 s instead of 1 min 50.5 s (userspace 69 s
+  instead of 96 s).
+- GDM's fprintd activation at 49.8 s failed at once ("Unit fprintd.service
+  is masked"), and the greeter fell back 40 ms later; the previous boot's
+  greeter had waited 25 s for it.
+- The secure unit was skipped by its condition, and no unit failed.
+- GDM still started at 47.6 s.
+
 `multi-user.target` itself was not waiting for the fingerprint, despite what
 `systemd-analyze critical-chain` showed for the failed unit. The holder was
 `ubuntu-gts9u-sensors-resume.service`. It starts after the display manager
