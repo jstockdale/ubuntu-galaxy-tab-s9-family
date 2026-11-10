@@ -665,7 +665,10 @@ if [ "${RESUME_ROOTFS:-0}" = 1 ]; then
 	chroot "$rootfs" apt-get check
 	echo "resuming completed $profile rootfs: $rootfs"
 else
-	rm -rf -- "$rootfs"
+	# --one-file-system: a mount an earlier build left inside (mmdebstrap
+	# bind-mounts the host's /dev/shm there) stops the removal under set -e
+	# instead of deleting the host's files through it.
+	rm -rf --one-file-system -- "$rootfs"
 	mkdir -p "$rootfs" "$base"
 
 	echo "building $profile rootfs: $suite arm64 -> $rootfs"
@@ -687,13 +690,14 @@ fi
 
 # mmdebstrap's cleanup can lose its unmount race against a process the hooks
 # leave running for a few more seconds; it then only warns and leaves /proc
-# (or /sys, /dev) mounted inside the rootfs.  Everything downstream assumes a
-# plain directory tree -- the summary du dies racing live procfs churn, and
-# stage 4's tar would image a mounted /proc wholesale -- so settle the mounts
+# (or /sys, /dev, or its bind mount of the host's /dev/shm) mounted inside
+# the rootfs.  Everything downstream assumes a plain directory tree -- the
+# summary du dies racing live procfs churn, stage 4's tar would image a
+# mounted /proc, or the host's shared memory, wholesale -- so settle the mounts
 # here and refuse to continue if one will not go.  The straggler can outlive
 # 10 s (v1.2.4, 2026-11-09: a 72-minute rootfs was lost to a /proc that was
 # free again a minute later), so wait up to 2 minutes and name the holders.
-for sub in proc sys dev/pts dev; do
+for sub in proc sys dev/shm dev/pts dev; do
 	mountpoint -q "$rootfs/$sub" 2>/dev/null || continue
 	for attempt in $(seq 1 60); do
 		umount "$rootfs/$sub" 2>/dev/null && break
