@@ -143,11 +143,11 @@ strace,tree
 # libgdk-pixbuf2.0-bin (image thumbnails), xdg-utils (xdg-open), "Open in
 # Terminal", desktop privileges for mounting, password quality checks, event
 # sounds through PipeWire's Pulse server, the screen reader (orca,
-# speech-dispatcher) and accessibility themes, Noto and Liberation fonts
-# (CJK and many other scripts were empty boxes), and Ubuntu's small standard
-# applications: document and image viewers, calculator, clocks, system
-# monitor, disks, disk usage, characters, fonts, logs, passwords and keys,
-# and power statistics.
+# speech-dispatcher and its espeak-ng voice, itself only a Recommends) and
+# accessibility themes, Noto and Liberation fonts (CJK and many other scripts
+# were empty boxes), and Ubuntu's small standard applications: document and
+# image viewers, calculator, clocks, system monitor, disks, disk usage,
+# characters, fonts, logs, passwords and keys, and power statistics.
 # Left out on purpose: crash and usage reporting (apport-gtk, whoopsie,
 # kerneloops, ubuntu-report), cloud-init, laptop-detect, pcmciautils,
 # libpam-sss, fwupd (no LVFS firmware for these tablets), hplip and the
@@ -176,7 +176,8 @@ gvfs-backends,gvfs-fuse,libgdk-pixbuf2.0-bin,xdg-utils,
 nautilus-extension-gnome-terminal,policykit-desktop-privileges,
 gsettings-ubuntu-schemas,cracklib-runtime,libcanberra-pulse,
 apt-config-icons-hidpi,xcursor-themes,
-orca,speech-dispatcher,mousetweaks,gnome-accessibility-themes,
+orca,speech-dispatcher,speech-dispatcher-espeak-ng,mousetweaks,
+gnome-accessibility-themes,
 fonts-liberation,fonts-noto-core,fonts-noto-cjk,
 evince,eog,gnome-calculator,gnome-clocks,gnome-system-monitor,
 gnome-disk-utility,baobab,gnome-characters,gnome-font-viewer,gnome-logs,
