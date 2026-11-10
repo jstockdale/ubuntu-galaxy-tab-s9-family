@@ -212,18 +212,27 @@ evince:
     def test_names_are_chosen_after_the_indexes_refresh(self):
         transaction = self.root / "transaction"
         transaction.mkdir()
-        manifest = {"files": {}, "apt_packages": ["cups", "libnss-mdns", "evince"]}
-        calls = []
-        def run(argv, capture=False, offline=False):
-            calls.append(argv[:2])
-            return self.POLICY if argv[:2] == ["apt-cache", "policy"] else ""
-        with patch.object(c, "TRANSACTION", transaction), patch.object(c, "run", run):
-            c.resolve_dependencies(manifest, False)
-        self.assertEqual(calls, [["apt-get", "update"], ["apt-cache", "policy"],
-                                 ["apt-get", "-y"], ["apt-get", "check"]])
-        plan = json.loads((transaction / "plan.json").read_text())
-        self.assertEqual(plan["apt_install"], ["libnss-mdns", "evince"])
-        self.assertEqual(plan["apt_packages"], ["cups", "libnss-mdns", "evince"])
+        listed = ["cups", "libnss-mdns", "evince"]
+        for repair, expected in ((False, ["libnss-mdns", "evince"]), (True, listed)):
+            with self.subTest(repair=repair):
+                manifest = {"files": {}, "apt_packages": list(listed)}
+                calls = []
+                def run(argv, capture=False, offline=False):
+                    calls.append(argv)
+                    return self.POLICY if argv[:2] == ["apt-cache", "policy"] else ""
+                with patch.object(c, "TRANSACTION", transaction), patch.object(c, "run", run):
+                    c.resolve_dependencies(manifest, repair)
+                steps = [argv[:2] for argv in calls]
+                self.assertEqual(steps, [["apt-get", "update"]]
+                                 + ([] if repair else [["apt-cache", "policy"]])
+                                 + [["apt-get", "-y"], ["apt-get", "check"]])
+                # Preparation only downloads; installing is the offline pass.
+                self.assertIn("--download-only", calls[-2])
+                self.assertNotIn("--no-download", calls[-2])
+                self.assertEqual(calls[-2][-len(expected):], expected)
+                plan = json.loads((transaction / "plan.json").read_text())
+                self.assertEqual(plan["apt_install"], expected)
+                self.assertEqual(plan["apt_packages"], listed)
 
     def prepared_repair_flag(self, args):
         """Run prepare() up to dependency resolution; return its repair flag."""
