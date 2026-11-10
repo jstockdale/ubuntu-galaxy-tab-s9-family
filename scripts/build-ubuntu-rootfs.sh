@@ -131,7 +131,13 @@ strace,tree
 #   libnss-mdns        avahi-daemon finds printers and hosts, but without its
 #                      NSS module nothing resolves a .local name: cupsd
 #                      could not reach EPSON40EF69.local, so adding a
-#                      discovered printer failed (2026-11-09).
+#                      discovered printer failed (2026-11-09).  It is also
+#                      what lets cups-browsed create real queues for
+#                      driverless network printers, which Chrome lists (it
+#                      ignores CUPS's temporary ones).  Noble's cups-browsed
+#                      does that by default, whatever its man page says
+#                      about LocalOnly: both tablets got an implicitclass
+#                      queue for the Epson with nobody adding it.
 #
 # The rest of what ubuntu-desktop-minimal, gnome-shell, gnome-control-center,
 # nautilus, gnome-terminal and network-manager recommend was audited on
