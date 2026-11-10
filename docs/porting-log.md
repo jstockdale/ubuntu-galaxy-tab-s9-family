@@ -8827,12 +8827,33 @@ To install it, copy the kit to the tablet's `~/hang-log` and run `sudo sh
 ~/hang-log/install.sh`, then reboot. Its preconditions and the checks that
 follow are in the kit README.
 
+**On squirtle.** The owner ran `install.sh` at 02:45 (boot `a5f2177f`). It
+wrote and read back `vendor_boot` (`9165f429…`) and `boot` (`d583546b…`),
+installed the 63-module tree and the sysctl drop-in, and saved the
+camera-bus images and the BT UART module tree to
+`/var/backups/ubuntu-gts9u-hang-log/`. There is no saved Ubuntu boot set to
+keep in step. After the owner's reboot at 02:46, boot `e0a06178` was up and
+`running` 67 s later.
+- `verify.sh` (no root) passed every check: the kit's kernel and key, the
+  detectors and sysctls (`watchdog` 1, console loglevel 5), the ramoops
+  layout registered with ECC 96, `/dev/pmsg0`, the camera-bus DTB settings,
+  the signed netconsole module, and no module failures.
+- The six `ramoops: uncorrectable error in header` lines are this first boot
+  reading the old layout's contents.
+- No failed units. Wi-Fi and USB networking are up, hci0 has its EFS address
+  and no interrupt or HCI errors, and the audio sink is present.
+- The BT UART kit's `verify.sh` fails only its build-ID check, which is
+  expected now that its kernel has been replaced.
+- The three `OVERLAP DETECTED` reserved-memory warnings (ABL's `kaslr` and
+  `uh` regions) were there in earlier boots too.
+
 **Not done:**
-- Not flashed, not on the tablet: the owner installs it.
-- No physical check has run. The kit README lists them: `verify.sh`, the
-  `hung-test` (a write blocked on a frozen loop file system), the camera,
-  audio and Wi-Fi rechecks, a dry run of `hang-capture.sh`, an optional
-  sysrq-`c` panic to prove the chain, and the warm-reset test.
+- Still to run, all on squirtle with sudo: `sudo verify.sh`, the `hung-test`
+  (a write blocked on a frozen loop file system), and a dry run of
+  `hang-capture.sh`.
+- Still to run by hand: the camera at a known size and audio playback. The
+  kit README also has the optional sysrq-`c` panic to prove the chain, and
+  the warm-reset test.
 - netconsole over ath11k is untested.
 - The kernel was not rebuilt with the changes dropped to compare `Image.gz`
   byte for byte, because a new key changes the image anyway. The
