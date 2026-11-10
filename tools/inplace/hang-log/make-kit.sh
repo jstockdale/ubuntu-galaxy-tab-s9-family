@@ -2,7 +2,7 @@
 # Pack the hang-log kit on the build host.  It goes on top of the camera-bus
 # kit: the BT UART kernel rebuilt with this branch's hang-evidence options
 # (config-gts9wifi.fragment), and the camera-bus DTB with the ramoops region
-# reorganised (pmsg and ftrace zones, ECC 64), in boot (appended) and
+# reorganised (pmsg and ftrace zones, ECC 96), in boot (appended) and
 # vendor_boot, plus the build's module tree, signed with its own key.
 #
 #   bash tools/inplace/hang-log/make-kit.sh BUILD_SCRATCH KERNEL_OUT_DIR \
@@ -180,9 +180,11 @@ diff <(decompile "$tmp/cambus.dtb") <(decompile "$out/$dts.dtb") > "$tmp/dtb.dif
 grep '^[<>]' "$tmp/dtb.diff" | sed 's/^\([<>]\) *\t*/\1    /' | sort > "$tmp/dtb.changed" || :
 sort > "$tmp/dtb.want" <<'EOF'
 <    ecc-size = <0x10>;
->    ecc-size = <0x40>;
+<    record-size = <0x20000>;
+>    ecc-size = <0x60>;
 >    ftrace-size = <0x20000>;
 >    pmsg-size = <0x20000>;
+>    record-size = <0x40000>;
 EOF
 cmp -s "$tmp/dtb.changed" "$tmp/dtb.want" || {
 	echo 'the DTB differs from the camera-bus one in more than the ramoops node:' >&2
@@ -190,7 +192,7 @@ cmp -s "$tmp/dtb.changed" "$tmp/dtb.want" || {
 	exit 1
 }
 grep -q 'sec-pmsg@880900000' <(decompile "$out/$dts.dtb") || die 'no sec-pmsg@880900000 in the new DTB'
-echo 'DTB: only the ramoops node changed (ecc-size 16 -> 64, pmsg-size and ftrace-size added)'
+echo 'DTB: only the ramoops node changed (ECC 16 -> 96, records 128 -> 256 KiB, pmsg and ftrace zones added)'
 
 # 3. The configuration: the BT UART kernel's but for the expected symbols.
 conf() { # CONFIG -> "SYMBOL<tab>VALUE" lines, "n" for "is not set"

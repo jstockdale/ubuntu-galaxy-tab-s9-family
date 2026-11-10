@@ -151,6 +151,10 @@ CONFIG_PSTORE_PMSG=y
 # with pstore.record_ftrace=1 on the command line, which traces every kernel
 # function: kept off, for a reset that leaves nothing else.
 CONFIG_PSTORE_FTRACE=y
+# Every reset on this board decays 7 to 20 % of the region's bytes (measured
+# on five boots, 2026-11-10).  A deflated oops/panic record is unreadable
+# from the first block ECC cannot repair; a plain one stays legible.
+# CONFIG_PSTORE_COMPRESS is not set
 
 # Hang evidence.  On 2026-11-10 squirtle hung with 30+ tasks in D state and
 # the disk stalled, so the journal kept nothing; the console record held only

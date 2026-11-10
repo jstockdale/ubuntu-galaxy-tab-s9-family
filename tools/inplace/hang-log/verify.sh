@@ -82,7 +82,7 @@ for c in CONFIG_DETECT_HUNG_TASK=y CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=60 \
 	CONFIG_HARDLOCKUP_DETECTOR=y CONFIG_HARDLOCKUP_DETECTOR_BUDDY=y \
 	CONFIG_WQ_WATCHDOG=y CONFIG_NETCONSOLE=m CONFIG_NETCONSOLE_DYNAMIC=y \
 	CONFIG_PSTORE_RAM=y CONFIG_PSTORE_CONSOLE=y CONFIG_PSTORE_PMSG=y \
-	CONFIG_PSTORE_FTRACE=y; do
+	CONFIG_PSTORE_FTRACE=y '# CONFIG_PSTORE_COMPRESS is not set'; do
 	printf '%s\n' "$cfg" | grep -qx "$c" || bad "config: no $c"
 done
 ok 'config: the detectors, netconsole and pstore options are as built'
@@ -102,12 +102,13 @@ read -r level rest < /proc/sys/kernel/printk
 	bad "console loglevel $level: is /etc/sysctl.d/60-gts9u-hang-log.conf installed?"
 
 # The ramoops region as the kit's DTB describes it, and as ramoops took it.
-[ "$(u32 "$ramoops/ecc-size")" = 64 ] && [ "$(u32 "$ramoops/pmsg-size")" = 131072 ] &&
-	[ "$(u32 "$ramoops/ftrace-size")" = 131072 ] && [ "$(u32 "$ramoops/console-size")" = 1048576 ] &&
-	ok 'DT: ramoops console 1 MiB, pmsg and ftrace 128 KiB, ECC 64' ||
+[ "$(u32 "$ramoops/ecc-size")" = 96 ] && [ "$(u32 "$ramoops/record-size")" = 262144 ] &&
+	[ "$(u32 "$ramoops/pmsg-size")" = 131072 ] && [ "$(u32 "$ramoops/ftrace-size")" = 131072 ] &&
+	[ "$(u32 "$ramoops/console-size")" = 1048576 ] &&
+	ok 'DT: ramoops records 256 KiB, console 1 MiB, pmsg and ftrace 128 KiB, ECC 96' ||
 	bad 'DT: the ramoops node is not the kit'"'"'s'
-printf '%s\n' "$k" | grep -q 'ramoops: using 0x200000@0x880900000, ecc: 64' &&
-	ok 'ramoops registered with ECC 64' || bad 'no "ramoops: using 0x200000@0x880900000, ecc: 64" this boot'
+printf '%s\n' "$k" | grep -q 'ramoops: using 0x200000@0x880900000, ecc: 96' &&
+	ok 'ramoops registered with ECC 96' || bad 'no "ramoops: using 0x200000@0x880900000, ecc: 96" this boot'
 [ -c /dev/pmsg0 ] && ok '/dev/pmsg0 exists' || bad 'no /dev/pmsg0'
 printf '%s\n' "$k" | grep -E 'ramoops|pstore|persistent_ram' | sed 's/^/     /'
 

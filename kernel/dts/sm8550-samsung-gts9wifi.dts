@@ -170,28 +170,37 @@
 		 * A new address could be DDR that XBL or ABL writes, which no DT
 		 * would show.
 		 *
-		 * The forced restart after the 2026-11-10 hang kept the console
-		 * record, decayed: about 10 % of its bytes changed, mostly by
-		 * cleared bits, and ECC 16 (8 bytes per 128-byte block) recovered
-		 * 3 blocks of about 96, as a Poisson model at that rate predicts
-		 * (5 %).  ECC 64 corrects 32 bytes per block, which the model puts
-		 * at 99.7 % of blocks; the parity costs a third of each zone.
-		 * Zones, in ramoops' order: six 128 KiB oops/panic records, the
-		 * 1 MiB console (now at offset 768 KiB), 128 KiB of pmsg
-		 * (/dev/pmsg0, for test markers) and 128 KiB of ftrace (off; see
-		 * config-gts9wifi.fragment).  Sizes are powers of two, as ramoops
-		 * requires.  The first boot after a layout change reads the old
-		 * contents as noise.
+		 * "Survived" above means present, not intact.  Aligned against the
+		 * journal, the console records of five boots (four ended by a
+		 * clean reboot, one by a forced restart after the 00:19 hang) had
+		 * 7 to 20 % of their bytes changed, 81 to 86 % of the changes by
+		 * cleared bits only, evenly from the oldest line to the newest and
+		 * whatever the uptime: DRAM decay across the reset, not an
+		 * overwrite and not ECC or layout trouble.  Each record held
+		 * exactly the err-level text the journal has after 17 s, when
+		 * systemd-pstore's unlink zaps the live console zone.  ECC 16
+		 * (8 bytes per 128-byte block) left 77 to 99 % of blocks
+		 * unrecoverable.  ECC 96 corrects 48 bytes per block: a Poisson
+		 * model at 13.5 % keeps 99.9 % of blocks, at 20 % two thirds, for
+		 * 43 % of each zone.  Linux resets with PSCI SYSTEM_RESET (reboot
+		 * mode cold); whether a warm reset keeps DDR refreshed is untested.
+		 *
+		 * Zones, in ramoops' order: three 256 KiB oops/panic records
+		 * (uncompressed, see config-gts9wifi.fragment), the 1 MiB console
+		 * (now at offset 768 KiB), 128 KiB of pmsg (/dev/pmsg0, for test
+		 * markers) and 128 KiB of ftrace (off).  Sizes are powers of two,
+		 * as ramoops requires.  The first boot after a layout change reads
+		 * the old contents as noise.
 		 */
 		sec_pmsg_mem: sec-pmsg@880900000 {
 			compatible = "ramoops";
 			reg = <0x8 0x80900000 0x0 0x200000>;
 			no-map;
-			record-size = <0x20000>;
+			record-size = <0x40000>;
 			console-size = <0x100000>;
 			pmsg-size = <0x20000>;
 			ftrace-size = <0x20000>;
-			ecc-size = <64>;
+			ecc-size = <96>;
 		};
 
 		google_debug_kinfo_mem: google-debug-kinfo@880b00000 {
