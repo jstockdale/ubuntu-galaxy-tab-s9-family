@@ -41,9 +41,13 @@ console.
 - **`/etc/sysctl.d/60-gts9u-hang-log.conf`:**
   - `kernel.watchdog = 1`. ABL appends `nowatchdog`, which would leave both
     lockup detectors off.
-  - `kernel.printk = 5 4 1 7`, so that warnings, and WARN backtraces with
-    them, reach the ramoops console. The cost is the 115200 debug UART: the
-    busiest minute on 2026-11-09 had 16 warning lines.
+  - The console loglevel stays at Ubuntu's 4. On this tablet each line the
+    consoles print costs 0.1 to 0.25 s with interrupts off: the three err
+    lines of a hung-task report came 231, 108 and 243 ms apart. The first
+    version of this drop-in also set `kernel.printk = 5 4 1 7`, which put
+    every warning, ath11k's `msdu_done` bursts in the Wi-Fi receive path
+    among them, through that cost; it is gone. A panic writes the log's tail
+    to pstore whatever the loglevel.
 - **The module tree** comes from this build and is signed with its own key,
   which is archived in the key registry. The configuration change moves
   `task_struct` (the hung-task fields) and `net_device` (netpoll), and the
@@ -153,25 +157,27 @@ in two terminals, started **before** the test:
 
 ```sh
 sh tools/inplace/cameras/hang-capture.sh log <user>@<tablet> [DIR]
-sh tools/inplace/cameras/hang-capture.sh shell <user>@<tablet>
+sh tools/inplace/cameras/hang-capture.sh shell <user>@<tablet> [DIR]
 ```
 
 - **`log`** streams `dmesg -w` over SSH into `DIR/hang-<tablet>-<time>.log`,
-  with a tick every 30 s that shows userspace is still alive. While it runs:
-  - it raises the console loglevel to 7, so that hung-task stacks and sysrq
-    dumps (KERN_INFO) also reach ramoops;
+  with a tick every 30 s that shows userspace is still alive. `dmesg -w`
+  gets every line whatever the console loglevel. While it runs:
   - it turns on all-CPU backtraces for hung-task reports;
   - it traces RPMh requests and completions (`rpmh_send_msg`,
     `rpmh_tx_done`), interconnect votes (`icc_set_bw`, `icc_set_bw_end`) and
     GMU frequency changes (`msm_gmu_freq_change`) into a 16 KB-per-CPU
     ftrace buffer. The 00:19 hang ended in an interconnect RPMh timeout,
     after a day of GMU bandwidth-vote timeouts. A request with no completion,
-    or a vote with no end, is the stuck one. Sysrq `z` prints the buffer,
-    and so does a panic (`ftrace_dump_on_oops`). `--no-trace` skips this.
+    or a vote with no end, is the stuck one. The shell reads the buffer;
+    `--no-trace` skips this.
+  - `--console-level 7` also raises the console loglevel, so that hung-task
+    stacks and sysrq dumps reach the ramoops console. Each extra console line
+    then costs 0.1 to 0.25 s with interrupts off, so it is off by default.
 
   Ctrl-C restores all of it.
 - **`shell`** opens a root shell with no profile, in `/`, ready before the
-  hang. During the 00:19 hang, ping and an open SSH session kept working, but
+  hang, and logs what it shows into `DIR/shell-<tablet>-<time>.log`. During the 00:19 hang, ping and an open SSH session kept working, but
   anything that needs the disk (sudo, a new login, `ls`) would have blocked.
   `echo` is built into the shell and `/proc` is not on the disk, so this
   still works:
@@ -179,10 +185,14 @@ sh tools/inplace/cameras/hang-capture.sh shell <user>@<tablet>
   ```sh
   echo w > /proc/sysrq-trigger     # blocked tasks with stacks
   echo l > /proc/sysrq-trigger     # every CPU's backtrace
-  echo z > /proc/sysrq-trigger     # the RPMh/interconnect/GMU trace
   echo 'what you saw' > /dev/pmsg0 # a note the next boot keeps
+  # the trace, into the shell's log file:
+  while IFS= read -r l; do echo "$l"; done < /sys/kernel/tracing/trace
   echo c > /proc/sysrq-trigger     # last: panic, pstore gets the log, reset after 10 s
   ```
+
+  Avoid sysrq `z` (the trace) and `t` (every task). They print through the
+  consoles, which here means minutes with a CPU's interrupts off.
 
   Prefer `c` to holding the power key, because the panic writes the log's
   tail, sysrq output included, to a plain pstore record. Both resets decay
@@ -208,7 +218,7 @@ default) into `DIR/netconsole-<tablet>-<time>.log`.
   BH-disabling locks, while netpoll calls it with interrupts off, and that is
   untested here. Use the USB link, or pass `--allow-wifi`.
 - netconsole is a console, so it carries what the console loglevel lets
-  through: warnings with the kit's sysctl, everything while `log` runs.
+  through: errors by default, more with `log --console-level`.
 
 ## After a hang
 

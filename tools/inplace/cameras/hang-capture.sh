@@ -2,11 +2,13 @@
 # Keep evidence if the SM-X710 hangs during a risky test (an untested camera
 # size, say).  Run it on the host, before the test, in two terminals:
 #
-#   sh hang-capture.sh log TARGET [DIR] [--no-trace]
+#   sh hang-capture.sh log TARGET [DIR] [--no-trace] [--console-level N]
 #                                            the kernel log, streamed into
 #                                            DIR/hang-<tablet>-<time>.log
-#   sh hang-capture.sh shell TARGET          a root shell that needs no disk,
-#                                            for sysrq during the hang
+#   sh hang-capture.sh shell TARGET [DIR]    a root shell that needs no disk,
+#                                            for sysrq during the hang; its
+#                                            output also goes to
+#                                            DIR/shell-<tablet>-<time>.log
 #   sh hang-capture.sh netconsole TARGET [PORT [DIR]] [--allow-wifi]
 #                                            the kernel log over UDP, sent by
 #                                            printk itself (hang-log kit)
@@ -20,14 +22,19 @@
 # session still worked, but the disk had stalled, so the journal kept
 # nothing, and a command that needs the disk (sudo, ls, a new login) would
 # have blocked.  Hence both sessions start before the test, and the shell
-# uses only builtins.  "log" raises the console loglevel to 7 while it runs,
-# so hung-task stacks and sysrq dumps also reach the ramoops console, which
-# the next boot keeps under /sys/fs/pstore, and turns on all-CPU backtraces
-# for hung-task reports.  It also traces RPMh requests and completions,
-# interconnect votes and GMU frequency changes into a small ftrace buffer
-# (the hang's last line was an interconnect RPMh timeout, after a day of GMU
-# bandwidth-vote timeouts): sysrq z prints it, and a panic does
-# (ftrace_dump_on_oops).  Ctrl-C ends it and restores all of this.
+# uses only builtins.  "log" turns on all-CPU backtraces for hung-task
+# reports, and traces RPMh requests and completions, interconnect votes and
+# GMU frequency changes into a small ftrace buffer (the hang's last line was
+# an interconnect RPMh timeout, after a day of GMU bandwidth-vote timeouts).
+# The shell reads that buffer with builtins, not through printk.  Ctrl-C ends
+# "log" and restores both.
+#
+# The console loglevel stays as it is unless --console-level asks: every line
+# the consoles print costs 0.1 to 0.25 s on this tablet, with interrupts off
+# (2026-11-10).  dmesg -w gets every line whatever the level, and a panic
+# (sysrq c) writes the log's tail to pstore whatever the level.  At 7, the
+# ramoops console keeps hung-task stacks and sysrq dumps too, at that cost
+# per line.
 set -eu
 
 usage() { sed -n 's/^#   //p' "$0" >&2; exit 2; }
@@ -53,22 +60,27 @@ case $mode in
 log)
 	dir=.
 	trace=yes
-	for a in "$@"; do
-		case $a in
+	level=keep
+	while [ $# -gt 0 ]; do
+		case $1 in
 		--no-trace) trace=no ;;
-		*) dir=$a ;;
+		--console-level) level=${2:?--console-level needs a number}; shift ;;
+		*) dir=$1 ;;
 		esac
+		shift
 	done
+	case $level in keep|[0-8]) ;; *) echo "--console-level: 0 to 8" >&2; exit 2 ;; esac
 	mkdir -p "$dir"
 	file=$dir/hang-$name-$stamp.log
 	echo "== host: $(date -Is), kernel log of $target" > "$file"
-	echo "writing $file; Ctrl-C stops the stream and restores the loglevel"
+	echo "writing $file; Ctrl-C stops the stream and restores the settings"
 	remote='set -u
 printk=/proc/sys/kernel/printk
 bt=/proc/sys/kernel/hung_task_all_cpu_backtrace
 T=/sys/kernel/tracing
-dump=/proc/sys/kernel/ftrace_dump_on_oops
 read -r old rest < "$printk"
+level=$2
+[ "$level" = keep ] && level=$old
 oldbt=
 [ -w "$bt" ] && read -r oldbt < "$bt"
 tick=
@@ -79,33 +91,30 @@ restore() {
 	[ -n "$oldbt" ] && echo "$oldbt" > "$bt"
 	if [ -n "$traced" ]; then
 		for e in $traced; do echo 0 > "$T/events/$e/enable"; done
-		echo "$olddump" > "$dump"
 		echo "$oldkb" > "$T/buffer_size_kb"
 	fi
 	echo "== hang-capture: console loglevel back to $old${traced:+, tracing off}"
 }
 trap "restore; exit 0" INT TERM HUP
-echo 7 > "$printk"
+echo "$level" > "$printk"
 btstate=unavailable
 [ -n "$oldbt" ] && echo 1 > "$bt" && btstate=on
 if [ "$1" = yes ] && [ -d "$T/events" ]; then
 	read -r oldkb rest < "$T/buffer_size_kb"
 	# "7 (expanded: 1408)" until the buffer is first used.
 	case $rest in *expanded:*) oldkb=${rest#*expanded: }; oldkb=${oldkb%)} ;; esac
-	read -r olddump < "$dump"
 	echo 0 > "$T/tracing_on"
 	echo 16 > "$T/buffer_size_kb"
 	for e in rpmh/rpmh_send_msg rpmh/rpmh_tx_done interconnect/icc_set_bw \
 		interconnect/icc_set_bw_end drm_msm_gpu/msm_gmu_freq_change; do
 		[ -w "$T/events/$e/enable" ] && echo 1 > "$T/events/$e/enable" && traced="$traced $e"
 	done
-	echo 1 > "$dump"
 	echo 1 > "$T/tracing_on"
 fi
 read -r up idle < /proc/uptime
 echo "== hang-capture on $(uname -n): kernel $(uname -v), boot $(cat /proc/sys/kernel/random/boot_id)"
-echo "== uptime $up s at $(date -Is); console loglevel $old -> 7; hung-task all-CPU backtraces $btstate"
-echo "== traced (16 KB per CPU; sysrq z or a panic prints it):${traced:- nothing}"
+echo "== uptime $up s at $(date -Is); console loglevel $old -> $level; hung-task all-CPU backtraces $btstate"
+echo "== traced into 16 KB per CPU (read it from the shell):${traced:- nothing}"
 echo "hang-capture: log started at uptime $up" > /dev/kmsg
 [ -c /dev/pmsg0 ] && echo "hang-capture: log started at uptime $up" > /dev/pmsg0
 (while sleep 30; do read -r up idle < /proc/uptime; echo "== tick: uptime $up"; done) &
@@ -114,7 +123,7 @@ dmesg -w -x
 restore'
 	# The terminal gets the stream as the remote tty sends it; the file
 	# gets it without the tty's carriage returns.
-	as_root "$remote" "$trace" | tee /dev/tty | tr -d '\r' >> "$file" || :
+	as_root "$remote" "$trace" "$level" | tee /dev/tty | tr -d '\r' >> "$file" || :
 	echo "== host: $(date -Is), stream ended" | tee -a "$file"
 	;;
 shell)
@@ -125,10 +134,13 @@ into the shell and /proc is not on the disk, so they work while it stalls:
   echo w > /proc/sysrq-trigger     the blocked (D-state) tasks, with stacks
   echo l > /proc/sysrq-trigger     a backtrace of every CPU (a CPU spinning
                                    with interrupts off cannot answer)
-  echo z > /proc/sysrq-trigger     the RPMh, interconnect and GMU trace that
-                                   "log" collects (the last requests before
-                                   the hang; a request with no completion)
   echo 'what you saw' > /dev/pmsg0 a note the next boot keeps (pstore pmsg)
+
+and the RPMh, interconnect and GMU trace that "log" collects (the last
+requests before the hang; a request with no completion is the stuck one),
+read with builtins into this shell's log file rather than through printk:
+
+  while IFS= read -r l; do echo "$l"; done < /sys/kernel/tracing/trace
 
 Then, once the log stream has shown them, or has stopped:
 
@@ -139,13 +151,21 @@ Prefer that to holding the power key: the panic also writes the log's tail,
 sysrq output included, to a pstore record.  Every reset decays 7 to 20 % of
 the ramoops RAM (ECC 96 repairs most of it).  If the kit README's warm-reset
 test passed, type  echo warm > /sys/kernel/reboot/mode  before  c.
+Avoid sysrq z and t: they print through the consoles, which cost 0.1 to
+0.25 s per line here with interrupts off.
 
 Nothing else: no Tab completion, no other command, no exit; any of them may
 wait on the stalled disk.
 EOF
+	dir=${1:-.}
+	mkdir -p "$dir"
+	file=$dir/shell-$name-$stamp.log
+	echo "== host: $(date -Is), root shell on $target" > "$file"
+	echo "this shell's output also goes to $file"
 	remote='cd / || exit 1
 exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin TERM=vt100 HOME=/ PS1="hang# " /bin/sh -i'
-	as_root "$remote"
+	as_root "$remote" | tee /dev/tty | tr -d '\r' >> "$file" || :
+	echo "== host: $(date -Is), shell ended" | tee -a "$file"
 	;;
 netconsole)
 	port=6666

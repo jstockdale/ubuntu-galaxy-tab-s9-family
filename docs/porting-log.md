@@ -8847,10 +8847,48 @@ keep in step. After the owner's reboot at 02:46, boot `e0a06178` was up and
 - The three `OVERLAP DETECTED` reserved-memory warnings (ABL's `kaslr` and
   `uh` regions) were there in earlier boots too.
 
+`sudo verify.sh hung-test` passed. The detector reported the write blocked on
+the frozen loop file system (pid 5310, state D, waiting in
+`percpu_rwsem_wait` from `mnt_want_write`) about 75 s after it started.
+
+**Each console line costs 0.1 to 0.25 s.** The detector's report showed the
+problem:
+- Its three err lines came 231, 108 and 243 ms apart, with no code between
+  the three `pr_err` calls. Its info-level stack lines, which no console
+  prints, came out within microseconds.
+- So each line the consoles print costs 0.1 to 0.25 s on this tablet, and
+  legacy consoles are written with interrupts off.
+- The cs35l45 control errors at boot are 0.24 to 0.28 s apart on the old
+  kernel too, so this predates the kit.
+- Suspects, not tested: fbcon on `tty0`, which takes the 2560x1600 panel at
+  12.28 s as a 320x100 console, and the earlycon boot console `qcom_geni0`,
+  still registered beside `ttyMSM0`.
+
+Because of that, the kit changed:
+- The drop-in no longer sets `kernel.printk = 5 4 1 7`. That setting would
+  have put every warning through the cost, ath11k's `msdu_done` bursts in the
+  Wi-Fi receive path among them.
+- `hang-capture.sh log` no longer raises the console loglevel to 7 (that is
+  now `--console-level`) and no longer sets `ftrace_dump_on_oops`.
+- `shell` no longer suggests sysrq `z`. It reads the trace with builtins
+  instead, into a host log file.
+- A panic still writes the log's tail to pstore whatever the loglevel.
+
+The re-staged kit is `~/ubuntu-gts9u/backups/hang-log-kit-r2`. Its images
+and module tree are byte-identical to the installed ones; only these three
+files changed:
+```
+4739f9282ac118a8363dc6ae4020a7f1cdc6e6ad26f3e4142eb4376e36bdeeba  verify.sh
+dd98c7b29ee687320ab77f9890726e41183ef5be97bf0adb15203fe7aae6d679  60-gts9u-hang-log.conf
+29299fe351e0e8caf8e1765ca275898002a1f619a73b1b12cc742d88d363b49a  README.md
+```
+
 **Not done:**
-- Still to run, all on squirtle with sudo: `sudo verify.sh`, the `hung-test`
-  (a write blocked on a frozen loop file system), and a dry run of
-  `hang-capture.sh`.
+- Still to run on squirtle, with sudo:
+  - update the installed drop-in (`kernel.printk` back to 4);
+  - `sudo verify.sh`;
+  - a dry run of `hang-capture.sh`.
+- Finding the slow console is a separate task.
 - Still to run by hand: the camera at a known size and audio playback. The
   kit README also has the optional sysrq-`c` panic to prove the chain, and
   the warm-reset test.

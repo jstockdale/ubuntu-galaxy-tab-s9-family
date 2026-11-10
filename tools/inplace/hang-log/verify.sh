@@ -98,8 +98,7 @@ sysctl_is soft_watchdog 1
 sysctl_is nmi_watchdog 1
 sysctl_is softlockup_panic 0
 read -r level rest < /proc/sys/kernel/printk
-[ "$level" -ge 5 ] && ok "console loglevel $level (warnings reach ramoops)" ||
-	bad "console loglevel $level: is /etc/sysctl.d/60-gts9u-hang-log.conf installed?"
+note "console loglevel $level (4 is Ubuntu's; each console line costs 0.1-0.25 s here)"
 
 # The ramoops region as the kit's DTB describes it, and as ramoops took it.
 [ "$(u32 "$ramoops/ecc-size")" = 96 ] && [ "$(u32 "$ramoops/record-size")" = 262144 ] &&
