@@ -1,0 +1,336 @@
+Subject: [PATCH] usb: typec: tcpm: let a sink request DFP before discovery
+
+A charge-through dock or hub is the power source and wants to be the USB
+device.  It attaches as Source/DFP and asks for a DR_Swap once discovery
+has run; on the SM-X910 about 270 ms after the last discovery reply.  With
+the SM5714 that swap does not hold.  TCPM accepts it and becomes DFP, and
+1.3 to 5.7 ms after the Accept the partner sends a Soft_Reset whose header
+still claims Source/DFP, whether or not the port has sent anything in its
+new role by then.  TCPM logs "Data role mismatch, initiating error
+recovery", and the next attach repeats it.  One hub did this 28 times out
+of 28; a dock from another vendor did it in one of the two attaches on
+record and sent a Hard_Reset in the other.  The cause is unknown.
+
+A DR_Swap that the sink sent before its first Discover Identity was
+accepted within 4 ms and held, both times that happened (one hub; the
+requests came from user space and happened to get in ahead of discovery).
+One that is started later, while a VDM of the port is waiting for its
+reply, collides with that reply and ends in a Soft_Reset, 30 times out of
+30.  User space cannot time the request; TCPM can, by making it before
+discovery.
+
+Provide an opt-in TCPC flag for that.  As Sink/UFP under an explicit
+contract, when the first source PDO advertises data role swap, request DFP
+from the SNK_READY entry instead of starting discovery.  The request goes
+through tcpm_ams_start(), so a PD 3.0 sink still waits for SinkTxOK; when
+it has to wait, the discover work retries it before it sends anything of
+its own.  No request is made on top of a state change that is already
+pending, or once the port has gone on to its own Discover Identity.
+
+Accept, Reject and Not_Supported settle the matter, and so does a data role
+swap that the partner asked for and the port accepted, so that the port
+does not ask for a role back that it has just handed over.  After Wait the
+request is repeated once tDRSwapWait has passed.  A request that got no
+answer or was lost to another message is repeated as well.  At most three
+requests are started per attach.  After Accept, discovery runs once, as
+DFP; otherwise it runs as it does today.
+
+A Hard Reset returns both ends to their default data roles.  This tree
+keeps a sink in the host role across it when the TCPC sets
+adopt_retained_source_ufp.  That is right for a role adopted for a partner
+that has retained UFP, and wrong for one that came from a DR_Swap: the
+partner is DFP again, and its next message is a data role mismatch.  With
+the flag set, a role that came from a DR_Swap goes back to the default, and
+the request is made again after the new contract if one is left.
+
+DR_SWAP_SEND sets send_discover (as UFP, or above PD 2.0) and
+DR_SWAP_SEND_TIMEOUT clears it, which assumes that discovery had already
+run.  With the flag set, the timeout restores what DR_SWAP_SEND found: a
+request that got no answer is still followed by discovery, and a swap asked
+for after discovery is not.
+
+Also with the flag set, the discover work stops re-arming itself once the
+port is detached, and a detach or a Hard Reset drops a state change that
+was queued before it.  tcpm_ams_start() leaves the request in
+upcoming_state until the state machine runs; if the detach or the reset is
+handled first, the next SNK_READY would send the DR_Swap unchecked, to
+another partner or in a data role it was not meant for.  HARD_RESET_SEND
+already clears upcoming_state for a Hard Reset that the port sends.
+
+Ports whose TCPC does not set the flag are not affected.
+---
+ drivers/usb/typec/tcpm/tcpm.c | 141 ++++++++++++++++++++++++++++++++++++++++---
+ include/linux/usb/tcpm.h      |   9 +++++++++
+ 2 files changed, 147 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
+--- a/drivers/usb/typec/tcpm/tcpm.c
++++ b/drivers/usb/typec/tcpm/tcpm.c
+@@ -276,6 +276,10 @@ enum frs_typec_current {
+ #define GET_SINK_CAP_RETRY_MS	100
+ #define SEND_DISCOVER_RETRY_MS	100
+ 
++/* tcpc->request_dfp_as_sink: DR_Swap requests per attach, and tDRSwapWait */
++#define SINK_DFP_SWAP_TRIES	3
++#define SINK_DFP_SWAP_WAIT_MS	100
++
+ struct pd_mode_data {
+ 	int svid_index;		/* current SVID index		*/
+ 	int nsvids;
+@@ -531,6 +535,17 @@ struct tcpm_port {
+ 	unsigned int hard_reset_count;
+ 	bool pd_capable;
+ 	bool explicit_contract;
++	/*
++	 * tcpc->request_dfp_as_sink, per attach: the DR_Swap requests started,
++	 * whether requesting is over, and when tDRSwapWait ends.
++	 */
++	unsigned int sink_dfp_tries;
++	bool sink_dfp_done;
++	ktime_t sink_dfp_not_before;
++	/* The data role comes from a DR_Swap since the attach or a Hard Reset */
++	bool data_role_swapped;
++	/* What send_discover was when the DR_Swap in progress was sent */
++	bool send_discover_before_swap;
+ 	unsigned int rx_msgid;
+ 
+ 	/* USB PD objects */
+@@ -1763,6 +1778,62 @@ static int tcpm_ams_start(struct tcpm_po
+ }
+ 
+ /*
++ * Opt-in (tcpc->request_dfp_as_sink): as Sink/UFP under an explicit contract
++ * with a Source that advertises data role swap, ask for DFP before discovery
++ * starts.  The request goes out ahead of the port's own Discover Identity, so
++ * that it cannot collide with a VDM that is waiting for its reply, and
++ * discovery runs once, in the resulting role.  Once the port has gone on to
++ * its Discover Identity, no request is made.
++ *
++ * Accept, Reject and Not_Supported settle the matter, and so does a data role
++ * swap that the partner asked for and the port accepted.  After Wait the
++ * request is repeated once tDRSwapWait has passed; a request that got no
++ * answer, or that was lost to another message, is repeated as well.  At most
++ * SINK_DFP_SWAP_TRIES requests are started per attach.  Until the matter is
++ * settled or the requests are used up, no Discover Identity is sent.
++ *
++ * A Hard Reset reopens the matter.  A host role that came from a DR_Swap goes
++ * back to the default there, and a request that was about to go out is
++ * dropped.
++ *
++ * A request waits while the port has a state change pending, which it would
++ * otherwise replace.
++ *
++ * Returns 1 when a DR_Swap was started, -EAGAIN when it has to wait, and 0
++ * when no request is due.
++ */
++static int tcpm_request_dfp_as_sink(struct tcpm_port *port)
++{
++	if (!port->tcpc->request_dfp_as_sink || port->sink_dfp_done ||
++	    port->sink_dfp_tries >= SINK_DFP_SWAP_TRIES)
++		return 0;
++
++	if (port->typec_caps.data != TYPEC_PORT_DRD ||
++	    port->pwr_role != TYPEC_SINK || port->data_role != TYPEC_DEVICE ||
++	    !port->pd_capable || !port->explicit_contract ||
++	    !port->nr_source_caps ||
++	    !(port->source_caps[0] & PDO_FIXED_DATA_SWAP))
++		return 0;
++
++	if (port->state != SNK_READY || port->vdm_sm_running ||
++	    port->upcoming_state != INVALID_STATE ||
++	    port->delayed_state != INVALID_STATE ||
++	    ktime_before(ktime_get(), port->sink_dfp_not_before))
++		return -EAGAIN;
++
++	port->upcoming_state = DR_SWAP_SEND;
++	if (tcpm_ams_start(port, DATA_ROLE_SWAP) == -EAGAIN) {
++		port->upcoming_state = INVALID_STATE;
++		return -EAGAIN;
++	}
++
++	port->sink_dfp_tries++;
++	tcpm_log(port, "Requesting DFP before discovery");
++
++	return 1;
++}
++
++/*
+  * VDM/VDO handling functions
+  */
+ static void tcpm_queue_vdm(struct tcpm_port *port, const u32 header,
+@@ -3680,6 +3751,12 @@ static void tcpm_pd_ctrl_request(struct
+ 		case DR_SWAP_SEND:
+ 			port->swap_status = (type == PD_CTRL_WAIT ?
+ 					     -EAGAIN : -EOPNOTSUPP);
++			/* For tcpm_request_dfp_as_sink(): Wait is not final */
++			if (type == PD_CTRL_WAIT)
++				port->sink_dfp_not_before =
++					ktime_add_ms(ktime_get(), SINK_DFP_SWAP_WAIT_MS);
++			else
++				port->sink_dfp_done = true;
+ 			tcpm_set_state(port, DR_SWAP_CANCEL, 0);
+ 			break;
+ 		case PR_SWAP_SEND:
+@@ -4956,6 +5033,13 @@ static void tcpm_reset_port(struct tcpm_
+ 	tcpm_typec_disconnect(port);
+ 	port->attached = false;
+ 	port->pd_capable = false;
++	port->sink_dfp_tries = 0;
++	port->sink_dfp_done = false;
++	port->sink_dfp_not_before = 0;
++	port->data_role_swapped = false;
++	/* A request that was about to go out is not for the next partner */
++	if (port->tcpc->request_dfp_as_sink)
++		port->upcoming_state = INVALID_STATE;
+ 	port->pps_data.supported = false;
+ 	tcpm_set_partner_usb_comm_capable(port, false);
+ 
+@@ -5853,7 +5937,13 @@ static void run_state_machine(struct tcp
+ 				port->tx_sop_type = TCPC_TX_SOP;
+ 				tcpm_set_initial_svdm_version(port);
+ 			}
+-			mod_send_discover_delayed_work(port, 0);
++			/*
++			 * A DR_Swap requested here precedes discovery, which
++			 * starts when the port is back in SNK_READY.  When the
++			 * request has to wait, the discover work retries it.
++			 */
++			if (tcpm_request_dfp_as_sink(port) <= 0)
++				mod_send_discover_delayed_work(port, 0);
+ 		} else {
+ 			port->send_discover = false;
+ 			port->send_discover_prime = false;
+@@ -5904,6 +5994,15 @@ static void run_state_machine(struct tcp
+ 		port->nr_sink_caps = 0;
+ 		port->send_discover = true;
+ 		port->send_discover_prime = false;
++		/*
++		 * A new contract follows: ask for DFP again if that is due.
++		 * With tcpc->request_dfp_as_sink, drop a state change that was
++		 * queued before the reset: a request left there would go out
++		 * unchecked at the next SNK_READY.
++		 */
++		port->sink_dfp_done = false;
++		if (port->tcpc->request_dfp_as_sink)
++			port->upcoming_state = INVALID_STATE;
+ 		if (port->pwr_role == TYPEC_SOURCE)
+ 			tcpm_set_state(port, SRC_HARD_RESET_VBUS_OFF,
+ 				       PD_T_PS_HARD_RESET);
+@@ -5921,6 +6020,7 @@ static void run_state_machine(struct tcp
+ 		tcpm_set_vbus(port, false);
+ 		tcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SOURCE,
+ 			       tcpm_data_role_for_source(port));
++		port->data_role_swapped = false;
+ 		/*
+ 		 * If tcpc fails to notify vbus off, TCPM will wait for PD_T_SAFE_0V +
+ 		 * PD_T_SRC_RECOVER before turning vbus back on.
+@@ -5951,10 +6051,20 @@ static void run_state_machine(struct tcp
+ 		tcpm_set_vconn(port, false);
+ 		if (port->pd_capable)
+ 			tcpm_set_charge(port, false);
++		/*
++		 * With tcpc->adopt_retained_source_ufp a host role is kept,
++		 * for a partner that keeps its own role too.  With
++		 * tcpc->request_dfp_as_sink, one that came from a DR_Swap is
++		 * not: it goes back to the default like the partner's, and is
++		 * asked for again after the new contract.
++		 */
+ 		tcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SINK,
+ 			       port->tcpc->adopt_retained_source_ufp &&
+-			       port->data_role == TYPEC_HOST ?
++			       port->data_role == TYPEC_HOST &&
++			       !(port->tcpc->request_dfp_as_sink &&
++				 port->data_role_swapped) ?
+ 			       TYPEC_HOST : tcpm_data_role_for_sink(port));
++		port->data_role_swapped = false;
+ 		/*
+ 		 * VBUS may or may not toggle, depending on the adapter.
+ 		 * If it doesn't toggle, transition to SNK_HARD_RESET_SINK_ON
+@@ -6052,6 +6162,7 @@ static void run_state_machine(struct tcp
+ 	/* DR_Swap states */
+ 	case DR_SWAP_SEND:
+ 		tcpm_pd_send_control(port, PD_CTRL_DR_SWAP, TCPC_TX_SOP);
++		port->send_discover_before_swap = port->send_discover;
+ 		if (port->data_role == TYPEC_DEVICE || port->negotiated_rev > PD_REV20) {
+ 			port->send_discover = true;
+ 			port->send_discover_prime = false;
+@@ -6069,12 +6180,20 @@ static void run_state_machine(struct tcp
+ 		break;
+ 	case DR_SWAP_SEND_TIMEOUT:
+ 		tcpm_swap_complete(port, -ETIMEDOUT);
+-		port->send_discover = false;
++		/*
++		 * With tcpc->request_dfp_as_sink a DR_Swap can precede
++		 * discovery, which is then still due when it got no answer.
++		 */
++		port->send_discover = port->tcpc->request_dfp_as_sink &&
++				      port->send_discover_before_swap;
+ 		port->send_discover_prime = false;
+ 		tcpm_ams_finish(port);
+ 		tcpm_set_state(port, ready_state(port), 0);
+ 		break;
+ 	case DR_SWAP_CHANGE_DR:
++		/* Whoever asked for it, a completed swap settles the data role */
++		port->sink_dfp_done = true;
++		port->data_role_swapped = true;
+ 		tcpm_unregister_altmodes(port);
+ 		if (port->data_role == TYPEC_HOST)
+ 			tcpm_set_roles(port, true, TYPEC_STATE_USB, port->pwr_role,
+@@ -7092,8 +7211,22 @@ unlock:
+ static void tcpm_send_discover_work(struct kthread_work *work)
+ {
+ 	struct tcpm_port *port = container_of(work, struct tcpm_port, send_discover_work);
++	int ret;
+ 
+ 	mutex_lock(&port->lock);
++	/* Nothing to discover once the partner is gone, and no retry either */
++	if (port->tcpc->request_dfp_as_sink && !port->attached)
++		goto unlock;
++
++	/* A pending DR_Swap to DFP goes out before any Discover Identity. */
++	ret = tcpm_request_dfp_as_sink(port);
++	if (ret > 0)
++		goto unlock;
++	if (ret == -EAGAIN) {
++		mod_send_discover_delayed_work(port, SEND_DISCOVER_RETRY_MS);
++		goto unlock;
++	}
++
+ 	/* No need to send DISCOVER_IDENTITY anymore */
+ 	if (!port->send_discover && !port->send_discover_prime)
+ 		goto unlock;
+@@ -7111,6 +7244,8 @@ static void tcpm_send_discover_work(stru
+ 		goto unlock;
+ 	}
+ 
++	/* From here on tcpm_request_dfp_as_sink() makes no request */
++	port->sink_dfp_done = true;
+ 	tcpm_send_vdm(port, USB_SID_PD, CMD_DISCOVER_IDENT, NULL, 0, port->tx_sop_type);
+ 
+ unlock:
+diff --git a/include/linux/usb/tcpm.h b/include/linux/usb/tcpm.h
+--- a/include/linux/usb/tcpm.h
++++ b/include/linux/usb/tcpm.h
+@@ -130,6 +130,13 @@ enum tcpm_transmit_type {
+  *		swap following Discover Identity on SOP' occurs.
+  *		Return true when the TCPM is allowed to request a Vconn swap
+  *		after Discovery Identity on SOP.
++ * @request_dfp_as_sink:
++ *		Optional; as Sink/UFP, request a DR_Swap to DFP once an explicit
++ *		contract is in place and before discovery, when the Source's
++ *		capabilities advertise data role swap. For controllers on which
++ *		a DR_Swap that the partner starts later does not hold. The
++ *		request is repeated after Wait and when it got no answer, with
++ *		a few requests per attach at most.
+  */
+ struct tcpc_dev {
+ 	struct fwnode_handle *fwnode;
+@@ -148,6 +155,8 @@ struct tcpc_dev {
+ 	 */
+ 	bool (*consume_retained_sink_dfp)(struct tcpc_dev *dev);
+ 
++	bool request_dfp_as_sink;
++
+ 	int (*init)(struct tcpc_dev *dev);
+ 	int (*get_vbus)(struct tcpc_dev *dev);
+ 	int (*get_current_limit)(struct tcpc_dev *dev);

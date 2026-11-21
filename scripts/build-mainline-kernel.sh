@@ -381,6 +381,27 @@ apply_unless 'adopt_retained_source_ufp' \
 	include/linux/usb/tcpm.h tcpm-adopt-retained-source-ufp-role.patch
 apply_unless 'consume_retained_sink_dfp' \
 	include/linux/usb/tcpm.h tcpm-use-retained-sink-data-role.patch
+# A charge-through dock sends its own DR_Swap about 270 ms after discovery.
+# TCPM accepts it, and within 6 ms the dock sends a Soft_Reset that still
+# claims DFP: TCPM sees a role mismatch and the attach repeats without end.
+# A swap the tablet requests before its own discovery is accepted and holds
+# (both docks, on the SM-X910), so sm5714_usbpd asks TCPM to request DFP
+# before discovery.  Inert unless a controller sets
+# tcpc->request_dfp_as_sink.
+apply_unless 'request_dfp_as_sink' \
+	include/linux/usb/tcpm.h tcpm-request-dfp-as-sink-before-discovery.patch
+# The SM5714 reports a source only after its own debounce, 124 to 147 ms
+# after Rd went up inside Try.SNK, so the 100 ms of Try.SNK always ran out
+# and a dual-role dock ended up powered by the tablet.  Lets a controller
+# extend the wait; inert at tcpc->try_snk_extra_wait_ms = 0.
+# The wait is one deadline: an Rp that goes away again before it (a dock
+# that tries the sink role first itself, seen when one is plugged in) sends
+# the port back to waiting instead of ending the attempt.  The deadline has
+# not run on a tablet yet (docs/usb-c-dock-roles.md).
+# Applies on top of the patch above (its tcpm.h hunk follows
+# request_dfp_as_sink).
+apply_unless 'try_snk_extra_wait_ms' \
+	include/linux/usb/tcpm.h tcpm-try-snk-extra-wait.patch
 # A dock's DisplayPort alternate mode is discovered while the tablet is still
 # UFP; typec_displayport then refuses to bind (-EPROTO) and the mode sat
 # driverless until a physical re-plug.  Impatient adapters hard-reset around
