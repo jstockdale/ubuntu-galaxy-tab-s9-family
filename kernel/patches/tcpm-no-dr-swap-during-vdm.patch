@@ -1,0 +1,56 @@
+Subject: [PATCH] usb: typec: tcpm: no DR_Swap while a VDM is in progress
+
+A Discover Identity or another VDM exchange is an interruptible AMS, so
+tcpm_ams_start() lets a DATA_ROLE_SWAP begin while the port still waits
+for the VDM's reply.  That reply is on its way by then.  It collides with
+the DR_Swap, which the TCPC reports as discarded, and is received in
+DR_SWAP_SEND.  The swap cannot be interrupted, and at PD 3.x
+tcpm_pd_handle_msg() answers the reply with a Soft Reset.
+
+On the SM-X910 a "host" written to the port's data_role 3.6 ms after
+SNK_READY, 0.5 ms after the Discover Identity had gone out, ended that
+way:
+
+  AMS DISCOVER_IDENTITY start
+  PD TX complete, status: 0
+  AMS DATA_ROLE_SWAP start
+  state change AMS_START -> DR_SWAP_SEND [rev3 DATA_ROLE_SWAP]
+  PD TX complete, status: 1
+  PD RX, header: 0x57af [1]
+  state change DR_SWAP_SEND -> SNK_SOFT_RESET [rev3 DATA_ROLE_SWAP]
+
+The contract was negotiated again and the swap was not sent a second
+time.
+
+Refuse the DATA_ROLE_SWAP with -EAGAIN while the VDM state machine runs.
+That is the test tcpm_send_discover_work() and tcpm_enable_frs_work() use
+for an idle port.  tcpm_dr_set() hands the error to userspace, which can
+write again.  The request for DFP before discovery waits for the VDM
+state machine itself and never gets here with it running.  A swap the
+partner asks for does not come through tcpm_ams_start() and is handled as
+before.
+---
+ drivers/usb/typec/tcpm/tcpm.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
+--- a/drivers/usb/typec/tcpm/tcpm.c
++++ b/drivers/usb/typec/tcpm/tcpm.c
+@@ -1702,6 +1702,17 @@ static int tcpm_ams_start(struct tcpm_po
+ 		return -EAGAIN;
+ 	}
+ 
++	/*
++	 * A VDM exchange may be interrupted, a DR_Swap may not.  A DR_Swap
++	 * that is sent while a VDM waits for its reply gets that reply as its
++	 * answer, which ends in a Soft Reset.  The requester can try again.
++	 */
++	if (ams == DATA_ROLE_SWAP && port->vdm_sm_running) {
++		port->upcoming_state = INVALID_STATE;
++		tcpm_log(port, "VDM in progress, DATA_ROLE_SWAP not started");
++		return -EAGAIN;
++	}
++
+ 	if (port->pwr_role == TYPEC_SOURCE) {
+ 		enum typec_cc_status cc_req = port->cc_req;
+ 

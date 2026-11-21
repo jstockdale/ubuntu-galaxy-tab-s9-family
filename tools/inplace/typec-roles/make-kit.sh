@@ -1,6 +1,6 @@
 #!/bin/bash
 # Pack the Type-C roles kit on the build host.  It goes on top of the
-# hang-log kit: the hang-log kernel rebuilt with this branch's two TCPM
+# hang-log kit: the hang-log kernel rebuilt with this branch's four TCPM
 # patches and the sm5714_usbpd policy that turns them on
 # (docs/usb-c-dock-roles.md), in boot, plus the build's module tree, signed
 # with its own key.  The configuration and the DTB do not change, so
@@ -48,7 +48,8 @@ avbtool=$tools/avbtool.py
 size=100663296
 dts=sm8550-samsung-gts9wifi
 tcpm_dir=drivers/usb/typec/tcpm
-patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch)
+patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
+	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch)
 
 # The tablet's current set: the hang-log kit.
 hang_boot=d583546b5e5c33dbc48fbafc99b7eb039df33f64b0316e498d3f158f834ee968
@@ -60,9 +61,14 @@ hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
 
 # What only the new kernel may contain: the patch's log line, the driver's
 # two parameters, and the deadline of the Try.SNK wait, a member of tcpm_port
-# whose name is in the image's type information.  The last one is what tells
-# this revision's wait from the plain longer timeout before it.
-new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until)
+# whose name is in the image's type information; that one tells the wait
+# with a deadline from the plain longer timeout before it.  Then what this
+# revision adds: the log lines of the two fixes for a data role swap asked
+# for from userspace, and policy_open, a member of the driver's structure,
+# which only a driver that reads its parameters at each attach has.
+new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
+	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
+	policy_open)
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
@@ -143,15 +149,17 @@ cmp -s "$out/config" "$hang/config" || {
 echo "DTB (${hang_dtb:0:12}) and configuration (${hang_config:0:12}): the hang-log build's, byte for byte"
 
 # 3. The sources.  The driver is this checkout's; the two TCPM files are the
-# hang-log tree's with this checkout's two patches on top; nothing else in
+# hang-log tree's with this checkout's four patches on top; nothing else in
 # the kernel tree differs.
 cmp -s "$tree/$tcpm_dir/sm5714_usbpd.c" "$repo/kernel/drivers/sm5714_usbpd.c" ||
 	die "the build tree's sm5714_usbpd.c is not this checkout's"
 grep -q 'request_dfp_as_sink' "$tree/include/linux/usb/tcpm.h" &&
 	grep -q 'try_snk_extra_wait_ms' "$tree/include/linux/usb/tcpm.h" &&
 	grep -q 'tcpm_try_snk_wait_left' "$tree/$tcpm_dir/tcpm.c" &&
-	grep -q 'Requesting DFP before discovery' "$tree/$tcpm_dir/tcpm.c" ||
-	die 'the build tree does not carry both TCPM patches'
+	grep -q 'Requesting DFP before discovery' "$tree/$tcpm_dir/tcpm.c" &&
+	grep -q 'VDM in progress, DATA_ROLE_SWAP not started' "$tree/$tcpm_dir/tcpm.c" &&
+	grep -q 'Data role swap ended with the role unchanged' "$tree/$tcpm_dir/tcpm.c" ||
+	die 'the build tree does not carry the four TCPM patches'
 source_check='marker lines only (HANG_SCRATCH not set)'
 if [ -n "${HANG_SCRATCH:-}" ]; then
 	hang_tree=$HANG_SCRATCH/linux-src-gts9wifi
@@ -184,10 +192,10 @@ EOF
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $hang_tree: three files differ, tcpm.c and tcpm.h by this checkout's two patches"
+	source_check="compared with $hang_tree: three files differ, tcpm.c and tcpm.h by this checkout's four patches"
 	echo 'sources: only sm5714_usbpd.c, tcpm.c and tcpm.h differ from the hang-log tree, by exactly this checkout'"'"'s changes'
 else
-	echo 'sources: both TCPM patches and this checkout'"'"'s driver are in the build tree (HANG_SCRATCH not set: no tree comparison)'
+	echo 'sources: the four TCPM patches and this checkout'"'"'s driver are in the build tree (HANG_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.

@@ -8,11 +8,17 @@
 #                                               (default 1)
 #   sudo sh ~/typec-roles/verify.sh now         save the TCPM log as it is, for
 #                                               a boot with the dock attached
+#   sudo sh ~/typec-roles/verify.sh swap [N]    N plug-ins of a powered dock
+#                                               (default 1) with the host role
+#                                               asked for through data_role, as
+#                                               a helper in userspace would
 #   sh ~/typec-roles/verify.sh summary LOG...   the counters of saved TCPM logs
-# dock, record and now also run on the kernel before the kit, for a baseline.
-# They write only below ~/typec-roles/logs.  Reading the TCPM log empties it;
-# that is how each trial gets its own (the log keeps its first 1024 lines and
-# drops the rest, so a log that is not emptied misses the plug-in).
+# dock, record, now and swap also run on the kernel before the kit, for a
+# baseline.  They write only below ~/typec-roles/logs.  Reading the TCPM log
+# empties it; that is how each trial gets its own (the log keeps its first
+# 1024 lines and drops the rest, so a log that is not emptied misses the
+# plug-in).  swap switches the kernel's own request off (sink_host_swap) for
+# the run and puts the switch back when it ends, also when it is interrupted.
 set -u
 export LC_ALL=C
 kit=$(cd "$(dirname "$0")" && pwd)
@@ -99,10 +105,34 @@ usb_devices() {
 	done
 }
 
-plug_test() { # dock|record|now [COUNT]
+ask_host() { # FILE: once a partner shows, write "host" to data_role as a
+	# helper in userspace would.  TCPM registers the partner when the port is
+	# ready, under its contract, the moment before it starts its discovery:
+	# twenty writes 5 ms apart to meet that discovery, then five more 300 ms
+	# apart.  The first write that is accepted ends it.  FILE gets which
+	# write that was and what the data role was right after it.  Ends with
+	# the script.
+	tries=0
+	until [ -e "$partner" ]; do
+		kill -0 $$ 2> /dev/null || return 0
+		sleep 0.005
+	done
+	while [ "$tries" -lt 25 ] && kill -0 $$ 2> /dev/null; do
+		tries=$((tries + 1))
+		# To sysfs >> is the same as >.
+		if { echo host >> "$port/data_role"; } 2> /dev/null; then
+			echo "write $tries was accepted, the data role right after it: $(role data_role)" > "$1"
+			return 0
+		fi
+		if [ "$tries" -lt 20 ]; then sleep 0.005; else sleep 0.3; fi
+	done
+	echo "none of $tries writes was accepted" > "$1"
+}
+
+plug_test() { # dock|record|now|swap [COUNT]
 	mode=$1
 	[ "$(id -u)" = 0 ] || { echo "$mode needs sudo (the TCPM log is root's)" >&2; exit 1; }
-	case $mode in dock) total=${2:-10} ;; record) total=${2:-1} ;; now) total=1 ;; esac
+	case $mode in dock) total=${2:-10} ;; record|swap) total=${2:-1} ;; now) total=1 ;; esac
 	case $total in ''|*[!0-9]*|0) echo "not a count: $total" >&2; exit 2 ;; esac
 	set -- /sys/kernel/debug/usb/tcpm-*/log
 	[ $# = 1 ] && [ -r "$1" ] || { echo 'no single TCPM log in /sys/kernel/debug/usb' >&2; exit 1; }
@@ -117,11 +147,35 @@ plug_test() { # dock|record|now [COUNT]
 	dir=$kit/logs/$stamp-$mode
 	mkdir -p "$dir" || exit 1
 	own() { [ -z "${SUDO_UID:-}" ] || chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$kit/logs"; }
-	trap 'own; echo; echo "stopped; what was recorded is in $dir"; exit 1' INT TERM HUP
+	# swap: the kernel's own request is off for the run and a writer asks
+	# instead.  Neither may outlive the run, however it ends.
+	was='' writer='' writes=''
+	stop_writer() {
+		[ -n "$writer" ] || return 0
+		# A writer that has said its word has ended; only one that has not
+		# is signalled, so that the signal cannot reach a stranger.
+		[ -e "$writes" ] || kill "$writer" 2> /dev/null
+		wait "$writer" 2> /dev/null
+		writer=''
+	}
+	restore() {
+		stop_writer
+		[ -z "$was" ] || echo "$was" > "$params/sink_host_swap"
+		was=''
+	}
+	trap 'restore; own; echo; echo "stopped; what was recorded is in $dir"; exit 1' INT TERM HUP
+	if [ "$mode" = swap ] && [ -e "$params/sink_host_swap" ]; then
+		# Written before the first unplug: a kernel that reads the switch
+		# only when the port empties then has it for the first plug-in too.
+		was=$(cat "$params/sink_host_swap")
+		echo N > "$params/sink_host_swap" ||
+			{ was=''; echo "cannot write $params/sink_host_swap" >&2; exit 1; }
+	fi
 	{
 		echo "kernel: $(uname -v)"
 		echo "build ID: $(build_id) (the kit's: $(cat "$kit/BUILD_ID" 2>/dev/null))"
 		echo "sink_host_swap: $(cat "$params/sink_host_swap" 2>/dev/null || echo absent)"
+		[ -z "$was" ] || echo "sink_host_swap before this run and after it: $was"
 		echo "try_snk_extra_wait_ms: $(cat "$params/try_snk_extra_wait_ms" 2>/dev/null || echo absent)"
 		echo "TCPM log: $tcpm"
 	} > "$dir/kernel"
@@ -129,6 +183,10 @@ plug_test() { # dock|record|now [COUNT]
 		note "the running kernel is not the kit's: this is a baseline run"
 	printf 'trial\tverdict\tdata_8s\tpower_8s\tdata_14s\tpower_14s\tpartner\tusb_devices\tbattery\t%s\n' \
 		"$counter_names" > "$dir/results.tsv"
+	if [ "$mode" = swap ]; then
+		printf 'trial\tasked\trefused_in_vdm\tsent\trole_unchanged\tcut_short\twrite\n' > "$dir/swap.tsv"
+		refused_total=0
+	fi
 
 	n=1
 	while [ "$n" -le "$total" ]; do
@@ -141,12 +199,19 @@ plug_test() { # dock|record|now [COUNT]
 			wait_partner absent 300 || { bad "trial $n: still attached after 5 minutes"; break; }
 			cat "$tcpm" > /dev/null
 			echo "gts9u typec-roles: $stamp trial $n" > /dev/kmsg
+			if [ "$mode" = swap ]; then
+				writes=$out.writes
+				rm -f "$writes"
+				ask_host "$writes" &
+				writer=$!
+			fi
 			echo "trial $n/$total: plug it in now"
 			wait_partner present 300 || { bad "trial $n: nothing attached within 5 minutes"; break; }
 			sleep 8
 			d1=$(role data_role) p1=$(role power_role)
 			sleep 6
 			d2=$(role data_role) p2=$(role power_role)
+			stop_writer
 		fi
 		[ -e "$partner" ] && there=yes || there=no
 		cat "$tcpm" > "$out.tcpm.log"
@@ -172,15 +237,60 @@ plug_test() { # dock|record|now [COUNT]
 				fail=1
 			fi
 		fi
+		if [ "$mode" = swap ]; then
+			# Not the roles: with the kernel's own request off the dock's
+			# swap can still end them.  What counts is what the writes did:
+			# none sent into a discovery, none reported done with the role
+			# unchanged, and the switch really off.
+			asked=$(count '\] AMS DATA_ROLE_SWAP start$' "$out.tcpm.log")
+			refused=$(count 'VDM in progress, DATA_ROLE_SWAP not started' "$out.tcpm.log")
+			sent=$(count '\] state change AMS_START -> DR_SWAP_SEND( |$)' "$out.tcpm.log")
+			unchanged=$(count 'Data role swap ended with the role unchanged' "$out.tcpm.log")
+			cut=$(count '\] state change DR_SWAP_SEND -> [A-Z_]*SOFT_RESET' "$out.tcpm.log")
+			wrote=$(cat "$writes" 2> /dev/null)
+			refused_total=$((refused_total + refused))
+			# A write that was accepted with the tablet not the host right
+			# after it, and no swap of the tablet's in the log that a reset
+			# could have undone since: that write reported what did not happen.
+			lied=0
+			case $wrote in *': host') ;; write*) [ "$(echo "$c" | cut -f3)" != 0 ] || lied=1 ;; esac
+			if [ "$cut" != 0 ] || [ "$lied" = 1 ] || [ "$(echo "$c" | cut -f2)" != 0 ] ||
+				[ "$(echo "$c" | cut -f10)" != 0 ]; then
+				verdict=FAIL
+				fail=1
+			elif [ "$asked" != 0 ]; then
+				verdict=PASS
+			fi
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$asked" "$refused" "$sent" "$unchanged" "$cut" \
+				"${wrote:-the writer was stopped before it was done}" >> "$dir/swap.tsv"
+		fi
 		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 			"$n" "$verdict" "$d1" "$p1" "$d2" "$p2" "$there" "$usb" "$battery" "$c" >> "$dir/results.tsv"
 		case $verdict in -) lead="trial $n:" ;; *) lead="trial $n: $verdict," ;; esac
 		echo "$lead data ${d1:-?}/${d2:-?}, power ${p1:-?}/${p2:-?} (at 8 s/14 s), partner $there," \
 			"$usb USB devices, battery ${battery:-?}; $(describe "$c")"
+		if [ "$mode" = swap ]; then
+			echo "  data_role: $asked swaps asked for, $refused refused during a discovery, $sent sent," \
+				"$unchanged ended with the role unchanged, $cut cut short by a Soft Reset;" \
+				"${wrote:-the writer was stopped before it was done}"
+			[ "$(echo "$c" | cut -f2)" = 0 ] ||
+				echo '  the kernel asked for the host role itself: the switch was not off for this plug-in'
+			[ "$lied" = 0 ] || echo '  a write reported a swap that did not happen'
+			[ "$verdict" != - ] ||
+				echo '  no swap was asked for: not a PD source with the tablet as its USB device'
+		fi
 		n=$((n + 1))
 	done
+	restore
 	own
 	echo "recorded in $dir"
+	if [ "$mode" = swap ]; then
+		passed=$(awk -F '\t' '$2 == "PASS"' "$dir/results.tsv" | wc -l)
+		echo "$passed of $total plug-ins: a swap asked for through data_role, none sent into a" \
+			'discovery, none reported done with the role unchanged'
+		[ "$refused_total" != 0 ] ||
+			note 'no write fell into a discovery, so the refusal itself was not seen: plug in again'
+	fi
 	if [ "$mode" = dock ]; then
 		passed=$(awk -F '\t' '$2 == "PASS"' "$dir/results.tsv" | wc -l)
 		echo "$passed of $total plug-ins ended as USB host and power sink with one attach"
@@ -206,9 +316,9 @@ wait_partner() { # present|absent SECONDS; absent has to hold for 3 s, a
 	return 1
 }
 case ${1:-} in
-dock|record|now) plug_test "$@" ;;
+dock|record|now|swap) plug_test "$@" ;;
 '') ;;
-*) sed -n '2,12s/^# //p' "$0" >&2; exit 2 ;;
+*) sed -n '2,15s/^# //p' "$0" >&2; exit 2 ;;
 esac
 
 echo "kernel: $(uname -v)"

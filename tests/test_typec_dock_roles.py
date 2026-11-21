@@ -1,6 +1,7 @@
 """The roles the tablet takes on a powered USB-C dock.
 
-Two TCPM patches and the SM5714 policy that switches them on:
+Two TCPM patches and the SM5714 policy that switches them on, and two fixes
+for a data role swap asked for from userspace:
 
 - request_dfp_as_sink: as PD sink, ask for the USB host role before discovery
   (a charge-through dock otherwise flaps over its own DR_Swap), a few times
@@ -8,7 +9,9 @@ Two TCPM patches and the SM5714 policy that switches them on:
 - try_snk_extra_wait_ms: keep waiting for Rp in Try.SNK (the SM5714 reports a
   source after TCPM's 100 ms have run out, so a dual-role dock ended up being
   powered by the tablet), as one deadline, so that an Rp which goes away
-  again does not end the attempt.
+  again does not end the attempt;
+- no DATA_ROLE_SWAP is started while a VDM waits for its reply, and a write
+  to data_role that changed no role fails (both for every TCPM port).
 
 The driver sets tcpc_dev fields that only these patches declare, so a kernel
 without the hooks does not compile; the tests keep driver, patches and hooks
@@ -40,6 +43,13 @@ FIELDS = [
     ("consume_retained_sink_dfp", "tcpm-use-retained-sink-data-role.patch"),
     ("request_dfp_as_sink", "tcpm-request-dfp-as-sink-before-discovery.patch"),
     ("try_snk_extra_wait_ms", "tcpm-try-snk-extra-wait.patch"),
+]
+
+# The log line a later patch adds to tcpm.c -> that patch, in build order.
+# These two declare no field: they are for every TCPM port.
+LATER = [
+    ("VDM in progress, DATA_ROLE_SWAP not started", "tcpm-no-dr-swap-during-vdm.patch"),
+    ("Data role swap ended with the role unchanged", "tcpm-dr-set-checks-data-role.patch"),
 ]
 
 
@@ -78,7 +88,8 @@ class BuildHookTests(unittest.TestCase):
     def test_every_field_is_hooked_in_dependency_order(self):
         tcpm = [(marker, path, patch) for marker, path, patch in hooks()
                 if patch.startswith("tcpm-")]
-        self.assertEqual(tcpm, [(field, TCPM_H, patch) for field, patch in FIELDS])
+        self.assertEqual(tcpm, [(field, TCPM_H, patch) for field, patch in FIELDS] +
+                         [(line, TCPM_C, patch) for line, patch in LATER])
 
     def test_marker_means_this_patch_and_no_earlier_one(self):
         # apply_unless skips a patch whose marker is already in the file: the
@@ -88,11 +99,22 @@ class BuildHookTests(unittest.TestCase):
             self.assertIn(field, added(patch, TCPM_H), patch)
             for _, earlier in FIELDS[:number]:
                 self.assertNotIn(field, added(earlier, TCPM_H), earlier)
+        # The later ones are marked by their log line, in tcpm.c.  The marker
+        # is a grep pattern: plain text, added once, by this patch alone.
+        for number, (line, patch) in enumerate(LATER):
+            self.assertTrue((PATCHES / patch).is_file(), patch)
+            self.assertRegex(line, r"^[A-Za-z_, ]+$")
+            self.assertEqual(added(patch, TCPM_C).count('tcpm_log(port, "%s");' % line), 1, patch)
+            for _, earlier in FIELDS + LATER[:number]:
+                self.assertNotIn(line, (PATCHES / earlier).read_text(), earlier)
 
     def test_tcpm_patches_touch_only_tcpm(self):
         for _, patch in FIELDS:
             files = re.findall(r"^\+\+\+ b/(\S+)", (PATCHES / patch).read_text(), re.M)
             self.assertEqual(sorted(files), [TCPM_C, TCPM_H], patch)
+        for _, patch in LATER:
+            files = re.findall(r"^\+\+\+ b/(\S+)", (PATCHES / patch).read_text(), re.M)
+            self.assertEqual(files, [TCPM_C], patch)
 
     def test_usb_power_domain_patch_is_applied_where_it_is_carried(self):
         # What lets the USB host live through the suspend cycle of a boot
@@ -235,9 +257,10 @@ class DriverTests(unittest.TestCase):
                               self.source).group(1))
         default = int(re.search(r"try_snk_extra_wait_ms = (\d+);", self.source).group(1))
         # 100 ms is tDRPTry.  453 ms is the latest report of a source measured
-        # after Rd (port forced to sink); inside Try.SNK the reports came 124
-        # to 147 ms after Rd, and the estimate for a dock that tries the sink
-        # role first itself is about 515 ms.
+        # after Rd (port forced to sink); inside Try.SNK the reports came 123
+        # to 147 ms after Rd.  For a dock that tries the sink role first
+        # itself the estimate was about 515 ms; the one time it was seen the
+        # lasting Rp came 407 ms after Rd.
         self.assertGreater(100 + default, 515 + 150)
         self.assertLessEqual(default, limit)
         self.assertLessEqual(limit, 2000)
@@ -251,6 +274,34 @@ class DriverTests(unittest.TestCase):
         toggling = function(self.source, "sm5714_usbpd_start_toggling")
         self.assertLess(toggling.index("sm5714_usbpd_update_policy(sm);"),
                         toggling.index("port_type =="))
+        self.assertRegex(toggling, r"\tsm5714_usbpd_update_policy\(sm\);\n"
+                                   r"\tsm->policy_open = true;\n")
+
+    def test_a_parameter_written_at_an_empty_port_applies_from_the_next_attach(self):
+        # start_toggling() has run by the time the port sits empty, so what is
+        # written then would come one attach late.  Every get_cc() up to the
+        # first that reports a partner refreshes the copies; that one closes
+        # them, so that nothing changes under an attach.
+        latch = function(self.source, "sm5714_usbpd_latch_policy")
+        self.assertRegex(latch, r"^\tif \(!sm->policy_open\)\n"
+                                r"\t\treturn;\n\n"
+                                r"\tsm5714_usbpd_update_policy\(sm\);\n"
+                                r"\tif \(attached\)\n"
+                                r"\t\tsm->policy_open = false;$")
+        # Opened where the port starts to toggle and closed by the latch, in
+        # no other place.
+        self.assertEqual(len(re.findall(r"policy_open = ", self.source)), 2)
+        # get_cc() goes through the latch on every way out that has read the
+        # CC state; an audio accessory is a partner, an open CC line is none.
+        get_cc = function(self.source, "sm5714_usbpd_get_cc")
+        latched = re.findall(r"\tsm5714_usbpd_latch_policy\(sm, (.+)\);\n\t+return 0;", get_cc)
+        self.assertEqual(latched, ["true", "active != TYPEC_CC_OPEN"])
+        self.assertEqual(get_cc.count("return 0;"), 2)
+        self.assertEqual(self.source.count("sm5714_usbpd_latch_policy(sm, "), 2)
+        # The policy is read and written under the TCPM port lock only: from
+        # probe before the port exists, from start_toggling() and from the
+        # latch.
+        self.assertEqual(self.source.count("sm5714_usbpd_update_policy(sm);"), 3)
 
     def test_both_boards_ask_for_the_sink_role_on_a_dual_role_port(self):
         # Without try-power-role TCPM never enters Try.SNK, and the DR_Swap
@@ -272,7 +323,7 @@ def kernel_source():
 
 @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
 class AppliedTests(unittest.TestCase):
-    """The four TCPM patches on the pinned kernel, applied as the build does."""
+    """The six TCPM patches on the pinned kernel, applied as the build does."""
 
     @classmethod
     def setUpClass(cls):
@@ -285,8 +336,9 @@ class AppliedTests(unittest.TestCase):
                 ["git", "-C", str(kernel_source()), "show", "HEAD:" + path],
                 check=True, capture_output=True).stdout)
         cls.log = {}
-        for field, patch in FIELDS:
-            assert field not in (tree / TCPM_H).read_text(), field
+        for marker, patch in FIELDS + LATER:
+            marked = TCPM_H if (marker, patch) in FIELDS else TCPM_C
+            assert marker not in (tree / marked).read_text(), marker
             with open(PATCHES / patch, "rb") as stream:
                 cls.log[patch] = subprocess.run(
                     ["patch", "-d", str(tree), "-p1", "--no-backup-if-mismatch"],
@@ -297,7 +349,7 @@ class AppliedTests(unittest.TestCase):
     def test_new_patches_apply_exactly(self):
         # Fuzz or an offset in a state machine full of look-alike case blocks
         # is how a hunk lands in the wrong state.
-        for _, patch in FIELDS[2:]:
+        for _, patch in FIELDS[2:] + LATER:
             self.assertNotRegex(self.log[patch], r"fuzz|offset", patch)
 
     def test_header_declares_every_field_once(self):
@@ -516,6 +568,58 @@ class AppliedTests(unittest.TestCase):
             body = function(self.source, handler)
             self.assertRegex(body, r"case SNK_TRY:\n\t+case SNK_TRY_WAIT:\n"
                                    r"\t+/\* Do nothing, waiting for timeout \*/", handler)
+
+    def test_no_data_role_swap_is_started_into_a_running_vdm(self):
+        # A VDM exchange is an interruptible AMS; the DR_Swap sent into one
+        # meets the VDM's reply and ends in a Soft Reset.  The refusal comes
+        # after the check for an AMS that cannot be interrupted and before
+        # anything is done for the new one, on either power role.
+        start = function(self.source, "tcpm_ams_start")
+        self.assertRegex(start, r"\tif \(ams == DATA_ROLE_SWAP && port->vdm_sm_running\) \{\n"
+                                r"\t\tport->upcoming_state = INVALID_STATE;\n"
+                                r"\t\ttcpm_log\(port, \"%s\"\);\n"
+                                r"\t\treturn -EAGAIN;\n"
+                                r"\t\}\n" % LATER[0][0])
+        refusal = start.index("if (ams == DATA_ROLE_SWAP && port->vdm_sm_running) {")
+        self.assertLess(start.index("not interruptible, aborting"), refusal)
+        self.assertLess(refusal, start.index("if (port->pwr_role == TYPEC_SOURCE) {"))
+        self.assertLess(refusal, start.index("port->ams = ams;"))
+        self.assertEqual(self.source.count(LATER[0][0]), 1)
+        # Two callers start this AMS: the request before discovery, which
+        # waits for the VDM state machine itself, and a write to data_role.
+        # A swap the partner asks for does not come this way.
+        self.assertEqual(self.source.count("tcpm_ams_start(port, DATA_ROLE_SWAP)"), 2)
+        self.assertIn("tcpm_ams_start(port, DATA_ROLE_SWAP)",
+                      function(self.source, "tcpm_request_dfp_as_sink"))
+        self.assertIn("ret = tcpm_ams_start(port, DATA_ROLE_SWAP);\n"
+                      "\t\tif (ret == -EAGAIN) {\n"
+                      "\t\t\tport->upcoming_state = INVALID_STATE;\n"
+                      "\t\t\tgoto port_unlock;",
+                      function(self.source, "tcpm_dr_set"))
+
+    def test_a_write_to_data_role_that_changed_no_role_fails(self):
+        # The next ready state completes a pending swap with status 0,
+        # whatever became of it.  Only a status of 0 is looked into, after
+        # the wait and under the port lock, which the wait had given up.
+        dr_set = function(self.source, "tcpm_dr_set")
+        self.assertRegex(dr_set, r"\t\tret = port->swap_status;\n\n"
+                                 r"(?:\t ?/?\*.*\n)+"
+                                 r"\tif \(!ret\) \{\n"
+                                 r"\t\tmutex_lock\(&port->lock\);\n"
+                                 r"\t\tif \(port->data_role != data\) \{\n"
+                                 r"\t\t\ttcpm_log\(port, \"%s\"\);\n"
+                                 r"\t\t\tret = -EAGAIN;\n"
+                                 r"\t\t\}\n"
+                                 r"\t\tmutex_unlock\(&port->lock\);\n"
+                                 r"\t\}\n\n"
+                                 r"\tport->non_pd_role_swap = false;\n" % LATER[1][0])
+        self.assertLess(dr_set.index("mutex_unlock(&port->lock);\n\n\tif (!wait_for_completion_timeout("),
+                        dr_set.index("if (!ret) {"))
+        self.assertEqual(self.source.count(LATER[1][0]), 1)
+        # Power role and VCONN writes complete the same way and are left as
+        # upstream has them.
+        for name in ("tcpm_pr_set", "tcpm_vconn_set"):
+            self.assertNotIn("if (!ret) {", function(self.source, name), name)
 
     def test_states_the_write_up_names_exist(self):
         names = set(re.findall(r"\b[A-Z]+(?:_[A-Z]+)+\b", DOC.read_text()))
