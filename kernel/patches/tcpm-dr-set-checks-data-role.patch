@@ -1,0 +1,49 @@
+Subject: [PATCH] usb: typec: tcpm: fail a dr_set that changed no role
+
+tcpm_dr_set() waits for the swap to complete and returns the status it
+was completed with.  A refusal and the timeouts complete it with an
+error.  Whatever else ends a swap leaves it pending, and the next
+SRC_READY or SNK_READY completes it with status 0, also when the data
+role is still the old one.  A write to the port's data_role then
+succeeds without having done anything.
+
+On the SM-X910 a Soft Reset cut a DR_Swap short.  The contract was back
+157 ms later, SNK_READY completed the swap, and the write of "host"
+returned 0 with the port still a device.
+
+Look at the data role once the swap has completed with status 0, and
+return -EAGAIN when it is not the one that was asked for.  That also
+covers a partner without PD, where the swap is a port reset that can
+bring the old roles back.
+
+tcpm_pr_set() and tcpm_vconn_set() complete the same way and are left as
+they are.
+---
+ drivers/usb/typec/tcpm/tcpm.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
+--- a/drivers/usb/typec/tcpm/tcpm.c
++++ b/drivers/usb/typec/tcpm/tcpm.c
+@@ -7372,6 +7372,21 @@ static int tcpm_dr_set(struct typec_port
+ 	else
+ 		ret = port->swap_status;
+ 
++	/*
++	 * The next ready state completes the swap with status 0 whatever
++	 * became of it, also after a Soft Reset that cut it short and after
++	 * a port reset that brought the old roles back.  Only the data role
++	 * says whether it happened.
++	 */
++	if (!ret) {
++		mutex_lock(&port->lock);
++		if (port->data_role != data) {
++			tcpm_log(port, "Data role swap ended with the role unchanged");
++			ret = -EAGAIN;
++		}
++		mutex_unlock(&port->lock);
++	}
++
+ 	port->non_pd_role_swap = false;
+ 	goto swap_unlock;
+ 

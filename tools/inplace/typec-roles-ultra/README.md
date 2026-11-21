@@ -15,7 +15,7 @@ did not get there:
   mismatch and one hard reset);
 - a dock seen as a sink first kept the tablet as power source, because
   Try.SNK gives up after 100 ms and the SM5714 reports a source later than
-  that: 124 to 147 ms after Rd in the four attaches measured;
+  that: 123 to 147 ms after Rd in the seven attaches measured;
 - a boot with the dock attached lost its USB host controller in the suspend
   cycle the boot runs for the panel (`HC died`), and plugging the dock in
   again did not bring it back.
@@ -30,18 +30,31 @@ TCPM changes, was tried with both docks:
   and the wait gave up there;
 - the boot with the dock attached lost its USB host as before.
 
-This revision makes the wait one deadline, so that an Rp which goes away
-again sends the port back to waiting, and adds the third change, for the boot
-with the dock attached. **Neither of the two has run on a tablet yet.**
+The second revision made the wait one deadline, so that an Rp which goes
+away again sends the port back to waiting, and added the third change, for
+the boot with the dock attached. It ran the same day: two boots with the
+Satechi attached and four plug-ins into the running tablet, two with each
+dock. All six ended with the tablet as USB host and power sink, and both
+boots kept the USB host controller through the boot's suspend cycle. One of
+the two Satechi plug-ins took the path the first revision lost: the Rp went
+away after 46 ms and was back 407 ms after Rd, with 528 ms of the wait left.
+
+This revision adds two fixes for a data role swap asked for from userspace
+(a write to the port's `data_role`) and a driver that reads its two switches
+at each attach. **None of the three has run on a tablet yet**, and neither
+has a real sleep with the dock attached.
 
 **What changes:**
 - **Kernel:** the release kernel rebuilt with
   `kernel/patches/tcpm-request-dfp-as-sink-before-discovery.patch`,
   `kernel/patches/tcpm-try-snk-extra-wait.patch`, the `sm5714_usbpd.c` that
-  turns both on, and `kernel/patches/gcc-sm8550-usb-gdscs-retention.patch`,
+  turns both on, `kernel/patches/gcc-sm8550-usb-gdscs-retention.patch`,
   which keeps the two USB power domains in retention across suspend instead
-  of switching them off. In the kernel source tree four files differ from
-  the release build: `tcpm.c`, `tcpm.h`, the driver and `gcc-sm8550.c`.
+  of switching them off, and the two fixes for a swap asked for from
+  userspace, `kernel/patches/tcpm-no-dr-swap-during-vdm.patch` and
+  `kernel/patches/tcpm-dr-set-checks-data-role.patch`. In the kernel source
+  tree four files differ from the release build: `tcpm.c`, `tcpm.h`, the
+  driver and `gcc-sm8550.c`.
   `make-kit.sh` checks that, and that the configuration, the DTB and the
   fingerprint layers are byte for byte the release build's.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
@@ -89,6 +102,10 @@ detail):
   to be its device;
 - a USB stick, keyboard or unpowered hub gets power about 0.6 s later;
 - the A-to-C cable to the build host is not PD and should behave as before;
+- a program that writes the port's `data_role` itself now gets `EAGAIN`
+  (`Resource temporarily unavailable`) while the kernel's discovery is
+  running, and when the swap ended with the role unchanged, where it used to
+  be told that the swap was done. Writing again is the answer to both;
 - the USB power domains now stay in retention while the tablet sleeps. What
   that costs in sleep, and whether the USB host survives a real sleep with
   it, has not been measured.
@@ -133,6 +150,7 @@ sudo sh ~/typec-roles/install.sh
 sudo reboot
 sh ~/typec-roles/verify.sh
 sudo sh ~/typec-roles/verify.sh dock 10
+sudo sh ~/typec-roles/verify.sh swap 3
 sudo sh ~/typec-roles/rollback.sh          # back to the release kernel; reboot
 ```
 
@@ -190,6 +208,28 @@ that must keep working. `verify.sh now` saves the log as it is, for a boot
 with the dock attached. `verify.sh summary LOG...` prints the counters of
 saved logs. All of them also run on the kernel before the kit.
 
+`verify.sh swap [N]` (1 by default) tests the two fixes for a data role swap
+asked for from userspace. For the run it switches the kernel's own request
+off (`sink_host_swap`), and at each plug-in a writer asks for the host role
+through the port's `data_role`, as the stopgap service did: from the moment
+the partner shows, which is when the kernel starts its discovery, up to
+twenty writes 5 ms apart and five more 300 ms apart, until one is accepted.
+A plug-in passes when a swap was asked for, **none was sent into a
+discovery** (a `DR_SWAP_SEND` cut short by a Soft Reset), **no write was
+told "done" with the role unchanged**, and the kernel made no request of its
+own. The roles at the end do not decide here: with the kernel's request off,
+the dock's own swap can still end them as it used to. `N refused during a
+discovery` in a plug-in's line counts the writes the first fix turned away
+(`VDM in progress, DATA_ROLE_SWAP not started` in the TCPM log); a run in
+which no write met a discovery says so and asks for another plug-in. Start
+the run with nothing plugged in: the first plug-in then also shows that the
+driver read the switch at the attach. On a kernel without the fixes the same
+run should show the fault, the write sent into the discovery and cut short;
+that has not been run either. The switch is put back when the run ends, also
+on Ctrl-C. If the run is killed outright the switch stays off until the next
+boot, or until
+`echo Y | sudo tee /sys/module/sm5714_usbpd/parameters/sink_host_swap`.
+
 What a passing dock looks like in `trial-N.tcpm.log` is in the write-up:
 `SNK_READY -> AMS_START`, `Requesting DFP before discovery`, `AMS_START ->
 DR_SWAP_SEND -> DR_SWAP_CHANGE_DR -> SNK_READY`, then one discovery. A dock
@@ -213,6 +253,10 @@ that cannot be read.
 
 ## Physical checks still to run (owner)
 
+Checks 1 to 3 passed with the second revision on 2026-11-21 (two boots with
+the dock attached, four plug-ins); this revision's kernel is a new build, so
+they are worth one more run. Check 4 is new.
+
 1. After installing and rebooting: `verify.sh`.
 2. **A boot with the dock attached**, then `sh ~/typec-roles/verify.sh` and
    `sudo sh ~/typec-roles/verify.sh now`. The keyboard and the hub behind the
@@ -224,7 +268,7 @@ that cannot be read.
    it should. Note whether the battery charges; near 100 % it reports `Full`
    and no current.
    **The Satechi is the case to watch**: this is where the first revision
-   failed, and `(Rp came and went 1)` in its line means this revision did its
+   failed, and `(Rp came and went 1)` in its line means the deadline did its
    work. If it re-attaches without end,
    `echo 0 | sudo tee /sys/module/sm5714_usbpd/parameters/try_snk_extra_wait_ms`
    gives its old behaviour back; keep the logs. If its log shows
@@ -233,16 +277,22 @@ that cannot be read.
    log, look for `PD TX complete, status: 1` right after the tablet's
    DR_Swap: a request the controller discarded, which still counts as one of
    the three.
-4. `sudo sh ~/typec-roles/verify.sh record` once each with: a plain PD
+4. `sudo sh ~/typec-roles/verify.sh swap 3` with a powered dock, started
+   with nothing plugged in. Each plug-in should pass, and at least one line
+   should count a write `refused during a discovery`. Afterwards
+   `cat /sys/module/sm5714_usbpd/parameters/sink_host_swap` says `Y` again,
+   and one `sudo sh ~/typec-roles/verify.sh dock 1` passes with `host role
+   requested 1`: the kernel asks by itself again from the next plug-in.
+5. `sudo sh ~/typec-roles/verify.sh record` once each with: a plain PD
    charger (charges; a swap only if the charger offers one), an unpowered hub
    and a USB stick (enumerate), a DisplayPort monitor or dock (the picture
    comes up), the A-to-C cable to the build host (`usb0` comes up, the gadget
    network works).
-5. Suspend and resume with the dock attached, then with the charger. The
+6. Suspend and resume with the dock attached, then with the charger. The
    sleep hook still takes the port out of host role around a real sleep, so
    this shows whether the dock comes back afterwards, not whether the host
    controller would survive the sleep on its own. Battery drain over a night
    of sleep, against the release kernel, is the check for what retention
    costs.
-6. Bluetooth, Wi-Fi, audio, the fingerprint reader and the cameras: the
+7. Bluetooth, Wi-Fi, audio, the fingerprint reader and the cameras: the
    kernel was rebuilt, and nothing else in it changed.

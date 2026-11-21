@@ -116,7 +116,8 @@ MODULE_PARM_DESC(connection_wakeup,
  * Source capabilities cannot tell a dock from a laptop or a phone: the
  * request goes to every PD source that advertises data role swap, and one
  * that accepts becomes the tablet's USB device.  Clear this to get TCPM's
- * standard behaviour back; a change applies from the next attach.
+ * standard behaviour back; a change applies from the next attach (see
+ * sm5714_usbpd_latch_policy()).
  */
 static bool sink_host_swap = true;
 module_param(sink_host_swap, bool, 0644);
@@ -138,7 +139,7 @@ MODULE_PARM_DESC(sink_host_swap,
  *
  * The cost is that an accessory which can only be a sink gets VBUS this much
  * later.  0 gives the standard timing back; a change applies from the next
- * attach.
+ * attach (see sm5714_usbpd_latch_policy()).
  */
 #define SM5714_TRY_SNK_EXTRA_WAIT_MAX_MS	2000
 
@@ -172,6 +173,7 @@ struct sm5714_usbpd {
 	bool watch_saw_attach;
 	bool irq_wake_enabled;
 	bool suspended;
+	bool policy_open;
 	unsigned int negotiated_mv;
 	unsigned int negotiated_ma;
 };
@@ -382,6 +384,37 @@ static int sm5714_usbpd_get_current_limit(struct tcpc_dev *tcpc)
 	}
 }
 
+/*
+ * The policy parameters are writable at runtime.  TCPM reads the copies in
+ * tcpc_dev under its port lock, which it also holds around start_toggling()
+ * and get_cc().
+ */
+static void sm5714_usbpd_update_policy(struct sm5714_usbpd *sm)
+{
+	sm->tcpc.request_dfp_as_sink = sink_host_swap;
+	sm->tcpc.try_snk_extra_wait_ms =
+		min(try_snk_extra_wait_ms, SM5714_TRY_SNK_EXTRA_WAIT_MAX_MS);
+}
+
+/*
+ * A changed parameter applies from the next attach.  start_toggling() alone
+ * cannot give that: it runs when the port goes back to unattached, so a
+ * value written while the port sits empty would be picked up one attach
+ * late.  The copies are therefore refreshed by every get_cc() from there up
+ * to the one that reports a partner.  That one is the first thing TCPM asks
+ * for in an attach, ahead of every use of the policy, and from it the copies
+ * stay as they are until the port toggles again.
+ */
+static void sm5714_usbpd_latch_policy(struct sm5714_usbpd *sm, bool attached)
+{
+	if (!sm->policy_open)
+		return;
+
+	sm5714_usbpd_update_policy(sm);
+	if (attached)
+		sm->policy_open = false;
+}
+
 static int sm5714_usbpd_get_cc(struct tcpc_dev *tcpc,
 			       enum typec_cc_status *cc1,
 			       enum typec_cc_status *cc2)
@@ -415,6 +448,7 @@ static int sm5714_usbpd_get_cc(struct tcpc_dev *tcpc,
 	case SM5714_CC_ATTACH_AUDIO:
 		*cc1 = TYPEC_CC_RA;
 		*cc2 = TYPEC_CC_RA;
+		sm5714_usbpd_latch_policy(sm, true);
 		return 0;
 	default:
 		break;
@@ -423,6 +457,7 @@ static int sm5714_usbpd_get_cc(struct tcpc_dev *tcpc,
 	flipped = cc & SM5714_CC_FLIPPED;
 	*cc1 = flipped ? inactive : active;
 	*cc2 = flipped ? active : inactive;
+	sm5714_usbpd_latch_policy(sm, active != TYPEC_CC_OPEN);
 	return 0;
 }
 
@@ -542,18 +577,6 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 	return ret;
 }
 
-/*
- * The policy parameters are writable at runtime.  TCPM reads the copies in
- * tcpc_dev under its port lock, which is also held around start_toggling(),
- * so refreshing them there applies a change from the next attach.
- */
-static void sm5714_usbpd_update_policy(struct sm5714_usbpd *sm)
-{
-	sm->tcpc.request_dfp_as_sink = sink_host_swap;
-	sm->tcpc.try_snk_extra_wait_ms =
-		min(try_snk_extra_wait_ms, SM5714_TRY_SNK_EXTRA_WAIT_MAX_MS);
-}
-
 static int sm5714_usbpd_start_toggling(struct tcpc_dev *tcpc,
 				       enum typec_port_type port_type,
 				       enum typec_cc_status cc)
@@ -563,6 +586,7 @@ static int sm5714_usbpd_start_toggling(struct tcpc_dev *tcpc,
 	int ret;
 
 	sm5714_usbpd_update_policy(sm);
+	sm->policy_open = true;
 
 	/*
 	 * The SM5714 has an autonomous DRP state machine.  Samsung's NORMAL_DRP
