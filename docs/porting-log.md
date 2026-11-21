@@ -7164,3 +7164,54 @@ IOPS, with the IOMMU in strict mode (the S9's figures were taken in lazy
 mode). 403 MHz is covered there only because rpmhpd has not synced on the
 SM-X910, which holds CX at its maximum, and the module refuses to load once
 it has.
+
+### Powered USB-C docks: the roles (2026-11-20)
+
+Two powered docks on the SM-X910, an Anker hub and a Satechi Thunderbolt 4
+dock, never settled. As a sink the tablet accepted the dock's DR_Swap about
+270 ms after discovery, and 1.3 to 5.7 ms after the Accept the dock sent a
+Soft_Reset that still claimed the host role, in 7 of 29 cases before the
+tablet had sent anything as host. TCPM went to error recovery over the data
+role mismatch, attach after attach: 28 of 28 with the Anker hub; the Satechi
+has two such attaches on record, one mismatch and one Hard_Reset. Seen as a
+sink first, the Satechi ended up powered by the tablet: TCPM's Try.SNK gives
+the partner 100 ms to show Rp, and the SM5714 reports a source only after its
+own debounce, 433 and 453 ms after Rd went up in the two samples taken with
+the port forced to sink. All 13 Try.SNK attempts in the traces timed out.
+
+Two opt-in TCPM patches, switched on by `sm5714_usbpd` for both boards. With
+`request_dfp_as_sink` the tablet asks for the host role itself before its
+own discovery, which the Anker hub accepted both times it was tried by hand,
+and discovery then runs once, as host. The request is repeated after Wait or
+when it got no answer, three times per attach at most; a host role that came
+from a swap is given up at a Hard Reset and asked for again. With
+`try_snk_extra_wait_ms` (600) the port keeps presenting Rd and takes an Rp
+that is reported late. Both have a module parameter to turn them off.
+
+**On the SM-X910 (2026-11-21)** a test kernel with both ran with the two
+docks. Each accepted the tablet's request, 4 to 9 ms after it, on all three
+attaches where the tablet was the power sink, and the tablet stayed USB host
+and charged (9 V, 1.66 A). Inside Try.SNK the SM5714 reported the source 124
+to 147 ms after Rd, not the 433 and 453 ms of the forced-sink samples, and
+the longer wait kept the sink role on three attaches of four. The fourth was
+the Satechi plugged into the running tablet: its Rp was reported after
+130 ms and was gone again 46 ms later, without VBUS, and the wait gave up
+there. Read from the timing, the dock tries the sink role first itself and
+shows Rp for good only after that. The wait became one deadline: an Rp that
+goes away again sends the port back to waiting for what is left of the
+700 ms.
+
+The same day's boot with the dock attached charged but had no keyboard: the
+port was USB host when the boot's suspend cycle for the panel ran, the xHCI
+did not answer afterwards (`HC died`), and a later attach ended in `Host halt
+failed, -110`, so plugging the dock in again did not help. That is the fault
+of the two USB power domains, which sm8550 switches off in suspend where
+sm8650 keeps them in retention;
+`kernel/patches/gcc-sm8550-usb-gdscs-retention.patch` does the same here and
+the kernel build applies it.
+
+The deadline and the power domain change are compiled into test kernels and
+have not run on a tablet yet; nothing of this has run on the SM-X710. The
+verification steps, what changes for laptops, phones and unpowered
+accessories, and what is still open are in
+[`usb-c-dock-roles.md`](usb-c-dock-roles.md).

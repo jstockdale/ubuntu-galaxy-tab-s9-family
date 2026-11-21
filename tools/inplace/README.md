@@ -36,6 +36,13 @@ cite their procedures and results.  They are not an install or update path.
 | [`suspendkit/`](suspendkit/README.md) | suspend reliability runs, the ADSP-start sleep lock | [`scripts/diagnostics/suspend/README.md`](../../scripts/diagnostics/suspend/README.md) |
 | [`wifi/`](wifi/README.md) | the Wi-Fi address from EFS, firmware at the first probe, the L1 substates | [`docs/gts9wifi-wifi.md`](../../docs/gts9wifi-wifi.md) |
 
+One kit is for the SM-X910 and is not superseded.  It goes on top of release
+v1.2.5 and needs nothing else on the tablet:
+
+| kit | what it tries | results |
+|---|---|---|
+| [`typec-roles-ultra/`](typec-roles-ultra/README.md) | the kernel changes for powered USB-C docks: the tablet asks for the USB host role itself before discovery, Try.SNK waits for the SM5714 to report a source, and the USB power domains stay in retention across suspend (a boot with the dock attached); a plug-in recorder with a verdict for each plug-in | [`docs/usb-c-dock-roles.md`](../../docs/usb-c-dock-roles.md) |
+
 The commands in the kit READMEs use `<user>@10.42.0.2`, where `<user>` is the
 desktop user on the tablet.  10.42.0.2 is the tablet's end of the development
 USB network, which only an image built with `GTS9U_USB_GADGET=1` has

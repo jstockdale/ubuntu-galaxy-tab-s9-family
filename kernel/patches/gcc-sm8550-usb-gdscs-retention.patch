@@ -1,0 +1,73 @@
+Subject: [PATCH] clk: qcom: gcc-sm8550: keep the USB GDSCs in retention like sm8650
+
+USB30_PRIM_GDSC and USB3_PHY_GDSC are declared .pwrsts = PWRSTS_OFF_ON, so
+genpd powers them off in the noirq phase of a system suspend, the
+pm_test=platform test included.  The dwc3 core then skips its re-init
+(the glue is a wakeup source), and xhci resumes without power_lost or
+XHCI_RESET_ON_RESUME.  RETAIN_FF_ENABLE keeps the flip-flop registers, so
+xhci's save/restore handshake appears to succeed on a controller whose
+internal context is gone.  Two ways it then fails, both seen on an SM-X910
+(blastoise) in USB host role with a hub attached:
+
+ a) the GET_STATUS and stop-endpoint commands time out, 5 s each: "xHCI
+    host not responding to stop endpoint command" 11.2 s after the resume
+    began, then "HC died" (boots of 2026-11-10 01:33 and 01:43, in the
+    boot-time panel recovery cycle);
+ b) the controller DMAs from a stale address: "arm-smmu 15000000.iommu:
+    Unhandled context fault: fsr=0x402, iova=0x88adc2770, ...,
+    cbfrsynra=0x40" and then "xhci-hcd xhci-hcd.2.auto: WARNING: Host
+    System Error" (the boot cycle of the saved boot -2, and the real deep
+    suspends in host role at 193.6 s and 230.1 s of that boot).
+
+Upstream keeps the same two GDSCs, at the same GDSCR offsets 0x39004 and
+0x50018, in retention on sm8650 (commit 8b75c2973997), as on sc8280xp
+and x1e80100, and this file's own PCIe GDSCs already got PWRSTS_RET_ON
+(967e011013ed); the commit ids are as identified upstream, the shallow
+build tree does not carry them.  In this tree gcc-sm8650.c has
+PWRSTS_RET_ON for both USB GDSCs, and gcc-sm8550.c for pcie_0_gdsc.
+
+Change only .pwrsts; .flags stays POLL_CFG_GDSCR | RETAIN_FF_ENABLE.  With
+PWRSTS_RET_ON, gdsc_disable() leaves the GDSC on (drivers/clk/qcom/gdsc.c,
+"If the GDSC supports only a Retention state, apart from ON, leave it in ON
+state"); the hardware enters retention when its parent domain goes down.
+
+The SM-X710 builds from the same file, so its USB GDSCs change too: when
+its controller runtime-suspends, the GDSC now stays on in software while
+genpd still drops the domain's vote on its parent.  Check its idle and
+suspend power after the first build with this patch.
+
+Open risk: whether sm8550's USB retention holds through a real CX
+collapse in deep suspend.  Validate with (1) one SM-X910 boot with the hub
+attached and the boot-cycle USB host park disabled
+(/etc/ubuntu-gts9u/usb-host-park-off): no xHCI lines, and the hub's
+devices survive the cycle without re-enumerating; then (2) real deep
+suspends in host role with the sleep hook's role change disabled the same
+way (~/ufs-ice/suspend-cycles.sh on blastoise, hub attached).  Only then
+retire ubuntu-gts9u-usb-host-park and the sleep hook's role change.
+
+--- a/drivers/clk/qcom/gcc-sm8550.c
++++ b/drivers/clk/qcom/gcc-sm8550.c
+@@ -3058,12 +3058,13 @@
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+ 
++/* Retention across system suspend, as on sm8650: see gcc-sm8550-usb-gdscs-retention.patch */
+ static struct gdsc usb30_prim_gdsc = {
+ 	.gdscr = 0x39004,
+ 	.pd = {
+ 		.name = "usb30_prim_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_OFF_ON,
++	.pwrsts = PWRSTS_RET_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+ 
+@@ -3072,7 +3073,7 @@
+ 	.pd = {
+ 		.name = "usb3_phy_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_OFF_ON,
++	.pwrsts = PWRSTS_RET_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+ 

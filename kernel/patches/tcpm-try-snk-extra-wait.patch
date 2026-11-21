@@ -1,0 +1,187 @@
+Subject: [PATCH] usb: typec: tcpm: optional extra wait for Rp in Try.SNK
+
+In Try.SNK TCPM presents Rd, waits tDRPTry and then expects to find the
+partner's Rp in the CC status.  That assumes a controller which reports
+its CC comparators.  The SM5714 only reports an attachment that it has
+debounced itself.  With the port forced to sink, it signalled a dual-role
+dock 433 and 453 ms after Rd went up (two samples), about 30 ms after the
+dock's VBUS.  All 13 Try.SNK attempts in the traces from the SM-X910 ran
+out with no Rp reported, the port went on as a source, and a dock that
+could charge the tablet was powered by it.
+
+Let the TCPC ask for more time.  With try_snk_extra_wait_ms set, a port
+that has seen no Rp when tDRPTry ends stays in SNK_TRY_WAIT, still
+presenting Rd, for that long before it moves on to SRC_TRYWAIT.  An Rp
+reported in the meantime takes the port through SNK_TRY_WAIT_DEBOUNCE as
+it would have at the end of tDRPTry.  Other CC changes are ignored until
+the timeout, as they are during tDRPTry.
+
+The time is one deadline for the whole attempt.  When an Rp goes away
+again before the deadline, the port returns to SNK_TRY_WAIT for the rest
+of the time; without the extra wait the two debounce states give the
+attempt up, as before.  One of the docks needs that when it is plugged
+in: its Rp was reported 130 ms after Rd and was gone 46 ms later with
+VBUS still off.  Giving up there left the tablet as its power source.
+The dock behaves like a partner that tries the sink role first itself,
+which offers Rp for good only after its own Try.SNK has run out against
+this port's Rd.
+
+A partner that can only be a sink gets VBUS later by the extra time.
+
+With the field left at 0 nothing changes: SNK_TRY_WAIT is left at once and
+never sees an event, and the debounce states give up as they did.
+---
+ drivers/usb/typec/tcpm/tcpm.c | 57 ++++++++++++++++++++++++++++++++++++++++-----
+ include/linux/usb/tcpm.h      | 10 ++++++++++
+ 2 files changed, 62 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
+--- a/drivers/usb/typec/tcpm/tcpm.c
++++ b/drivers/usb/typec/tcpm/tcpm.c
+@@ -622,6 +622,8 @@ struct tcpm_port {
+ 
+ 	/* Deadline in jiffies to exit src_try_wait state */
+ 	unsigned long max_wait;
++	/* Deadline in jiffies of tcpc->try_snk_extra_wait_ms, set in SNK_TRY */
++	unsigned long try_snk_wait_until;
+ 
+ 	/* port belongs to a self powered device */
+ 	bool self_powered;
+@@ -5290,6 +5292,21 @@ static void tcpm_set_initial_negotiated_
+ 	port->negotiated_rev_prime = port->negotiated_rev;
+ }
+ 
++/*
++ * Time in ms that is left of tcpc->try_snk_extra_wait_ms, the extra wait for
++ * the partner's Rp in Try.SNK; 0 without it and once it has run out.
++ */
++static unsigned int tcpm_try_snk_wait_left(struct tcpm_port *port)
++{
++	unsigned long now = jiffies;
++
++	if (!port->tcpc->try_snk_extra_wait_ms ||
++	    !time_before(now, port->try_snk_wait_until))
++		return 0;
++
++	return jiffies_to_msecs(port->try_snk_wait_until - now);
++}
++
+ static void run_state_machine(struct tcpm_port *port)
+ {
+ 	int ret;
+@@ -5354,13 +5371,24 @@ static void run_state_machine(struct tcp
+ 		 *   Until then, ignore any state changes.
+ 		 */
+ 		tcpm_set_cc(port, TYPEC_CC_RD);
++		port->try_snk_wait_until = jiffies +
++			msecs_to_jiffies(PD_T_DRP_TRY +
++					 port->tcpc->try_snk_extra_wait_ms);
+ 		tcpm_set_state(port, SNK_TRY_WAIT, PD_T_DRP_TRY);
+ 		break;
+ 	case SNK_TRY_WAIT:
+ 		if (tcpm_port_is_sink(port)) {
+ 			tcpm_set_state(port, SNK_TRY_WAIT_DEBOUNCE, 0);
+ 		} else {
+-			tcpm_set_state(port, SRC_TRYWAIT, 0);
++			/*
++			 * With tcpc->try_snk_extra_wait_ms the port stays here,
++			 * still presenting Rd, for what is left of that time,
++			 * and _tcpm_cc_change() picks up an Rp that is reported
++			 * late. It also sends the port back here when an Rp
++			 * goes away again within that time.
++			 */
++			tcpm_set_state(port, SRC_TRYWAIT,
++				       tcpm_try_snk_wait_left(port));
+ 			port->max_wait = 0;
+ 		}
+ 		break;
+@@ -6665,6 +6693,16 @@ static void _tcpm_cc_change(struct tcpm_
+ 	case SNK_TRY:
+ 		/* Do nothing, waiting for timeout */
+ 		break;
++	case SNK_TRY_WAIT:
++		/*
++		 * Only reached while waiting for tcpc->try_snk_extra_wait_ms.
++		 * Rp counts as it would have at the end of tDRPTry, also after
++		 * one that did not stay; any other change waits for the timeout,
++		 * as in SNK_TRY.
++		 */
++		if (tcpm_port_is_sink(port))
++			tcpm_set_state(port, SNK_TRY_WAIT_DEBOUNCE, 0);
++		break;
+ 
+ 	case SNK_DISCOVERY:
+ 		/* CC line is unstable, wait for debounce */
+@@ -6686,7 +6724,11 @@ static void _tcpm_cc_change(struct tcpm_
+ 	case SNK_TRY_WAIT_DEBOUNCE:
+ 		if (!tcpm_port_is_sink(port)) {
+ 			port->max_wait = 0;
+-			tcpm_set_state(port, SRC_TRYWAIT, PD_T_PD_DEBOUNCE);
++			/* Rp went away again: what is left of the extra wait goes on */
++			if (tcpm_try_snk_wait_left(port))
++				tcpm_set_state(port, SNK_TRY_WAIT, 0);
++			else
++				tcpm_set_state(port, SRC_TRYWAIT, PD_T_PD_DEBOUNCE);
+ 		}
+ 		break;
+ 	case SRC_TRY_WAIT:
+@@ -6705,10 +6747,13 @@ static void _tcpm_cc_change(struct tcpm_
+ 			tcpm_set_state(port, SNK_TRYWAIT_DEBOUNCE, 0);
+ 		break;
+ 	case SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS:
+-		if (!tcpm_port_is_sink(port))
+-			tcpm_set_state(port, SRC_TRYWAIT, PD_T_TRY_CC_DEBOUNCE);
+-		else
++		/* Without Rp, as in SNK_TRY_WAIT_DEBOUNCE */
++		if (tcpm_port_is_sink(port))
+ 			tcpm_set_state(port, SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS, 0);
++		else if (tcpm_try_snk_wait_left(port))
++			tcpm_set_state(port, SNK_TRY_WAIT, 0);
++		else
++			tcpm_set_state(port, SRC_TRYWAIT, PD_T_TRY_CC_DEBOUNCE);
+ 		break;
+ 	case SNK_TRYWAIT:
+ 		/* Do nothing, waiting for tCCDebounce */
+@@ -6785,6 +6830,7 @@ static void _tcpm_pd_vbus_on(struct tcpm
+ 		break;
+ 
+ 	case SNK_TRY:
++	case SNK_TRY_WAIT:
+ 		/* Do nothing, waiting for timeout */
+ 		break;
+ 	case SRC_TRYWAIT:
+@@ -6852,6 +6898,7 @@ static void _tcpm_pd_vbus_off(struct tcp
+ 	case HARD_RESET_SEND:
+ 		break;
+ 	case SNK_TRY:
++	case SNK_TRY_WAIT:
+ 		/* Do nothing, waiting for timeout */
+ 		break;
+ 	case SRC_TRYWAIT:
+diff --git a/include/linux/usb/tcpm.h b/include/linux/usb/tcpm.h
+--- a/include/linux/usb/tcpm.h
++++ b/include/linux/usb/tcpm.h
+@@ -137,6 +137,15 @@ enum tcpm_transmit_type {
+  *		a DR_Swap that the partner starts later does not hold. The
+  *		request is repeated after Wait and when it got no answer, with
+  *		a few requests per attach at most.
++ * @try_snk_extra_wait_ms:
++ *		Optional; time in ms to keep waiting for the partner's Rp in
++ *		Try.SNK after tDRPTry has run out. For controllers that debounce
++ *		an attachment themselves and report it only afterwards, on which
++ *		the wait of the specification is over before the first report
++ *		can arrive. An Rp that goes away again within that time, as
++ *		that of a partner which tries the sink role first itself, sends
++ *		the port back to waiting for the rest of it. 0 keeps the
++ *		standard timing.
+  */
+ struct tcpc_dev {
+ 	struct fwnode_handle *fwnode;
+@@ -156,6 +165,7 @@ struct tcpc_dev {
+ 	bool (*consume_retained_sink_dfp)(struct tcpc_dev *dev);
+ 
+ 	bool request_dfp_as_sink;
++	unsigned int try_snk_extra_wait_ms;
+ 
+ 	int (*init)(struct tcpc_dev *dev);
+ 	int (*get_vbus)(struct tcpc_dev *dev);

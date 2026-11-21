@@ -382,6 +382,7 @@ The planned order is the SM-X710 bring-up first, then the SM-X810 on the same
 | [Ubuntu userspace](docs/ubuntu-userspace.md) | Root filesystem, desktop integration and the build pipeline |
 | [Release 1.2.0 build inputs](docs/release-1.2.0-build.md), [firmware manifests](configs/firmware/README.md) | The SM-X910 release's NPU and fingerprint inputs, and staging the firmware of one bootloader revision for `scripts/build-release.sh` |
 | [DisplayPort](docs/gts9u-displayport.md) | USB-C DisplayPort output on the SM-X910 and its remaining issues |
+| [USB-C dock roles](docs/usb-c-dock-roles.md) | Why powered docks re-attached without end, were powered by the tablet or lost the USB host in a boot with the dock attached; the two TCPM changes, their switches and the USB power domain change |
 | SM-X710: [display](docs/gts9wifi-display.md), [touch](docs/gts9wifi-touch-fts1ba90a.md), [sensors](docs/gts9wifi-sensors.md), [Wi-Fi](docs/gts9wifi-wifi.md), [cameras](docs/gts9wifi-cameras.md), [interconnect](docs/gts9wifi-interconnect.md), [bring-up flags](docs/gts9wifi-bringup-flags.md) | Galaxy Tab S9 bring-up notes |
 | [Fingerprint reader](docs/fingerprint-reader.md) | Working EL721/UDFPS integration, validation evidence and maintenance constraints |
 | [Gunyah virtual machines](docs/gunyah.md) | Host-driver architecture, current validation and tablet test procedure |

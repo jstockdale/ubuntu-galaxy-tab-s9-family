@@ -70,6 +70,14 @@ which is the kernel doing what a manual
 `echo port0-partner.0 > /sys/bus/typec/drivers/typec_displayport/bind`
 was proven to do in recovery testing.
 
+With the two powered charge-through docks that were traced, the dock's own
+DR_Swap did not hold at all and the attach repeated without end; the tablet
+now asks for the host role itself, before discovery, so the mode is
+discovered as host in the first place
+([USB-C dock roles](usb-c-dock-roles.md); both docks accepted the request on
+the SM-X910, DisplayPort through them was not looked at).  The
+re-probe stays for partners that refuse that request and swap later.
+
 ## Known issues (traces on file, fixes pending)
 
 1. **HPD sampled only at Status/Configure on some adapters.**  The test

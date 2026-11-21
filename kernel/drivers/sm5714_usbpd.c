@@ -13,6 +13,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -96,6 +97,55 @@ static bool connection_wakeup;
 module_param(connection_wakeup, bool, 0644);
 MODULE_PARM_DESC(connection_wakeup,
 		 "allow USB-C connection events to wake the system");
+
+/*
+ * As a PD sink, ask the source for the USB host role as soon as the contract
+ * is in place (tcpc_dev.request_dfp_as_sink).
+ *
+ * A powered dock or hub is the power source and wants to be the USB device.
+ * It attaches as Source/DFP and, left alone, asks for the data role swap
+ * itself about 270 ms after discovery.  On this controller that swap does not
+ * hold: TCPM accepts it and becomes DFP, the dock's next message still claims
+ * DFP, and TCPM goes to error recovery over the data role mismatch, attach
+ * after attach.  A swap that the tablet asked for first, before any
+ * discovery, was accepted and held both times it was tried (one hub), and
+ * discovery then ran once, as host.  TCPM repeats the request after Wait or
+ * when it got no answer, with at most three requests per attach.  A Hard
+ * Reset returns the role to the default; it is then asked for again.
+ *
+ * Source capabilities cannot tell a dock from a laptop or a phone: the
+ * request goes to every PD source that advertises data role swap, and one
+ * that accepts becomes the tablet's USB device.  Clear this to get TCPM's
+ * standard behaviour back; a change applies from the next attach.
+ */
+static bool sink_host_swap = true;
+module_param(sink_host_swap, bool, 0644);
+MODULE_PARM_DESC(sink_host_swap,
+		 "as PD sink, request the USB host role before discovery (default on)");
+
+/*
+ * How much longer than the specification's tDRPTry TCPM keeps presenting Rd
+ * in Try.SNK (tcpc_dev.try_snk_extra_wait_ms).
+ *
+ * The connector asks for the sink role (try-power-role), but that never took
+ * effect: TCPM gives the partner 100 ms to answer Rd with Rp, and the SM5714
+ * does not expose its CC comparators, only an attachment it has debounced
+ * itself.  With the port forced to sink, the report for a dual-role dock
+ * came 433 and 453 ms after Rd went up (two samples), about 30 ms after the
+ * dock's VBUS.  All 13 Try.SNK attempts on record timed out, and a dual-role
+ * dock that was first seen as a sink ended up powered by the tablet instead
+ * of charging it.
+ *
+ * The cost is that an accessory which can only be a sink gets VBUS this much
+ * later.  0 gives the standard timing back; a change applies from the next
+ * attach.
+ */
+#define SM5714_TRY_SNK_EXTRA_WAIT_MAX_MS	2000
+
+static unsigned int try_snk_extra_wait_ms = 600;
+module_param(try_snk_extra_wait_ms, uint, 0644);
+MODULE_PARM_DESC(try_snk_extra_wait_ms,
+		 "extra ms to wait for a source in Try.SNK: 0 standard timing, default 600, at most 2000");
 
 /* Implemented by the companion charger/fuel-gauge driver on this board. */
 int sm5714_battery_set_pd_contract(unsigned int mv, unsigned int ma);
@@ -492,6 +542,18 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 	return ret;
 }
 
+/*
+ * The policy parameters are writable at runtime.  TCPM reads the copies in
+ * tcpc_dev under its port lock, which is also held around start_toggling(),
+ * so refreshing them there applies a change from the next attach.
+ */
+static void sm5714_usbpd_update_policy(struct sm5714_usbpd *sm)
+{
+	sm->tcpc.request_dfp_as_sink = sink_host_swap;
+	sm->tcpc.try_snk_extra_wait_ms =
+		min(try_snk_extra_wait_ms, SM5714_TRY_SNK_EXTRA_WAIT_MAX_MS);
+}
+
 static int sm5714_usbpd_start_toggling(struct tcpc_dev *tcpc,
 				       enum typec_port_type port_type,
 				       enum typec_cc_status cc)
@@ -499,6 +561,8 @@ static int sm5714_usbpd_start_toggling(struct tcpc_dev *tcpc,
 	struct sm5714_usbpd *sm = tcpc_to_sm5714(tcpc);
 	unsigned int val = 0x40;
 	int ret;
+
+	sm5714_usbpd_update_policy(sm);
 
 	/*
 	 * The SM5714 has an autonomous DRP state machine.  Samsung's NORMAL_DRP
@@ -915,6 +979,7 @@ static int sm5714_usbpd_probe(struct i2c_client *client)
 	sm->tcpc.adopt_retained_source_ufp = true;
 	sm->tcpc.consume_retained_sink_dfp =
 		sm5714_usbpd_consume_retained_sink_dfp;
+	sm5714_usbpd_update_policy(sm);
 	sm->tcpc.init = sm5714_usbpd_init;
 	sm->tcpc.get_vbus = sm5714_usbpd_get_vbus;
 	sm->tcpc.get_current_limit = sm5714_usbpd_get_current_limit;
