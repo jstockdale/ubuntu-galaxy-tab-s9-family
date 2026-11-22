@@ -7228,9 +7228,25 @@ reply (30 failures of 30 in the traces).
 `tcpm-dr-set-checks-data-role.patch` returns `EAGAIN` when the swap ended
 with the role unchanged, where the writer used to be told that it was done.
 The driver now takes its two switches as they are when a partner shows and
-keeps them until the port is empty again. A third test kernel with these
-has booted once with the Satechi attached, with the same outcome as the
-second; the two fixes and the switches have not been tried on a tablet yet.
+keeps them for that attach, until the port looks for a partner again. A
+Soft Reset keeps them, and so does a Hard Reset that the port comes through
+attached; an error recovery does not, and the dock that is still plugged
+in attaches again with the values of that moment. A third test kernel with
+these has booted once with the Satechi attached, with the same outcome as
+the second.
+
+A third fix came from reading the code, not from a trace.
+`tcpm-keep-queued-swap-pending.patch`, again for every TCPM port, keeps
+`SRC_READY` and `SNK_READY` from reporting a swap done while it is still
+queued behind a message of the partner's
+(`Swap is still queued, left pending`), for writes to `data_role`,
+`power_role` and `vconn_source`, and drops a queued DR_Swap when the
+partner's own DR_Swap got in first and changed the role
+(`Partner swapped first, queued DR_SWAP_SEND dropped`); sent afterwards, it
+would have put the role back. Neither case has been seen on a tablet. Test
+kernels with it were built for both tablets on 2026-11-21 and are installed
+on neither. None of the three fixes and neither switch has been tried on a
+tablet yet.
 
 The SM-X710 has the third kernel's TCPM changes installed, without the power
 domain change. Before that, with the standard wait, the Satechi left it as

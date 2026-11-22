@@ -7,7 +7,9 @@ absolute path they touch is moved under a temporary directory, the partition
 size and the pinned image identities (release v1.2.5's, and revision 3 of the
 kit's) are replaced by those of small stand-in images, and id, uname, flock,
 findmnt, fuser, dpkg, depmod, blockdev, systemctl, journalctl, modinfo, dmesg,
-sync and sleep are stubbed.  The systemctl stub keeps the typec-sink-host
+sync and sleep are stubbed, and for verify.sh cat as well: the TCPM log it
+reads is emptied by each read and holds 1023 lines, as the kernel's does.  The
+systemctl stub keeps the typec-sink-host
 stopgap's state in two files, depmod fails on request, which stops an
 install between the module swap and the flash, and sync records what is on
 the disk each time it is called, and fails on request.  make-kit.sh needs a
@@ -18,6 +20,7 @@ power domain patch and of the age of the objects the image was linked from.
 """
 import hashlib
 import io
+import itertools
 import os
 import pathlib
 import re
@@ -298,6 +301,95 @@ SWAP_CUT_AGAIN_LOG = SWAP_CUT_LOG + """\
 [ 3089.843405] state change DR_SWAP_SEND -> DR_SWAP_CHANGE_DR [rev3 DATA_ROLE_SWAP]
 [ 3089.843406] state change DR_SWAP_CHANGE_DR -> SNK_READY [rev3 DATA_ROLE_SWAP]
 """
+# What the third fix, tcpm-keep-queued-swap-pending.patch, leaves in the log;
+# made from its code, none of it seen on a tablet.  The dock's own DR_Swap is
+# handled while the write's swap waits in AMS_START: it takes the swap's place
+# in upcoming_state, SNK_READY leaves the write waiting, and the dock's swap
+# gives the tablet the role the write asked for.
+SWAP_PARTNER_FIRST_LOG = """\
+[  600.000001] state change SNK_DEBOUNCED -> SNK_ATTACHED [rev3 NONE_AMS]
+[  600.200001] state change SNK_TRANSITION_SINK -> SNK_READY [rev3 POWER_NEGOTIATION]
+[  600.230001] AMS DATA_ROLE_SWAP start
+[  600.230002] state change SNK_READY -> AMS_START [rev3 DATA_ROLE_SWAP]
+[  600.230101] PD RX, header: 0x7a9 [1]
+[  600.230102] state change AMS_START -> SNK_READY [rev3 DATA_ROLE_SWAP]
+[  600.230103] Swap is still queued, left pending
+[  600.230104] AMS DATA_ROLE_SWAP finished
+[  600.230105] state change SNK_READY -> DR_SWAP_ACCEPT [rev3 DATA_ROLE_SWAP]
+[  600.231501] state change DR_SWAP_ACCEPT -> DR_SWAP_CHANGE_DR [rev3 DATA_ROLE_SWAP]
+[  600.231502] AMS DATA_ROLE_SWAP finished
+[  600.231503] state change DR_SWAP_CHANGE_DR -> SNK_READY [rev3 NONE_AMS]
+"""
+# The tablet as PD 3 source, the partner's USB device since the partner's
+# first swap: the write's AMS_START waits tSinkTx, and the partner's second
+# DR_Swap comes in that time.  The port accepts it and drops the DR_Swap it
+# had queued, which would have put the role back.
+SWAP_PARTNER_FIRST_AS_SOURCE_LOG = """\
+[  700.000001] state change SRC_ATTACH_WAIT -> SRC_ATTACHED [delayed 200 ms]
+[  700.300001] state change SRC_TRANSITION_SUPPLY -> SRC_READY [rev3 POWER_NEGOTIATION]
+[  700.400001] PD RX, header: 0x289 [1]
+[  700.400002] state change SRC_READY -> DR_SWAP_ACCEPT [rev3 DATA_ROLE_SWAP]
+[  700.401501] state change DR_SWAP_ACCEPT -> DR_SWAP_CHANGE_DR [rev3 DATA_ROLE_SWAP]
+[  700.401502] AMS DATA_ROLE_SWAP finished
+[  700.401503] state change DR_SWAP_CHANGE_DR -> SRC_READY [rev3 NONE_AMS]
+[  700.500001] AMS DATA_ROLE_SWAP start
+[  700.500002] pending state change SRC_READY -> AMS_START @ 16 ms [rev3 DATA_ROLE_SWAP]
+[  700.505001] PD RX, header: 0x4a9 [1]
+[  700.505002] state change SRC_READY -> DR_SWAP_ACCEPT [rev3 DATA_ROLE_SWAP]
+[  700.506501] state change DR_SWAP_ACCEPT -> DR_SWAP_CHANGE_DR [rev3 DATA_ROLE_SWAP]
+[  700.506502] Partner swapped first, queued DR_SWAP_SEND dropped
+[  700.506503] AMS DATA_ROLE_SWAP finished
+[  700.506504] state change DR_SWAP_CHANGE_DR -> SRC_READY [rev3 NONE_AMS]
+"""
+# The same tablet, and a new Request of the partner's in that time instead:
+# SRC_READY at the end of the negotiation leaves the write waiting and sends
+# its swap from there, not from AMS_START.
+SWAP_SENT_FROM_READY_LOG = """\
+[  750.000001] state change SRC_ATTACH_WAIT -> SRC_ATTACHED [delayed 200 ms]
+[  750.300001] state change SRC_TRANSITION_SUPPLY -> SRC_READY [rev3 POWER_NEGOTIATION]
+[  750.400001] PD RX, header: 0x289 [1]
+[  750.400002] state change SRC_READY -> DR_SWAP_ACCEPT [rev3 DATA_ROLE_SWAP]
+[  750.401501] state change DR_SWAP_ACCEPT -> DR_SWAP_CHANGE_DR [rev3 DATA_ROLE_SWAP]
+[  750.401502] AMS DATA_ROLE_SWAP finished
+[  750.401503] state change DR_SWAP_CHANGE_DR -> SRC_READY [rev3 NONE_AMS]
+[  750.500001] AMS DATA_ROLE_SWAP start
+[  750.500002] pending state change SRC_READY -> AMS_START @ 16 ms [rev3 DATA_ROLE_SWAP]
+[  750.505001] PD RX, header: 0x14a2 [1]
+[  750.505002] state change SRC_READY -> SRC_NEGOTIATE_CAPABILITIES [rev3 POWER_NEGOTIATION]
+[  750.506001] pending state change SRC_NEGOTIATE_CAPABILITIES -> SRC_TRANSITION_SUPPLY @ 35 ms [rev3 POWER_NEGOTIATION]
+[  750.541001] state change SRC_NEGOTIATE_CAPABILITIES -> SRC_TRANSITION_SUPPLY [delayed 35 ms]
+[  750.542001] state change SRC_TRANSITION_SUPPLY -> SRC_READY [rev3 POWER_NEGOTIATION]
+[  750.542002] Swap is still queued, left pending
+[  750.542003] AMS POWER_NEGOTIATION finished
+[  750.542004] state change SRC_READY -> DR_SWAP_SEND [rev3 NONE_AMS]
+[  750.545401] state change DR_SWAP_SEND -> DR_SWAP_CHANGE_DR [rev3 NONE_AMS]
+[  750.545402] AMS NONE_AMS finished
+[  750.545403] state change DR_SWAP_CHANGE_DR -> SRC_READY [rev3 NONE_AMS]
+"""
+
+
+def dock_messages(start, count):
+    """COUNT lines of the dock's messages, a microsecond apart from START
+    (in microseconds): lines that no counter counts."""
+    return "".join("[%5d.%06d] PD RX, header: 0x1a6f [1]\n" % divmod(start + i, 1_000_000)
+                   for i in range(count))
+
+
+# The TCPM log as the kernel keeps it: what was logged since the last read,
+# and reading it empties it.  The ring has 1024 entries and holds 1023
+# lines; once it is full, every line that comes replaces the last one with
+# "overflow".  The tests log in pieces, each put in place whole, so that a
+# read takes a piece whole or leaves it to the next read.  Each read is noted
+# in the events file.
+TCPM_LOG_STUB = r'''case $# in 1) ;; *) exec /usr/bin/cat "$@" ;; esac
+case $1 in "$FAKE_ROOT"/sys/kernel/debug/usb/tcpm-*/log) ;; *) exec /usr/bin/cat "$1" ;; esac
+echo read >> "$FAKE_ROOT/events"
+for piece in "$FAKE_ROOT"/tcpm-spool/[0-9]*; do
+	[ -e "$piece" ] || continue
+	/usr/bin/cat "$piece" && rm "$piece"
+done | awk 'NR < 1023 { print; next } { last = $0 }
+END { if (NR == 1023) print last; else if (NR > 1023) { sub(/\].*/, "]", last); print last " overflow" } }'
+'''
 
 
 def sha(data):
@@ -1215,10 +1307,51 @@ class VerifyTest(FakeTablet):
         self.partner = self.root / "sys/class/typec/port0-partner"
         self.tcpm = self.root / "sys/kernel/debug/usb/tcpm-8-0033/log"
         self.tcpm.write_text("")
+        self.spool = self.root / "tcpm-spool"
+        self.spool.mkdir()
+        self.pieces = itertools.count(1)
+        (self.bin / "cat").write_text("#!/bin/sh\n" + TCPM_LOG_STUB)
+        (self.bin / "cat").chmod(0o755)
         self.roles("device", "sink")
         usb = self.root / "sys/bus/usb/devices/1-1"
         (usb / "idVendor").write_text("291a\n")
         (usb / "idProduct").write_text("8383\n")
+
+    def log_tcpm(self, text):
+        """Log TEXT on the port: the next read of the TCPM log gets it."""
+        name = "%06d" % next(self.pieces)
+        (self.spool / ("." + name)).write_text(text)
+        os.replace(self.spool / ("." + name), self.spool / name)
+
+    def unread(self):
+        """What the next read of the TCPM log gets, as it is logged."""
+        text = []
+        for piece in sorted(self.spool.iterdir()):
+            try:
+                text.append("" if piece.name.startswith(".") else piece.read_text())
+            except FileNotFoundError:  # read in the meantime
+                pass
+        return "".join(text)
+
+    def cat(self, path):
+        """Read PATH with the cat the scripts get."""
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_ROOT": str(self.root)}
+        return subprocess.run(["cat", str(path)], env=env, capture_output=True, text=True,
+                              check=True).stdout
+
+    def test_the_fake_tcpm_log_is_emptied_by_a_read_and_overflows_as_the_kernel_s(self):
+        self.log_tcpm(PASS_LOG)
+        self.log_tcpm(SWAP_EARLY_LOG)
+        self.assertEqual(self.cat(self.tcpm), PASS_LOG + SWAP_EARLY_LOG)
+        self.assertEqual(self.cat(self.tcpm), "")
+        full = dock_messages(500_000_000, 1023)
+        self.log_tcpm(full)
+        self.assertEqual(self.cat(self.tcpm), full)
+        self.log_tcpm(full + dock_messages(500_001_023, 2))
+        self.assertEqual(self.cat(self.tcpm), "".join(full.splitlines(True)[:1022])
+                         + "[  500.001024] overflow\n")
+        # Every other file is read as it is.
+        self.assertEqual(self.cat(self.kit / "BUILD_ID"), NEW_BUILD_ID + "\n")
 
     def roles(self, data, power):
         self.port.joinpath("data_role").write_text(
@@ -1238,7 +1371,7 @@ class VerifyTest(FakeTablet):
                     if time.monotonic() > deadline:
                         return
                     time.sleep(0.005)
-                self.tcpm.write_text(log)
+                self.log_tcpm(log)
                 self.roles(data, power)
                 self.partner.mkdir()
                 while not list(logs.glob(f"*/trial-{n}.state")):
@@ -1257,14 +1390,18 @@ class VerifyTest(FakeTablet):
         return [dict(zip(rows[0], row)) for row in rows[1:]]
 
     def test_dock_verdict_is_the_roles_and_a_single_attach(self):
+        # The last one overflowed between two reads: what it lost may be an
+        # attach or a mismatch.
         self.plug([(PASS_LOG, "host", "sink"), (FLAP_LOG, "device", "sink"),
                    (TRY_SNK_LOG, "host", "sink"), (PASS_LOG, "host", "source"),
-                   (PASS_LOG, "device", "sink"), (WAIT_LOG, "host", "sink")])
-        result = self.run_script("verify.sh", "dock", "6")
+                   (PASS_LOG, "device", "sink"), (WAIT_LOG, "host", "sink"),
+                   (PASS_LOG + "[  100.900001] overflow\n", "host", "sink")])
+        result = self.run_script("verify.sh", "dock", "7")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         rows = self.results()
         self.assertEqual([r["verdict"] for r in rows],
-                         ["PASS", "FAIL", "PASS", "FAIL", "FAIL", "PASS"])
+                         ["PASS", "FAIL", "PASS", "FAIL", "FAIL", "PASS", "FAIL"])
+        self.assertEqual(rows[6]["overflow"], "1")
         # A request that was repeated after Wait is still one attach, and the
         # verdict is the roles.
         self.assertEqual((rows[5]["attaches"], rows[5]["dfp_requests"], rows[5]["dr_swaps"]),
@@ -1280,7 +1417,7 @@ class VerifyTest(FakeTablet):
         self.assertEqual(list(rows[0])[-1], "try_snk_rp_lost")
         self.assertEqual({len(r) for r in rows}, {20})
         self.assertEqual(rows[0]["usb_devices"], "1")
-        self.assertIn("3 of 6 plug-ins ended as USB host and power sink", result.stdout)
+        self.assertIn("3 of 7 plug-ins ended as USB host and power sink", result.stdout)
         self.assertIn("this is a baseline run", result.stdout)
         (trial,) = (self.kit / "logs").glob("*/trial-1.tcpm.log")
         self.assertEqual(trial.read_text(), PASS_LOG)
@@ -1296,6 +1433,7 @@ class VerifyTest(FakeTablet):
         record the daemon, not the kernel."""
         self.stopgap(active=True)
         self.boot_kit()
+        self.log_tcpm(PASS_LOG)
         switch = self.root / "sys/module/sm5714_usbpd/parameters/sink_host_swap"
         for mode in ("dock", "record", "now", "swap"):
             with self.subTest(mode):
@@ -1304,7 +1442,29 @@ class VerifyTest(FakeTablet):
                 self.assertIn("sudo systemctl stop typec-sink-host", result.stderr)
                 self.assertFalse((self.kit / "logs").exists())
                 self.assertEqual(switch.read_text(), "Y\n")
-        self.assertEqual(self.tcpm.read_text(), "")
+        # Not even read.
+        self.assertEqual(self.unread(), PASS_LOG)
+
+    def test_a_trial_s_log_starts_empty(self):
+        """A second run in the same second has the first one's directory."""
+        (self.bin / "date").write_text("#!/bin/sh\necho 20261121-174500\n")
+        (self.bin / "date").chmod(0o755)
+        earlier = self.kit / "logs/20261121-174500-dock/trial-1.tcpm.log"
+        earlier.parent.mkdir(parents=True)
+        earlier.write_text(FLAP_LOG)
+        self.plug([(PASS_LOG, "host", "sink")])
+        result = self.run_script("verify.sh", "dock", "1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([r["verdict"] for r in self.results()], ["PASS"])
+        self.assertEqual(earlier.read_text(), PASS_LOG)
+        # now reads the log once, into a log of its own as well.
+        earlier = self.kit / "logs/20261121-174500-now/trial-1.tcpm.log"
+        earlier.parent.mkdir(parents=True)
+        earlier.write_text(FLAP_LOG)
+        self.log_tcpm(PASS_LOG)
+        result = self.run_script("verify.sh", "now")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(earlier.read_text(), PASS_LOG)
 
     def test_record_gives_no_verdict_and_passes(self):
         self.plug([(TRY_SNK_LOST_LOG, "host", "source")])
@@ -1315,7 +1475,7 @@ class VerifyTest(FakeTablet):
                          ("-", "host", "source", "1"))
 
     def test_now_saves_the_log_without_waiting_for_a_plug(self):
-        self.tcpm.write_text(PASS_LOG)
+        self.log_tcpm(PASS_LOG)
         self.roles("host", "sink")
         self.partner.mkdir()
         result = self.run_script("verify.sh", "now")
@@ -1373,9 +1533,11 @@ class VerifyTest(FakeTablet):
 
     def plug_for_swap(self, scenarios):
         """Play the user and the port for the swap mode: at each trial's cue
-        the TCPM log is LOG and data_role takes a write and reads as ROLE
+        the port logs LOG and data_role takes a write and reads as ROLE
         (None: it refuses every write); unplugged once the trial is recorded.
-        Returns the list that gets what the switch said during each trial."""
+        LOG can be a tuple of pieces: each after the first is logged once
+        the ones before it have been read.  Returns the list that gets what
+        the switch said during each trial."""
         kmsg = self.root / "dev/kmsg"
         logs = self.kit / "logs"
         switch = self.root / "sys/module/sm5714_usbpd/parameters/sink_host_swap"
@@ -1384,9 +1546,11 @@ class VerifyTest(FakeTablet):
             self.player.join()
         kmsg.unlink(missing_ok=True)
         self.data_role(None)
-        # The script's two waits before it reads the roles are long enough
-        # here for all the writer's writes; the writer's own are short.
-        (self.bin / "sleep").write_text("#!/bin/sh\ncase $1 in\n8|6) exec /usr/bin/sleep 0.3 ;;\n"
+        # The script's waits before it reads the roles, fourteen steps of a
+        # second, are long enough here for all the writer's writes; the
+        # writer's own are short.  Each wait is noted in the events file.
+        (self.bin / "sleep").write_text("#!/bin/sh\necho \"sleep $1\" >> \"$FAKE_ROOT/events\"\n"
+                                        "case $1 in\n1) exec /usr/bin/sleep 0.05 ;;\n"
                                         "0.005|0.3) exec /usr/bin/sleep 0.001 ;;\nesac\n"
                                         "exec /usr/bin/sleep 0.01\n")
 
@@ -1398,9 +1562,16 @@ class VerifyTest(FakeTablet):
                         return
                     time.sleep(0.005)
                 seen.append(switch.read_text() if switch.exists() else None)
-                self.tcpm.write_text(log)
+                pieces = (log,) if isinstance(log, str) else log
+                self.log_tcpm(pieces[0])
                 self.data_role(role)
                 self.partner.mkdir()
+                for piece in pieces[1:]:
+                    while self.unread():
+                        if time.monotonic() > deadline:
+                            return
+                        time.sleep(0.005)
+                    self.log_tcpm(piece)
                 while not list(logs.glob(f"*/trial-{n}.state")):
                     if time.monotonic() > deadline:
                         return
@@ -1437,7 +1608,7 @@ class VerifyTest(FakeTablet):
         result = self.run_script("verify.sh", "swap", "10")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual([r["verdict"] for r in self.results()],
-                         ["PASS", "FAIL", "FAIL", "PASS", "-", "FAIL", "PASS", "FAIL", "FAIL", "-"])
+                         ["PASS", "FAIL", "FAIL", "PASS", "-", "FAIL", "PASS", "FAIL", "-", "-"])
         self.assertEqual({len(r) for r in self.results()}, {20})
         rows = self.swap_rows()
         self.assertEqual([(r["asked"], r["refused_in_vdm"], r["sent"], r["role_unchanged"],
@@ -1455,37 +1626,50 @@ class VerifyTest(FakeTablet):
                           accepted + "host", accepted + "host"])
         out = result.stdout
         self.assertIn("trial 1: PASS, data host/host, power sink/sink (at 8 s/14 s)", out)
-        self.assertIn("  data_role: 3 swaps asked for, 2 refused during a discovery, 1 sent, "
+        self.assertIn("  data_role: 3 swaps asked for, 2 refused during a VDM exchange, 1 sent, "
                       "0 ended with the role unchanged, 0 cut short by a Soft Reset; "
                       + accepted + "host\n", out)
-        self.assertIn("  data_role: 1 swaps asked for, 0 refused during a discovery, 1 sent, "
+        self.assertIn("  data_role: 1 swaps asked for, 0 refused during a VDM exchange, 1 sent, "
                       "0 ended with the role unchanged, 1 cut short by a Soft Reset; "
                       + accepted + "device\n", out)
-        self.assertIn("  data_role: 2 swaps asked for, 0 refused during a discovery, 2 sent, "
+        self.assertIn("  data_role: 2 swaps asked for, 0 refused during a VDM exchange, 2 sent, "
                       "1 ended with the role unchanged, 0 cut short by a Soft Reset; ", out)
         # A swap that was cut short fails the plug-in whatever the write was
-        # told and whatever the role is in the end, and so does a log that
-        # lost lines: what it lost may be just that.
+        # told and whatever the role is in the end.  A log that lost lines
+        # between two reads gives no verdict: what it lost may be just that.
         self.assertIn("trial 8: FAIL, data host/host, power sink/sink (at 8 s/14 s)", out)
-        self.assertIn("  data_role: 2 swaps asked for, 0 refused during a discovery, 2 sent, "
+        self.assertIn("  data_role: 2 swaps asked for, 0 refused during a VDM exchange, 2 sent, "
                       "1 ended with the role unchanged, 1 cut short by a Soft Reset; "
                       + accepted + "host\n", out)
-        self.assertIn("trial 9: FAIL, data host/host, power sink/sink (at 8 s/14 s)", out)
+        self.assertIn("trial 9: data host/host, power sink/sink (at 8 s/14 s)", out)
         self.assertEqual(self.results()[8]["overflow"], "1")
         self.assertIn("trial 5: data ?/?, power sink/sink", out)
         self.assertIn("trial 10: data host/host, power sink/sink", out)
         # Trial 3 alone; trials 2 and 6 (in trial 4 the swap was done before
         # the reset undid it, and in trial 10 the tablet is the host with no
         # swap in the log: a write that asks for the role it has is done);
-        # trials 5 and 10.
+        # trial 9; trial 5; trial 10.
         self.assertEqual(out.count("the kernel asked for the host role itself: "
                                    "the switch was not off for this plug-in"), 1)
         self.assertEqual(out.count("a write reported a swap that did not happen"), 2)
-        self.assertEqual(out.count("no swap was asked for: not a PD source with the tablet "
-                                   "as its USB device"), 2)
-        self.assertIn("3 of 10 plug-ins: a swap asked for through data_role, none sent into a "
-                      "discovery, none reported done with the role unchanged", out)
+        self.assertEqual(self.trial_lines(out, 9)[-1],
+                         "  the TCPM log overflowed between two reads, so lines were lost: this "
+                         "plug-in cannot be judged")
+        self.assertEqual(out.count("cannot be judged"), 1)
+        self.assertEqual(self.trial_lines(out, 5)[-1],
+                         "  every write was refused before TCPM started a swap (the log has no AMS "
+                         "DATA_ROLE_SWAP): the port was not ready at any of them, or the partner "
+                         "has no PD")
+        self.assertEqual(out.count("every write was refused"), 1)
+        self.assertEqual(self.trial_lines(out, 10)[-1],
+                         "  no swap was asked for: not a PD source with the tablet as its USB device")
+        self.assertEqual(out.count("no swap was asked for"), 1)
+        self.assertIn("3 of 10 plug-ins: a swap asked for through data_role, none cut short by a "
+                      "Soft Reset, none reported done with the role unchanged", out)
         self.assertNotIn("the refusal itself was not seen", out)
+        self.assertNotIn("no plug-in could be judged", out)
+        self.assertNotIn("left pending", out)
+        self.assertNotIn("partner swapped first", out)
         # The kernel's own request is off for every trial and back afterwards.
         self.assertEqual(seen, ["N\n"] * 10)
         self.assertEqual(switch.read_text(), "Y\n")
@@ -1493,7 +1677,118 @@ class VerifyTest(FakeTablet):
         self.assertIn("sink_host_swap: N\n", kernel.read_text())
         self.assertIn("sink_host_swap before this run and after it: Y\n", kernel.read_text())
 
-    def test_swap_says_when_no_write_met_a_discovery(self):
+    def trial_lines(self, out, n):
+        """The lines the swap mode printed for trial N."""
+        lines = out.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith(f"trial {n}:"))
+        end = start + 1
+        while end < len(lines) and lines[end].startswith("  "):
+            end += 1
+        return lines[start:end]
+
+    def test_swap_counts_what_the_third_fix_logs(self):
+        """A write that the partner's own DR_Swap answered, and one whose
+        swap went out from a ready state: both are done, neither was sent
+        from AMS_START, and the third fix's two lines are counted."""
+        self.boot_kit()
+        self.plug_for_swap([(SWAP_PARTNER_FIRST_LOG, "host"),
+                            (SWAP_PARTNER_FIRST_AS_SOURCE_LOG, "host"),
+                            (SWAP_SENT_FROM_READY_LOG, "host")])
+        result = self.run_script("verify.sh", "swap", "3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([r["verdict"] for r in self.results()], ["PASS"] * 3)
+        # No swap of the tablet's took the role in the first two.
+        self.assertEqual([r["dr_swaps"] for r in self.results()], ["0", "0", "1"])
+        self.assertEqual([(r["asked"], r["refused_in_vdm"], r["sent"], r["role_unchanged"],
+                           r["cut_short"]) for r in self.swap_rows()],
+                         [("1", "0", "0", "0", "0"), ("1", "0", "0", "0", "0"),
+                          ("1", "0", "1", "0", "0")])
+        out = result.stdout
+        pending = "  still queued when the port was ready again, left pending: 1"
+        dropped = "  dropped because the partner swapped first: 1"
+        accepted = "write 1 was accepted, the data role right after it: host"
+        self.assertEqual(self.trial_lines(out, 1)[1:],
+                         ["  data_role: 1 swaps asked for, 0 refused during a VDM exchange, 0 sent, "
+                          "0 ended with the role unchanged, 0 cut short by a Soft Reset; " + accepted,
+                          pending])
+        self.assertEqual(self.trial_lines(out, 2)[1:],
+                         ["  data_role: 1 swaps asked for, 0 refused during a VDM exchange, 0 sent, "
+                          "0 ended with the role unchanged, 0 cut short by a Soft Reset; " + accepted,
+                          dropped])
+        self.assertEqual(self.trial_lines(out, 3)[1:],
+                         ["  data_role: 1 swaps asked for, 0 refused during a VDM exchange, 1 sent, "
+                          "0 ended with the role unchanged, 0 cut short by a Soft Reset; " + accepted,
+                          pending])
+        self.assertIn("3 of 3 plug-ins: a swap asked for through data_role", out)
+
+    def test_the_log_is_read_every_second_during_a_plug_in(self):
+        """A dock that re-attaches in a loop fills the log in seconds.  What
+        was logged before a read in the middle of the plug-in is judged with
+        what came after it, and together they are more lines than the log
+        holds: read once at the end it would have kept 1022 and an
+        overflow."""
+        self.boot_kit()
+        lines = SWAP_LOG.splitlines(True)
+        first = "".join(lines[:7]) + dock_messages(300_210_100, 700)
+        second = dock_messages(300_212_000, 700) + "".join(lines[7:])
+        self.plug_for_swap([((first, second), "host")])
+        result = self.run_script("verify.sh", "swap")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Read once to empty it before the plug-in, after each second of the
+        # fourteen, and once at the end.
+        events = (self.root / "events").read_text().splitlines()
+        self.assertEqual([event for event in events if event in ("read", "sleep 1")],
+                         ["read"] + ["sleep 1", "read"] * 14 + ["read"])
+        (trial,) = (self.kit / "logs").glob("*/trial-1.tcpm.log")
+        self.assertEqual(trial.read_text(), first + second)
+        self.assertGreater(len((first + second).splitlines()), 1023)
+        self.assertEqual([r["verdict"] for r in self.results()], ["PASS"])
+        self.assertEqual(self.results()[0]["overflow"], "0")
+        self.assertEqual([(r["asked"], r["refused_in_vdm"], r["sent"]) for r in self.swap_rows()],
+                         [("3", "2", "1")])
+
+    def test_a_log_that_overflows_between_two_reads_gives_no_verdict_and_fails_the_run(self):
+        """The second plug-in's swap is among the lines the log lost, so its
+        write, which reported the device role, cannot be called a lie
+        either."""
+        self.boot_kit()
+        storm = dock_messages(300_000_000, 1100) + SWAP_LOG
+        self.plug_for_swap([(SWAP_EARLY_LOG, "host"), (storm, "device")])
+        result = self.run_script("verify.sh", "swap", "2")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual([r["verdict"] for r in self.results()], ["PASS", "-"])
+        self.assertEqual(self.results()[1]["overflow"], "1")
+        (trial,) = (self.kit / "logs").glob("*/trial-2.tcpm.log")
+        kept = trial.read_text().splitlines()
+        self.assertEqual(len(kept), 1023)
+        self.assertEqual(kept[-1], "[  300.221002] overflow")
+        self.assertNotIn("a write reported a swap that did not happen", result.stdout)
+        self.assertEqual(self.trial_lines(result.stdout, 2)[-1],
+                         "  the TCPM log overflowed between two reads, so lines were lost: this "
+                         "plug-in cannot be judged")
+        self.assertIn("1 of 2 plug-ins: a swap asked for through data_role", result.stdout)
+        self.assertNotIn("FAIL", result.stdout)
+
+    def test_a_swap_run_with_no_verdict_fails(self):
+        """Nothing was shown: every write refused in one plug-in, the role
+        already the host in the other."""
+        self.boot_kit()
+        self.plug_for_swap([(FLAP_LOG, None), (TRY_SNK_LOST_LOG, "host")])
+        result = self.run_script("verify.sh", "swap", "2")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual([r["verdict"] for r in self.results()], ["-", "-"])
+        self.assertIn("every write was refused before TCPM started a swap",
+                      self.trial_lines(result.stdout, 1)[-1])
+        self.assertIn("no swap was asked for", self.trial_lines(result.stdout, 2)[-1])
+        self.assertTrue(result.stdout.endswith(
+            "0 of 2 plug-ins: a swap asked for through data_role, none cut short by a Soft Reset, "
+            "none reported done with the role unchanged\n"
+            "note no write fell into a VDM exchange, so the refusal itself was not seen: plug in "
+            "again\n"
+            "FAIL no plug-in could be judged (the lines under each plug-in say why)\n"),
+            result.stdout)
+
+    def test_swap_says_when_no_write_met_a_vdm_exchange(self):
         """One clean swap is a pass, but the refusal was not put to the test.
         A switch that was off stays off, and the kernel before the kit, which
         has no switch, is recorded as well."""
@@ -1511,8 +1806,9 @@ class VerifyTest(FakeTablet):
                 self.assertEqual([(r["asked"], r["refused_in_vdm"], r["sent"])
                                   for r in self.swap_rows()], [("1", "0", "1")])
                 self.assertIn("1 of 1 plug-ins: a swap asked for through data_role", result.stdout)
-                self.assertIn("note no write fell into a discovery, so the refusal itself "
+                self.assertIn("note no write fell into a VDM exchange, so the refusal itself "
                               "was not seen: plug in again", result.stdout)
+                self.assertNotIn("FAIL", result.stdout)
                 self.assertIn("this is a baseline run", result.stdout)
                 self.assertEqual(seen, [was])
                 self.assertEqual(switch.read_text() if switch.exists() else None, was)
@@ -1521,12 +1817,30 @@ class VerifyTest(FakeTablet):
                               kernel.read_text())
                 self.assertEqual("before this run" in kernel.read_text(), bool(was))
 
+    @staticmethod
+    def scripts_running(path):
+        """The processes that run the script at PATH: the shell and any
+        subshell of it, such as the writer."""
+        found = set()
+        for proc in pathlib.Path("/proc").iterdir():
+            try:
+                if proc.name.isdigit() and str(path).encode() in (
+                        proc / "cmdline").read_bytes().split(b"\0"):
+                    found.add(int(proc.name))
+            except OSError:  # gone in the meantime
+                pass
+        return found
+
     def test_a_swap_run_that_is_stopped_puts_the_switch_back_and_leaves_no_writer(self):
         self.boot_kit()
         self.data_role(None)
         switch = self.root / "sys/module/sm5714_usbpd/parameters/sink_host_swap"
         path = self.tmp / "run-verify.sh"
         path.write_text(self.script("verify.sh"))
+        # The writer looks for the partner once a second here: one that the
+        # stop leaves behind outlives the script by up to that second.
+        (self.bin / "sleep").write_text("#!/bin/sh\ncase $1 in\n0.005) exec /usr/bin/sleep 1 ;;\n"
+                                        "esac\nexec /usr/bin/sleep 0.01\n")
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_ROOT": str(self.root),
                "HOME": str(self.tmp)}
         run = subprocess.Popen(["sh", str(path), "swap", "3"], env=env, stdout=subprocess.PIPE,
@@ -1539,14 +1853,28 @@ class VerifyTest(FakeTablet):
             self.assertLess(time.monotonic(), deadline)
             self.assertIsNone(run.poll())
             time.sleep(0.005)
-        # It waits for the plug-in now, and its writer with it.
-        time.sleep(0.2)
+        # It waits for the plug-in now, and its writer with it: a subshell
+        # that is there on two looks 0.05 s apart (a command it starts is a
+        # copy of it only until its exec).
+        writers = set()
+        while not writers:
+            self.assertLess(time.monotonic(), deadline)
+            self.assertIsNone(run.poll())
+            before = self.scripts_running(path) - {run.pid}
+            time.sleep(0.05)
+            writers = before & self.scripts_running(path)
         self.assertEqual(switch.read_text(), "N\n")
         run.terminate()
+        # Nothing of the run is left once it has ended.  Looked at before
+        # the pipes are read to their end, which a writer left behind
+        # holds open.
+        run.wait(timeout=20)
+        left = self.scripts_running(path)
         stdout, stderr = run.communicate(timeout=60)
         self.assertEqual(run.returncode, 1, stdout + stderr)
         self.assertIn("stopped; what was recorded is in", stdout)
         self.assertEqual(switch.read_text(), "Y\n")
+        self.assertEqual(left, set())
         # A writer left behind would take this plug-in.
         self.data_role("device")
         self.partner.mkdir()
@@ -1562,7 +1890,7 @@ class VerifyTest(FakeTablet):
         self.plug_for_swap([(FLAP_LOG, None), (SWAP_EARLY_LOG, "host")])
         # The first plug-in takes no write, and the writer's last writes are
         # a second apart here: it is not done when the roles have been read.
-        (self.bin / "sleep").write_text("#!/bin/sh\ncase $1 in\n8|6) exec /usr/bin/sleep 0.3 ;;\n"
+        (self.bin / "sleep").write_text("#!/bin/sh\ncase $1 in\n1) exec /usr/bin/sleep 0.05 ;;\n"
                                         "0.005) exec /usr/bin/sleep 0.001 ;;\n"
                                         "0.3) exec /usr/bin/sleep 1 ;;\nesac\n"
                                         "exec /usr/bin/sleep 0.01\n")
@@ -2076,8 +2404,32 @@ class ScriptsTest(unittest.TestCase):
                       "sudo sh ~/typec-roles/verify.sh swap 3\n",
                       (KIT_SRC / "README.md").read_text())
         self.assertIn("a program that writes the port's `data_role` itself now gets `EAGAIN` "
-                      "(`Resource temporarily unavailable`) while the kernel's discovery is "
-                      "running, and when the swap ended with the role unchanged", readme)
+                      "(`Resource temporarily unavailable`) while a VDM exchange is under way, "
+                      "from the moment TCPM queues a VDM (discovery's, for one) until that "
+                      "exchange is over, and when the swap ended with the role unchanged", readme)
+        self.assertNotIn("discovery is running", readme)
+        # The patches it names are the kit's, and so is their count.
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        kit = re.search(r"^patches=\((.*?)\)$", text, re.M | re.S).group(1).split()
+        self.assertEqual(sorted(re.findall(r"`kernel/patches/([^`]+)`", readme)), sorted(kit))
+        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (6, 5))
+        self.assertIn("`kernel/patches/tcpm-keep-queued-swap-pending.patch`: six patches, five of "
+                      "them to TCPM.", readme)
+        # What has run, and what has not.
+        self.assertIn("This revision adds a third fix of that kind; its kernel was built on "
+                      "2026-11-21 and has not run on a tablet. **None of the three fixes and "
+                      "neither switch has been tried on a tablet yet**", readme)
+        self.assertIn("Check 4 has not been run on any revision.", readme)
+        # Why the recorder reads the log every second, and what a plug-in or
+        # a swap run without a verdict means.
+        self.assertIn("so during a plug-in the script **reads the log every second** and adds "
+                      "what it read to the trial's `trial-N.tcpm.log`. A log that overflows all "
+                      "the same has lost lines between two reads: in `dock` that plug-in fails, "
+                      "since its one attach cannot be shown, and in `swap` it gets no verdict "
+                      "and the run fails.", readme)
+        self.assertIn("**no `DR_SWAP_SEND` was cut short by a Soft Reset**", readme)
+        self.assertNotIn("none was sent into a discovery", readme.replace("*", ""))
+        self.assertIn("A run in which no plug-in got a verdict fails.", readme)
         for said in ("until the reboot the running kernel can load no module it has not loaded yet",
                      "while the kit is installed: rollback.sh first, then upgrade "
                      "ubuntu-gts9u-device or ubuntu-gts9u-hardware"):

@@ -17,8 +17,11 @@
 # baseline.  They write only below ~/typec-roles/logs.  Reading the TCPM log
 # empties it; that is how each trial gets its own (the log keeps its first
 # 1024 lines and drops the rest, so a log that is not emptied misses the
-# plug-in).  swap switches the kernel's own request off (sink_host_swap) for
-# the run and puts the switch back when it ends, also when it is interrupted.
+# plug-in).  dock, record and swap also read it every second during a
+# plug-in and add what they read to the trial's: a dock that re-attaches in
+# a loop fills it in seconds.  swap switches the kernel's own request off
+# (sink_host_swap) for the run and puts the switch back when it ends, also
+# when it is interrupted.
 set -u
 export LC_ALL=C
 kit=$(cd "$(dirname "$0")" && pwd)
@@ -163,6 +166,14 @@ plug_test() { # dock|record|now|swap [COUNT]
 		[ -z "$was" ] || echo "$was" > "$params/sink_host_swap"
 		was=''
 	}
+	drain() { # SECONDS: wait, and add the TCPM log to the trial's every second
+		t=0
+		while [ "$t" -lt "$1" ]; do
+			sleep 1
+			cat "$tcpm" >> "$out.tcpm.log"
+			t=$((t + 1))
+		done
+	}
 	trap 'restore; own; echo; echo "stopped; what was recorded is in $dir"; exit 1' INT TERM HUP
 	if [ "$mode" = swap ] && [ -e "$params/sink_host_swap" ]; then
 		# Written before the first unplug: a kernel that reads the switch
@@ -198,6 +209,7 @@ plug_test() { # dock|record|now|swap [COUNT]
 			[ -e "$partner" ] && echo "trial $n/$total: unplug the USB-C cable at the tablet"
 			wait_partner absent 300 || { bad "trial $n: still attached after 5 minutes"; break; }
 			cat "$tcpm" > /dev/null
+			: > "$out.tcpm.log"
 			echo "gts9u typec-roles: $stamp trial $n" > /dev/kmsg
 			if [ "$mode" = swap ]; then
 				writes=$out.writes
@@ -207,17 +219,18 @@ plug_test() { # dock|record|now|swap [COUNT]
 			fi
 			echo "trial $n/$total: plug it in now"
 			wait_partner present 300 || { bad "trial $n: nothing attached within 5 minutes"; break; }
-			sleep 8
+			drain 8
 			d1=$(role data_role) p1=$(role power_role)
-			sleep 6
+			drain 6
 			d2=$(role data_role) p2=$(role power_role)
 			stop_writer
 		fi
 		[ -e "$partner" ] && there=yes || there=no
-		cat "$tcpm" > "$out.tcpm.log"
 		if [ "$mode" = now ]; then
+			cat "$tcpm" > "$out.tcpm.log"
 			dmesg > "$out.dmesg"
 		else
+			cat "$tcpm" >> "$out.tcpm.log"
 			dmesg | sed -n "/gts9u typec-roles: $stamp trial $n\$/,\$p" > "$out.dmesg"
 		fi
 		state > "$out.state"
@@ -227,7 +240,10 @@ plug_test() { # dock|record|now|swap [COUNT]
 		verdict=-
 		if [ "$mode" = dock ]; then
 			# The roles, not the fact that a swap was sent: host and sink at
-			# both samples, one attach, no role mismatch, still attached.
+			# both samples, one attach, no role mismatch, still attached.  A
+			# log that overflowed between two reads a second apart lost lines
+			# and cannot show the one attach; only a port that re-attaches or
+			# resets in a loop logs that much.
 			if [ "$d1 $p1 $d2 $p2 $there" = 'host sink host sink yes' ] &&
 				[ "$(echo "$c" | cut -f1)" = 1 ] && [ "$(echo "$c" | cut -f4)" = 0 ] &&
 				[ "$(echo "$c" | cut -f10)" = 0 ]; then
@@ -240,22 +256,31 @@ plug_test() { # dock|record|now|swap [COUNT]
 		if [ "$mode" = swap ]; then
 			# Not the roles: with the kernel's own request off the dock's
 			# swap can still end them.  What counts is what the writes did:
-			# none sent into a discovery, none reported done with the role
-			# unchanged, and the switch really off.
+			# none cut short by a Soft Reset, none reported done with the
+			# role unchanged, and the switch really off.  A log that lost
+			# lines between two reads cannot show that.
 			asked=$(count '\] AMS DATA_ROLE_SWAP start$' "$out.tcpm.log")
 			refused=$(count 'VDM in progress, DATA_ROLE_SWAP not started' "$out.tcpm.log")
-			sent=$(count '\] state change AMS_START -> DR_SWAP_SEND( |$)' "$out.tcpm.log")
+			# From AMS_START, or from a ready state that took the swap
+			# out of upcoming_state.
+			sent=$(count '\] state change [A-Z_]+ -> DR_SWAP_SEND( |$)' "$out.tcpm.log")
 			unchanged=$(count 'Data role swap ended with the role unchanged' "$out.tcpm.log")
 			cut=$(count '\] state change DR_SWAP_SEND -> [A-Z_]*SOFT_RESET' "$out.tcpm.log")
+			queued=$(count 'Swap is still queued, left pending' "$out.tcpm.log")
+			dropped=$(count 'Partner swapped first, queued DR_SWAP_SEND dropped' "$out.tcpm.log")
+			overflow=$(echo "$c" | cut -f10)
 			wrote=$(cat "$writes" 2> /dev/null)
 			refused_total=$((refused_total + refused))
 			# A write that was accepted with the tablet not the host right
 			# after it, and no swap of the tablet's in the log that a reset
 			# could have undone since: that write reported what did not happen.
 			lied=0
-			case $wrote in *': host') ;; write*) [ "$(echo "$c" | cut -f3)" != 0 ] || lied=1 ;; esac
-			if [ "$cut" != 0 ] || [ "$lied" = 1 ] || [ "$(echo "$c" | cut -f2)" != 0 ] ||
-				[ "$(echo "$c" | cut -f10)" != 0 ]; then
+			if [ "$overflow" = 0 ]; then
+				case $wrote in *': host') ;; write*) [ "$(echo "$c" | cut -f3)" != 0 ] || lied=1 ;; esac
+			fi
+			if [ "$overflow" != 0 ]; then
+				fail=1
+			elif [ "$cut" != 0 ] || [ "$lied" = 1 ] || [ "$(echo "$c" | cut -f2)" != 0 ]; then
 				verdict=FAIL
 				fail=1
 			elif [ "$asked" != 0 ]; then
@@ -270,14 +295,25 @@ plug_test() { # dock|record|now|swap [COUNT]
 		echo "$lead data ${d1:-?}/${d2:-?}, power ${p1:-?}/${p2:-?} (at 8 s/14 s), partner $there," \
 			"$usb USB devices, battery ${battery:-?}; $(describe "$c")"
 		if [ "$mode" = swap ]; then
-			echo "  data_role: $asked swaps asked for, $refused refused during a discovery, $sent sent," \
+			echo "  data_role: $asked swaps asked for, $refused refused during a VDM exchange, $sent sent," \
 				"$unchanged ended with the role unchanged, $cut cut short by a Soft Reset;" \
 				"${wrote:-the writer was stopped before it was done}"
+			# The third fix's two lines; neither decides the verdict.
+			[ "$queued" = 0 ] || echo "  still queued when the port was ready again, left pending: $queued"
+			[ "$dropped" = 0 ] || echo "  dropped because the partner swapped first: $dropped"
 			[ "$(echo "$c" | cut -f2)" = 0 ] ||
 				echo '  the kernel asked for the host role itself: the switch was not off for this plug-in'
 			[ "$lied" = 0 ] || echo '  a write reported a swap that did not happen'
-			[ "$verdict" != - ] ||
-				echo '  no swap was asked for: not a PD source with the tablet as its USB device'
+			if [ "$overflow" != 0 ]; then
+				echo '  the TCPM log overflowed between two reads, so lines were lost: this plug-in' \
+					'cannot be judged'
+			elif [ "$verdict" = - ]; then
+				case $wrote in
+				none*) echo '  every write was refused before TCPM started a swap (the log has no AMS' \
+					'DATA_ROLE_SWAP): the port was not ready at any of them, or the partner has no PD' ;;
+				*) echo '  no swap was asked for: not a PD source with the tablet as its USB device' ;;
+				esac
+			fi
 		fi
 		n=$((n + 1))
 	done
@@ -286,10 +322,13 @@ plug_test() { # dock|record|now|swap [COUNT]
 	echo "recorded in $dir"
 	if [ "$mode" = swap ]; then
 		passed=$(awk -F '\t' '$2 == "PASS"' "$dir/results.tsv" | wc -l)
-		echo "$passed of $total plug-ins: a swap asked for through data_role, none sent into a" \
-			'discovery, none reported done with the role unchanged'
+		echo "$passed of $total plug-ins: a swap asked for through data_role, none cut short by a" \
+			'Soft Reset, none reported done with the role unchanged'
 		[ "$refused_total" != 0 ] ||
-			note 'no write fell into a discovery, so the refusal itself was not seen: plug in again'
+			note 'no write fell into a VDM exchange, so the refusal itself was not seen: plug in again'
+		# A run in which no plug-in got a verdict has shown nothing.
+		judged=$(awk -F '\t' 'NR > 1 && $2 != "-"' "$dir/results.tsv" | wc -l)
+		[ "$judged" != 0 ] || bad 'no plug-in could be judged (the lines under each plug-in say why)'
 	fi
 	if [ "$mode" = dock ]; then
 		passed=$(awk -F '\t' '$2 == "PASS"' "$dir/results.tsv" | wc -l)

@@ -771,10 +771,57 @@ class WriteUpTests(unittest.TestCase):
         self.assertNotIn("Both docks did this on every attach", flat)
         self.assertNotIn("once per attach", flat)
         self.assertNotIn("have not run on a tablet yet", flat)
-        self.assertIn("**The two fixes and the switches have not been tried on a tablet yet.**", flat)
+        self.assertIn("**None of the three fixes and neither switch has been tried on a tablet "
+                      "yet.**", flat)
+        self.assertIn("Test kernels with it were built for both tablets on 2026-11-21 and are "
+                      "installed on neither.", flat)
+        self.assertIn("the third fix is in no kernel that has run.", flat)
+        for stale in ("the third is what the tree carries now", "The two fixes and the switches",
+                      "Neither fix has been tried"):
+            self.assertNotIn(stale, flat)
         self.assertIn("**No dock has been plugged into it yet.**", flat)
         self.assertIn("**a boot with the dock attached has not been tried there yet**", flat)
         self.assertIn("This is read from the timing; nothing has watched the CC line itself.", flat)
+
+    def test_the_fixes_for_a_write_are_described_as_the_patches_have_them(self):
+        flat = " ".join(self.doc.split())
+        # Each fix by its patch and its log lines.
+        for line, patch in LATER:
+            self.assertIn("`%s`" % patch, flat)
+            self.assertIn("`%s`" % line, flat)
+        self.assertIn("`%s`" % PARTNER_FIRST, flat)
+        # The refusal comes while the VDM state machine runs, discovery or
+        # not.
+        self.assertIn("It now turns the swap down for as long as the VDM state machine runs "
+                      "(`vdm_sm_running`: from the moment TCPM queues a VDM", flat)
+        self.assertIn("can get `EAGAIN`** (`Resource temporarily unavailable`): while a VDM "
+                      "exchange is under way, from the moment TCPM queues a VDM", flat)
+        self.assertNotIn("discovery is running", flat)
+        # The third came from the code, for every port and all three role
+        # attributes; the drop is for the data role.
+        self.assertIn("A third fix, `tcpm-keep-queued-swap-pending.patch`, comes from reading "
+                      "the code after those two; no trace showed the fault.", flat)
+        self.assertIn("A write to `data_role`, `power_role` or `vconn_source` puts its swap in "
+                      "`upcoming_state`", flat)
+        self.assertIn("Both parts are for every TCPM port, the first for all three role "
+                      "attributes, the second for the data role. Neither case has been seen on "
+                      "a tablet.", flat)
+        # What the power role and VCONN writes still go without.
+        self.assertIn("Writes to `power_role` and `vconn_source` (`tcpm_pr_set()`, "
+                      "`tcpm_vconn_set()`) have neither of the first two fixes", flat)
+        self.assertIn("Of the three fixes only the third covers them", flat)
+
+    def test_the_switches_are_taken_per_attach(self):
+        # The latch opens where the port starts to toggle again, which an
+        # error recovery does with the dock still plugged in.
+        flat = " ".join(self.doc.split())
+        self.assertIn("keeps what it read until the port looks for one again, so one attach is "
+                      "never handled half with the old value and half with the new. An attach "
+                      "is not the same as a plug-in.", flat)
+        self.assertIn("A Soft Reset keeps the attach and the values with it, and so does a Hard "
+                      "Reset that the port comes through attached.", flat)
+        self.assertNotIn("until the port is empty again", flat)
+        self.assertNotIn("one connection is never handled", flat)
 
     def test_links_resolve(self):
         for target in re.findall(r"\]\(([^)#]+)(?:#[^)]*)?\)", self.doc):

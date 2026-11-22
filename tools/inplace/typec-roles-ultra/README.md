@@ -39,12 +39,14 @@ boots kept the USB host controller through the boot's suspend cycle. One of
 the two Satechi plug-ins took the path the first revision lost: the Rp went
 away after 47 ms and was back 407 ms after Rd, with 528 ms of the wait left.
 
-This revision adds two fixes for a data role swap asked for from userspace
-(a write to the port's `data_role`) and a driver that reads its two switches
-at each attach. One boot with the Satechi attached has run on it and ended
-as the two before it did, the Rp going away once on the way. **The two fixes
-and the switches have not been tried on a tablet yet**, and neither has a
-real sleep with the dock attached.
+The revision before this one added two fixes for a data role swap asked for
+from userspace (a write to the port's `data_role`) and a driver that reads
+its two switches at each attach. One boot with the Satechi attached has run
+on it and ended as the two before it did, the Rp going away once on the
+way. This revision adds a third fix of that kind; its kernel was built on
+2026-11-21 and has not run on a tablet. **None of the three fixes and
+neither switch has been tried on a tablet yet**, and neither has a real
+sleep with the dock attached.
 
 **What changes:**
 - **Kernel:** the release kernel rebuilt with
@@ -52,11 +54,12 @@ real sleep with the dock attached.
   `kernel/patches/tcpm-try-snk-extra-wait.patch`, the `sm5714_usbpd.c` that
   turns both on, `kernel/patches/gcc-sm8550-usb-gdscs-retention.patch`,
   which keeps the two USB power domains in retention across suspend instead
-  of switching them off, and the two fixes for a swap asked for from
-  userspace, `kernel/patches/tcpm-no-dr-swap-during-vdm.patch` and
-  `kernel/patches/tcpm-dr-set-checks-data-role.patch`. In the kernel source
-  tree four files differ from the release build: `tcpm.c`, `tcpm.h`, the
-  driver and `gcc-sm8550.c`.
+  of switching them off, and the three fixes for a swap asked for from
+  userspace, `kernel/patches/tcpm-no-dr-swap-during-vdm.patch`,
+  `kernel/patches/tcpm-dr-set-checks-data-role.patch` and
+  `kernel/patches/tcpm-keep-queued-swap-pending.patch`: six patches, five
+  of them to TCPM. In the kernel source tree four files differ from the
+  release build: `tcpm.c`, `tcpm.h`, the driver and `gcc-sm8550.c`.
   `make-kit.sh` checks that, and that the configuration, the DTB and the
   fingerprint layers are byte for byte the release build's.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
@@ -105,9 +108,13 @@ detail):
 - a USB stick, keyboard or unpowered hub gets power about 0.6 s later;
 - the A-to-C cable to the build host is not PD and should behave as before;
 - a program that writes the port's `data_role` itself now gets `EAGAIN`
-  (`Resource temporarily unavailable`) while the kernel's discovery is
-  running, and when the swap ended with the role unchanged, where it used to
-  be told that the swap was done. Writing again is the answer to both;
+  (`Resource temporarily unavailable`) while a VDM exchange is under way,
+  from the moment TCPM queues a VDM (discovery's, for one) until that
+  exchange is over, and when the swap ended with the role unchanged, where
+  it used to be told that the swap was done. Writing again is the answer to
+  both. A write to `data_role`, `power_role` or `vconn_source` that waits
+  behind a message of the partner's is answered once its swap has run, no
+  longer before it is sent;
 - the USB power domains now stay in retention while the tablet sleeps. What
   that costs in sleep, and whether the USB host survives a real sleep with
   it, has not been measured.
@@ -205,31 +212,44 @@ the trial and the port, battery and USB state under
 host and power sink at both readings, attached once, with no data role
 mismatch**. The roles decide, not the fact that a swap was sent.
 
+The TCPM log holds 1023 lines; once it is full, every line that comes
+replaces its last one with `overflow`, until the log is read, which empties
+it. A dock that re-attaches in a loop fills it in seconds, so during a
+plug-in the script **reads the log every second** and adds what it read to
+the trial's `trial-N.tcpm.log`. A log that overflows all the same has lost
+lines between two reads: in `dock` that plug-in fails, since its one attach
+cannot be shown, and in `swap` it gets no verdict and the run fails.
+
 `verify.sh record [N]` records the same without a verdict, for the things
 that must keep working. `verify.sh now` saves the log as it is, for a boot
 with the dock attached. `verify.sh summary LOG...` prints the counters of
 saved logs. All of them also run on the kernel before the kit.
 
-`verify.sh swap [N]` (1 by default) tests the two fixes for a data role swap
+`verify.sh swap [N]` (1 by default) tests the fixes for a data role swap
 asked for from userspace. For the run it switches the kernel's own request
 off (`sink_host_swap`), and at each plug-in a writer asks for the host role
 through the port's `data_role`, as the stopgap service did: from the moment
 the partner shows, which is when the kernel starts its discovery, up to
-twenty writes 5 ms apart and five more 300 ms apart, until one is accepted.
-A plug-in passes when a swap was asked for, **none was sent into a
-discovery** (a `DR_SWAP_SEND` cut short by a Soft Reset), **no write was
+twenty writes 5 ms apart and five more 300 ms apart, until one is accepted. A
+plug-in passes when a swap was asked for, **no `DR_SWAP_SEND` was cut short
+by a Soft Reset** (what a swap sent into a discovery ends in), **no write was
 told "done" with the role unchanged**, and the kernel made no request of its
 own. The roles at the end do not decide here: with the kernel's request off,
-the dock's own swap can still end them as it used to. `N refused during a
-discovery` in a plug-in's line counts the writes the first fix turned away
-(`VDM in progress, DATA_ROLE_SWAP not started` in the TCPM log); a run in
-which no write met a discovery says so and asks for another plug-in. Start
-the run with nothing plugged in: the first plug-in then also shows that the
-driver read the switch at the attach. On a kernel without the fixes the same
-run should show the fault, the write sent into the discovery and cut short;
-that has not been run either. The switch is put back when the run ends, also
-on Ctrl-C. If the run is killed outright the switch stays off until the next
-boot, or until
+the dock's own swap can still end them as it used to.
+`N refused during a VDM exchange` in a plug-in's line counts the writes the
+first fix turned away (`VDM in progress, DATA_ROLE_SWAP not started` in the
+TCPM log); a run in which no write met a VDM exchange says so and asks for
+another plug-in. The third fix's two lines are counted under the plug-in when
+they show (`left pending`, `dropped because the partner swapped first`); they
+do not decide, and the run cannot bring about the race they come from. A
+plug-in without a verdict says why: no swap asked for, every write refused
+before TCPM started one, or a log that lost lines. A run in which no plug-in
+got a verdict fails. Start the run with nothing plugged in: the first plug-in
+then also shows that the driver read the switch at the attach. On a kernel
+without the fixes the same run should show the fault, the write sent into the
+discovery and cut short; that has not been run either. The switch is put back
+when the run ends, also on Ctrl-C. If the run is killed outright the switch
+stays off until the next boot, or until
 `echo Y | sudo tee /sys/module/sm5714_usbpd/parameters/sink_host_swap`.
 
 What a passing dock looks like in `trial-N.tcpm.log` is in the write-up:
@@ -257,7 +277,7 @@ that cannot be read.
 
 Checks 1 to 3 passed with the second revision on 2026-11-21 (two boots with
 the dock attached, four plug-ins); this revision's kernel is a new build, so
-they are worth one more run. Check 4 is new.
+they are worth one more run. Check 4 has not been run on any revision.
 
 1. After installing and rebooting: `verify.sh`.
 2. **A boot with the dock attached**, then `sh ~/typec-roles/verify.sh` and
@@ -281,10 +301,10 @@ they are worth one more run. Check 4 is new.
    the three.
 4. `sudo sh ~/typec-roles/verify.sh swap 3` with a powered dock, started
    with nothing plugged in. Each plug-in should pass, and at least one line
-   should count a write `refused during a discovery`. Afterwards
+   should count a write `refused during a VDM exchange`. Afterwards
    `cat /sys/module/sm5714_usbpd/parameters/sink_host_swap` says `Y` again,
    and one `sudo sh ~/typec-roles/verify.sh dock 1` passes with `host role
-   requested 1`: the kernel asks by itself again from the next plug-in.
+   requested 1`: the kernel asks by itself again from the next attach.
 5. `sudo sh ~/typec-roles/verify.sh record` once each with: a plain PD
    charger (charges; a swap only if the charger offers one), an unpowered hub
    and a USB stick (enumerate), a DisplayPort monitor or dock (the picture
