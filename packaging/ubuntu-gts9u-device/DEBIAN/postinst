@@ -59,7 +59,8 @@ case "$1" in
 			release=${release%%/*}
 			depmod -a "$release"
 		done
-		# Up to 2.58 the Bluetooth address unit was enabled in multi-user.target.
+		# Up to 2.58 on the SM-X710, and before 2.74 on the SM-X910, the
+		# Bluetooth address unit was enabled in multi-user.target.
 		# udev starts it for every hci0 now (70-gts9u-bluetooth-address.rules),
 		# and that link would run it a second time at boot.
 		if command -v deb-systemd-helper >/dev/null 2>&1; then
@@ -91,7 +92,8 @@ case "$1" in
 			systemctl restart ubuntu-gts9u-suspend-mode.service || true
 			systemctl try-restart ubuntu-gts9u-powerkey.service || true
 			systemctl restart ubuntu-gts9u-cpu-boost.service || true
-			# 2.58's address unit stayed active after its run (RemainAfterExit),
+			# Up to 2.58 on the SM-X710, and before 2.74 on the SM-X910, the
+			# address unit stayed active after its run (RemainAfterExit),
 			# which would make udev's start for the next hci0 a no-op until a
 			# reboot.  The stop only resets that: hci0 keeps its address.
 			if [ "$(systemctl is-active ubuntu-gts9u-bluetooth-address.service 2>/dev/null)" = active ]; then

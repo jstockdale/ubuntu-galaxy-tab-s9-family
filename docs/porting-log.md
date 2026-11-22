@@ -9056,3 +9056,75 @@ counts the drops of all three kinds. None of it has been seen on a tablet.
 Not done on the SM-X710: `dock` and `swap` runs on a kit kernel, the Satechi
 on a kit kernel, and a boot with the dock attached and devices on the bus.
 These changes are in no kernel that has run on a tablet.
+
+### Device 2.74: the first package from both lines (2026-11-21)
+
+`claude/typec-merge-prep` (`e992297`, `b2548fe`) joins the SM-X910 line at
+`b6854fc` (device 2.71) and the SM-X710 line at `109c079` (device 2.69).
+Both lines grew from `53c4286` (device 2.57) and numbered their device
+packages apart: 2.61, 2.63 to 2.66, 2.68 and 2.71 on the SM-X910 line, 2.58
+to 2.62, 2.67 and 2.69 on the SM-X710 line. 2.61 is on both, with different
+contents. The merge left the control file at 2.71. 2.72 and 2.73 were built
+from uncommitted work on the boot-time panel cycle, which is not in this
+tree. The merged package is 2.74.
+
+postinst and prerm compare no versions: postinst runs the same steps on
+every configure, whatever the package before it.
+
+What an SM-X910 gets over 2.71 (`git diff b6854fc b2548fe -- packaging/`):
+- The SM-X710 line's address change (2.59).
+  `70-gts9u-bluetooth-address.rules` starts
+  `ubuntu-gts9u-bluetooth-address.service` for every `hci0` add, and the
+  unit has no `RemainAfterExit` and no `[Install]` section. The rule is not
+  gated by board. On an upgrade postinst removes the unit's
+  `multi-user.target` link (`deb-systemd-helper purge` and the symlink), and
+  on a running system stops the unit if it reads active, as on the SM-X710
+  at 2.59. At boot `bluetoothd` is then started by `bluetooth.target` when
+  `hci0` appears, as the 2.59 entry describes. None of this has run on an
+  SM-X910.
+- Units and a hook it skips. `ubuntu-gts9u-usb-runtime-pm.service` (2.58)
+  and `ubuntu-gts9u-bt-uart-recover.service` (2.59) carry
+  `ConditionFirmware=device-tree-compatible(samsung,gts9wifi)`, and postinst
+  enables both on every board. The system-sleep hook
+  `ubuntu-gts9u-bt-uart-recover` exits on any other board before it starts
+  anything. prerm stops the runtime PM unit when the package is removed.
+- The description's Bluetooth item.
+
+Nothing else: the camera pins are 2.71's, and
+`scripts/build-ubuntu-rootfs.sh`, Tab Companion (1.3.18) and the GNOME
+Camera package are the SM-X910 line's.
+
+What an SM-X710 gets over 2.69
+(`git diff 109c079 b2548fe -- packaging/ scripts/build-ubuntu-rootfs.sh`):
+- In the device package, from the SM-X910 line:
+  - the system-sleep hook `ubuntu-gts9u-usb-role` (2.64 and 2.65). Before
+    each sleep a port in USB host role goes to device role, and after it
+    back to host if the partner is still attached or the port still holds
+    the host data role. The hook is not gated by board. It has not run on
+    an SM-X710.
+  - `cups-browsed.service.d/50-gts9u-off-the-boot-path.conf` (2.68):
+    `cups-browsed` no longer holds `multi-user.target` until the network is
+    online.
+  - 2.71's fingerprint changes: the gate also masks fprintd on an SM-X910
+    without the secure runtime, and the secure unit and helper give up there
+    at once. On the SM-X710 fprintd stays masked, as before.
+  - The double tap to wake permission (`71-gts9u-touchscreen.rules`) and its
+    hand-over in `ubuntu-gts9u-desktop-user` also cover the SM-X910's Goodix
+    driver. Nothing changes on the SM-X710.
+
+  postinst and prerm run the same steps as 2.69's; the camera pins are
+  2.69's.
+- In the image (`scripts/build-ubuntu-rootfs.sh`): what a stock Ubuntu
+  desktop has and a build without Recommends left out (audited 2026-11-09),
+  printing with CUPS and `.local` names among it; GNOME Camera rebuilt to
+  take pictures at full resolution (`gnome-snapshot` 46.2-1ubuntu2+gts9u1);
+  `.trackerignore` in the work directory, `rm --one-file-system`, and up to
+  2 minutes for a busy mount.
+- Tab Companion 1.3.18; the SM-X710 line had 1.3.15.
+
+2.74 is built per board (`DEVICE=gts9uwifi` or `DEVICE=gts9wifi`), against
+the kernel the tablet will run: it carries `updates/qcom_spss_irq.ko` signed
+by that build. Both Type-C roles kits say not to upgrade this package while
+they are installed.
+
+No 2.74 package has been built for a tablet, and none is installed.

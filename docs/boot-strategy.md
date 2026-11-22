@@ -306,8 +306,8 @@ GTS9U_EXTRA_CMDLINE='…' bash scripts/build-android-v4-bundle.sh
   `ubuntu-gts9u-icc-late-release.service` releases the vote after the cycle
   ([`gts9wifi-interconnect.md`](gts9wifi-interconnect.md)).
 - The USB controller goes through that cycle runtime-active, as it always has.
-  `ubuntu-gts9u-usb-runtime-pm.service` (device package 2.58) allows its
-  runtime PM only after the cycle.
+  On the SM-X710, `ubuntu-gts9u-usb-runtime-pm.service` (device package 2.58)
+  allows its runtime PM only after the cycle; the SM-X910 skips that unit.
 - The cycle's suspend can leave the SM-X710's Bluetooth UART with its IRQ
   disabled (1 of 32 logged boots). `ubuntu-gts9u-bt-uart-recover.service`
   (device package 2.59) checks for that after the cycle, and its

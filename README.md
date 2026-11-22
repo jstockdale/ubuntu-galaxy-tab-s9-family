@@ -53,7 +53,7 @@ If the project is useful to you, consider supporting its author:
 | Cover switch | ✅ | ✅ | — | X910 suspends on close; X710 locks on close |
 | Power and volume buttons | ✅ | ✅ | — | On the X710 the power key locks and blanks instead of suspending |
 | Wi-Fi | ✅ | ✅ | — | Different companion chips: X910 WCN7850 on ath12k, X710 WCN6855 on ath11k with Samsung's board data for 5 GHz ([Wi-Fi notes](docs/gts9wifi-wifi.md)) |
-| Bluetooth | ✅ | 🟡 | — | Controller and audio on the X910; the X710 controller comes up, Bluetooth audio not yet tested |
+| Bluetooth | ✅ | 🟡 | — | Controller and audio on the X910; on the X710 the controller comes up and A2DP audio with the AAC codec works |
 | Speakers and microphones | ✅ | ✅ | — | Four CS35L45 amplifiers and digital microphones on both; the X710 needs Samsung's speaker-protection files staged by hand |
 | Vibration / haptics | ✅ | ✅ | — | On-screen keyboard feedback |
 | Motion sensors | ✅ | ✅ | — | Through the ADSP sensor core: rotation and the light sensor on the X710 ([sensor notes](docs/gts9wifi-sensors.md)) |
@@ -65,7 +65,7 @@ If the project is useful to you, consider supporting its author:
 | microSD | ✅ | 🟡 | — | Detected and mounted on the X710; not exercised further |
 | USB host | ✅ | ❓ | — | HID, storage and USB audio on the X910, directly or through a USB-C hub, and across suspend (see above) |
 | USB-C DisplayPort | ✅ | ❓ | — | [DisplayPort notes](docs/gts9u-displayport.md) |
-| Cameras and flash | ✅ | 🟡 | — | X910 four cameras with autofocus; X710 two HI1337 described, off unless enabled, not yet tested ([camera notes](docs/gts9wifi-cameras.md)) |
+| Cameras and flash | ✅ | 🟡 | — | X910 four cameras with autofocus; X710 two HI1337 described, off unless enabled: the rear captures and focuses, the front is not yet tested ([camera notes](docs/gts9wifi-cameras.md)) |
 | Fingerprint reader | ✅ | ❌ | — | EL721 under-display reader works on the X910; not supported on the X710 yet, its services are skipped there |
 | NPU | ✅ | ❌ | — | Not built for the X710 (`GTS9U_INCLUDE_NPU=0`) |
 | Virtual machines | 🟡 | ❓ | — | Gunyah host support on the X910; guests still in development |
@@ -276,14 +276,15 @@ SM-X710 (this branch):
   DDR bandwidth monitor (`icc_bwmon`) is a module and blacklisted
   ([interconnect notes](docs/gts9wifi-interconnect.md)).
 - **The USB controller may runtime-suspend after that cycle** (device package
-  2.58, not yet tested on hardware). It suspends 5 s after it is left
+  2.58; on the test unit it suspended unplugged and resumed on replug, the
+  rest of its tests have not run). It suspends 5 s after it is left
   unconnected. To keep it on, create `/etc/ubuntu-gts9u/usb-runtime-pm-off`.
 - **Bluetooth recovers from a UART IRQ storm by itself** (device package
-  2.59, not yet tested on hardware). A suspend, the boot-time cycle
-  included, can leave the BT UART with its IRQ disabled. After that cycle
-  and after every resume, `ubuntu-gts9u-bt-uart-recover` checks for this
-  and rebinds the UART once. To turn it off, create
-  `/etc/ubuntu-gts9u/bt-uart-recover-off`.
+  2.59; installed on the test unit, its rebind not yet exercised there). A
+  suspend, the boot-time cycle included, can leave the BT UART with its IRQ
+  disabled. After that cycle and after every resume,
+  `ubuntu-gts9u-bt-uart-recover` checks for this and rebinds the UART once.
+  To turn it off, create `/etc/ubuntu-gts9u/bt-uart-recover-off`.
 - Only the EF-DX720 cover keyboard has been tested.
 
 ## Galaxy Tab S9 (SM-X710)
