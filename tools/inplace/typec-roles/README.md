@@ -546,19 +546,71 @@ first runs. A run with the floor held says `floor held` in every verdict:
 it does not sleep as deep as the 2026-11-21 failure, which came with the
 floor released.
 
-**What only the tablet can show.** None of the following has run on the
-tablet yet (as of 2026-11-22 no sleep test has completed a deep sleep: the
-revision 7 baseline never slept, none has run on revision 8, and the
-freeze has not run there at all): that `fsfreeze` of util-linux
-2.39.3 freezes through `/proc/1/root` and a second freeze fails with
-`EBUSY` (`dry` shows both), that `mount -o remount,errors=continue` with
-fstab's `errors=remount-ro` merged in ends with `errors=continue` (the run
-checks it, and stops if not), what an ext4 error after a resume does under
-`errors=continue` with the disk read-only (read from the kernel source
-only), and whether the desktop's tasks let the freezer through (NO-SLEEP
-(freezer) if not). `fstrim.timer` (weekly) would, if it fired during a run,
-send discards to the read-only disk, which the block layer logs as a write
-and the run fails; it is not stopped for the run.
+**What has run on the tablet (2026-11-22).** On squirtle, revision 7's
+kernel (the logs are in `~/ubuntu-gts9u/backups/`; details in
+[`docs/resume-recovery.md`](../../../docs/resume-recovery.md#what-ran-on-the-tablet-2026-11-22)):
+- a freeze proof on throwaway ext4 images (09:18): after a freeze and
+  `blockdev --setro` the image mounts cleanly; the error flag the 03:28 run
+  left makes the mount fail as in that boot loop, and `e2fsck -p` repairs
+  it; an ext4 error raised while frozen under `errors=continue` aborts
+  nothing and writes nothing. Under `errors=remount-ro` the same error
+  aborted the journal and wrote its superblock past the read-only flag, but
+  with error number 0 (the sysfs trigger's `ext4_error()`), which the next
+  mount ignores; an error that carries an errno, as a lost disk's do, is
+  not something the proof could raise, so that part is read from the
+  source only;
+- `dry` (09:35): `fsfreeze` of util-linux 2.39.3 froze the root through
+  `/proc/1/root`, the second freeze failed with `EBUSY`, `mount -o
+  remount,errors=continue` with fstab's `errors=remount-ro` merged in ended
+  with `errors=continue`; the next boot mounted the root with the orphan
+  cleanup, no journal replay, `errors_count` 0;
+- two revision 7 baselines with sleeps, docked, the floor released: 09:44
+  `ro 3 30` and 10:17 `ro 10 30`. 13 of 13 cycles resumed with the UFS
+  reading back as before, all SHALLOW (`aosd`, `cxsd`, `ddr` +0); the
+  desktop's tasks let the freezer through each time; the first resume of
+  each run logged the expected `fs/super.c:1919` warning, writers waiting
+  on the root were reported as hung tasks; each next boot was clean. The
+  2026-11-21 failure was not reproduced.
+
+Not run yet: revision 8, a cycle that reaches AOSS sleep, CX collapse or
+DDR low power, and an ext4 error with an errno under `errors=continue`.
+`fstrim.timer` (weekly) would, if it fired during a run, send discards to
+the read-only disk, which the block layer logs as a write and the run
+fails; it is not stopped for the run.
+
+**Evidence around each cycle.** Since the baselines, every run also prints
+read-only evidence (`evidence:` lines on the terminal and in the run's
+log; nothing of it decides a verdict, and a read that fails gives `-` or
+nothing):
+- once, after the protection and before the first read: every line of
+  `pm_genpd_summary`, the regulators in use and their users
+  (`regulator_summary`), the interconnect nodes with a vote and the requests
+  that make it (`interconnect_summary`; a request whose tag is 0 or has the
+  sleep bit is marked `(sleep set too)`: it holds bandwidth while the CPUs
+  sleep), the wakeup sources with events, and each PCIe function's power
+  state, link, `d3cold_allowed` and wakeup;
+- before each sleep: the runtime state and clock of the UFS host, the USB
+  controller's runtime state and wakeup, each PCIe function's power state,
+  the DSPs (`remoteproc`), the panel's backlight, the warmest thermal zone,
+  and the power domains of the rails, the UFS, USB and PCIe and any that is
+  on;
+- after it: what every `qcom_stats` file counted during the sleep (the
+  SoC's `aosd`, `cxsd`, `ddr`; the subsystems, `apss` being the CPUs', with
+  the time each spent asleep; `ddr_stats`' low-power modes and the time at
+  each DDR frequency), the wakeup sources and the interrupts that fired,
+  whether the PCIe link went down and came back (`PCIe Gen.N xN link up`
+  in the cycle's kernel lines; none means the PCIe host kept its link,
+  clocks and votes through the sleep), the same power domains, and the
+  cycle's kernel lines (the PM core's, the CPUs', the storage's, USB's,
+  PCIe's, the DSPs', warnings and errors; at most 150, without the Wi-Fi's
+  per-packet lines and the hung-task reports).
+
+pmsg gets two short lines of it per cycle (`cycle N/M: evidence: ...`, the
+`qcom_stats` line and one with the PCIe link, the top interrupts, the
+wakeup sources and the state before), between the cycle's diagnostic lines
+and its verdict. Reading `qcom_stats/ddr_stats` sends the AOSS a request to
+update its numbers, as every read of that file does; everything else is a
+plain read.
 
 **The interconnect floor.** `ubuntu-gts9u-icc-late-release` releases it
 about 45 s into a boot. After a boot that released it and then ended
@@ -731,5 +783,9 @@ again, up to three per attach; the verdict is still the roles.
    docked and undocked, does a sleep with a writable root follow. Battery
    drain over a night of sleep, against the hang-log kernel, is the check
    for what the USB power domains' retention costs, and comes after that.
+   Done on 2026-11-22: `dry` and two revision 7 baselines, 13 of 13 cycles
+   resumed, all SHALLOW ("What has run on the tablet", above). No run has
+   reached a PASS yet: no recorded sleep of the SM-X710 has counted AOSS
+   sleep, CX collapse or DDR low power.
 7. Bluetooth, Wi-Fi, audio and the rear camera at a known size: the kernel was
    rebuilt, and nothing else in it changed.

@@ -113,6 +113,9 @@ PREFIXES = (
     "/sys/kernel/debug/interconnect/", "/sys/bus/platform/devices/", "/dev/pmsg0",
     "/etc/ubuntu-gts9u/", "/var/lib/ubuntu-gts9u/", "/usr/libexec/", "/sys/fs/ext4/",
     "/proc/interrupts",
+    # sleep-test.sh's evidence.
+    "/sys/kernel/debug/pm_genpd/", "/sys/kernel/debug/regulator/", "/sys/kernel/debug/wakeup_sources",
+    "/sys/bus/pci/devices", "/sys/class/remoteproc/", "/sys/class/backlight/", "/sys/class/thermal/",
 )
 
 STUBS = {
@@ -2956,6 +2959,10 @@ for q in aosd cxsd ddr; do
 	[ -e "$s/no-$q" ] || [ ! -e "$F/sys/kernel/debug/qcom_stats/$q" ] ||
 		sed -i "s/^Count: \(.*\)/echo Count: \$((\1 + 1))/e" "$F/sys/kernel/debug/qcom_stats/$q"
 done
+# What the sleep left in the files the evidence reads, if the cycle says.
+[ ! -d "$s/qcom_stats" ] || cp "$s/qcom_stats/"* "$F/sys/kernel/debug/qcom_stats/"
+[ ! -e "$s/interrupts" ] || cp "$s/interrupts" "$F/proc/interrupts"
+[ ! -e "$s/wakeup_sources" ] || cp "$s/wakeup_sources" "$F/sys/kernel/debug/wakeup_sources"
 # pm_wakeup_irq: the cycle's, or the RTC's.
 if [ -e "$s/wakeup-irq" ]; then cat "$s/wakeup-irq" > "$F/sys/power/pm_wakeup_irq"; else echo 21 > "$F/sys/power/pm_wakeup_irq"; fi
 [ ! -e "$s/storage-dead" ] || touch "$T/storage-dead"
@@ -3256,6 +3263,61 @@ FREEZER_FAIL = """\
 """
 FREEZER_LINE = ("Freezing user space processes failed after 20.003 seconds (2 tasks refusing to freeze, "
                 "wq_busy=0):")
+# What sleep-test.sh's evidence reads, in the forms 7.2 prints them, with
+# made-up values: pm_genpd_summary (genpd_summary_one), regulator_summary
+# (regulator_summary_show_subtree), interconnect_summary (icc_summary_show),
+# wakeup_sources (print_wakeup_source_stats) and qcom_stats
+# (qcom_print_stats, qcom_ddr_stats_print).
+GENPD_SUMMARY = (
+    "domain                          status          children        performance\n"
+    "    /device                         runtime status                  managed by\n"
+    "------------------------------------------------------------------------------\n"
+    "cx                              on                              0\n"
+    "                                                mmcx, ufs_phy_gdsc\n"
+    "    9a0000.i2c                      active                      0           SW\n"
+    "ufs_phy_gdsc                    off-0                           0\n"
+    "    1d84000.ufshc                   suspended                   0           SW\n"
+    "gpu_cc_cx_gdsc                  off-0                           0\n"
+    "    3d64000.gmu                     suspended                   0           SW\n")
+REGULATOR_SUMMARY = (
+    " regulator                      use open bypass  opmode voltage current     min     max\n"
+    "---------------------------------------------------------------------------------------\n"
+    " regulator-dummy                  0    0      0 unknown     0mV     0mA     0mV     0mV\n"
+    " vreg_l1e_0p88                    2    3      0    fast   880mV     0mA   880mV   880mV\n"
+    "    1d80000.phy-vdda-phy          1                                 0mA     0mV     0mV\n"
+    "    88e8000.phy-vdda-phy          1                                 0mA     0mV     0mV\n"
+    "    ae94000.dsi-vdda              0                                 0mA     0mV     0mV\n")
+ICC_SUMMARY = (
+    " node                                  tag          avg         peak\n"
+    "--------------------------------------------------------------------\n"
+    "qhm_qup1                                          0            0\n"
+    "ebi                                           76800       200000\n"
+    "  1c00000.pcie                           0        76800       200000\n"
+    "  3d00000.gpu                            3            0            0\n"
+    "  cpu0                                   3         1000         2000\n")
+
+
+def wakeup_sources(*rows):
+    """/sys/kernel/debug/wakeup_sources with ROWS of (name, events, wakeups)."""
+    lines = ["name\t\tactive_count\tevent_count\twakeup_count\texpire_count\tactive_since\ttotal_time\t"
+             "max_time\tlast_change\tprevent_suspend_time"]
+    lines += [f"{name:<12s}\t{events}\t\t{events}\t\t{wakeups}\t\t0\t\t0\t\t0\t\t0\t\t1000\t\t0"
+              for name, events, wakeups in rows]
+    return "\n".join(lines) + "\n"
+
+
+def qcom_stat(count, seconds):
+    """A qcom_stats state's file: COUNT entries, SECONDS spent in it."""
+    return (f"Count: {count}\nLast Entered At: 0\nLast Exited At: 0\n"
+            f"Accumulated Duration: {int(seconds * 19200000)}\n")
+
+
+def ddr_stats(seconds_at_547):
+    """qcom_stats/ddr_stats: two low-power modes, two frequencies."""
+    return ("DDR LPM Stat Name:0xd4\tcount:0\tDuration (ticks):0\n"
+            "DDR LPM Stat Name:0xd0\tcount:2\tDuration (ticks):100\n"
+            f"DDR Freq 547Mhz:\tCP IDX:0\tcount:5\tDuration (ticks):{int(seconds_at_547 * 19200000)}\n"
+            "DDR Freq 2092Mhz:\tCP IDX:5\tcount:9\tDuration (ticks):384000000\n")
 
 
 class SleepTestTest(FakeTablet):
@@ -3571,12 +3633,13 @@ class SleepTestTest(FakeTablet):
             fail = fail.replace(f"${name}", re.search(rf"^{name}='([^']*)'$", text, re.M).group(1))
         return re.compile(fail.replace("$disk", "sda").replace("\\\\", "\\"))
 
-    def pmsg_lines(self):
-        """What the run wrote to pmsg, without its prefix and stamp."""
+    def pmsg_lines(self, evidence=True):
+        """What the run wrote to pmsg, without its prefix and stamp; without
+        the cycles' evidence lines if EVIDENCE is false."""
         prefix = f"gts9u sleep-test: {self.ramdir().name} "
         lines = (self.root / "dev/pmsg0").read_text().splitlines()
         self.assertTrue(all(line.startswith(prefix) for line in lines), lines)
-        return [line[len(prefix):] for line in lines]
+        return [line[len(prefix):] for line in lines if evidence or ": evidence: " not in line]
 
     def test_each_cycle_s_diagnostic_lines_are_kept_with_its_verdict(self):
         """Revision 8's kernel logs a line at each calibration.  Each cycle
@@ -3603,10 +3666,17 @@ class SleepTestTest(FakeTablet):
                 f"cycle 2/2: diagnostic: {entry[2]}",
                 "SLEEP-TEST cycle 2/2: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back as "
                 "before; floor released"]
-        self.assertEqual(self.pmsg_lines()[:4], kept)
+        self.assertEqual(self.pmsg_lines(evidence=False)[:4], kept)
+        # In pmsg each cycle's two evidence lines come between its
+        # diagnostic lines and its verdict; the result file has none.
+        pmsg = self.pmsg_lines()
+        self.assertEqual([line.split(": evidence: ")[0] for line in pmsg[:8]],
+                         [kept[0], "cycle 1/2", "cycle 1/2", kept[1], kept[2], "cycle 2/2", "cycle 2/2", kept[3]])
         self.assertEqual((self.ramdir() / "result").read_text().splitlines()[:4], kept)
+        self.assertNotIn("evidence:", (self.ramdir() / "result").read_text())
         kmsg = (self.root / "dev/kmsg").read_text()
         self.assertNotIn("diagnostic:", kmsg)
+        self.assertNotIn("evidence:", kmsg)
         for line in entry.values():
             self.assertEqual(kmsg.count(line), 1)
         # Nothing the run itself wrote to the kernel log is a diagnostic or
@@ -3654,8 +3724,12 @@ class SleepTestTest(FakeTablet):
         self.assertEqual(len(diag), 4)
         self.assertEqual([line[len("kernel: "):] for line in UFS_TIMEOUT if self.diag_re().search(line)],
                          [line.replace("CMN 0x1", "CMN 0x3") for line in diag])
-        pmsg = self.pmsg_lines()
         want = [f"cycle 1/1: diagnostic: {line}" for line in diag]
+        # The cycle's evidence lines come before its verdict, after the
+        # diagnostic's.
+        self.assertTrue(all(line.startswith("cycle 1/1: evidence: ") for line in self.pmsg_lines()[4:6]),
+                        self.pmsg_lines())
+        pmsg = self.pmsg_lines(evidence=False)
         self.assertEqual(pmsg[:4], want)
         self.assertTrue(pmsg[4].startswith("SLEEP-TEST cycle 1/1: FAIL: "), pmsg)
         self.assertTrue(pmsg[5].startswith("SLEEP-TEST RESULT: FAIL at cycle 1/1: "), pmsg)
@@ -3685,7 +3759,7 @@ class SleepTestTest(FakeTablet):
         note = (f"cycle 1/1: diagnostic: 44 of 60 lines left out here (kept: the first 12 and the last "
                 f"4); the terminal and {self.ramdir()}/log had them all")
         want = diag[:12] + [note] + diag[-4:]
-        pmsg = self.pmsg_lines()
+        pmsg = self.pmsg_lines(evidence=False)
         self.assertEqual(pmsg[:17], want)
         self.assertTrue(pmsg[17].startswith("SLEEP-TEST cycle 1/1: FAIL: 33 failure lines"), pmsg[17])
         self.assertTrue(pmsg[18].startswith("SLEEP-TEST RESULT: FAIL at cycle 1/1: "), pmsg[18])
@@ -3694,6 +3768,216 @@ class SleepTestTest(FakeTablet):
         # Every pmsg line is cut at 300 characters, past the prefix.
         self.assertIn("%.300s", re.search(r"^keep\(\) \{\n.*?^\}\n", self.script("sleep-test.sh"),
                                           re.M | re.S).group(0))
+        self.assertIn("%.300s", re.search(r"^ev_pmsg\(\) \{\n.*?^\}\n", self.script("sleep-test.sh"),
+                                          re.M | re.S).group(0))
+
+    def evidence_files(self):
+        """The files the evidence reads, as squirtle has them (made-up
+        values): the sleep statistics, the domains, rails, votes and wakeup
+        sources, the interrupts, the UFS host and the USB controller, both
+        PCIe functions, the audio DSP, the panel's backlight and two thermal
+        zones."""
+        F = self.root
+        stats = F / "sys/kernel/debug/qcom_stats"
+        (stats / "apss").write_text(qcom_stat(10, 10))
+        (stats / "adsp").write_text(qcom_stat(3, 0))
+        (stats / "cdsp").write_text("")
+        (stats / "ddr_stats").write_text(ddr_stats(10))
+        for d, name, text in (("pm_genpd", "pm_genpd_summary", GENPD_SUMMARY),
+                              ("regulator", "regulator_summary", REGULATOR_SUMMARY)):
+            (F / "sys/kernel/debug" / d).mkdir(parents=True)
+            (F / "sys/kernel/debug" / d / name).write_text(text)
+        (F / "sys/kernel/debug/interconnect/interconnect_summary").write_text(ICC_SUMMARY)
+        (F / "sys/kernel/debug/wakeup_sources").write_text(
+            wakeup_sources(("alarmtimer.0.auto", 1, 0), ("a600000.usb", 0, 0)))
+        (F / "proc/interrupts").write_text(INTERRUPTS)
+        files = {
+            "sys/bus/platform/devices/1d84000.ufshc/power/runtime_status": "suspended",
+            "sys/bus/platform/devices/1d84000.ufshc/devfreq/1d84000.ufshc/cur_freq": "75000000",
+            "sys/bus/platform/devices/a600000.usb/power/runtime_status": "active",
+            "sys/bus/platform/devices/a600000.usb/power/wakeup": "enabled",
+            "sys/class/remoteproc/remoteproc0/name": "adsp",
+            "sys/class/remoteproc/remoteproc0/state": "running",
+            "sys/class/backlight/ae94000.dsi.0/bl_power": "4",
+            "sys/class/backlight/ae94000.dsi.0/brightness": "0",
+            "sys/class/thermal/thermal_zone0/type": "cpu-0-0-top",
+            "sys/class/thermal/thermal_zone0/temp": "41200",
+            "sys/class/thermal/thermal_zone1/type": "pm8550_tz",
+            "sys/class/thermal/thermal_zone1/temp": "35000",
+        }
+        for dev, wakeup in (("0000:00:00.0", "enabled"), ("0000:01:00.0", "disabled")):
+            for attr, value in (("power_state", "D0"), ("current_link_speed", "5.0 GT/s PCIe"),
+                                ("d3cold_allowed", "1"), ("power/wakeup", wakeup),
+                                ("power/runtime_status", "active")):
+                files[f"sys/bus/pci/devices/{dev}/{attr}"] = value
+        for path, value in files.items():
+            (F / path).parent.mkdir(parents=True, exist_ok=True)
+            (F / path).write_text(value + "\n")
+
+    def evidence_cycle(self, n, link_up=False):
+        """Sleep N of a run as the r7 baselines slept (aosd, cxsd and ddr
+        +0) and what it leaves in the evidence's files: the CPUs' subsystem
+        30 s asleep, DDR 30 s at its lowest frequency, the RTC's interrupt
+        and its wakeup source once more; the PCIe link down and up again if
+        LINK_UP.  Its kernel lines with the Wi-Fi's per-packet noise and a
+        CPU's feature line, which the evidence leaves out."""
+        d = self.tmp / f"cycle-{n}" / "qcom_stats"
+        d.mkdir(parents=True)
+        (d / "apss").write_text(qcom_stat(10 + n, 10 + 30 * n))
+        (d / "ddr_stats").write_text(ddr_stats(10 + 30 * n))
+        (self.tmp / f"cycle-{n}" / "interrupts").write_text(
+            INTERRUPTS.replace(" 21:          4", f" 21:          {4 + n}"))
+        (self.tmp / f"cycle-{n}" / "wakeup_sources").write_text(
+            wakeup_sources(("alarmtimer.0.auto", 1 + n, n), ("a600000.usb", 0, 0)))
+        log = (f"[  {n}00.000001] PM: suspend entry (deep)\n"
+               f"[  {n}00.000002] CPU features: SANITY CHECK: Unexpected variation in SYS_ID_AA64MMFR1_EL1. "
+               "Boot CPU: 0x00000011212122, CPU3: 0x00000010212122\n"
+               f"[  {n}00.000003] Timekeeping suspended for 30.002 seconds\n"
+               f"[  {n}00.000004] mhi mhi0: Requested to power ON\n"
+               + (f"[  {n}00.000005] qcom-pcie 1c00000.pcie: PCIe Gen.2 x1 link up\n" if link_up else "")
+               + f"[  {n}00.000006] PM: suspend exit\n"
+               f"[  {n}00.000007] ath11k_pci 0000:01:00.0: msdu_done bit in attention is not set\n")
+        self.cycle(n, "no-aosd", "no-cxsd", "no-ddr", log=log)
+
+    def test_each_cycle_s_evidence_reaches_the_terminal_and_pmsg(self):
+        """Around each cycle, read only: the sleep statistics (the SoC's
+        states, the subsystems', DDR's modes and frequencies), the wakeup
+        sources and interrupts that fired, whether the PCIe link went down,
+        the domains of the rails, UFS, USB and PCIe, and the cycle's kernel
+        lines; once before the first sleep, every domain, the rails in use,
+        the bandwidth votes (those in the sleep set marked), the wakeup
+        sources and the PCIe functions.  The terminal and the log get it
+        all, pmsg two short lines per cycle, the result file and the kernel
+        log nothing.  The verdicts are as without it."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.evidence_files()
+        self.evidence_cycle(1)
+        self.evidence_cycle(2, link_up=True)
+        result = self.run_test("ro", "2", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        for i in (1, 2):
+            self.assertIn(f"SLEEP-TEST cycle {i}/2: SHALLOW: resumed and the UFS read back as before, but not "
+                          "every sleep state was reached (aosd +0 cxsd +0 ddr +0); floor released", self.out)
+            self.assertIn(f"cycle {i}/2: evidence: qcom_stats: aosd +0, cxsd +0, ddr +0; subsystems adsp +0, "
+                          "apss +1 30.0s; ddr modes 0xd4 +0, 0xd0 +0; ddr time at 547MHz 30.0s", self.out)
+            self.assertIn(f"cycle {i}/2: evidence: wakeup sources: alarmtimer.0.auto +1 (wakeup +1)", self.out)
+            self.assertIn(f"cycle {i}/2: evidence: interrupts: 21 pm8xxx_rtc_alarm +1\n", self.out)
+            self.assertIn(f"cycle {i}/2: evidence: before: ufs suspended 75000000Hz; usb active wakeup enabled; "
+                          "pci 0000:00:00.0 D0 0000:01:00.0 D0; remoteproc adsp=running; backlight ae94000.dsi.0 "
+                          "power=4 brightness=0; warmest 41.2C cpu-0-0-top", self.out)
+            for when in ("before", "after"):
+                self.assertRegex(self.out, rf"cycle {i}/2: evidence: {when}: genpd: cx +on +0\n")
+                self.assertRegex(self.out, rf"cycle {i}/2: evidence: {when}: genpd: ufs_phy_gdsc +off-0 +0\n")
+                self.assertRegex(self.out, rf"cycle {i}/2: evidence: {when}: genpd:     1d84000\.ufshc +suspended")
+            self.assertIn(f"cycle {i}/2: evidence: kernel: [  {i}00.000004] mhi mhi0: Requested to power ON",
+                          self.out)
+        self.assertIn("cycle 1/2: evidence: pcie: no link-up line: the PCIe host kept its link, clocks and votes "
+                      "through the sleep", self.out)
+        self.assertIn("cycle 2/2: evidence: pcie: qcom-pcie 1c00000.pcie: PCIe Gen.2 x1 link up", self.out)
+        evidence = [line for line in self.out.splitlines() if "evidence:" in line]
+        # Each cycle shows the domains of its list and those that are on,
+        # not the others; the Wi-Fi's per-packet lines and the CPUs' feature
+        # lines are left out.
+        self.assertFalse([line for line in evidence if "cycle " in line and "gpu_cc_cx_gdsc" in line])
+        self.assertFalse([line for line in evidence if "msdu_done" in line or "SANITY CHECK" in line])
+        # Once, before the first sleep: every domain line (with its
+        # children), the rails in use and their users, the bandwidth votes
+        # with those in the sleep set marked, the wakeup sources with events,
+        # each PCIe function.
+        once = [line.split("] ", 1)[1] for line in evidence if "cycle " not in line]
+        fixture = {line.split()[0]: line for text in (GENPD_SUMMARY, REGULATOR_SUMMARY, ICC_SUMMARY)
+                   for line in text.splitlines() if line.strip()}
+        for want in [f"evidence:   {fixture[name]}" for name in ("gpu_cc_cx_gdsc", "vreg_l1e_0p88",
+                                                                  "1d80000.phy-vdda-phy", "ebi", "cpu0")] + [
+                "evidence:   " + " " * 48 + "mmcx, ufs_phy_gdsc",
+                f"evidence:   {fixture['1c00000.pcie']}   (sleep set too)",
+                "evidence:   alarmtimer.0.auto 1 0",
+                "evidence: pci 0000:00:00.0: D0, link 5.0 GT/s PCIe, d3cold_allowed 1, wakeup enabled, "
+                "runtime active"]:
+            self.assertIn(want, once)
+        for unwanted in ("regulator-dummy", "ae94000.dsi-vdda", "qhm_qup1", "3d00000.gpu", "a600000.usb 0 0"):
+            self.assertFalse([line for line in once if unwanted in line], unwanted)
+        # The order: the state once, the first read, then each cycle's
+        # evidence before its sleep and after it, before its verdict.
+        log = (self.ramdir() / "log").read_text()
+        order = ["evidence: power domains", "read of ", "cycle 1/2: evidence: before:", "cycle 1/2: deep sleep",
+                 "cycle 1/2: asleep", "cycle 1/2: evidence: qcom_stats", "SLEEP-TEST cycle 1/2: SHALLOW",
+                 "cycle 2/2: evidence: before:", "cycle 2/2: deep sleep", "cycle 2/2: evidence: qcom_stats"]
+        self.assertEqual([log.index(said) for said in order], sorted(log.index(said) for said in order))
+        # pmsg: two lines per cycle, each cut at 300 characters.
+        pmsg = [line for line in self.pmsg_lines() if ": evidence: " in line]
+        self.assertEqual(len(pmsg), 4, pmsg)
+        self.assertEqual(pmsg[0], "cycle 1/2: evidence: qcom_stats: aosd +0, cxsd +0, ddr +0; subsystems adsp +0, "
+                                  "apss +1 30.0s; ddr modes 0xd4 +0, 0xd0 +0; ddr time at 547MHz 30.0s")
+        self.assertTrue(pmsg[1].startswith("cycle 1/2: evidence: pcie link kept; irq 21 pm8xxx_rtc_alarm +1; "
+                                           "wakeup alarmtimer.0.auto +1 (wakeup +1); before: ufs suspended "
+                                           "75000000Hz; usb active wakeup enabled;"), pmsg[1])
+        self.assertTrue(pmsg[3].startswith("cycle 2/2: evidence: pcie link down and up again; irq 21 "
+                                           "pm8xxx_rtc_alarm +1; wakeup "), pmsg[3])
+        prefix = f"gts9u sleep-test: {self.ramdir().name} "
+        for line in (self.root / "dev/pmsg0").read_text().splitlines():
+            self.assertLessEqual(len(line), len(prefix) + 300, line)
+        # Neither the result file nor the kernel log.
+        self.assertNotIn("evidence:", (self.ramdir() / "result").read_text())
+        self.assertNotIn("evidence:", (self.root / "dev/kmsg").read_text())
+
+    def test_evidence_that_cannot_be_read_changes_nothing(self):
+        """Files of the evidence that are missing or cannot be read as files
+        (a directory in their place) give "-", "none" or nothing, no error
+        line in the log, and the run as without them."""
+        F = self.root
+        (F / "sys/kernel/debug/qcom_stats/ddr_stats").mkdir()
+        (F / "sys/kernel/debug/pm_genpd/pm_genpd_summary").mkdir(parents=True)
+        (F / "sys/kernel/debug/wakeup_sources").mkdir()
+        (F / "sys/bus/pci/devices/0000:01:00.0").mkdir(parents=True)
+        result = self.run_test("ro", "2", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles resumed with the UFS readable, 2 of them deep; floor "
+                      "released; kernel 68d243e908c0", self.out)
+        for i in (1, 2):
+            self.assertIn(f"cycle {i}/2: evidence: qcom_stats: aosd +1, cxsd +1, ddr +1\n", self.out)
+            self.assertIn(f"cycle {i}/2: evidence: wakeup sources: none\n", self.out)
+            self.assertIn(f"cycle {i}/2: evidence: interrupts: none\n", self.out)
+            self.assertIn(f"cycle {i}/2: evidence: before: ufs -; usb - wakeup -; pci 0000:01:00.0 -; "
+                          "remoteproc none; backlight none; warmest -\n", self.out)
+        self.assertIn("evidence: pci 0000:01:00.0: -, link -, d3cold_allowed -, wakeup -, runtime -", self.out)
+        log = (self.ramdir() / "log").read_text()
+        for word in ("cannot open", "No such file", "Is a directory", "awk:", "read error"):
+            self.assertNotIn(word, log)
+
+    def test_ten_cycles_of_evidence_leave_pmsg_room_for_the_verdicts(self):
+        """Ten cycles with every evidence file: pmsg (a ring of about 73 KiB
+        of data) gets well under a quarter of it."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.evidence_files()
+        for n in range(1, 11):
+            self.evidence_cycle(n)
+        result = self.run_test("ro", "10", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: SHALLOW: 10 of 10 cycles resumed with the UFS readable, 0 of them "
+                      "deep", self.out)
+        self.assertEqual(len([line for line in self.pmsg_lines() if ": evidence: " in line]), 20)
+        self.assertLess(len((self.root / "dev/pmsg0").read_bytes()), 16 * 1024)
+
+    def test_the_evidence_reads_and_writes_only_its_own_files(self):
+        """The evidence functions write nothing but their output files in
+        the RAM directory (the OUT argument) and pmsg, run no command that
+        changes anything, and are given OUT files in the RAM directory."""
+        text = (KIT_SRC / "sleep-test.sh").read_text()
+        start = text.index("# ------------------------------------------------- evidence, reads only ---")
+        end = text.index("# The failure lines of a kernel log excerpt", start)
+        code = "\n".join(line for line in text[start:end].splitlines() if not line.lstrip().startswith("#"))
+        # awk's programs (single-quoted) compare with > and are not the shell's.
+        shell = re.sub(r"'[^']*'", "''", code)
+        targets = {m.group(1) for m in re.finditer(r"(?<![0-9&<])>>?\s*(\"[^\"]*\"|[^\s;|)]+)", shell)}
+        self.assertEqual(targets, {'"$1"', "/dev/pmsg0"})
+        for word in ("fsfreeze", "blockdev", "mount", "sysrq", "/dev/kmsg", "dd ", "tee ", "cp ", "mv ", "rm ",
+                     "sync", "echo 1", "dynamic_debug", "/sys/power/"):
+            self.assertNotIn(word, shell)
+        for call in re.finditer(r"^\s*(ev_stats|ev_irqs|ev_wake) (\S+)", text, re.M):
+            self.assertTrue(call.group(2).startswith('"$ramdir/ev-'), call.group(0))
 
     def test_a_held_floor_is_said_loudly_and_labels_every_verdict(self):
         self.floor_held()
