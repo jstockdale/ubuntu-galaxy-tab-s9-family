@@ -9373,3 +9373,101 @@ depth may never have run on this firmware.
 cable): `pci=remove pm_test=core trace`, then `pm_test=platform`, then the
 real sleep docked (the USB host keeps XO: an intermediate depth), then the
 undocked real sleep again with `trace`.
+
+**13:42, `pm_test=core`** (`ro 1 30 release-floor pci=remove pm_test=core
+trace hold=60 restart-ok`, boot `5dcd9d3d`, up 2442 s, on the cable as
+before; `squirtle-sleep-r7-pcirm-core-20261122{.log,/}`). The run released
+the floor (`INT_MAX nodes` 43, then 0), took the root port off the bus (`PCI
+devices 2 -> 0`), froze the root and passed its one cycle as `PM-TEST core`.
+The cycle's kernel lines, in order: `qcom-pcie 1c00000.pcie: Timeout
+waiting for L2 entry! LTSSM: 0x11` (the poll after PME_Turn_Off, a warning
+only; the host then powered down), `PM: noirq suspend of devices complete
+after 16.350 msecs`, `psci: CPU7 killed (polled 0 ms)` and so on down to
+CPU1, `Calling psci_idle_syscore_suspend+0x0/0xb0`, `PM: suspend debug:
+Waiting for 5 second(s).`, `Timekeeping suspended for 5.000 seconds`,
+`Calling psci_idle_syscore_resume+0x0/0xec`, the seven CPUs up again,
+`qcom-pcie 1c00000.pcie: PCIe Gen.2 x1 link up`, `PM: noirq resume of
+devices complete after 267.277 msecs`, `PM: suspend exit`. `aosd`, `cxsd`,
+`ddr` and `apss` +0, as expected: at `core` the CPU busy-waits with
+interrupts off. The UFS read back as before, and the boot after the restart
+came up. So the kernel's whole suspend path came back with the PCIe host
+powered down and up: the devices through their noirq phase, the CPUs
+offline, and the PSCI syscore hook, which powers the CPU cluster's domain off
+in genpd's books and so has the RPMh RSC write its sleep and wake sets
+(`dev_pm_genpd_suspend()`, the RSC's power-off notifier, `rpmh_flush()`; read
+from the source, no line shows the flush itself). Left out were the
+`SYSTEM_SUSPEND` call, the state below it, and a resume from that state.
+
+**14:00, `pm_test=platform`** (the same with `pm_test=platform`, in the boot
+after the 13:42 restart, `de4c1908`;
+`squirtle-sleep-r7-pcirm-platform-20261122{.log,/}`; the `dmesg-ramoops-0` in
+that archive is an older kernel's record, explained in the note beside it).
+`PM-TEST platform`: `qcom-pcie 1c00000.pcie: Timeout waiting for L2 entry!
+LTSSM: 0x11`, `PM: noirq suspend of devices complete after 21.772 msecs`,
+`PM: suspend debug: Waiting for 5 second(s).`, `qcom-pcie 1c00000.pcie: PCIe
+Gen.2 x1 link up`, `PM: noirq resume of devices complete after 283.843
+msecs`, `PM: suspend exit`; `qcom_stats` `aosd +0, cxsd +0, ddr +0`, `apss +0`
+and `adsp +258 8.1s` (the audio DSP sleeping on its own). The cycle's line
+said `asleep ?s, woken by IRQ ?`: at `platform` timekeeping is never
+suspended, so there is no `Timekeeping suspended for` line, and nothing
+woke the tablet, so `/sys/power/pm_wakeup_irq` has no data. Not a fault in
+what the script read; it now says so in words.
+
+**That +0 says nothing about the deep state.** The expectation written down
+before the run, that at `platform` "cpuidle may take the SoC down without
+SYSTEM_SUSPEND" (the `pm_test=LEVEL` bullet above, and sections C and D of
+the analysis), was wrong. Pausing cpuidle is not the only gate. The CPU
+cluster's power domain (`power-domain-cluster`) has one device, the RPMh RSC
+`17a00000.rsc`; the suspend's prepare phase counted it (`genpd_prepare()`
+raises the domain's `prepared_count`), and `genpd_power_off()` does nothing
+while a domain's `prepared_count` is above 0 (`drivers/pmdomain/core.c`).
+The CPUs' own devices are syscore devices and are not prepared, so during
+the wait each CPU could still power down its own domain (core power
+collapse), but none could take the cluster down, and with it the APSS and
+the RSC's sleep set. `aosd`, `cxsd`, `ddr` and `apss` +0 was the only outcome
+that run could have. The same holds at `devices`; only at `freezer`, before
+anything is prepared, can idle take the cluster down.
+[gts9wifi-interconnect.md](gts9wifi-interconnect.md) had this right for
+`platform`; two broader sentences there are corrected.
+
+**14:18, the real sleep docked** (`ro 1 30 release-floor pci=remove trace
+hold=60 restart-ok`, no `pm_test`, boot `09283fee`, up 949 s, on the powered
+dock: `Type-C: data=host power=sink partner=present, USB devices 11`;
+`squirtle-sleep-r7-pcirm-docked-20261122{.log,/}`). It did not come back.
+The run released the floor (`INT_MAX nodes` 43, then 0), removed the root
+port, froze the root and entered its one cycle; the pmsg record ends at
+`progress: cycle 1/1: entering the sleep`, the console record at `printk:
+Suspending console(s)` (1026.29 s), and the tablet restarted by itself, with
+no panic record and nobody touching it, as at 12:05. The next boot mounted
+the root clean. So the USB role does not matter, and the docked sleep is no
+"intermediate depth" that comes back (the order above expected one): with
+the PCIe host powered down, a real `deep` sleep fails in device role and in
+host role alike, and the same kernel path passes when the firmware call is
+left out (13:42, 14:00). Still not known: whether the tablet hangs on the way
+in, or sleeps and never wakes.
+
+**Next: suspend-to-idle with the root port removed** (read from the 7.2-rc3
+source; nothing of it has run on the tablet). Suspend-to-idle goes around
+that gate. All CPUs stay online and idle in their s2idle state
+(`cpu-sleep-X-0`); the last one down calls `dev_pm_genpd_suspend()`
+(`drivers/cpuidle/cpuidle-psci.c`), which powers the cluster's domain off
+without looking at `prepared_count` and runs the same RSC flush, and then
+enters PSCI `CPU_SUSPEND` with the cluster's deepest state, `cluster-sleep-1`
+(`0x4100c344`), in OS-initiated mode: the call runtime idle on this port
+makes all the time, here with the RSC's wake timer at "never". `deep`
+instead takes CPUs 1 to 7 offline and calls `SYSTEM_SUSPEND`, which takes
+no state and leaves the depth to the firmware; the stock system sleeps with
+suspend-to-idle, so `SYSTEM_SUSPEND` at that depth may never have run on
+this firmware. If suspend-to-idle with the root port removed counts `aosd`,
+`cxsd` and `ddr` and comes back, what failed at 12:05 and 14:18 is probably
+the `SYSTEM_SUSPEND` path, and suspend-to-idle the sleep mode for this port;
+if it does not come back either, the deep state itself, or the way out of
+it, is the problem. The device side is the one the 13:42 and 14:00 runs
+already took (with `pci=remove` the PCIe host takes the same branch in both
+modes). `sleep-test.sh` now has `mode=s2idle`: `rtcwake -m freeze` for each
+cycle, its own evidence (each CPU's s2idle entries, the cluster domain's idle
+states) and its own verdict for a sleep that a wakeup cut short (WOKEN EARLY);
+the kit's README says what each verdict means. The analysis, with the
+source lines, is in `~/ubuntu-gts9u/backups/s2idle-analysis-2026-11-22.md`.
+The next run: on the cable, a fresh boot, one cycle, `ro 1 30 release-floor
+pci=remove mode=s2idle trace hold=60 restart-ok`.

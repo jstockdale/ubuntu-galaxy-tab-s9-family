@@ -66,11 +66,15 @@ hang.
   `rpmh_rsc_pd_callback()` flushes it on `GENPD_NOTIFY_PRE_OFF`, from cpuidle
   as well as from system suspend.  With the floor, the sleep set is INT_MAX
   everywhere and the cluster's idle states never let DDR or CX go.
-* But not during a pm_test cycle: from `dpm_prepare()` to `dpm_complete()`
-  genpd refuses to power a domain off while `prepared_count > 0`
-  (`genpd_power_off()`), and the RSC device itself sits in the cluster domain,
-  so the cluster stays up whatever the CPUs do (a real s2idle goes around this
-  with `dev_pm_genpd_suspend()`; a pm_test cycle never gets there).  The
+* But not during a pm_test cycle at `devices` or `platform`: from
+  `dpm_prepare()` to `dpm_complete()` genpd refuses to power a domain off
+  while `prepared_count > 0` (`genpd_power_off()`), and the RSC device itself
+  sits in the cluster domain, so the cluster stays up whatever the CPUs do (a
+  real s2idle goes around this with `dev_pm_genpd_suspend()` from cpuidle,
+  and `deep` with the same call from the PSCI syscore hook, which a
+  `pm_test=core` cycle runs too; `devices` and `platform` never get there, and
+  at `freezer` nothing is prepared yet).  (Corrected 2026-11-22: this said
+  "a pm_test cycle" without the levels.)  The
   platform level's 5 s wait is `msleep(1000)` five
   times (`suspend_test()`, level > TEST_CORE), so CPU0 does idle, but only in
   CPU-level states.  During the cycle AOP never gets the sleep set; what
