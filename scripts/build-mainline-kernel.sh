@@ -248,6 +248,18 @@ apply_unless 'static void qmp_ufs_tx_pull_down_ctrl' \
 	drivers/phy/qualcomm/phy-qcom-qmp-ufs.c \
 	qmp-ufs-reset-serdes-before-power-down-gts9u.patch
 bash "$repo/scripts/stage-ufs-resume-experiment.sh" "$kernel_tree"
+# genpd drops performance votes on runtime suspend only.  The UFS host is
+# runtime-active at every SM8550 system suspend and dwc3 never runtime
+# suspends, so both kept their CX votes through the sleep once the GCC GDSCs
+# reach CX (gts9wifi DTS).  Both drop them with their clocks.  SM-X710 only:
+# the SM-X910's GDSCs have no CX parent, and neither patch has run on it.
+if [ "$DEVICE" = gts9wifi ]; then
+	apply_unless 'ufshcd_opp_drop_votes' \
+		drivers/ufs/core/ufshcd.c ufshcd-drop-opp-votes-in-system-suspend.patch
+	apply_unless 'dwc3_qcom_set_pstate' \
+		drivers/usb/dwc3/dwc3-qcom.c \
+		dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch
+fi
 bash "$repo/scripts/stage-gpu-recovery-experiment.sh" "$kernel_tree"
 apply_unless 'Late-created SM-X910 DSP endpoints' \
 	drivers/mailbox/qcom-ipcc.c ipcc-reserve-gts9u-runtime-channels.patch
@@ -310,6 +322,17 @@ apply_unless 'Match the SM-X910 Samsung kernel at standard mode' \
 apply_unless "Samsung's SM8550 driver cancels first" \
 	drivers/i2c/busses/i2c-qcom-geni.c \
 	qcom-geni-cancel-before-abort.patch
+# The geni UART's handler returned IRQ_NONE, its status uncleared, from the
+# moment uart_suspend_port() marked the port suspended, before RX and TX
+# were stopped.  On the X710 the Bluetooth UART's level-triggered interrupt
+# stormed in the boot-time pm_test cycle and was disabled, and every HCI
+# command timed out until a rebind.  X710 first: the Ultra's Bluetooth UART
+# has the same window, and gets this once the X710 has passed its matrix.
+if [ "$DEVICE" = gts9wifi ]; then
+	apply_unless 'Serve the interrupt even once uart_suspend_port()' \
+		drivers/tty/serial/qcom_geni_serial.c \
+		qcom-geni-serial-serve-irq-while-suspending.patch
+fi
 apply_unless 'sc8280xp_snd_startup' \
 	sound/soc/qcom/sc8280xp.c set-mi2s-codec-dai-format.patch
 apply_unless 'ret != -ENODEV && ret != -EPROBE_DEFER' \
@@ -434,9 +457,12 @@ apply_unless 'Re-probe driverless partner alternate modes' \
 # In USB host role the xHCI refuses system suspend (-EINVAL: root hubs not
 # suspended).  ubuntu-gts9u-usb-role (a system-sleep hook) works around it
 # for hubs and docks with nothing attached; this logs the root hub states
-# whenever it still happens, to find the cause.
-apply_unless 'suspend refused: root hub states' \
-	drivers/usb/host/xhci.c xhci-say-why-suspend-is-refused.patch
+# whenever it still happens, to find the cause.  SM-X910 only: it has not run
+# on the SM-X710.
+if [ "$DEVICE" = gts9uwifi ]; then
+	apply_unless 'suspend refused: root hub states' \
+		drivers/usb/host/xhci.c xhci-say-why-suspend-is-refused.patch
+fi
 apply_unless 'disable_irq_nosync(irq)' \
 	drivers/remoteproc/qcom_q6v5.c \
 	qcom-q6v5-mask-completed-handover-irq.patch
@@ -523,10 +549,13 @@ if [ "$fingerprint_touch" = 1 ]; then
 	# needs the sponge address, the command helper and the lock that
 	# support-goodix-samsung-fod.patch adds, so it lives in this block.  The
 	# double_tap_to_wake attribute is off by default and is created only where
-	# the firmware publishes the sponge (the SM-X910's GT6936).
-	apply_unless 'double_tap_to_wake' \
-		drivers/input/touchscreen/goodix_berlin_core.c \
-		support-goodix-samsung-double-tap-wake.patch
+	# the firmware publishes the sponge (the SM-X910's GT6936).  SM-X910 only:
+	# it has not run on the SM-X710.
+	if [ "$DEVICE" = gts9uwifi ]; then
+		apply_unless 'double_tap_to_wake' \
+			drivers/input/touchscreen/goodix_berlin_core.c \
+			support-goodix-samsung-double-tap-wake.patch
+	fi
 fi
 
 # Xorg only creates a PRIME GPU screen when MODE_GETRESOURCES succeeds.  Keep
@@ -931,6 +960,10 @@ apply_fragment() {
 				value=${value%\"}
 				"$kernel_tree/scripts/config" --file "$build_dir/.config" \
 					--set-str "${symbol#CONFIG_}" "$value" ;;
+			CONFIG_*=[0-9]*|CONFIG_*=-[0-9]*)
+				symbol=${setting%%=*}
+				"$kernel_tree/scripts/config" --file "$build_dir/.config" \
+					--set-val "${symbol#CONFIG_}" "${setting#*=}" ;;
 			'# CONFIG_'*' is not set')
 				symbol=${setting#\# CONFIG_}
 				symbol=${symbol% is not set}
@@ -990,6 +1023,9 @@ for fragment in "${fragments[@]}"; do
 				symbol=${setting%%=*}
 				grep -q "^$symbol=" "$build_dir/.config" || \
 					missing="$missing $symbol" ;;
+			CONFIG_*=[0-9]*|CONFIG_*=-[0-9]*)
+				grep -qxF "$setting" "$build_dir/.config" || \
+					missing="$missing ${setting%%=*}" ;;
 		esac
 	done < "$fragment"
 done
@@ -1069,13 +1105,14 @@ if [ "${BUILD_WIFI_MODULES:-1}" = 1 ]; then
 	# Only Image.gz and the isolated M= trees are built, so an in-tree =m
 	# option is silently left out; the payload check below fails the build
 	# for any the fragments ask for.  An in-tree driver a fragment keeps
-	# modular on purpose (an experiment switch) is listed here and built as
-	# a single target: M=drivers/soc/qcom would also build that directory's
+	# modular on purpose (an experiment switch, or netconsole, loaded only
+	# for a test) is listed here and built as a single target: M=drivers/soc/qcom would also build that directory's
 	# other =m objects, and pmic_glink_altmode needs DRM bridge symbols this
 	# build never produces.  Keyed on the fragments, not on .config: the
 	# inherited base config leaves many options at =m that no board here
 	# ships, the bandwidth monitor among them on the Ultra.
-	for single in CONFIG_QCOM_ICC_BWMON:drivers/soc/qcom/icc-bwmon.ko; do
+	for single in CONFIG_QCOM_ICC_BWMON:drivers/soc/qcom/icc-bwmon.ko \
+		CONFIG_NETCONSOLE:drivers/net/netconsole.ko; do
 		symbol=${single%%:*}
 		object=${single#*:}
 		case " ${requested_m[*]} " in

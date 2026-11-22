@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Every suspend with Bluetooth on can leave the SM-X710's BT UART with its IRQ
+# disabled: the race is in /usr/libexec/ubuntu-gts9u-bt-uart-recover.  After
+# each resume, start the unit that checks for it and rebinds the UART.
+# --no-block: a rebind takes up to a few minutes and must not hold up the
+# resume.  The unit's Before=sleep.target makes a following suspend wait for it.
+DT_COMPATIBLE=/proc/device-tree/compatible
+
+case "${1-}" in
+post)
+	tr '\0' '\n' < "$DT_COMPATIBLE" 2>/dev/null | grep -qx 'samsung,gts9wifi' || exit 0
+	systemctl start --no-block ubuntu-gts9u-bt-uart-recover.service 2>/dev/null || true
+	;;
+esac
+exit 0

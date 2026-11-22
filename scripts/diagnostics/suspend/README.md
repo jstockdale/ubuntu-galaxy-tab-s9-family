@@ -110,6 +110,15 @@ Stage 2 held a 10-minute watch, but an interconnect synced before the boot-time
 released yet. Expect a possible wedge: hold Power and Volume Down until the
 tablet restarts; it comes back on plain Stage 2.
 
+CX also needs its rail votes gone. Since the gts9wifi DTS gives the GCC GDSCs
+CX as their parent, the UFS host and the USB controller vote CX through them.
+Both were runtime-active at every suspend and kept that vote while asleep,
+until `ufshcd-drop-opp-votes-in-system-suspend.patch` and
+`dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch`. On a kernel
+without those two patches, `cxsd +0` can come from the vote and not from the
+interconnect. The `pm_test=devices` probe check in `docs/porting-log.md` ("The
+CX votes across system suspend") shows both votes drop and come back.
+
 ## Likely first findings, and what they point at
 
 | Result | Points at | Next step |

@@ -9,10 +9,24 @@
 # module and moves the lens.  A reboot undoes everything (the camera switch
 # is per boot).
 #
+# PipeWire's libcamera keeps the lens open, and a rebind under an open file
+# would free the driver's state.  So, with the Camera app closed, it pauses
+# the owner's PipeWire (audio stops too) and the camera relays for the test,
+# then starts them again and reconnects the Bluetooth devices it found.
+#
 #   1. open the lens with the rail cold, as the first open after enabling did
 #   2. if that fails again: open it while the sensor streams, so the shared
 #      rear rail has been up for seconds
-#   3. whichever open works: sweep focus_absolute and read the status register
+#   3. whichever open works: sweep focus_absolute with the lens held open, so
+#      it stays powered between steps
+#   4. 20 power cycles: each open powers the lens up and moves it, and the
+#      close comes 0.2 s later, once it has settled; a failure is rebound and
+#      counted.  This is the power-up on its own.
+#   5. up to 6 quick cycles, closed right after the move.  Before the
+#      dw9808_vcm suspend fix the first may already fail: a park that finds
+#      the lens still settling returns -EBUSY after powering it down, the
+#      device stays "active", and the next open talks to an unpowered lens
+#      (CCI timeouts, then "unbalanced disables for rear_cam_vio").
 #
 # Everything lands in /var/log/gts9u-cameras-test/TIME-lens/ (group adm).
 set -u
@@ -24,6 +38,38 @@ dev=/sys/bus/i2c/devices/$lens
 out=/var/log/gts9u-cameras-test/$(date +%Y%m%d-%H%M%S)-lens
 mkdir -p "$out"; chgrp adm "$out" 2>/dev/null; chmod 0750 "$out"
 log() { echo "$*" | tee -a "$out/summary.txt"; }
+owner=$(cat /run/ubuntu-gts9u/desktop-user 2>/dev/null || echo "${SUDO_USER:-}")
+uid=$(id -u "$owner" 2>/dev/null || :)
+as_owner() {
+	runuser -u "$owner" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+		DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+}
+holders() { # NODE: "pid command" of every process with NODE open
+	for f in /proc/[0-9]*/fd/*; do
+		[ "$(readlink "$f" 2>/dev/null)" = "$1" ] || continue
+		p=${f#/proc/}
+		p=${p%%/*}
+		echo "$p $(cat "/proc/$p/comm" 2>/dev/null)"
+	done | sort -u | tr '\n' ' '
+}
+pw_units='pipewire.socket pipewire-pulse.socket pipewire.service pipewire-pulse.service wireplumber.service'
+paused= relays= bt=
+resume_users() {
+	[ -n "$paused" ] || return 0
+	paused=
+	as_owner systemctl --user start $pw_units
+	[ "$relays" = active ] && systemctl start ubuntu-gts9u-camera-relays.service
+	sleep 5
+	for addr in $bt; do
+		if bluetoothctl connect "$addr" > /dev/null 2>&1; then
+			log "Bluetooth $addr connected again"
+		else
+			log "Bluetooth $addr did not reconnect"
+		fi
+	done
+	log "PipeWire and the camera relays started again"
+}
+trap resume_users EXIT
 subdev() { # the lens's v4l-subdev node
 	for s in "$dev"/video4linux/v4l-subdev*; do [ -e "$s" ] && echo "/dev/${s##*/}"; done | head -1
 }
@@ -35,6 +81,10 @@ rebind() {
 	sleep 1
 	echo "$lens" > "$drv/bind" || log "  bind failed"
 	sleep 1
+}
+since() { # MARK FILE: the kernel log after MARK, and its lens and bus lines
+	dmesg | tail -n +"$(($1 + 1))" > "$2"
+	grep -iE 'dw9808|cci|timeout|i2c' "$2" | sed 's/^/  /' | tee -a "$out/summary.txt"
 }
 try_open() { # label
 	mark=$(dmesg | wc -l)
@@ -48,12 +98,25 @@ try_open() { # label
 		ok=0
 	fi
 	state
-	dmesg | tail -n +"$((mark + 1))" > "$out/$1-dmesg.txt"
-	grep -iE 'dw9808|cci|timeout|i2c' "$out/$1-dmesg.txt" | sed 's/^/  /' | tee -a "$out/summary.txt"
+	since "$mark" "$out/$1-dmesg.txt"
 	return $((1 - ok))
 }
 
 log "kernel $(uname -r), boot $(cat /proc/sys/kernel/random/boot_id)"
+held=$(holders "$(subdev)")
+if [ -n "$held" ]; then
+	log "the lens is held open by: $held"
+	[ -n "$uid" ] || { log "no desktop user to pause: stop those and run again"; exit 1; }
+	relays=$(systemctl show -p ActiveState --value ubuntu-gts9u-camera-relays.service)
+	bt=$(bluetoothctl devices Connected 2>/dev/null | awk '$1 == "Device" {print $2}')
+	paused=1
+	systemctl stop ubuntu-gts9u-camera-relays.service
+	as_owner systemctl --user stop $pw_units
+	sleep 2
+	held=$(holders "$(subdev)")
+	[ -z "$held" ] || { log "still held open by: $held; nothing was tested"; exit 1; }
+	log "paused PipeWire and the camera relays for the test"
+fi
 log "before:"; state
 
 # 1: the rail cold, as on the first open.
@@ -70,18 +133,68 @@ if try_open cold; then good=cold; else
 	wait "$cam_pid" 2>/dev/null
 fi
 
-# 3: the lens answering: a focus sweep, with the open held by a reader.
+# 3: the lens answering: a focus sweep, held open by fd 3 so that the lens
+# stays powered from step to step.
 if [ -n "$good" ]; then
 	sd=$(subdev)
-	log "sweep on $sd (opened $good):"
-	for pos in 0 256 512 768 1023 512; do
-		if v4l2-ctl -d "$sd" --set-ctrl focus_absolute=$pos 2>> "$out/sweep.txt"; then
-			log "  focus_absolute=$pos ok"
-		else
-			log "  focus_absolute=$pos FAILED"
+	mark=$(dmesg | wc -l)
+	log "sweep on $sd (opened $good), held open:"
+	(
+		command exec 3<> "$sd" || { log "  hold-open FAILED"; exit 1; }
+		for pos in 0 256 512 768 1023 512; do
+			if v4l2-ctl -d "$sd" --set-ctrl focus_absolute=$pos 2>> "$out/sweep.txt"; then
+				log "  focus_absolute=$pos ok"
+			else
+				log "  focus_absolute=$pos FAILED"
+			fi
+			sleep 0.3
+		done
+	)
+	state
+	since "$mark" "$out/sweep-dmesg.txt"
+
+	# 4: power cycles.  fd 3 opens the lens (power-up, init, walk to the
+	# last position), the set jumps it, and fd 3 closes it 0.2 s later
+	# (walk back, power-down).
+	mark=$(dmesg | wc -l)
+	log "20 power cycles, closed once settled:"
+	fails=0
+	i=1
+	while [ "$i" -le 20 ]; do
+		pos=$((i % 2 ? 800 : 200))
+		if ! (exec 3<> "$sd" && v4l2-ctl -d "$sd" --set-ctrl focus_absolute=$pos &&
+			sleep 0.2) 2>> "$out/cycles.txt"; then
+			fails=$((fails + 1))
+			log "  cycle $i (focus_absolute=$pos) FAILED: $(tail -n 1 "$out/cycles.txt")"
+			rebind
+			sd=$(subdev)
 		fi
 		sleep 0.3
+		i=$((i + 1))
 	done
+	log "  $((20 - fails)) of 20 power cycles ok"
+	state
+	since "$mark" "$out/cycles-dmesg.txt"
+
+	# 5: quick cycles: v4l2-ctl closes right after the jump.
+	mark=$(dmesg | wc -l)
+	log "quick cycles, closed right after the move (stops at the first failure):"
+	i=1
+	while [ "$i" -le 6 ]; do
+		pos=$((i % 2 ? 800 : 200))
+		if ! v4l2-ctl -d "$sd" --set-ctrl focus_absolute=$pos 2>> "$out/quick.txt"; then
+			log "  quick cycle $i (focus_absolute=$pos) FAILED: $(tail -n 1 "$out/quick.txt")"
+			break
+		fi
+		log "  quick cycle $i ok"
+		sleep 0.3
+		i=$((i + 1))
+	done
+	sleep 2
+	state
+	since "$mark" "$out/quick-dmesg.txt"
+	grep -c 'unbalanced disables for rear_cam_vio' "$out/quick-dmesg.txt" |
+		sed 's/^/  unbalanced rear_cam_vio disables: /' | tee -a "$out/summary.txt"
 fi
 log "result: ${good:-no open worked}"
 log "results: $out"

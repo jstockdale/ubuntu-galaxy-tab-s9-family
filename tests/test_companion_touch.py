@@ -246,9 +246,12 @@ class GoodixDoubleTapTests(unittest.TestCase):
                         "cleanup-goodix-fod-on-suspend.patch",
                         "retain-goodix-fod-contact-until-release.patch"):
             self.assertLess(block.index(earlier), block.index(patch))
-        # The apply_unless marker must be something the patch adds.
-        marker = re.search(r"apply_unless '([^']+)' \\\n\t\tdrivers/input/touchscreen/"
-                           r"goodix_berlin_core\.c \\\n\t\t" + re.escape(patch), block).group(1)
+        # The apply_unless marker must be something the patch adds.  The
+        # hook is the SM-X910's alone, in that board's gate in this block.
+        marker = re.search(r'\n\tif \[ "\$DEVICE" = gts9uwifi \]; then\n'
+                           r"\t\tapply_unless '([^']+)' \\\n\t\t\tdrivers/input/touchscreen/"
+                           r"goodix_berlin_core\.c \\\n\t\t\t" + re.escape(patch) + r"\n\tfi\n",
+                           block).group(1)
         self.assertIn(marker, self.added)
 
 

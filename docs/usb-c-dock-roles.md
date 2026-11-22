@@ -385,10 +385,9 @@ sudo sh -c 'cat /sys/kernel/debug/usb/tcpm-*/log'
 ```
 
 On the SM-X910 the [Type-C roles kit](../tools/inplace/typec-roles-ultra/README.md)
-carries a test kernel on top of release v1.2.5.  On the SM-X710 the test
-kernel comes as a kit as well, `tools/inplace/typec-roles`, on the branch
-that carries that tablet's kernel kits (it goes on top of the hang-log kit,
-which this branch does not have).  Either kit's `verify.sh dock` runs these
+carries a test kernel on top of release v1.2.5.  On the SM-X710 the
+[Type-C roles kit](../tools/inplace/typec-roles/README.md) carries a test
+kernel on top of the hang-log kit.  Either kit's `verify.sh dock` runs these
 steps for each plug-in, keeps the log and gives a verdict, and its
 `verify.sh swap` does the same for a swap asked for from userspace.
 

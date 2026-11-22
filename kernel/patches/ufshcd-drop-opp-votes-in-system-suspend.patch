@@ -1,0 +1,112 @@
+Subject: [PATCH] scsi: ufs: core: Drop the OPP votes across system suspend
+
+genpd drops a device's performance state when the device runtime-suspends
+and restores it on runtime resume, but its system sleep callbacks leave the
+state alone.  The UFS host controller can enter system suspend
+runtime-active: ufshcd_suspend_prepare() runtime-resumes it whenever
+spm_lvl differs from rpm_lvl, and ufs-qcom sets spm_lvl to 5 (rpm_lvl stays
+3) on every SoC whose data has no_phy_retention, SM8550 included, so there
+it is runtime-active at every system suspend.  ufshcd_system_suspend() then
+turns the clocks off but leaves the required-opps of the current OPP voted:
+on SM8550 the CX level of the 300 MHz clocks, nominal, held through the
+whole sleep wherever the controller's power domain reaches CX.
+
+Drop the OPP votes once ufshcd_suspend() has stopped the clocks, and before
+ufshcd_resume() starts them again restore the OPP whose rates the clocks
+still carry, looked up from the first clock's rate the way the OPP core
+finds its current OPP.  Re-applying the same OPP leaves the clock rates as
+they are.  Both run under clk_scaling_lock, like devfreq scaling.  A
+runtime-suspended controller is untouched: genpd has already dropped its
+votes and restores them on runtime resume.
+
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -10700,6 +10700,62 @@ out:
+ #endif /* CONFIG_PM */
+ 
+ #ifdef CONFIG_PM_SLEEP
++/*
++ * genpd drops a device's performance state on runtime suspend only, and the
++ * controller can reach system suspend runtime-active: ufshcd_suspend_prepare()
++ * runtime-resumes it whenever spm_lvl differs from rpm_lvl, as on every SoC
++ * whose ufs-qcom data sets no_phy_retention.  The required-opps of the current
++ * OPP (the CX level of its clocks) would then stay voted with the clocks off,
++ * through the whole sleep.  Drop them with the clocks, and before the clocks
++ * come back restore the OPP whose rates they still carry.
++ */
++static void ufshcd_opp_drop_votes(struct ufs_hba *hba)
++{
++	int ret;
++
++	if (!hba->use_pm_opp || !hba->is_powered)
++		return;
++
++	down_write(&hba->clk_scaling_lock);
++	ret = dev_pm_opp_set_opp(hba->dev, NULL);
++	up_write(&hba->clk_scaling_lock);
++	if (ret)
++		dev_warn(hba->dev, "%s: failed to drop the OPP votes: %d\n",
++			 __func__, ret);
++}
++
++static int ufshcd_opp_restore_votes(struct ufs_hba *hba)
++{
++	struct ufs_clk_info *clki;
++	struct dev_pm_opp *opp;
++	unsigned long freq;
++	int ret;
++
++	if (!hba->use_pm_opp || !hba->is_powered ||
++	    list_empty(&hba->clk_list_head))
++		return 0;
++
++	/*
++	 * The clocks keep their rates while off.  The first one carries the
++	 * OPP table's index-0 rate; look it up as the OPP core does when it
++	 * finds the current OPP, rounding up so the vote is never too low.
++	 */
++	clki = list_first_entry(&hba->clk_list_head, struct ufs_clk_info, list);
++	freq = clk_get_rate(clki->clk);
++	opp = dev_pm_opp_find_freq_ceil_indexed(hba->dev, &freq, 0);
++	if (IS_ERR(opp))
++		opp = dev_pm_opp_find_freq_floor_indexed(hba->dev, &freq, 0);
++	if (IS_ERR(opp))
++		return PTR_ERR(opp);
++
++	down_write(&hba->clk_scaling_lock);
++	ret = dev_pm_opp_set_opp(hba->dev, opp);
++	up_write(&hba->clk_scaling_lock);
++	dev_pm_opp_put(opp);
++
++	return ret;
++}
++
+ /**
+  * ufshcd_system_suspend - system suspend callback
+  * @dev: Device associated with the UFS controller.
+@@ -10719,6 +10775,8 @@ int ufshcd_system_suspend(struct device
+ 		goto out;
+ 
+ 	ret = ufshcd_suspend(hba);
++	if (!ret)
++		ufshcd_opp_drop_votes(hba);
+ out:
+ 	trace_ufshcd_system_suspend(hba, ret,
+ 		ktime_to_us(ktime_sub(ktime_get(), start)),
+@@ -10745,7 +10803,16 @@ int ufshcd_system_resume(struct device *
+ 	if (pm_runtime_suspended(hba->dev))
+ 		goto out;
+ 
++	ret = ufshcd_opp_restore_votes(hba);
++	if (ret) {
++		dev_err(hba->dev, "%s: failed to restore the OPP votes: %d\n",
++			__func__, ret);
++		goto out;
++	}
++
+ 	ret = ufshcd_resume(hba);
++	if (ret)
++		ufshcd_opp_drop_votes(hba);
+ 
+ out:
+ 	trace_ufshcd_system_resume(hba, ret,

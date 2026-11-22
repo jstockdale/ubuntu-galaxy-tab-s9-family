@@ -121,7 +121,11 @@ others (0x50020, 0x50044) now toggle to zero (0x40000000).
 * ramoops reports a header error on every boot ("ramoops: error in header"),
   so pstore has not yet carried a console across a reset on this unit.  TWRP's
   `/proc/last_kmsg` (the sec_log ring) is the other channel; its retention
-  across a watchdog reset on the X710 is untested.
+  across a watchdog reset on the X710 is untested.  (Superseded 2026-11-10:
+  pstore does carry the console across resets, decayed, at 7 to 20 % of
+  bytes, at every reset.  The 00:19 hang's record ends in the BCM voter's
+  `Error sending AMC RPMH requests (-110)`; see the
+  [porting log](porting-log.md#the-0019-hang-left-a-console-record-2026-11-10).)
 * It is a hard hang, not a slow cycle cut short.  Nothing in Linux can time
   the cycle out on this kernel: `/sys/class/watchdog` is empty (qcom_wdt is
   =m and not loaded), systemd's `RuntimeWatchdogUSec=0`, and the soft- and

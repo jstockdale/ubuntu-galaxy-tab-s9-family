@@ -1,0 +1,131 @@
+Subject: [PATCH] usb: dwc3: qcom: Drop the required-opps vote across system suspend
+
+genpd votes the level in the controller node's required-opps while the
+device is runtime-active, and drops it only on runtime suspend.  dwc3
+forbids runtime PM by default, so the controller is runtime-active at every
+system suspend, and dwc3_qcom_pm_suspend() turns its clocks off with the
+vote still held: on SM8550 a nominal CX vote through the whole sleep,
+wherever USB30_PRIM_GDSC reaches CX.
+
+Drop the vote after dwc3_qcom_suspend() and restore it in
+dwc3_qcom_pm_resume() before the clocks come back.  The resume also covers
+a controller that was runtime-suspended: dwc3_pm_resume() marks it active
+without a runtime resume, so genpd never restored its vote, and the next
+runtime suspend then saved a level of 0 as the one to restore, losing the
+vote for good.  Runtime PM stays disabled across the resume, so genpd
+applies the level at once instead of saving it for that runtime resume.
+The level is only recorded when genpd attached the controller to a single
+power domain and applied it there.
+
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -13,6 +13,9 @@
+ #include <linux/kernel.h>
+ #include <linux/interconnect.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_opp.h>
++#include <linux/pm_runtime.h>
+ #include <linux/phy/phy.h>
+ #include <linux/usb/of.h>
+ #include <linux/reset.h>
+@@ -81,6 +84,7 @@ struct dwc3_qcom {
+ 	enum usb_dr_mode	mode;
+ 	bool			is_suspended;
+ 	bool			pm_suspended;
++	unsigned int		pstate;
+ 	struct icc_path		*icc_path_ddr;
+ 	struct icc_path		*icc_path_apps;
+ 
+@@ -683,6 +687,14 @@ static int dwc3_qcom_probe(struct platfo
+ 	if (ignore_pipe_clk)
+ 		dwc3_qcom_select_utmi_clk(qcom);
+ 
++	/*
++	 * The level genpd voted when it attached the controller to its power
++	 * domain, or none without required-opps or a single genpd domain.
++	 */
++	ret = of_get_required_opp_performance_state(dev->of_node, 0);
++	if (ret > 0 && dev->pm_domain)
++		qcom->pstate = ret;
++
+ 	qcom->mode = usb_get_dr_mode(dev);
+ 
+ 	if (qcom->mode == USB_DR_MODE_HOST) {
+@@ -745,6 +757,27 @@ static void dwc3_qcom_remove(struct plat
+ 	pm_runtime_put_noidle(qcom->dev);
+ }
+ 
++/*
++ * genpd votes the node's required-opps level (qcom->pstate) while the
++ * controller is runtime-active and drops it on runtime suspend only.  dwc3
++ * forbids runtime PM by default, so without this the level stays voted with
++ * the clocks off through every system sleep.
++ */
++static int dwc3_qcom_set_pstate(struct dwc3_qcom *qcom, unsigned int state)
++{
++	int ret;
++
++	if (!qcom->pstate)
++		return 0;
++
++	ret = dev_pm_genpd_set_performance_state(qcom->dev, state);
++	if (ret)
++		dev_err(qcom->dev, "failed to set performance state %u: %d\n",
++			state, ret);
++
++	return ret;
++}
++
+ static int dwc3_qcom_pm_suspend(struct device *dev)
+ {
+ 	struct dwc3 *dwc = dev_get_drvdata(dev);
+@@ -760,6 +793,10 @@ static int dwc3_qcom_pm_suspend(struct d
+ 	if (ret)
+ 		return ret;
+ 
++	/* A runtime-suspended controller has no vote left to drop. */
++	if (!pm_runtime_suspended(dev))
++		dwc3_qcom_set_pstate(qcom, 0);
++
+ 	qcom->pm_suspended = true;
+ 
+ 	return 0;
+@@ -772,17 +809,32 @@ static int dwc3_qcom_pm_resume(struct de
+ 	bool wakeup = device_may_wakeup(dev);
+ 	int ret;
+ 
+-	ret = dwc3_qcom_resume(qcom, wakeup);
++	/*
++	 * Vote before the clocks come back.  dwc3_pm_resume() marks the
++	 * controller active even if it was runtime-suspended, without the
++	 * runtime resume in which genpd would restore the vote, so keep
++	 * runtime PM disabled across the resume: genpd then applies the level
++	 * now instead of saving it for a runtime resume that never comes.
++	 */
++	pm_runtime_disable(dev);
++
++	ret = dwc3_qcom_set_pstate(qcom, qcom->pstate);
+ 	if (ret)
+-		return ret;
++		goto out;
++
++	ret = dwc3_qcom_resume(qcom, wakeup);
++	if (ret) {
++		dwc3_qcom_set_pstate(qcom, 0);
++		goto out;
++	}
+ 
+ 	qcom->pm_suspended = false;
+ 
+ 	ret = dwc3_pm_resume(&qcom->dwc);
+-	if (ret)
+-		return ret;
++out:
++	pm_runtime_enable(dev);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void dwc3_qcom_complete(struct device *dev)

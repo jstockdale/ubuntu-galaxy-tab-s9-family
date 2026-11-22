@@ -95,6 +95,29 @@ def hooks():
     return re.findall(r"^apply_unless '([^']+)'\s+(\S+)\s+(\S+)\s*$", text, re.M)
 
 
+def board_hooks(board):
+    """hooks() of a build with DEVICE=board: with the hooks of that board's
+    `if [ "$DEVICE" = ... ]; then` blocks (indented one tab), in order."""
+    text = BUILD.read_text().replace("\\\n", " ")
+    found, gate = [], None
+    for line in text.splitlines():
+        opened = re.match(r'if \[ "\$DEVICE" = (\w+) \]; then$', line)
+        if opened:
+            gate = opened.group(1)
+        elif line == "fi":
+            gate = None
+        elif gate is not None and re.match(r"(else|elif)\b", line):
+            gate = "?"
+        hook = re.match(r"(\t?)apply_unless '([^']+)'\s+(\S+)\s+(\S+)\s*$", line)
+        if not hook or (hook.group(1) == "") != (gate is None):
+            continue
+        if gate == "?":
+            raise AssertionError("a hook in the else branch of a board gate: " + line)
+        if gate in (None, board):
+            found.append(hook.groups()[1:])
+    return found
+
+
 def function(source, name):
     """Body of a function defined at column 0, up to its closing brace."""
     match = re.search(r"^[a-z].*\b%s\(.*\n(?:.*\n)*?\{\n" % re.escape(name), source, re.M)
@@ -170,18 +193,18 @@ class Dwc3GuardTests(unittest.TestCase):
     def test_the_guard_is_hooked_last_on_its_file_and_after_the_power_domains(self):
         mine = [hook for hook in hooks() if hook[2] == DWC3_GUARD[1]]
         self.assertEqual(mine, [(DWC3_GUARD[0], DWC3_C, DWC3_GUARD[1])])
-        # On the SM-X710 line the opps patch changes the file first and the
-        # guard goes right after it; on the SM-X910 line nothing else
-        # patches the file and the guard follows the power domain patch.
-        order = hooks()
-        guard = order.index(mine[0])
-        on_file = [name for _, target, name in order if target == DWC3_C]
-        if (PATCHES / DWC3_OPPS[1]).is_file():
-            self.assertEqual(on_file, [DWC3_OPPS[1], DWC3_GUARD[1]])
-            self.assertEqual(order[guard - 1], (DWC3_OPPS[0], DWC3_C, DWC3_OPPS[1]))
-        else:
-            self.assertEqual(on_file, [DWC3_GUARD[1]])
-            self.assertEqual(order[guard - 1], (GDSC[0], GCC_C, GDSC[1]))
+        # The guard is for both tablets and follows the power domain patch.
+        # On the SM-X710 the opps patch, gated to that board, changes the
+        # file first; on the SM-X910 nothing else patches the file.
+        self.assertTrue((PATCHES / DWC3_OPPS[1]).is_file())
+        self.assertNotIn(DWC3_OPPS[1], [name for _, _, name in hooks()])
+        for board, before in (("gts9wifi", [DWC3_OPPS[1]]), ("gts9uwifi", [])):
+            with self.subTest(board):
+                order = board_hooks(board)
+                guard = order.index(mine[0])
+                on_file = [name for _, target, name in order if target == DWC3_C]
+                self.assertEqual(on_file, before + [DWC3_GUARD[1]])
+                self.assertEqual(order[guard - 1], (GDSC[0], GCC_C, GDSC[1]))
 
     def test_the_marker_is_this_patch_s_alone(self):
         # A grep pattern: plain text, added once, in the guard's comment, by
@@ -829,53 +852,65 @@ class AppliedTests(unittest.TestCase):
 
 @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
 class Dwc3GuardAppliedTests(unittest.TestCase):
-    """The guard on the pinned dwc3-qcom.c, after what the build applies to
-    that file before it."""
+    """The guard on the pinned dwc3-qcom.c, after what each tablet's build
+    applies to that file before it."""
+
+    BOARDS = ("gts9wifi", "gts9uwifi")
 
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
-        tree = Path(cls.tmp.name)
-        (tree / DWC3_C).parent.mkdir(parents=True)
-        (tree / DWC3_C).write_bytes(subprocess.run(
+        pristine = subprocess.run(
             ["git", "-C", str(kernel_source()), "show", "HEAD:" + DWC3_C],
-            check=True, capture_output=True).stdout)
-        cls.unpatched = (tree / DWC3_C).read_text()
-        cls.log = {}
-        for marker, target, patch in hooks():
-            if target != DWC3_C:
-                continue
-            assert marker not in (tree / DWC3_C).read_text(), marker
-            with open(PATCHES / patch, "rb") as stream:
-                cls.log[patch] = subprocess.run(
-                    ["patch", "-d", str(tree), "-p1", "--no-backup-if-mismatch"],
-                    stdin=stream, check=True, capture_output=True, text=True).stdout
-        cls.source = (tree / DWC3_C).read_text()
+            check=True, capture_output=True).stdout
+        cls.unpatched = pristine.decode()
+        cls.log, cls.source = {}, {}
+        for board in cls.BOARDS:
+            tree = Path(cls.tmp.name) / board
+            (tree / DWC3_C).parent.mkdir(parents=True)
+            (tree / DWC3_C).write_bytes(pristine)
+            cls.log[board] = {}
+            for marker, target, patch in board_hooks(board):
+                if target != DWC3_C:
+                    continue
+                assert marker not in (tree / DWC3_C).read_text(), marker
+                with open(PATCHES / patch, "rb") as stream:
+                    cls.log[board][patch] = subprocess.run(
+                        ["patch", "-d", str(tree), "-p1", "--no-backup-if-mismatch"],
+                        stdin=stream, check=True, capture_output=True, text=True).stdout
+            cls.source[board] = (tree / DWC3_C).read_text()
 
     def test_it_applies_without_fuzz(self):
-        # On the SM-X710 line the opps patch above the function moves the
-        # hunk by its four added lines; on the SM-X910 line it is exact.
-        log = self.log[DWC3_GUARD[1]]
-        self.assertNotIn("fuzz", log)
-        if DWC3_OPPS[1] in self.log:
-            self.assertEqual(re.findall(r"offset -?\d+ lines?", log), ["offset 4 lines"])
-        else:
-            self.assertNotIn("offset", log)
+        # On the SM-X710 the opps patch above the function moves the hunk by
+        # its four added lines; on the SM-X910 it is exact.
+        self.assertIn(DWC3_OPPS[1], self.log["gts9wifi"])
+        self.assertNotIn(DWC3_OPPS[1], self.log["gts9uwifi"])
+        for board in self.BOARDS:
+            with self.subTest(board):
+                log = self.log[board][DWC3_GUARD[1]]
+                self.assertNotIn("fuzz", log)
+                if DWC3_OPPS[1] in self.log[board]:
+                    self.assertEqual(re.findall(r"offset -?\d+ lines?", log), ["offset 4 lines"])
+                else:
+                    self.assertNotIn("offset", log)
 
     def test_the_hcd_is_checked_before_the_root_hub_is_read(self):
-        body = function(self.source, "dwc3_qcom_read_usb2_speed")
-        guard = re.search(r"\thcd = platform_get_drvdata\(dwc->xhci\);\n\n"
-                          r"\t/\*\n(?:\t \*.*\n)+\t \*/\n"
-                          r"\tif \(!hcd\)\n"
-                          r"\t\treturn USB_SPEED_UNKNOWN;\n\n"
-                          r"#ifdef CONFIG_USB\n"
-                          r"\tudev = usb_hub_find_child\(hcd->self\.root_hub, port_index \+ 1\);\n",
-                          body)
-        self.assertIsNotNone(guard, body)
-        self.assertIn(DWC3_GUARD[0], body[:guard.end()])
-        self.assertEqual(self.source.count(DWC3_GUARD[0]), 1)
-        self.assertEqual(body.count("hcd->"), 1)
+        for board in self.BOARDS:
+            with self.subTest(board):
+                source = self.source[board]
+                body = function(source, "dwc3_qcom_read_usb2_speed")
+                guard = re.search(r"\thcd = platform_get_drvdata\(dwc->xhci\);\n\n"
+                                  r"\t/\*\n(?:\t \*.*\n)+\t \*/\n"
+                                  r"\tif \(!hcd\)\n"
+                                  r"\t\treturn USB_SPEED_UNKNOWN;\n\n"
+                                  r"#ifdef CONFIG_USB\n"
+                                  r"\tudev = usb_hub_find_child\(hcd->self\.root_hub, port_index \+ 1\);\n",
+                                  body)
+                self.assertIsNotNone(guard, body)
+                self.assertIn(DWC3_GUARD[0], body[:guard.end()])
+                self.assertEqual(source.count(DWC3_GUARD[0]), 1)
+                self.assertEqual(body.count("hcd->"), 1)
         # The unpatched function reads the root hub right after the drvdata.
         self.assertNotIn("if (!hcd)", function(self.unpatched, "dwc3_qcom_read_usb2_speed"))
 

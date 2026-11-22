@@ -7165,6 +7165,1751 @@ mode). 403 MHz is covered there only because rpmhpd has not synced on the
 SM-X910, which holds CX at its maximum, and the module refuses to load once
 it has.
 
+### Why the link stops at HS-G4 (2026-11-07)
+
+The device, the controller and the PHY can all run HS-G5. One mapping in
+mainline's ufs-qcom keeps the link at G4.
+
+Measured on the SM-X710 (fix7-ice images): during a 2 GiB `O_DIRECT` read,
+`power_info` shows `HS_GEAR4`, `HS_RATE_A` and 2 lanes, with devfreq at its
+300 MHz top OPP. At idle the link drops to G1 or G2 (75 and 150 MHz).
+
+- The device is a Samsung KLUEG4RHHD-B0G1, UFS 4.0
+  (`specification_version` 0x0400). UFS 4.0 defines HS-G5. Its maximum
+  RX gear was not read directly, because that needs root or debug output; the
+  test kernel below shows it.
+- Rate-A is the evidence for the host and the PHY. The device tree sets no
+  `limit-hs-gear` or `limit-gear-rate`, so the default rate is B. ufs-qcom
+  switches to Rate-A only on a HW-version-5 controller (SM8550) whose PHY was
+  powered up for G5. So PARAM0 reports G5, and the PHY carries the G5 tables.
+- Mainline's SM8550 G5 serdes, TX, RX and PCS settings match Samsung's
+  Kalama `phy_cal_table_rate_A_g5` value for value once the second-lane table
+  is applied. The regulator loads (188 and 18.3 mA) match too. The two local
+  qmp-ufs patches do not depend on the gear. The interconnect table already
+  has the G5 x2 vote.
+- The cap is in `ufs_qcom_freq_to_gear_speed()`. With an OPP table, it picks
+  the gear from the OPP's UniPro clock: 403 MHz gives G5 and 300 MHz gives G4.
+  SM8550's UniPro clock stops at 300 MHz, in mainline `gcc-sm8550.c` and in
+  Samsung's `gcc-kalama.c`, so its top OPP is 300 MHz. SM8650's is 403 MHz.
+  On SM8550, every scale-up therefore sets G4, whatever the link negotiated.
+  Turning `clkscale_enable` off pins the 300 MHz OPP, which is still G4.
+- Samsung's Kalama kernel runs HS-G5 Rate-A at the same 300 MHz:
+  `ufs_qcom_parse_limits()` selects Rate-A and the G5 PHY mode for a HW v5
+  host with a UFS 4.0 device, and `freq-table-hz` ends at 300 MHz. The
+  upstream series that added the mapping (January 2025, "Support
+  Multi-frequency scale for UFS") was tested on SM8550 only with UFS 3.1,
+  which stops at G4 anyway.
+- Rate-A also costs throughput at G4. G4 Rate-A carries 9.98 Gbit/s per lane,
+  against 11.66 Gbit/s for G4 Rate-B. 1.84 GB/s is about 92 % of G4 Rate-A
+  x2 after 8b/10b coding (2.0 GB/s).
+
+The proposed fix is not built or flashed yet. It makes 300 MHz map to G5 on
+HW v5 hosts:
+
+```c
+	case 300000000:
+		/* HW ver 5 (SM8550) has no 403 MHz UniPro clock; it runs HS-G5 here */
+		gear = host->hw_ver.major == 0x5 ? UFS_HS_G5 : UFS_HS_G4;
+		break;
+```
+
+The existing `min_t()` against the negotiated maximum keeps a UFS 3.1 device
+at G4. The UFS driver is built in, so the change needs a new kernel image,
+which must ship with the module tree from the same build. HS-G5 Rate-A runs at
+19.97 Gbit/s per lane. UFS 4.0's 4200 MB/s figure assumes Rate-B
+(23.3 Gbit/s), so this part may stop nearer 3.5 GB/s; the test will measure
+it.
+
+Risks:
+- Link errors at G5. Samsung's shipping kernel uses the same PHY tables on
+  this board, but G5 has not been run on mainline here. Mainline also adds a
+  3.5 dB TX de-emphasis at G5 for Samsung devices, which Samsung's Kalama
+  driver does not set.
+- Resume. The PHY already starts with the G5 tables today, so calibration is
+  unchanged. Only the operating gear changes.
+- More PHY power and heat while busy. Idle still drops to G1 or G2.
+
+Tests:
+1. Under load, `power_info` shows `HS_GEAR5` / `HS_RATE_A`.
+2. No UIC or data-link errors in `dmesg` or in
+   `/sys/kernel/debug/ufshcd/1d84000.ufshc/stats` (root).
+3. fio on a freshly rewritten 2 GiB file, compared with 1844 and 1595 MB/s.
+4. 30 minutes of mixed fio.
+5. 20 suspend and resume cycles, checking the gear and errors after each.
+6. Idle drain compared with fix7-ice, and a reboot.
+
+Rollback is the fix7-ice boot image with its module set. If G5 is unreliable,
+there is a DTB-only fallback that needs no kernel change: `limit-hs-gear =
+<4>` starts the PHY at G4, so the Rate-A rule does not apply and the link runs
+G4 Rate-B, about 17 % more line rate than now. The SM-X910 has the same SoC
+and driver, so the same cap applies there.
+
+#### The HS-G5 kit (built 2026-11-07, not flashed)
+
+The owner asked for the experiment. Commit `b9f5b08` adds
+`ufs-qcom-hs-g5-at-300mhz-sm8550.patch`. `build-mainline-kernel.sh` applies it
+for `DEVICE=gts9wifi` only, so the Ultra gets it only after the X710 has
+passed. `scripts/test-ufs-hs-g5-gear.py` applies it with zero fuzz to the
+pinned source. It then runs the real mapping function against stubs: 300 MHz
+gives G5 on HW ver 5, G4 when the device stops at G4, and G4 on other host
+versions.
+
+The kernel was built from a frozen export of `b9f5b08` into a new worktree
+and build directory. Another session's uncommitted ICE driver patch sat in the
+shared X710 tree, and the G5 kernel does not contain it. The first run failed
+at the SNVM module. The snapshot had been made read-only, and the script copies
+`kernel/drivers/snvm` with its mode, so the build could not write there. A
+writable snapshot of the same tree finished.
+
+Checks against fix6:
+
+- Same configuration (`c17980f0…`), `UTS_VERSION` (`#1 … Jul 12 21:16:39
+  UTC 2026`) and exported-symbol list.
+- The same 62 modules.
+- A new signing certificate, because the build directory is new. The kit
+  ships the whole module tree from this build.
+- In the disassembly, `ufs_qcom_freq_to_gear_speed()` now reads
+  `hw_ver.major` and compares it with 5 in the 300 MHz case.
+
+Outputs:
+
+- `Image.gz`: `6f7b96d5…`, vmlinux build ID `c0db6fe5…`.
+- The kit (`tools/inplace/ufs-g5`):
+  - `boot.img`: `4179f406…`. It is fix7-ice's image with this kernel, and the
+    fix7-ice DTB (`2da18630…`) appended. `vendor_boot` stays fix7-ice's. The
+    same packing reproduces fix7-ice's `boot.img` byte for byte from fix6's
+    kernel.
+  - `modules-7.2.0-rc3-dirty.tar`: `6f25de45…`.
+
+The kit is staged on squirtle as `~/ufs-g5` and not installed. Before it, on
+fix7-ice, `verify.sh` read `HS_GEAR4/HS_RATE_A` under load.
+
+The PCS-reset patch stays gated to the SM-X910, as
+[resume-recovery.md](resume-recovery.md#sm-x710-gts9wifi) decided. The 15
+boots before this one logged no UFS PHY error. They include each boot's
+`pm_test=platform` cycle and, on 2026-11-06, five `pm_test` levels, one real
+s2idle and one real deep sleep. Adding it to
+the G5 build would have made two PHY-side changes at once. If the G5 suspend
+runs show `PCS_READY` timeouts, it gets its own build.
+
+#### The HS-G5 kit on squirtle (2026-11-07 evening)
+
+The owner installed the kit at 20:24 (`boot` written and read back as
+`4179f406…`) and rebooted. The new boot runs vmlinux `c0db6fe5…`. `verify.sh`
+passed, both 30 s after boot and once the system was up:
+
+- `HS_GEAR5/HS_RATE_A` under load;
+- no UFS PHY, UIC or link messages;
+- no module BTF, signature or symbol failures.
+
+A 1 GiB `O_DIRECT` `dd` read ran at 2.5–2.7 GB/s, against 1.5 GB/s on
+fix7-ice. The only kernel warning, `disp_cc_mdss_mdp_clk_src: rcg didn't update
+its configuration`, is also on the fix7-ice boot.
+
+fix7-ice was measured with `~/usertests/ufs-bench.sh`, which runs fio jobs of
+8 s each, one job at QD32. The same script on G5, after a sequential rewrite
+of the file:
+
+| | fix7-ice (G4 Rate-A), 18:43 | G5 Rate-A, 20:29 |
+|---|---|---|
+| 1 MB sequential read | 1844 MB/s (after a rewrite) | 3483 MB/s |
+| 1 MB sequential write | 1707 MB/s | 2220 MB/s |
+| 4 KB random read | 199.5k IOPS | 136.6k IOPS (133.8k on a second run) |
+| 4 KB random write | 141k IOPS | 115k IOPS |
+
+Sequential reads reach about the 3.5 GB/s estimated for G5 Rate-A. The
+4 KB numbers are lower, but they are not yet a measured regression:
+
+- On G5, single-job random reads ranged from 80k to 154k IOPS from run to run.
+  They are lowest right after random writes to the same file.
+- Doubling the queue depth gave nothing (141k), while four jobs reached
+  203k IOPS.
+- All UFS interrupts go to CPU 0 (one `ufshcd` line, no MCQ ESI). Pinning fio
+  to CPU 0 drops it to about 10k. Pinned to the prime core, it read 80k and
+  wrote 155k.
+- devfreq made at most one transition per 8 s run, so the gear does not
+  bounce between G5 and G2.
+
+fix7-ice has a single 4 KB run, so a fair comparison needs the same protocol
+on both kernels: several runs, unpinned and pinned, one job and four.
+Rolling back with `rollback.sh` and reinstalling with `install.sh` makes that a
+reboot each way. One possible mechanism, a hypothesis only: HS-G5 bursts carry
+a longer sync (`RX_HS_G5_SYNC_LENGTH_CAPABILITY` 0x4F, as in Samsung's
+tables). That costs most when each burst carries little.
+
+Still to run: the 4 KB A/B, 30 minutes of mixed fio, 20 suspend cycles, idle
+drain and a reboot.
+
+#### Write speed and the WriteBooster cache
+
+At G5, KDiskMark's SEQ128K Q32T1 write came out about two thirds lower than on
+fix7-ice. The cause is the UFS part's SLC write cache (WriteBooster). The link
+is not involved.
+
+fio, 128 KB at QD32, one job, sampled each second (`attributes/wb_avail_buf`,
+`wb_on`, gear):
+
+- With the cache at 100 %, writes ran at 1884 MB/s. The cache emptied in
+  about 6 s.
+- With the cache at 0 %, 1 MB writes ran at 644 MB/s, the TLC write speed.
+- The link stayed at HS-G5, 300 MHz, with WriteBooster on.
+
+The cache is nominally 16 GiB (`wb_cur_buf` 0x1000 units of 4 MiB). About
+11 GB of it emptied in those 6 s. At idle it flushes back to 100 % in under
+15 s, but only while the link is in hibernate. Mainline turns WriteBooster on
+for HS gears of G3 and above (`clk_scaling.wb_gear`) and off at G1 and G2,
+when the clock scales down at idle. Flushing still runs then. So nothing here
+is specific to G5.
+
+The owner's KDiskMark profile uses an 8 GiB file and 5 loops, and its helper
+runs fio with `--size=8192m --runtime=<measuring time>` per loop. The SEQ1M
+write test alone therefore writes up to about 40 GiB, and the SEQ128K reads that
+follow keep the link out of hibernate. The SEQ128K write then starts with a
+mostly empty cache, and how empty depends on the timing of everything before
+it. The owner ran SEQ128K Q32T1 on its own after idling and confirmed the full
+speed. A fair G4/G5 comparison has to start each write test with the cache at
+100 %.
+
+#### Stress run at HS-G5 (2026-11-07, 21:16 to 21:48)
+
+`tools/inplace/ufs-g5/stress.sh 10`, no root, on the boot that already carried
+the benchmarks above. Each of the 10 rounds ran 150 s of load and then 30 s
+idle. The load:
+
+- 1 MB sequential reads at QD16 from a file written once;
+- two jobs of 4 KB random reads at QD32;
+- 4 KB random writes capped at 10 MB/s;
+- 128 KB writes at 30 MB/s, read back with crc32c (`verify_backlog=256`,
+  `verify_fatal`).
+
+Result: PASS. There was no fio or verify error and no UFS, I/O or ext4 kernel
+message, and `verify.sh` passed afterwards. Per round:
+
+- Sequential reads ran at 2.74–2.79 GB/s. The random reads were starved
+  behind them (about 7.6k IOPS for both jobs together).
+- Random writes ran at about 5 MB/s, verified writes at 30 MB/s.
+- Every 15 s sample under load read G5. At the end of each round the link
+  dropped to G1, with 2–4 devfreq transitions, about 27 power-mode changes in
+  all.
+- The hottest zone reached 52.7 °C in round 1 and about 40 °C after that. The
+  battery went from 54 % to 47 %, at 26–28 °C.
+
+In total about 4 TB was read, and about 52 GB written and checked.
+
+This does not cover the following:
+
+- UniPro error counters. Those need root
+  (`/sys/kernel/debug/ufshcd/1d84000.ufshc/stats`).
+- Suspend and resume at G5.
+- Idle drain.
+- A second boot.
+
+### The UFS clocks' CX vote never reached the rail (2026-11-07)
+
+The ICE entry ("Storage at 300 MB/s") says the ICE rates sit at "the low SVS,
+SVS and nominal levels those OPPs already vote". They are named but never voted. A review of the
+kernel source (mainline a13c140cc plus this port's patches) traces the path:
+
+- ufshcd scales through `dev_pm_opp_set_opp()`. The OPP core sets each
+  required OPP's level on `opp_table->required_devs[]`, and for a device with
+  one power domain `genpd_set_required_opp_dev()` registers the UFS device
+  itself there. The level lands on that device's domain, `UFS_PHY_GDSC`. The
+  node's own `required-opps = <&rpmhpd_opp_nom>` sets the same GDSC's default
+  at attach (`genpd_set_required_opp()`).
+- A GDSC has no `set_performance_state`. `_genpd_set_performance_state()`
+  only forwards a level along the GDSC's parent links, where
+  `genpd_xlate_performance_state()` passes it through unchanged (no OPP
+  table).
+- `gdsc_register()` takes the parent from the clock controller's own power
+  domain. sm8550.dtsi's `gcc` node has no `power-domains`, so no GCC GDSC has
+  a parent: `UFS_PHY_GDSC` records 256 (nominal) at 300 MHz and nothing votes
+  CX. The same holds for mainline's 300 MHz UFS clocks, the PCIe OPPs' low SVS
+  and the USB controller's nominal `required-opps`.
+
+403 MHz worked because CX was high for other reasons. On the X710, rpmhpd syncs
+at boot. After the Stage 0 release, its RPMh trace showed CX voted at nominal
+by its other consumers. Nothing ties that level to the UFS. On the SM-X910,
+rpmhpd has not synced, so it clamps every enabled rail at its maximum.
+
+Fix (X710 board DTS): `&gcc { power-domains = <&rpmhpd RPMHPD_CX>; }`. This is
+the mainline pattern in 7.2's sc7180, sc7280, sc8180x, sc8280xp, sdm845,
+sa8775p, x1e80100, milos and eliza DTs. `platform_probe()` attaches gcc to CX
+and powers it on. `gdsc_register()` then adds every GCC GDSC as a CX subdomain:
+PCIe 0/1 and their PHYs, UFS and its PHY, USB and its PHY. A GDSC the
+bootloader left on can only join a parent that is already on, and the attach
+has done that. A per-node CX domain on the UFS was rejected: with two power
+domains, ufs-qcom would have to attach them itself, which needs driver code.
+
+Effects checked in the source:
+
+- Votes that now reach CX: the UFS OPPs (low SVS/SVS/nominal, nominal by
+  default), pcie0's OPPs (low SVS; pcie1 is disabled here), and the USB
+  controller's nominal `required-opps` while it is runtime-active. All of them
+  only raise CX.
+- fw_devlink makes gcc a consumer of rpmhpd. Nothing under `apps_rsc` uses a
+  gcc clock, so there is no cycle. gcc is built in and binds early, so
+  rpmhpd's `sync_state` still waits on videocc, as before. The interconnect
+  providers and their late release are untouched.
+- gcc-sm8550 does not enable runtime PM, so the bound gcc device keeps the CX
+  genpd on at runtime. CX was already on.
+- System suspend: GDSCs set neither `GENPD_FLAG_ACTIVE_WAKEUP` nor
+  `ALWAYS_ON`, so they power off in noirq and release the CX genpd as before.
+  The votes on them did not drop, though; see the next section.
+- `dtbs_check`: qcom,sm8550-gcc.yaml does not list `power-domains` yet (the
+  x1e80100 binding requires it). For upstream, the binding needs that line.
+
+Build test (no kernel image, nothing flashed): the DTB was compiled with
+kbuild's cpp and `dtc -@` flags against the X710 kernel tree. The baseline
+(8c8be80) came out byte-identical to the last built X710 DTB (sha256
+`2da18630…`), so the method matches. The new DTB (sha256 `290a5395…`) differs
+from it only by `power-domains = <&rpmhpd 0x00>` on `clock-controller@100000`,
+with no new dtc warnings. The built-in `gts9-performance` and `gts9-family`
+overlays still apply with `fdtoverlay`.
+
+On-device check after the next X710 flash (read only; it reads the UFS for
+6 s to hold the 300 MHz OPP):
+
+```sh
+sudo sh -c '
+d=/sys/kernel/debug
+for b in /sys/block/sd*; do
+	readlink -f "$b" | grep -q 1d84000.ufshc && ufs=/dev/${b##*/} && break
+done
+timeout 6 dd if="$ufs" of=/dev/null bs=1M iflag=direct status=none &
+sleep 2
+for c in axi unipro_core ice_core; do
+	echo "gcc_ufs_phy_${c}_clk $(cat $d/clk/gcc_ufs_phy_${c}_clk/clk_rate)"
+done
+grep -A3 "^ufs_phy_gdsc " $d/pm_genpd/pm_genpd_summary
+echo "cx perf_state $(cat $d/pm_genpd/cx/perf_state)"
+grep -x ufs_phy_gdsc $d/pm_genpd/cx/sub_domains || echo "ufs_phy_gdsc: not a cx subdomain"
+wait
+dmesg | grep -iE "performance state|subdomain|gcc-sm8550" || true
+'
+```
+
+Pass:
+- The clocks read 300000000, 300000000 and 403000000.
+- `ufs_phy_gdsc` and its `1d84000.ufshc` line show 256.
+- `ufs_phy_gdsc` is listed as a cx subdomain.
+- cx `perf_state` is at least 256.
+- dmesg shows no performance-state or subdomain errors.
+
+On today's DTB the GDSC already shows 256, but the subdomain line fails. That
+gap is the bug.
+
+SM-X910: it needs the same fix before its rpmhpd syncs (the rpmhpd sync work
+planned there). The overlay route works. `gts9u-performance.c` applies
+`gts9u-performance.dtso` at `core_initcall`, before
+`of_platform_default_populate()` (`arch_initcall_sync`) creates gcc, so gcc
+probes with the property in place. A scratch fragment targeting
+`/soc@0/clock-controller@100000` with `power-domains = <&rpmhpd 0>` (CX)
+resolved and applied with `fdtoverlay` onto the pinned Ultra DTS (5046f92)
+compiled here. The Ultra files are unchanged.
+
+### The CX votes across system suspend (2026-11-07)
+
+genpd drops a device's performance state on runtime suspend
+(`genpd_runtime_suspend()`) and restores it on runtime resume. Its system
+sleep path (`genpd_finish_suspend()`/`genpd_finish_resume()`) powers domains
+off and on but leaves the votes alone. A parent also counts the votes of
+powered-off subdomains (`_genpd_reeval_performance_state()`). Two of the
+votes the `&gcc` change made live are held at every system suspend on this
+board:
+
+- UFS: ufs-qcom sets `spm_lvl` 5 on SM8550 (`no_phy_retention`), while
+  `rpm_lvl` stays 3. So `ufshcd_suspend_prepare()` always runtime-resumes the
+  controller before suspend. `ufshcd_system_suspend()` then stops the clocks
+  and keeps the current OPP's CX level.
+- USB: `dwc3_core_probe()` calls `pm_runtime_forbid()`, and nothing in the
+  device package allows it, so the controller is always runtime-active.
+  `dwc3_qcom_pm_suspend()` stops its clocks and interconnect and keeps the
+  nominal `required-opps` vote.
+
+pcie-qcom drops its own OPP in `suspend_noirq` (it keeps low SVS only for S2RAM
+with the link up, on purpose). sdhci-msm and the GENI drivers drop theirs too.
+Upstream practice is that a driver releases its own votes for system sleep, so
+the fix is in the two drivers, not in genpd:
+
+- `ufshcd-drop-opp-votes-in-system-suspend.patch`: after
+  `ufshcd_suspend()`, `dev_pm_opp_set_opp(dev, NULL)`. Before
+  `ufshcd_resume()`, it restores the OPP whose rates the clocks still carry: a
+  ceil lookup of the first clock's rate, as the OPP core's
+  `_find_current_opp()` does. Re-applying that OPP sets the same rates, a
+  no-op. Both calls run under `clk_scaling_lock`, and a controller that is not
+  powered is skipped. A runtime-suspended controller is untouched, because
+  genpd already holds its vote.
+- `dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch`: probe records
+  the `required-opps` level (`of_get_required_opp_performance_state()`), but
+  only for a controller genpd attached to a single domain.
+  Suspend sets it to 0 after `dwc3_qcom_suspend()`, unless the controller is
+  runtime-suspended. Resume restores it before the clocks, with runtime PM
+  disabled. This also fixes an upstream fault: `dwc3_pm_resume()` marks a
+  runtime-suspended controller active without the runtime resume in which
+  genpd would restore its vote. The next runtime suspend then saved 0 as the
+  level to restore, and the vote was lost for good. While runtime PM is
+  disabled, genpd applies the level at once instead of deferring it.
+
+Both are generic and also apply to the SM-X910 build. They are inert there
+while its GCC GDSCs have no parent.
+
+Build test, in an isolated copy of the X710 tree (`build-cx`, hardlinked
+source, own object directory, `.config` identical to the X710 build's, LLVM
+22):
+- `ufshcd.o` and `dwc3-qcom.o` compile with `W=1` and no warnings, before and
+  after the patches.
+- `checkpatch --strict`: clean.
+- Every new symbol either object references is in the X710 `System.map`.
+- Both patches dry-run on the shared tree at fuzz 0.
+- The `apply_unless` markers are absent before patching and present after.
+- The patched files are byte-identical to the compiled ones.
+
+No kernel image was built and nothing was flashed.
+
+dwc3 in s2idle and deep, from the source:
+- Both modes run the same dwc3-qcom callbacks, so the vote change covers both.
+- `dwc3_qcom_suspend()` cannot fail. "HS-PHY not in L2" is only a log line.
+- The existing vetoes are a gadget soft-disconnect timeout in device mode and
+  xHCI in host mode.
+- `wakeup-source` (gts9-family.dtso) arms the PDC wake IRQs and keeps the PHYs
+  only in host mode. `USB30_PRIM_GDSC` still powers off in noirq, so a
+  host-mode session relies on the GDSC's `RETAIN_FF_ENABLE`.
+- None of this changed.
+
+What is new: with dwc3 runtime PM forbidden, USB now holds CX at nominal
+whenever it is bound, in the sleep set as well, so it costs idle power. It
+does not block suspend. Allowing dwc3 runtime PM is a separate change that
+needs gadget and role-switch tests. The resume path above already handles a
+runtime-suspended controller.
+
+On-device check, after the next X710 flash with both patches. This is not
+read-only: it runs one `pm_test=devices` cycle (device callbacks only, no real
+sleep) with two probe events, then removes them.
+
+```sh
+sudo sh -c '
+t=/sys/kernel/tracing
+echo "p:cxvote/opp dev_pm_opp_set_opp dev=dev->kobj.name:string opp=opp:x64" >> $t/dynamic_events
+echo "p:cxvote/ps dev_pm_genpd_set_performance_state dev=dev->kobj.name:string state=state:u32" >> $t/dynamic_events
+echo > $t/trace
+echo 1 > $t/events/cxvote/enable
+echo devices > /sys/power/pm_test
+echo mem > /sys/power/state
+echo none > /sys/power/pm_test
+echo 0 > $t/events/cxvote/enable
+grep -E "1d84000.ufshc|a600000.usb" $t/trace
+echo "-:cxvote/opp" >> $t/dynamic_events
+echo "-:cxvote/ps" >> $t/dynamic_events
+grep -A3 -E "^(ufs_phy_gdsc|usb30_prim_gdsc) " /sys/kernel/debug/pm_genpd/pm_genpd_summary
+'
+```
+
+Pass:
+- One `1d84000.ufshc` call with `opp=0x0` and one `a600000.usb` call with
+  `state=0` during suspend.
+- On resume, a non-null `opp` for the UFS and `state=256` for USB.
+- The summary shows 256 again for `a600000.usb`, and the UFS's OPP level.
+- dmesg has no "failed to drop", "failed to restore" or "failed to set
+  performance state".
+
+Over real s2idle and deep cycles, `journalctl -t ubuntu-gts9u-sleep-stats`
+shows whether CX collapsed (`cxsd +N`).
+
+### dwc3 runtime PM on the SM-X710 (device 2.58, 2026-11-07)
+
+`dwc3_core_probe()` calls `pm_runtime_forbid()`, and nothing in the port
+allowed runtime PM again. So `a600000.usb` never runtime-suspended: its clocks,
+interconnect paths and `USB30_PRIM_GDSC` stayed on whenever the controller was
+bound. With the `&gcc` CX parent above, its nominal `required-opps` vote now
+also holds CX at nominal, in the sleep set too.
+
+The source (7.2-rc3 X710 tree) shows every way back from runtime suspend
+exists on this board:
+
+- Cable events: TCPM (the sm5714 TCPC) sets `USB_ROLE_NONE` on detach
+  (`tcpm_reset_port()`) and `USB_ROLE_DEVICE` or `USB_ROLE_HOST` on attach.
+  dwc3-qcom's `pre_set_role` runtime-resumes the controller on every role
+  change and toggles the VBUS-valid override, so the gadget sees connect and
+  disconnect. ps5169 only reads the role.
+- Device mode: the controller may suspend only while not connected
+  (`dwc3_runtime_checks()`), after the 5 s autosuspend delay. Binding a UDC
+  resumes it (`dwc3_gadget_pullup()` takes a runtime reference).
+- Host mode: it suspends only after the xHCI root hubs do. A connect or
+  remote wakeup comes back through the PDC wake IRQs that
+  `dwc3_qcom_suspend(.., true)` arms, and `qcom_dwc3_resume_irq()` then
+  resumes xHCI.
+- DisplayPort: the QMP USB/DP combo PHY forbids its own runtime PM, so a host
+  runtime suspend never gates its clocks. In device mode the suspend runs the
+  same `dwc3_core_exit()` that system suspend already runs on this board.
+- System sleep from runtime suspend: the dwc3-qcom suspend patch above
+  restores the vote, where upstream lost it.
+
+Change, in device package 2.58: `ubuntu-gts9u-usb-runtime-pm.service`
+writes `auto` to `a600000.usb/power/control`.
+- It does not use a udev rule because it must wait for the boot-time
+  `pm_test=platform` panel cycle. That cycle has hung on this board when state
+  changed under it (the interconnect, Stage 3), so the controller goes through
+  it runtime-active, as before.
+- It is ordered after `ubuntu-gts9u-panel-coldboot-recover` and the bring-up
+  gadget.
+- It runs on the SM-X710 only (`ConditionFirmware`).
+- To opt out, create `/etc/ubuntu-gts9u/usb-runtime-pm-off`. Stopping the unit
+  writes `on` again, and so does removing the package (prerm).
+- postinst enables it on both fresh installs and upgrades. An upgrade does not
+  start it; it takes effect at the next boot.
+
+Install 2.58 with, or after, a kernel that carries the dwc3-qcom suspend
+patch. A runtime-suspended controller would otherwise lose its vote at the
+first system sleep. Suspend is off on this board, so only the suspend tests
+reach that path.
+
+Expected costs, all upstream behavior:
+- A host that starts enumerating more than 5 s after the cable goes in (a
+  sleeping PC) is not seen until the cable is replugged, because no role
+  change wakes the controller.
+- Each device-mode runtime suspend may log dwc3-qcom's "HS-PHY not in L2".
+
+Checks:
+- `tests/test_usb_runtime_pm.py` (new, 9 tests: gating, ordering, opt-out, the
+  commands against a fake `power/control`, `systemd-analyze verify`, postinst
+  and prerm) and `tests/test_device_package.py` pass.
+- Package build (`DEVICE=gts9wifi`, under fakeroot, with the X710 kernel's
+  certificate, config and matching `qcom_spss_irq.ko`): `ubuntu-gts9u-device`
+  2.58 arm64, with Depends unchanged. Against the 2.57 backup, the only
+  differences are the version, the new unit (root, 0644), one postinst line and
+  two prerm lines.
+- Not installed, not tested on hardware.
+
+Test matrix for the owner, on the X710 after installing 2.58. Check the
+package's sha256 after the transfer, and require
+`apt-get install --simulate ./ubuntu-gts9u-device_2.58_arm64.deb` to remove
+nothing. "State" means `cat /sys/bus/platform/devices/a600000.usb/power/{control,runtime_status}`
+and `grep -A2 '^usb30_prim_gdsc ' /sys/kernel/debug/pm_genpd/pm_genpd_summary`
+(root).
+
+1. Boot: the panel comes up (the boot cycle completes), and
+   `systemctl is-active ubuntu-gts9u-usb-runtime-pm` reads active. State:
+   `auto`.
+2. No cable for 10 s: `suspended`; the GDSC `off`; `a600000.usb` at 0.
+3. Cable to the PC with the NCM gadget: `active` within a second; `usb0` up and
+   SSH over it works; still `active` after 2 min idle; the GDSC line at 256.
+4. Unplug, wait 10 s (`suspended`), replug: it enumerates again. Five times.
+5. Plug into a sleeping PC, then wake the PC: a known gap. Record whether it
+   enumerates without a replug.
+6. Wall charger only: PD charging as before (sm5714 is independent of dwc3);
+   `suspended` after 5 s.
+7. USB-C hub or dock with a keyboard and a flash drive: both work. Remove both
+   devices: `suspended` once the hub autosuspends. Plug one back in: it wakes
+   and enumerates. Unplug the dock and plug it back in: host role again.
+8. A dock with DisplayPort: the picture stays while the controller suspends.
+9. Suspend ladder: `pm_test` devices and platform, then one real s2idle and one
+   real deep sleep, once with no cable (suspended at entry) and once with NCM
+   up. After each, `active` or `suspended` as before, and 256 on the GDSC line
+   whenever it is `active`.
+10. Opt out: `sudo touch /etc/ubuntu-gts9u/usb-runtime-pm-off` and
+    `sudo systemctl stop ubuntu-gts9u-usb-runtime-pm` give `on`. Remove the
+    file and run `sudo systemctl start ubuntu-gts9u-usb-runtime-pm` to get
+    `auto` back.
+11. Reboot: again `auto` after the boot cycle, no boot loop.
+
+### The CX-vote kit, on top of the G5 kit (2026-11-07)
+
+The owner asked for this work to build on the latest G5 build. The branch now
+starts at the G5 branch tip (`claude/x710-ufs-hs-g5`, 87c6246, the passing
+30-minute G5 stress run). The kernel-key registry commit from
+`feature/sm-x710-gts9wifi` sits under it, so this build's signing key is
+archived. On top come the `&gcc` CX parent, the two suspend patches and
+device package 2.58.
+
+`tools/inplace/ufs-cx/` packs the kit, which installs over the G5 kit:
+- `boot`: the G5 kernel plus the two patches, with the CX DTB appended.
+- `vendor_boot`: fix7-ice's image with only its DTB swapped.
+- The matching module tree.
+- Optionally, device package 2.58.
+
+Packing checks, against the real images:
+- The `boot` recipe, given the G5 kernel and fix7-ice's DTB, reproduces the
+  G5 kit's `boot.img` (`4179f406…`) byte for byte.
+- `vendor_boot`: a repack with fix7-ice's own arguments and DTB reproduces its
+  3,137,536-byte body byte for byte. After the swap, every field reads back
+  unchanged except the DTB, which is the CX one (`290a5395…`).
+- Both footers pass `avbtool verify_image`.
+
+fix7-ice's own `vendor_boot` footer is stale. Its digest matches its body only
+with ` iommu.strict=0` zeroed, so the cmdline was patched in place after
+footing. vbmeta is disabled, so ABL never checks it. The kit's image gets a
+fresh, correct footer.
+
+The build (2026-11-08):
+- Source: a fresh worktree of `linux-mainline` at a13c140cc, built from the
+  snapshot `~/ubuntu-gts9u/snapshots/cx-0992e2a13671` of commit 0992e2a (the
+  `SNAPSHOT` file names its commit and tree). Build directory and worktree:
+  `gts9u-scratch/build-cxg5`. Output: `~/ubuntu-gts9u/out/kernel-gts9wifi-cx`.
+- The kernel tree differs from the G5 kernel's (`build-g5/linux-src-gts9wifi`)
+  in three files only: the X710 DTS, `ufshcd.c` and `dwc3-qcom.c`.
+- Image.gz `8b6d58c9…`, DTB `290a5395…`, release `7.2.0-rc3-dirty`.
+- `config` `c17980f0…`, fix6's and the G5 kernel's.
+- Exported symbols: the same 17,610 as the G5 build. The same 62 modules,
+  every one signed by this build's certificate (serial `1E124EA5…`).
+- The signing key, ID `1ded767e…`, is archived in `~/ubuntu-gts9u/kernel-keys`,
+  mirrored to the external drive and copied to `gdrive:gts9u-kernel-keys`.
+- The first run stopped at the snvm module: `cp -a` copies
+  `kernel/drivers/snvm` from the snapshot with its modes, and this snapshot had
+  been made read-only. Keep snapshots owner-writable, as the G5 one is.
+
+Device package 2.58, built against this kernel, sha256 `99366b71…`. Its
+`qcom_spss_irq.ko` is byte-identical to the kernel's signed copy.
+
+Kit `~/ubuntu-gts9u/backups/ufs-cx-kit`:
+- `boot.img` `47f7df27…`: the kernel is exactly `Image.gz` plus the CX DTB, and
+  every header field matches the G5 kit's.
+- `vendor_boot.img` `be06a00f…`.
+- `modules-7.2.0-rc3-dirty.tar` `f7d38300…`: root-owned, and the same module
+  list as the build.
+- The device package.
+
+Not flashed. It goes on the tablet after the G5 kit, as the owner ordered.
+
+On the tablet (squirtle, 2026-11-08), measured:
+- Host key checked against the stored key. Before the install it ran the G5
+  kernel (build ID `c0db6fe5…`).
+- `install.sh` saved both partitions and the G5 module tree, then wrote
+  `vendor_boot` (`be06a00f…`) and `boot` (`47f7df27…`) and read both back. The
+  tablet has no saved Ubuntu boot set (`/var/lib/gts9u-boot-sets`), so there
+  was none to update.
+- After the reboot it ran the CX kernel (build ID `bfb40d20…`). The panel
+  cycle and the interconnect late release both succeeded.
+- `verify.sh` (non-root): root rw; no UFS, module or vote errors; HS-G5
+  Rate-A under load.
+- `verify.sh` (root): `ufs_phy_gdsc`, `ufs_mem_phy_gdsc`, `usb30_prim_gdsc`
+  and `pcie_0_gdsc` are CX subdomains. Under load:
+  - the AXI and UniPro clocks at 300 MHz and the ICE clock at 402,999,902 Hz;
+  - `1d84000.ufshc` and `ufs_phy_gdsc` at 256;
+  - `a600000.usb` and `usb30_prim_gdsc` at 256 (USB never runtime-suspends);
+  - `cx` `perf_state` 256.
+- UFS devfreq kept scaling across all three OPPs (68 transitions by then).
+- `suspend-votes.sh`, one `pm_test=devices` cycle (mem_sleep `deep`):
+  - suspend: `a600000.usb` state 0 at 693.588 s, then `1d84000.ufshc` OPP
+    NULL at 693.605 s;
+  - resume: the UFS's same OPP again at 698.809 s, then USB state 256 at
+    698.946 s;
+  - no vote errors in the kernel log.
+
+  The raw probe hits are in
+  `~/ubuntu-gts9u/backups/ufs-cx-results-20261108/`.
+- Read speed: 1 GiB `O_DIRECT` `dd` runs at 2.5–3.2 GB/s on
+  `~/usertests/ufs-stress-read.bin`, at or above the G5 kit's 2.5–2.7 GB/s.
+  `verify.sh`'s default `ufs-test.bin` now reads 420 MB/s: the G5 stress run
+  spent 30 minutes of 4 KB random writes in it. That is fragmentation, not the
+  kernel (porting log, "Storage at 300 MB/s"). Rewrite it sequentially before
+  using it as a benchmark again.
+
+Two of the kit's checks needed fixes on the way, both in the checks, not in
+the kernel:
+- `verify.sh` wanted exactly 403000000 Hz for the ICE clock.
+- `suspend-votes.sh` matched kprobe lines by group (`cxvote/opp`); trace lines
+  carry only the event name (`opp:`).
+
+Both are fixed (999e6f2, 158fb55), and the kit's copies on the host and the
+tablet were updated with their checksums.
+
+Still to run: device package 2.58 and its test matrix, fio as for the G5 kit,
+and the suspend ladder with real s2idle and deep.
+
+Device package 2.58 on squirtle (2026-11-08), measured:
+- `apt-get install --simulate`: 1 upgraded, 0 to remove. Then installed:
+  status `ii`, `dpkg --audit` and `dpkg -V` clean. The package's
+  `qcom_spss_irq.ko` is the kit's copy.
+- apt's note "Download is performed unsandboxed as root" means `_apt` could
+  not read the .deb in the 0750 home directory, so root read it instead.
+- After the reboot (CX kernel `bfb40d20…`):
+  - the panel cycle finished at 41.9 s, `ubuntu-gts9u-usb-runtime-pm` ran at
+    42.5 s, and the interconnect late release ran at 51.0 s;
+  - `power/control` reads `auto`;
+  - with the USB-C cable to the PC carrying SSH over NCM, the controller stays
+    `active`, with 0 ms suspended (test matrix steps 1 and 3);
+  - the only dwc3 line this boot is "HS-PHY not in L2", from the boot-time
+    panel cycle, before the unit ran.
+- Cable out, watched once a second over Wi-Fi:
+  - the gadget disconnected at 01:04:43 (`usb0` down, PD contract 0 mV), and
+    the controller was `suspended` by 01:04:49, after the 5 s autosuspend
+    (step 2);
+  - after 97 s suspended, the cable went back in at 01:06:26. TCPM's role
+    change resumed the controller, charging came back at 5 V / 500 mA, and
+    NetworkManager activated `usb0` the same second. SSH over USB worked again
+    (step 4, once).
+  - dwc3-qcom logged "remote wakeup not configured" at the disconnect and
+    "HS-PHY not in L2" at the suspend, as expected.
+- Cable out again, root (`pm_genpd_summary`): `usb30_prim_gdsc` `off-0`
+  at 0, `a600000.usb` `suspended` at 0. Idle, the controller now powers its
+  GDSC off and holds no CX vote.
+- CX stayed at 256. `mmcx` is a CX subdomain, and with the display on MMCX
+  votes nominal. That is the "other consumer" that had kept CX at nominal
+  before any of this work. The other CX children are the GCC GDSCs.
+- Still to run: steps 4 (five times) to 11.
+
+### Bluetooth lost to a UART IRQ storm in the boot-time cycle (2026-11-08)
+
+On boot `0824d1f3` (CX kernel, device 2.58) Bluetooth came up at 21 s and
+went dead at 35 s. In the boot-time panel cycle's `pm_test=platform` suspend,
+at 24.8 s:
+- IRQ 191 (`qcom_geni_serial_uart1`, the BT UART at `898000.serial`, `ttyHS1`)
+  logged "nobody cared" inside `qcom_geni_serial_suspend()`;
+- the kernel then printed "Disabling IRQ #191".
+
+With its RX interrupt gone the UART could not receive. Every HCI command
+after the cycle timed out (from 35.0 s), and the QCA crash dump, the re-setup
+and three power-on retries all failed by about 181 s. 1 of the 32 boots with a
+kernel log in the journal shows this. Early bring-up saw it once, as "irq 188:
+nobody cared = ttyHS1 (BT UART) during the fake suspend". Boot −1, on the
+same kernel and DTB, was clean. The CX and USB changes do not touch this path.
+
+Mechanism (drivers/tty/serial/qcom_geni_serial.c):
+- `qcom_geni_serial_isr()` returns `IRQ_NONE` as soon as `uport->suspended`
+  is set, without clearing the SE's interrupt status.
+- `uart_suspend_port()` sets `suspended` before `stop_rx` masks RX.
+- An HCI event arriving in that window leaves the level-triggered interrupt
+  asserted. It refires, every time "unhandled", until the spurious-IRQ
+  detector disables it.
+- Every real suspend with Bluetooth on has the same window, so this matters
+  before a suspend mode is enabled.
+
+Recovery without a reboot, three steps, all root:
+1. Rebind the UART:
+   `echo 898000.serial > /sys/bus/platform/drivers/qcom_geni_serial/unbind`,
+   then the same name to `.../bind`. The driver requests its IRQ at probe, and
+   `__setup_irq()` clears `IRQS_SPURIOUS_DISABLED` for a first handler. The
+   BT serdev device re-probes and loads its firmware again (setup completed
+   at 11:54:13).
+2. The new `hci0` comes up with the NVM's null address. Unconfigured
+   controllers are skipped by bluetoothd, and restarting it does not help.
+3. `systemctl restart ubuntu-gts9u-bluetooth-address.service` applies the EFS
+   address again (`68:DF:E4:B4:91:C1`). bluetoothd and GNOME took the
+   controller at once (11:57:06).
+
+The second step is what made a re-probed controller invisible.
+`ubuntu-gts9u-bluetooth-address` is a oneshot with `RemainAfterExit`, so it
+runs only at boot.
+
+After the recovery the owner played audio over Bluetooth and confirmed that
+AAC works and sounds right. That is the X710's first Bluetooth audio test.
+PipeWire, read from the user session:
+- a `bluez_card` in profile `a2dp-sink` for the Beats Studio Pro headphones;
+- `api.bluez5.codec = "aac"`;
+- the sink `RUNNING` at s16le, 2 ch, 48 kHz.
+
+### Bluetooth bring-up without a human (device 2.59, 2026-11-08)
+
+The recovery above took three root steps. Device package 2.59 does both
+halves of it by itself. Not yet tested on hardware.
+
+**Every new `hci0` gets its native address.** Up to 2.58,
+`ubuntu-gts9u-bluetooth-address.service` was a oneshot with
+`RemainAfterExit=yes`, enabled in `multi-user.target`. It ran once per boot,
+and any later start was a no-op.
+- `70-gts9u-bluetooth-address.rules` now starts it from udev on every `add`
+  of `hci0` (`SYSTEMD_WANTS`). systemd applies that once per plug of the
+  device unit, so once per controller and never on a `change` event.
+- The unit has no `RemainAfterExit`. It is inactive after each run, so the
+  next `hci0` starts it again.
+- It has no `[Install]` section, because `multi-user.target` would run it a
+  second time at boot. postinst removes 2.58's link
+  (`deb-systemd-helper purge` and the `multi-user.target.wants` symlink).
+- On a live upgrade postinst also stops the unit if it reads `active`.
+  Otherwise 2.58's `RemainAfterExit` state would make udev's next start a
+  no-op until a reboot. The stop runs nothing, and the controller keeps its
+  address.
+- The helper is unchanged: it runs after `bluetooth.service`, feeds `btmgmt`
+  an empty pipe and bounds every call (development notes, "two `btmgmt`
+  traps").
+- At boot, `bluetoothd` is now started by `bluetooth.target` when `hci0`
+  appears, as on stock Ubuntu (systemd's `99-systemd.rules`). Until now it
+  started earlier, because this unit's `Wants=` pulled it in at
+  `multi-user.target`.
+- The SM-X910 gets the same change. There it only moves the boot run to the
+  `hci0` add. Not tested on the SM-X910.
+
+**The UART is rebound when its IRQ is gone.**
+`ubuntu-gts9u-bt-uart-recover.service` runs the helper of the same name, on
+the SM-X710 only (`ConditionFirmware`).
+- It runs at boot, after `ubuntu-gts9u-panel-coldboot-recover`,
+  `bluetooth.service` and the address unit. These are ordering-only
+  dependencies, as in `ubuntu-gts9u-icc-late-release`.
+- It runs again after every resume. The system-sleep hook
+  `ubuntu-gts9u-bt-uart-recover` starts it with `--no-block`, so the resume
+  is not held up. `Before=sleep.target` makes a suspend that is requested
+  during a rebind wait for it.
+- The boot cycle writes `/sys/power/state` itself, so no sleep hook runs for
+  it. That is why the boot needs its own run.
+
+It treats two conditions as a fault:
+1. The incident's. The kernel log has `Disabling IRQ #N`, where N is the IRQ
+   whose `/sys/kernel/irq/N/actions` reads `qcom_geni_serial_uart1`, and the
+   line comes after the UART's last probe report. Every bind prints
+   `898000.serial: ttyHS1 at MMIO 0x898000 (irq = N, …)`, so a disable from
+   before a rebind does not count, whether the rebind was by hand or by this
+   unit. N is read at run time: it was 188 in early bring-up and is 191 on
+   the CX kernel.
+2. `hci0` is UP, and three Read Local Version commands, 5 s apart, all time
+   out (`hciconfig hci0 version` waits 1 s). A controller that is DOWN or
+   absent is not asked. An error other than a timeout is not a fault.
+
+On a fault it:
+- unbinds and binds `898000.serial` on `qcom_geni_serial`, once;
+- waits up to 30 s for the new `hci0`, then up to 45 s for its address;
+- if udev's start of the address unit has not restored the address by then,
+  starts that unit itself and waits once more;
+- runs the diagnosis again, and logs `recovered` or `failed` in the journal
+  and the kernel log.
+
+Bounds:
+- One rebind per run and three per boot. A rebind that does not help is
+  logged, not retried in that run.
+- With `/etc/ubuntu-gts9u/bt-uart-recover-off` present, a fault is logged and
+  left alone.
+- A loop breaker covers a crash or hang inside the unbind and bind. A marker
+  in `/var/lib/ubuntu-gts9u` exists only for those seconds. A boot that finds
+  one from another boot rebinds nothing for that whole boot.
+
+`ubuntu-gts9u-bt-uart-recover check` shows what a run would do and changes
+nothing. `status` shows the UART, the IRQ, `hci0` and this boot's record
+(`/run/ubuntu-gts9u/bt-uart-recover`). Without root the kernel log is
+unreadable, so the probe is the only test in that case.
+
+This is a userspace safety net. The race itself is in `qcom_geni_serial` and
+needs a kernel fix, which is separate work. Once that fix is in, this unit
+should only ever log `healthy`.
+
+Checks, all offline:
+- `tests/test_bt_uart_recover.py` (new, 34 tests) runs the helper against a
+  simulated sysfs, kernel log and `hciconfig`. The stubbed `sleep` plays the
+  kernel's side of a rebind. The tests also cover the units, the udev rule,
+  the sleep hook and postinst.
+- Mutation check: ten mutants of the helper each fail at least one test. The
+  mutants are: no probe-report reset, one probe try, no cap, no loop breaker,
+  no opt-out, marker kept, no bind retry, no address fallback, probing a
+  dead UART, and writes in `check` mode.
+- `tests/test_device_package.py` and `tests/test_usb_runtime_pm.py` pass.
+- `systemd-analyze verify` (systemd 259, with ExecStart pointed at
+  `/bin/true`) accepts both units, and `udevadm verify` accepts the rule.
+- `sh -n` passes on the helper, the hook and postinst, and
+  `git diff --check` is clean.
+- Package build: `DEVICE=gts9wifi`, under fakeroot, against the CX kernel's
+  certificate and config. The `qcom_spss_irq.ko` is the signed one from the
+  CX `modules-root`, the same file as in the kit's 2.58. (The copy in
+  `build-cxg5/spss-irq-module-gts9wifi` is unsigned and fails the build's
+  key check.)
+- Result: `ubuntu-gts9u-device_2.59_arm64.deb`, sha256
+  `feb771a660c00202a860f9279d11af17df3bb44912b01b0d562238774be6df2c`, in
+  `~/ubuntu-gts9u/backups/bt-uart-recover-2.59/`. Depends are unchanged.
+- Compared with the kit's 2.58 (`99366b71…`), the only differences are:
+  - the four new files: the unit and the rule (0644), the helper and the hook
+    (0755), all owned by root;
+  - the address unit;
+  - control and postinst.
+- Not installed, not tested on hardware.
+
+Test plan for the owner, on squirtle (CX kit, device 2.58). Commands marked
+(root) need sudo. The journal and `/run/ubuntu-gts9u/bt-uart-recover` are
+readable without root.
+`irq=$(grep -lx qcom_geni_serial_uart1 /sys/kernel/irq/*/actions | cut -d/ -f5)`
+gives the UART's IRQ.
+
+1. Install.
+   - `sha256sum ubuntu-gts9u-device_2.59_arm64.deb` matches the hash above.
+   - (root) `apt-get install --simulate ./ubuntu-gts9u-device_2.59_arm64.deb`
+     removes nothing. Then install it.
+   - With no reboot:
+     - `ls /etc/systemd/system/multi-user.target.wants/ | grep bluetooth-address`
+       prints nothing;
+     - `systemctl is-active ubuntu-gts9u-bluetooth-address` reads `inactive`;
+     - `systemctl is-enabled ubuntu-gts9u-bt-uart-recover` reads `enabled`;
+     - `hciconfig hci0` still shows the native address and `UP RUNNING`, and
+       Bluetooth audio still plays.
+2. The address alone, as on 2026-11-08 but without its third step.
+   - (root) `echo 898000.serial > /sys/bus/platform/drivers/qcom_geni_serial/unbind`,
+     then the same name to `.../bind`.
+   - Within about 15 s, `hciconfig hci0` shows the native address.
+   - `journalctl -b -u ubuntu-gts9u-bluetooth-address -o cat` shows a second
+     run that applied it.
+   - GNOME shows the controller, and the headphones reconnect and play AAC.
+3. The full recovery path. The incident's log line is injected: the IRQ is
+   not really disabled, but every step after detection is real.
+   - (root) `echo "Disabling IRQ #$irq" > /dev/kmsg`.
+   - (root) `ubuntu-gts9u-bt-uart-recover check` says "would rebind".
+   - (root) `systemctl start ubuntu-gts9u-bt-uart-recover`.
+   - `journalctl -b -u ubuntu-gts9u-bt-uart-recover -o cat` shows `FAULT`,
+     `rebinding`, then `recovered: IRQ <irq>, hci0 answers, hci0 at <native>`.
+   - The record shows `result=recovered` and `rebinds=1`, and audio works.
+   - Start the unit again: it logs `healthy`, because the new probe report
+     supersedes the injected line.
+4. The opt-out.
+   - (root) `touch /etc/ubuntu-gts9u/bt-uart-recover-off`, inject, start: the
+     unit logs `FAULT` and `HOLD`, and Bluetooth is not reset.
+   - Remove the file and start the unit again: it recovers, with
+     `rebinds=2`.
+5. The cap. Inject and start once more (`rebinds=3`). The next injection and
+   start logs `HOLD: 3 rebinds this boot already (limit 3)`.
+6. The loop breaker.
+   - (root)
+     `printf 'boot_id=00000000-test\nuptime=1\n' > /var/lib/ubuntu-gts9u/bt-uart-recover.pending`,
+     then inject and start.
+   - The unit logs `HOLD: loop breaker: boot 00000000 began a rebind …`, and
+     the marker is gone afterwards.
+7. Reboot.
+   - The panel comes up, and there is no boot loop.
+   - `journalctl -b -u ubuntu-gts9u-bluetooth-address -o cat` shows a single
+     run at boot: one `Starting` line.
+   - `journalctl -b -u ubuntu-gts9u-bt-uart-recover -o short-monotonic` shows
+     one `healthy: IRQ <irq> log clear; hci0 answers (suspend_stats …)`,
+     after the panel cycle.
+   - The record reads `result=healthy` and `rebinds=0`, and Bluetooth audio
+     works.
+8. The resume path.
+   - (root) `/usr/lib/systemd/system-sleep/ubuntu-gts9u-bt-uart-recover post suspend`
+     makes the unit log a new `healthy` line.
+   - Then one real test cycle through systemd-sleep:
+     - (root) `echo s2idle > /run/ubuntu-gts9u/suspend-mode`,
+       `systemctl restart ubuntu-gts9u-suspend-mode` and
+       `echo platform > /sys/power/pm_test`;
+     - `systemctl suspend`, which returns after pm_test's 5 s;
+     - check for a new `healthy` line, with the suspend_stats success count
+       one higher;
+     - (root) `echo none > /sys/power/pm_test`,
+       `rm /run/ubuntu-gts9u/suspend-mode` and
+       `systemctl restart ubuntu-gts9u-suspend-mode`.
+9. Optional: the real race. Play audio over Bluetooth and repeat step 8's
+   cycle 20 times. Any cycle that hits the race should log
+   `FAULT: the kernel disabled IRQ …`, then `recovered`, and the audio should
+   come back by itself.
+
+### SM-X710 rear focus: two DW9808 faults, not the bus speed (2026-11-08)
+
+**Baseline:**
+- squirtle, CX kernel `bfb40d20…` with the first lens kit (CCI1 master 0 at
+  400 kHz, DTB `e6e7b957…`), device 2.58, boot `0a434817`.
+- Rear camera enabled by `camera-test.sh rear`; frames and the Camera app
+  worked, focus did not.
+
+**Observed:**
+- Both boots (1 MHz, `0824d1f3`; 400 kHz, `0a434817`) lost the lens at the
+  probe-time power-up. `i2c-qcom-cci ac16000.cci: master 0 queue 0 timeout`,
+  then `dw9808-vcm 14-000c: register 0x02 write failed: -110`. That is the
+  first write of `dw9808_init()`.
+- After a failed resume, runtime PM latched the error, and every open returned
+  `EINVAL` (`lens-diag.sh` sweep logs) until the driver was rebound.
+- 400 kHz, after a rebind: the cold open and the power-ups for 0 and 256
+  worked, and the power-up for 512 failed the same way.
+- 1 MHz, after a rebind:
+  - the cold open and the step to 0 (a 512-code jump, closed at once)
+    worked;
+  - the step to 256 got `EBUSY` from the move;
+  - its park timed out 36 times on CCI1;
+  - the standby write failed;
+  - `_regulator_disable()` warned "unbalanced disables for rear_cam_vio"
+    from `dw9808_suspend` (core.c:3245; the check is per consumer).
+
+**Causes:**
+1. Power-up timing (hypothesis, test pending).
+   - `dw9808_resume()` waits 1 ms after enabling `rear_cam_vio`.
+   - Stock waits 10 ms. Samsung's CamX record for this actuator in
+     `com.samsung.sensormodule.0_hynix_hi1337.bin` (X710XXS5CYG1, from the
+     firmware cache; the SM-X910's, from blastoise's extracted vendor, is
+     identical) is `13,1,1` then `4,1800000,10` for power-up, and `4,0,1`
+     then `13,0,1` for power-down.
+   - In those records, type 4 is VIO 1.8 V and 13 is the `RCAM_LDO_EN` GPIO.
+     The types are read from the same file's sensor and EEPROM records, and
+     the delays are CamX's milliseconds.
+2. The suspend error path (mechanism from the code, consistent with the log).
+   - `dw9808_suspend()` always disables the rail, then returns the park
+     walk's error.
+   - `dw9808_set_position()` turns a status poll that is still busy after
+     10 ms into `-EBUSY`.
+   - For `-EBUSY`, `rpm_suspend()` (runtime.c:472 and 750) puts the device
+     back to `RPM_ACTIVE` without latching an error.
+   - The 256 step's open therefore never ran `dw9808_resume()` (hence the
+     zero enable count in the warning). Its move and park went to an
+     unpowered lens.
+
+**Ruled out:**
+- The bus speed: 400 kHz failed the same way.
+- The actuator data: the X710's and the X910's differ only in the module id
+  and the signature.
+- The pad settings (stock 4 mA and a weak pull-up, against the dtsi's 2 mA
+  and strong 2.2 kOhm). The Ultra focuses with the dtsi's pads, the same lens,
+  rail, bus speed and driver. A pad kit was built (DTB `ab1ffa7b…`) and then
+  withdrawn untested, to keep the next test to one change.
+
+**Changes:**
+- DTS: the 400 kHz override is gone (the bus is at the dtsi's 1 MHz, as the
+  owner prefers). `rear_cam_vio` gets `startup-delay-us = <10000>`. Against
+  the CX DTB, that property is the only difference in the decompiled DTB
+  (`164e1bf8a393c642ffc7bd357ce5dfbc608b07ba77070ede8b2052434de42a84`).
+- `kernel/drivers/dw9808_vcm.c`:
+  - suspend returns 0 once the rail is off, and warns "lens not parked
+    before power-down";
+  - a failed open calls `pm_runtime_set_suspended()`, which clears the
+    latched error, so the next open powers up again.
+  - Compiled with `W=1 -Werror` against the CX object tree (out of tree,
+    compile only).
+  - Not deployed: the driver is built in (`CONFIG_VIDEO_DW9808_VCM=y`), so
+    it waits for the next kernel build. It is shared with the Ultra, and the
+    change touches its error paths only.
+- `tools/inplace/cam-lens/` is now the lens power-up kit, on the CX kit, DTB
+  only. Its self-tests passed: the recipe reproduces the CX `boot.img` and
+  `vendor_boot.img`, and only the DTB differs. Both AVB footers verify.
+  - `boot.img` `57406c8001a9f32c33b0e25171a8996daed4dd4f84d41c6a9338d71b69c76882`
+  - `vendor_boot.img` `b18510f38bae75d285347baef80a2beebfd57e246a2a7e7a4c7ce17983bd166a`
+- `lens-diag.sh`:
+  - the sweep holds the lens open (the old sweep power-cycled it at every
+    step, despite its comment);
+  - 20 power cycles close once the lens has settled, testing cause 1 on its
+    own;
+  - up to 6 quick cycles reproduce cause 2 on the CX kernel.
+
+**Staged:** the kit is in `~/cam-lens` on squirtle, hash-checked, with
+`~/cameras-kit/lens-diag.sh`. The 400 kHz kit is still installed, with its
+backups in `/var/backups/ubuntu-gts9u-cam-lens`. Its directory is now
+`~/cam-lens-400k`; the new kit's `rollback.sh` is the same file.
+
+**Pending:**
+- the reboot onto the kit, then `camera-test.sh rear` and `lens-diag.sh`;
+- the owner seeing focus in the Camera app;
+- the driver fix on hardware, with the next kernel build.
+
+**On squirtle, boot `9c0e3019` (the power-up kit):**
+- Installed with the 400 kHz kit's rollback, then the new install, without
+  a reboot between. Both logged in `/var/log/gts9u-cam-lens.log`:
+  `vendor_boot` `b18510f38bae…` and `boot` `57406c8001a9…` were written and
+  read back. The CX images are in `/var/backups/ubuntu-gts9u-cam-lens/`.
+  squirtle has no saved Ubuntu boot set (`/var/lib/gts9u-boot-sets/ubuntu`
+  is absent), so none was updated.
+- `/proc/device-tree/rear-camera-vio-regulator/startup-delay-us` = 10000.
+- `camera-test.sh rear` (`20261108-134534-rear`): the probe-time power-up
+  worked, and there is no `dw9808` or CCI line in the boot's kernel log.
+  libcamera kept the lens, and PipeWire had its node without a restart.
+  `/dev/video20` gave a real frame (mean luma 81, spread 169).
+- PipeWire (pid 4789) and WirePlumber (4791) keep `/dev/v4l-subdev31` open
+  from then on. The lens stays `active`, so the module rail stays on while
+  PipeWire runs.
+- Owner, GNOME Camera:
+  - first open: focus for about a second, then a glitch and a frozen
+    picture;
+  - second open: focused.
+  The first session made five stream configurations in 1.3 s (126.0 to
+  127.3 s), then logged nothing. There was no error anywhere and no
+  software-ISP benchmark line, so the stream stalled within its first
+  couple of seconds. The second session logged one
+  `qcom-camss acb7000.isp: Received wm done for unmapped index` (175.5 s).
+- `lens-diag.sh` (commit `06c988b`) found PipeWire holding the lens. A
+  rebind under an open file would free the driver's state, so it now pauses
+  the owner's PipeWire and the relays for its run, then starts them again
+  and reconnects Bluetooth.
+
+**Still pending:**
+- the `lens-diag.sh` stress run;
+- the freeze, for which the next step is to watch the `csid0` interrupt
+  count while it is frozen;
+- the driver fix, with the next kernel build;
+- whether the always-powered lens costs idle power.
+
+**`lens-diag.sh`, boot `9c0e3019` (`20261108-141752-lens`):**
+- the cold open, the held-open sweep to 1023, and 20 settled power cycles
+  (closed 0.2 s after the move): all OK;
+- quick cycle 1 (closed right after a 600-code jump): OK;
+- quick cycle 2's power-up: `master 0 queue 0 timeout`, then `register 0x02
+  write failed: -110` and `ETIMEDOUT` at the open, then `rpm=error`. No
+  unbalanced disable.
+- After the test the lens stayed latched in `error`, so PipeWire's libcamera
+  could not reopen it.
+
+Fault 1 is therefore narrower than the power-up delay. A clean power-up
+works with 10 ms. A power-up after a power-down taken mid-move can still
+fail. The stock data decoded so far shows no park or settle sequence to
+compare against (the actuator block has 13 init records and the power
+records, plus unidentified tuning words such as 7500 and 10000).
+
+### The geni UART handler ignored its interrupt while the port suspended (2026-11-08)
+
+The cause of the storm in "Bluetooth lost to a UART IRQ storm in the
+boot-time cycle", and its fix.
+
+Measured on squirtle, still on boot `0824d1f3`:
+- The report's stack ends `_raw_spin_unlock_irq+0x1c (P)` over
+  `qcom_geni_serial_suspend+0x60`, in the panel cycle's task
+  (`ubuntu-gts9u-pa`, PID 1325) on CPU 0.
+  - In the CX vmlinux, `+0x60` is the return address of the
+    `bl uart_suspend_port`.
+  - `_raw_spin_unlock_irq+0x1c` is the first instruction after
+    `msr DAIFClr`.
+  - So the interrupt became pending inside a port-locked section of
+    `uart_suspend_port()` and was taken the instant interrupts came back on.
+  - For a non-console port, the only such section is the one that runs
+    `stop_tx()`, `set_mctrl(0)` and `stop_rx()`.
+- IRQ 191 (hwirq 493, GIC SPI 461 from the UART's DT node) has
+  `effective_affinity_list` 0. There is no irqbalance, so it always goes to
+  CPU 0.
+
+Mechanism (7.2-rc3; mainline master read on 2026-11-08 is the same):
+- `uart_suspend_port()` sets `uport->suspended` first. Then, under the port
+  lock, it stops TX and RX. `shutdown()` disables the IRQ later still.
+- From the moment the flag is set, `qcom_geni_serial_isr()` returns
+  `IRQ_NONE` without reading or clearing the M, S or DMA status. The line
+  is level-triggered, so whatever latched in that window keeps it asserted:
+  received data, or the cancel status from `stop_rx_dma()`.
+  `stop_rx_dma()` clears `RX_EOT`, but it leaves the S sequencer's status to
+  the handler. `S_CMD_CANCEL_EN` is in the enabled S interrupts
+  (`geni_se_init()`), and `geni_se_io_set_mode()` routes all four sources
+  to the line.
+- If the IRQ's CPU is not the suspending task's, the storm lasts until
+  `shutdown()` masks it, a few microseconds. If it is the same CPU, the CPU
+  takes the interrupt again at every unlock and the task makes almost no
+  progress. After 100,000 unhandled interrupts the kernel disables the IRQ.
+- That the window opens only when the panel-cycle task happens to run on
+  CPU 0 fits 1 boot in 32, but it is a hypothesis. So is the claim that the
+  cancel alone asserts the line. The kit's test measures both.
+- The window dates from b1f84dd32166 (2018), which moved this driver's
+  system suspend out of the noirq phase. a4ced376fed0 then kept RFR ready
+  during suspend on purpose, so that the BT SoC can send wake bytes, so
+  traffic in the window is expected.
+
+Upstream: none of the 25 driver commits since 7.2-rc3 (GitHub's mirror of
+mainline, to 2026-10-13) touches this. Web searches found no posted fix.
+lore's search sits behind a bot check and was not read.
+
+The fix, `kernel/patches/qcom-geni-serial-serve-irq-while-suspending.patch`:
+the early return is gone, and the handler keeps serving the engine until
+`shutdown()` masks it.
+- Acking the status and returning `IRQ_HANDLED` while suspended was
+  rejected. It would drop a TX DMA completion, and `start_tx_dma()` does
+  nothing while `tx_dma_addr` is set, so TX would stall after resume.
+  Bluetooth would die the same way.
+- The handler cannot reach an unclocked engine:
+  - `shutdown()` disables and synchronises the IRQ before
+    `uart_change_pm(OFF)` drops the runtime PM reference;
+  - on resume, power comes back before `startup()` enables the IRQ;
+  - the wakeup path (`device_may_wakeup()`) never sets the flag.
+- The patch applies at fuzz 0 to the X710 tree and at fuzz 1 to mainline.
+  checkpatch `--strict` is clean.
+- `build-mainline-kernel.sh` applies it to gts9wifi builds only for now. The
+  Ultra's BT UART has the same window.
+
+The build (2026-11-08):
+- Source: snapshot `~/ubuntu-gts9u/snapshots/bt-5b08b136e713` of commit
+  5b08b13, whose `SNAPSHOT` file names its commit and tree. A fresh worktree
+  of `linux-mainline` at a13c140cc and a fresh build directory, both in
+  `gts9u-scratch/build-btirq`. Output: `~/ubuntu-gts9u/out/kernel-gts9wifi-btirq`.
+- The kernel tree differs from the CX build's (`build-cxg5/linux-src-gts9wifi`)
+  in `drivers/tty/serial/qcom_geni_serial.c` only. The `.config` is
+  byte-identical: `c17980f0…`, fix6's.
+- Image.gz `bc68d1a4…`, DTB `290a5395…` (the CX DTB), release
+  `7.2.0-rc3-dirty`, GNU build ID `82260a22e285…`. In the CX vmlinux,
+  `qcom_geni_serial_isr()` opens with `ldrb w8, [x1, #0x174]` (`suspended`)
+  and returns 0. In this one it goes straight to `_raw_spin_lock`.
+- Exported symbols: `Module.symvers` is identical to the CX build's
+  (17,610 symbols, the same CRCs).
+- The signing key is the CX build's, ID `1ded767e…` (certificate
+  byte-identical). Its key, `x509.genkey` and `.signing_key.pem.cmd` were
+  copied into the new build directory with their times, and kbuild kept
+  them (no `GENKEY`). This keeps device package 2.58's
+  `qcom_spss_irq.ko`, signed for the CX kernel, loadable under lockdown.
+  The registry recorded the build (`bc68d1a4ace2ee76`) under that key and
+  mirrored it to the external drive and to `gdrive:gts9u-kernel-keys`.
+- Modules: the same 62, every one signed with the CX key. None is
+  byte-identical to the CX build's. Code, data and BTF match. The rest
+  differs only by the build directory's absolute path, which is one
+  character longer: the path itself in the debug info, and the `__FILE__`
+  strings of the out-of-tree modules' BUG/WARN and dynamic-debug entries,
+  which are therefore laid out at shifted offsets.
+
+First kit, `~/ubuntu-gts9u/backups/bt-uart-kit` (`tools/inplace/bt-uart/`),
+on top of the CX kit (superseded by the repack below):
+- `boot.img` `061befd0…`. The recipe, given the CX kernel and DTB,
+  reproduces the CX kit's `boot.img` (`47f7df27…`) byte for byte. In the new
+  image every header field is the CX kit's, and the kernel is exactly
+  `Image.gz` plus the CX DTB.
+- `vendor_boot` is not written; it stays the CX kit's `be06a00f…`.
+- `modules-7.2.0-rc3-dirty.tar` `9c2f05b0…`, root-owned.
+- `BUILD_ID`, the install, rollback and verify scripts, the test
+  `suspend-bt.sh`, and a copy of `gts9u-suspend-cycles.sh` for the real
+  sleeps.
+
+Not flashed.
+
+Checks run (host, and read-only on squirtle):
+- The patch applies at fuzz 0 to the X710 tree. The build log shows it
+  applied ("patching file drivers/tty/serial/qcom_geni_serial.c").
+- `bash -n` and `sh -n` pass on the kit's scripts.
+- `verify.sh`, run non-root on the current CX boot, flags this boot's
+  "nobody cared" and HCI timeouts, as it should, and reads hci0 as up with
+  its EFS address.
+- `suspend-bt.sh`'s discovery, run on squirtle, finds `898000.serial`,
+  `hci0`, IRQ 191, hwirq 493 and CPU 0. On a sample trace its parser counts
+  handler results inside and outside the UART's suspend callback correctly.
+  The first run of the discovery picked `hci0:3`, a connection entry; it is
+  fixed to `hciN` names.
+
+The owner's test (`tools/inplace/bt-uart/README.md`, "The test"):
+- The test pins the suspending task to the Bluetooth IRQ's CPU (CPU 0), so
+  that every cycle is the case that killed boot `0824d1f3`.
+- 0, optional, before installing, on the CX kernel: `platform 5 --no-scan`.
+  This measures the window on the old handler: `unhandled` above 0 while
+  the port is suspending, and whether the cancels alone assert the line.
+  Run `recover` afterwards.
+- 1 to 6, on the kit:
+  - `verify.sh`, with and without sudo;
+  - `platform 20`;
+  - `platform 10` with A2DP audio playing;
+  - `platform 10 --no-pin`;
+  - `s2idle 3`, then `deep 3`;
+  - several reboots, each followed by `verify.sh`.
+- Expected on the kit: `unhandled 0` in every cycle, no "nobody cared", and
+  hci0 answering HCI Read Local Version after every resume.
+
+Not yet run: everything on the kit, and the CX-kernel baseline. The
+mechanism's last steps are inferred from the code and the one stack trace,
+not yet measured: which status latched, and why 1 boot in 32. Step 0
+measures them.
+
+The kit, repacked for the lens kit (2026-11-08). squirtle now runs the lens
+power-up kit over the CX kit (boot `9c0e3019`), and the first kit's
+`install.sh` refuses there. The owner asked for a repack that keeps the
+lens fix:
+- `boot.img` `39ecad3d…` is the same kernel (Image.gz `bc68d1a4…`, build ID
+  `82260a22…`) with the lens kit's DTB (`164e1bf8…`) appended.
+  - `dtc` shows that this DTB differs from the CX DTB only by
+    `startup-delay-us = <10000>` on `rear_cam_vio`.
+  - Given the CX kernel, the recipe reproduces the CX kit's `boot.img` with
+    the CX DTB, and the lens kit's (`57406c80…`) with the lens DTB.
+  - The new image's header fields are the lens kit's.
+- `vendor_boot` is not written. It stays the lens kit's `b18510f3…`, which
+  carries the same DTB.
+- `install.sh` checks:
+  - the CX and lens markers;
+  - `boot` = `57406c80…` and `vendor_boot` = `b18510f3…`.
+
+  It saves `boot-lens.img`, and `rollback.sh` writes it back. Roll back in
+  reverse order: this kit, then the lens kit, then the CX kit.
+- The kernel is still the one built from 5b08b13. Like the lens kit's
+  kernel (the CX one), it does not carry dcd0343, the built-in `dw9808_vcm`
+  power-down fix. The branch now merges `claude/x710-cx-kit` (5f4a517), so
+  its DTS matches the kit's DTB.
+- Modules tar `deb1b8ef…`. Its content is the first pack's; only one
+  file's time differs, see below.
+- Staged on squirtle at `~/bt-uart`, with checksums verified there. The
+  first kit moved to `~/bt-uart-cx-only`.
+
+A mistake on the host, repaired. During the module comparison, one
+`llvm-objcopy --dump-section` call had no output path, so llvm-objcopy
+rewrote its input in place and dropped the appended signature:
+- It hit `updates/qcom_sp_hlos_heap.ko` in both `out/kernel-gts9wifi-btirq`
+  and `out/kernel-gts9wifi-cx`.
+- Both copies were restored from the kits' module tars, which predate the
+  mistake. Each output tree now matches its kit's tar file for file; the
+  CX one matches the installed `f7d38300…`.
+- Nothing on the tablet was affected.
+
+The kernel, rebuilt with the lens driver fix (2026-11-08). The owner asked
+for the kit to carry dcd0343 as well ("dw9808_vcm: power down cleanly when
+the park fails", built in). Until now that fix had only been compiled out
+of tree:
+- Source: snapshot `~/ubuntu-gts9u/snapshots/bt-07c4924110a9` of 07c4924,
+  the branch after merging `claude/x710-cx-kit`. Fresh worktree and build
+  directory in `gts9u-scratch/build-btirq2`, with the CX key pre-seeded as
+  before. Output: `~/ubuntu-gts9u/out/kernel-gts9wifi-btirq2`.
+- The tree differs from the CX build's in three files only:
+  - `qcom_geni_serial.c`;
+  - `drivers/media/i2c/dw9808_vcm.c`, which is dcd0343's;
+  - the X710 DTS, where comments aside the only change is
+    `startup-delay-us = <10000>`.
+- `.config`, the signing certificate and `Module.symvers` (17,610 symbols)
+  are identical to the CX build's.
+- Image.gz `7b8de34e…`, GNU build ID `e862f606ab39…`. The vmlinux has the
+  ISR without the `suspended` check and dcd0343's "lens not parked before
+  power-down" warning.
+- This build's own DTB is `164e1bf8…`, byte-identical to the lens kit's.
+- The registry recorded the build (`7b8de34ea2a69c72`) under key
+  `1ded767e…` and mirrored it to the external drive and Google Drive.
+- The 62 modules are all signed with the CX key.
+- Device package 2.60's `qcom_spss_irq.ko` is the CX build's copy
+  (`8e421c6e…`, the one squirtle has now), signed with the CX key, with
+  vermagic `7.2.0-rc3-dirty`. This kernel accepts it.
+
+Kit `~/ubuntu-gts9u/backups/bt-uart-lens-dw9808-kit`, staged on squirtle as
+`~/bt-uart` with checksums verified there:
+- `boot.img` `faa774ad…`: the kernel plus the lens DTB. Given the CX kernel,
+  the recipe reproduces the CX kit's and the lens kit's `boot.img`. The
+  header fields are the lens kit's.
+- modules tar `76d2a7a5…`, `BUILD_ID` `e862f606…`.
+- The same scripts. `vendor_boot` is not written; it stays `b18510f3…`.
+
+The previous kit moved to `~/bt-uart-lens-5b08b13`. After installing, rerun
+the lens kit's checks (`camera-test.sh rear`, `lens-diag.sh`), since this
+is the first kernel to carry dcd0343.
+
+### Device 2.60 with the Bluetooth self-heal, for squirtle (2026-11-08)
+
+`claude/x710-bt-bringup` (2.59, the Bluetooth self-heal) is merged into
+`claude/x710-cx-kit` (`870c6de`). 2.60 carries both changes: the
+bt-uart-recover unit, udev rule, system-sleep hook and helper, and the camera
+package pins. `tests.test_bt_uart_recover` and `tests.test_usb_runtime_pm`:
+43 tests OK.
+
+Built with `DEVICE=gts9wifi` against the CX kernel (the build-cxg5 object
+tree and `out/kernel-gts9wifi-cx`), which is what squirtle runs:
+- `ubuntu-gts9u-device_2.60_arm64.deb` `26229eab029274e65c4a3790b65da0c82a8a92440093cd32e3ee30a60295b9b5`.
+  Against the installed 2.58 (`99366b71…`) it differs only in the four
+  self-heal files and the Bluetooth address unit. Its `qcom_spss_irq.ko` is
+  the CX build's (`8e421c6e…`, the one in `/lib/modules` on squirtle), and
+  the camera labels are `gts9wifi`.
+- `libcamera-gts9u_0.7.2+53.g62d4bfc-gts9u10_arm64.deb` `3daa7bdabda11d4036ddfec185ca38326671661aa3ad52202071f2f0688ef4ea`
+- `libspa-0.2-libcamera-gts9u_1.0.5-gts9u11_arm64.deb` `79f7cc4e2ff431ba9a6c9fc9c19f6743c61d3d667e6e16fd117e01ef06045e58`
+
+squirtle, boot `9c0e3019`:
+- installed: device 2.58, libcamera gts9u9, libspa gts9u10, companion
+  1.3.15; `dpkg --audit` clean.
+- The set is staged in `~/device-2.60` and checksum-verified. A copy is in
+  `~/ubuntu-gts9u/backups/device-260-kit` on the build host.
+- `apt-get -s install` of the three: 3 upgraded, 0 new, 0 removed, nothing
+  unauthenticated.
+- Not installed yet.
+
+### Smooth continuous autofocus: libcamera-gts9u patch 0009 (2026-11-08)
+
+**Owner report, squirtle, boot `487f28bc`:** the rear camera works and
+focuses, but the lens clicks, and focus is periodic and jerky.
+
+**Cause:** the old software-IPA autofocus (patches 0002, 0006 and 0007):
+- jumped the DW9808 up to 600 codes per write;
+- measured each position on one statistics frame;
+- probed ±48 codes every 45 statistics, about 6 s, in a still scene too.
+
+Details are in [camera focus](camera-focus-and-enumeration.md#smooth-continuous-autofocus-patch-0009-2026-11-08).
+
+**Change:**
+- SoftAf replaces it (`src/ipa/simple/soft_af.{h,cpp}`):
+  - at most 24 codes per frame;
+  - samples taken while moving, each credited 3 frames back;
+  - a fine pass there and back with a least-squares fit;
+  - stillness when focused, then noise-adaptive change detection, a local
+    refocus, and bounded retries after a failure.
+- `soft.mojom`'s `init()` now also takes the lens range and position.
+  `CameraLens::focusPosition()` reads the position the driver holds.
+- `tests/test_soft_af.py` (14 tests) builds SoftAf from the patch against a
+  simulated lens and scene. `scripts/test-camera-autofocus.py` now runs it
+  (the old test read state that no longer exists).
+- Versions: `libcamera-gts9u` 0.7.2+53.g62d4bfc-gts9u11,
+  `libspa-0.2-libcamera-gts9u` 1.0.5-gts9u12 (the exact pin; the SPA binary
+  is repackaged, since the public libcamera API did not change), and
+  `ubuntu-gts9u-device` 2.61 pinning both.
+
+**Simulated:**
+- 480 random scenes, noise 3-8 %, latency 1-6 frames: no frame moved the lens
+  more than 24 codes.
+- At 3 % noise and latency 2-5, every run ended within 2 % of the best
+  sharpness, with a median of 3.3-3.7 s to focus.
+- A still scene held the lens still for 60 s in every one of the 240 runs at
+  3 % noise.
+
+**Build:**
+- Camera packages from snapshot `camaf-fdb8ed9e61ec` (commit `fdb8ed9`, tree
+  `865c3e91…`), log `~/ubuntu-gts9u/camera-af-build.log`, output
+  `~/ubuntu-gts9u/out/camera-af`; in progress.
+- `962da80` (the Failed retries) came after that snapshot: the next build
+  takes it, with new versions.
+- `ubuntu-gts9u-device_2.61_arm64.deb`
+  `6084d7082b6e56757d082b5b5bb618cfcc3970666644708334917ece2f677366`. Built
+  against the CX kernel tree like 2.60; it differs from 2.60 only in the
+  version and the two pins. A copy is in
+  `~/ubuntu-gts9u/backups/device-261-kit`.
+
+**Pending:**
+- the build's compile, the first of the IPA and pipeline changes;
+- on squirtle (now boot `cc67dab2`, after an owner reboot at 16:39):
+  install, `camera-test.sh rear`, the owner listening and focusing near and far
+  in Snapshot, and `lens-diag.sh`;
+- on the Ultra.
+
+**On squirtle, boot `cc67dab2` (18:07):**
+- The three packages installed: 3 upgraded, none removed; `dpkg --audit`
+  clean. The owner's PipeWire and WirePlumber restarted with no old libcamera
+  mapped; Bluetooth (the S Pen and the Beats) reconnected.
+- `camera-test.sh rear`: the sensor and lens bound.
+- The lens's first power-up timed out once (18:08:08). The driver fix let the
+  next open succeed.
+- The owner used GNOME Camera: "Autofocus is much much better". The IPA logged
+  seven searches in 40 s, each focused after 92-140 frames.
+
+### A 1400x1050 stream killed PipeWire, and the audio with it (2026-11-08)
+
+**Observed:**
+- Measuring for full-resolution photos, the Snapshot session asked the rear
+  camera for 1400x1050, which the node offers. It did so three times
+  (18:20:51, 18:21:26, 18:24:11).
+- Each time PipeWire logged "debayerGPU failed" on every frame.
+- About 10 s later, at stop: `FATAL ... pipeline_handler.cpp:398 assertion
+  "data->queuedRequests_.empty()" failed in stop()`. The pipewire daemon
+  aborted, and the owner's audio and the Beats went with it.
+- With `cam`, in its own process, 8-16 frames each:
+  - heights that leave 2 when divided by 4 fail on every frame: 1050 (at
+    widths 1400, 1408 and 1680), 482 and 1082;
+  - 484, 540, 900, 1048, 1056 and 1080 work;
+  - widths are already aligned by validate() (642 became 640).
+- Separately, 1400x1056 stalls after 5 frames with no error, while 1400x1048
+  and 1416x1056 work. That one is not understood, and is not an offered size.
+
+**Causes:**
+1. `DebayerEGL::sizes()` steps heights by the Bayer pattern, 2. The output
+   is imported as a dma-buf for rendering, and Mesa's freedreno rejects
+   heights that are not a multiple of 4: `eglCreateImageKHR` fails, which is
+   logged only at Debug.
+2. On that error `DebayerEGL::process()` returned without handing back the
+   buffers or the statistics. `SoftwareIsp::stop()` returns the buffers
+   cancelled, but `SimpleCameraData::tryCompleteRequest()` still waits for
+   metadata that never comes. `clearIncompleteRequests()` only cancels
+   requests not yet sent to the ISP, so `PipelineHandler::stop()` asserts.
+   `DebayerCpu` has the same early return on a failed mapping.
+
+**Fix, `libcamera-gts9u` patch 0010:**
+- `DebayerEGL::sizes()` steps heights by 4 (the minimum height too), so
+  1400x1050 and 1680x1050 are no longer offered, and a request for one is
+  adjusted.
+- Both debayers hand back the buffers of a failed frame, marked FrameError.
+- `tryCompleteRequest()` does not wait for metadata when a buffer failed or
+  was cancelled.
+
+The three files pass an aarch64 clang `-fsyntax-only -Wall -Wextra` check
+against the build tree's generated headers, with no errors or warnings. The
+on-device test waits for the build.
+
+**Versions:**
+- `libcamera-gts9u` gts9u12. It also carries SoftAf's Failed retries
+  (`962da80`), which gts9u11 lacked.
+- `libspa-0.2-libcamera-gts9u` 1.0.5-gts9u13.
+- `ubuntu-gts9u-device` 2.62.
+
+**Built and staged (21:00):**
+- Camera packages from snapshot `camaf2-13760d35c118` (commit `13760d3`,
+  tree `29473c08…`), patches 0001 to 0010:
+  - `libcamera-gts9u_0.7.2+53.g62d4bfc-gts9u12_arm64.deb` `ade742b65dc3665c1971a3eb9cafab9507e24bd2362c99920f6ae6f3641ed3a8`
+  - `libspa-0.2-libcamera-gts9u_1.0.5-gts9u13_arm64.deb` `cba303d22e3e1b0b32582cf683bf8fc0462f1ca61a938cfa19055baa5335879d`
+    (SPA binary unchanged)
+  - `ubuntu-gts9u-device_2.62_arm64.deb` `1a9e52bd0855ecf00bf14fc1c3de407cd1f0aad44e45483267c7a04d16c2b9d8`
+- Staged in squirtle's `~/device-2.62`, checksums verified there.
+  `apt-get -s`: 3 upgraded, none removed.
+- The lens-pads kit (`6fa3d29`, DTB `19de4789…`) is staged in `~/cam-pads`,
+  for the same reboot.
+
+### Device 2.67 and full-resolution GNOME Camera on squirtle (2026-11-09)
+
+The camera packages were built once for both tablets, by the X910 release
+build, from `feature/sm-x710-gts9wifi` `eda9c92`. Its camera files are
+byte-identical to `claude/x710-cx-kit` `711c0fa`; `build-camera-packages.sh`
+now matches `eda9c92`'s exactly.
+- `libcamera-gts9u` gts9u13 `508b44281d67cb854c835beee22fa1e835ab78b726a2a4c59f16191fbe2d1326`:
+  `ipa_soft_simple.so` changed from gts9u12's (SoftAf keeps its focus across
+  stream reconfigurations); the file list is unchanged.
+- `libspa-0.2-libcamera-gts9u` 1.0.5-gts9u14 `f4c04298c2102e2ada7f7d9a767d54f0ed9d4334c77e82e0eec5b27322468fa6`:
+  the SPA binary is unchanged; only the pin is new.
+- `ubuntu-gts9u-device_2.67_arm64.deb` `d0344d9cc0179cea8b449138db651b40b800a7a95597dbce1948eede6305554b`
+  (`4d4d243`, built against the CX kernel tree): the contents are 2.62's,
+  with only the version and the pins changed. 2.63 to 2.66 belong to X910
+  builds.
+- `gnome-snapshot_46.2-1ubuntu2+gts9u1_arm64.deb` `278cd56392e2c70a…`: the
+  copy the full-resolution session validated and staged
+  (`claude/x710-snapshot-stills` `79abfeb`).
+
+Installed on boot `1883367c`:
+- 4 upgraded, 0 removed; `dpkg --audit` clean;
+- PipeWire and WirePlumber restarted (15:58:56) with no old libcamera mapped;
+- the Beats were not connected at the time and did not reconnect.
+The kit is in `~/ubuntu-gts9u/backups/device-267-kit`, and staged on squirtle
+in `~/device-2.67`.
+
+**Pending, owner:**
+- photos at 4120x3096;
+- 10 photos in a row;
+- a recording that starts without a focus sweep.
+
+### Device 2.69 on squirtle: the launcher watcher survives a burst (2026-11-09)
+
+`ubuntu-gts9u-device_2.69_arm64.deb` `e23894e4f7ada95a662c6e3aba2396158da9ac4541919c070ba2a38d01bed976`
+(`c591713`) is 2.67 plus the X910 branch's `f52fadb` (`StartLimitIntervalSec=0`
+on `ubuntu-gts9u-chromium-desktops.service`), carried as `3946da0`. Its
+postinst also resets both Chromium units and restarts the `.path` unit on
+upgrade.
+- Before: both units were failed on squirtle, from that day's ~100-package
+  install.
+- Installed (boot `1883367c`): 1 upgraded, `dpkg --audit` clean. The `.path`
+  unit came back active, with `StartLimitIntervalUSec=0`.
+- `scripts/test-chromium-desktops-burst.sh` (`9a7868e`) wrote and removed a
+  throw-away launcher 30 times in about 8 s: 56 service starts, no
+  start-limit message, neither unit failed: PASS. Before the fix, the sixth
+  start within 10 s failed both units until the next boot.
+
+### Full-resolution photos on squirtle, and a hang on an untested size (2026-11-10)
+
+The owner's first test of gnome-snapshot `46.2-1ubuntu2+gts9u1` with
+libcamera gts9u13, SPA gts9u14 and device 2.69 (boot `1883367c`):
+- Photos: 7 out of 7 at 4120x3096, taken from 00:00:13 to 00:00:51, about
+  7.5 to 7.9 MB each. The kernel logged no CCI, camss or csid errors.
+- Video: `Recording from 2026-11-10 00-00-58…webm` is 4120x3096 VP8 with
+  `framerate=0/1`. It has 214 frames in 19.9 s (about 10.7 fps), with gaps
+  of up to 433 ms. The 2026-11-08 recording, from before the install, was
+  1280x1080 at 30 fps. Video mode is meant to keep stock's 1280x1080, so the
+  switch to Video didn't restore the caps. The bug is in the Snapshot patch
+  (branch `claude/x710-snapshot-stills`).
+
+At about 00:19 squirtle hung: a black screen and no input, though it still
+answered ping and an SSH session that was already open.
+- The Snapshot session's headless camerabin replica had just asked for
+  2048x1536, a size that had never streamed on this camera.
+- Over SSH it saw a load of 40 to 46, with 30+ tasks in D state:
+  - storage: `ufs_clk_gating`, kblockd and flush-8:0;
+  - power and cpufreq: `pm`, and `sugov:0`, `sugov:3` and `sugov:7`;
+  - IRQ threads: touch (fts1ba90a) and pogo;
+  - GPU: `ring0` and `ring2`.
+- The owner force-restarted it (boot `3aa21a6a`, 00:24:35). The new boot is
+  healthy:
+  - CCI at 400 kHz;
+  - Bluetooth powered;
+  - audio sink up;
+  - no failed units.
+- Nothing about the stall was saved:
+  - the journal stops at 00:18:57, because the disk had stalled;
+  - the kernel log from 00:10 has only ath11k `msdu_done` lines;
+  - the kernel has no hung-task detector, no netconsole and no ramoops
+    region, and nobody captured dmesg before the restart. (Wrong about
+    ramoops: the region exists, and it kept a console record of the hang;
+    see [the next entry](#the-0019-hang-left-a-console-record-2026-11-10).)
+- Lead, unconfirmed: every task in that D-state set votes through
+  `icc_set_bw` (cpufreq-hw votes DDR and L3 on each frequency step). That
+  points to the interconnect lock, or an RPMh write that never completed,
+  with the camss clock and bandwidth vote for a new size as the trigger.
+- Before streaming any untested size again:
+  - keep `sudo dmesg -w` streaming to the host;
+  - keep a root shell open, so that `echo w > /proc/sysrq-trigger` can dump
+    the blocked tasks without touching the disk.
+
+### The 00:19 hang left a console record (2026-11-10)
+
+The previous entry said nothing survived the 00:19 hang. That was wrong.
+- The X710 DTS has had a ramoops region since 0cfa883: `sec-pmsg@880900000`,
+  with a 1 MiB console, ECC 16.
+- At boot `3aa21a6a`, ubuntu-gts9u-pstore-archive kept the hung boot's console
+  record: `/var/lib/ubuntu-gts9u/pstore/000015-20261110T082437Z-boot-1883367c/console-ramoops-0`
+  (12292 bytes, sha256 `3ff78807…`).
+
+**What the record holds.** After sysctl the console loglevel was 4, so the
+record has err-level lines and above only:
+- from 5398 s on: repeated `a6xx_hfi_wait_for_msg_interrupt … Message
+  HFI_H2F_MSG_GX_BW_PERF_VOTE id N timed out waiting for response`, each
+  followed by `Unexpected message id N on the response queue` (the GMU). The
+  same pairs appear in earlier boots.
+- at 86376 s: `geni_i2c a90000.i2c: geni_i2c_gpi_xfer: I2C timeout` and `GPI
+  transfer failed: -110`;
+- **the last line before the forced restart, at 94599.6 s: `Error sending AMC
+  RPMH requests (-110)`**. This is `qcom_icc_bcm_voter_commit()`
+  (`drivers/interconnect/qcom/bcm-voter.c`): an interconnect BCM vote's
+  active-only RPMh write got no completion within `RPMH_TIMEOUT_MS` (10 s).
+  If the boot never suspended, 94599 s after the 22:03:13 boot is about
+  00:19:50, a minute after the journal's last line.
+- `rpmh_write_batch()` WARNs just before returning that error. A WARN prints
+  at KERN_WARNING, and a console at loglevel 4 drops that, so the backtrace,
+  which would name the task and the path, is not in the record.
+
+**Hypothesis, not measured.** It fits the lead in the previous entry.
+- `icc_set_bw()` holds `icc_lock` across the commit.
+- `rpmh_rsc_send_data()` waits without a timeout for a free TCS, and
+  `claim_tcs_for_req()` also waits while a write to the same address is still
+  in flight.
+- So if the timed-out TCS never completes, the next vote for that BCM blocks
+  for good, still holding `icc_lock`. Everything that votes bandwidth then
+  queues behind it in D state: UFS clock gating, cpufreq, the I2C and touch
+  threads, the GPU.
+- That matches one error line followed by silence.
+
+**Why the records decay.** Measured on all 10 archived records, five of them
+against their boot's journal:
+- **Every reset decays the region, not only the forced restart.** Nine of the
+  10 boots ended in a clean `reboot: Restarting system`, and ECC 16 left 77 to
+  99 % of blocks unrecoverable in every one.
+- Aligned against `journalctl -k -p 0..3` (boots 9c0e3019, 487f28bc,
+  cc67dab2, e2c815b8, 1883367c):
+  - 7.2, 20.4, 10.1, 13.5 and 9.8 % of bytes changed;
+  - 81 to 86 % of the changes only cleared bits;
+  - the rate is flat from the oldest tenth of each record to the newest, and
+    does not grow with uptime (35 minutes gave 20 %, 26 hours gave 10 %).
+- So it is DRAM retention loss across the reset. It is not an overwrite by the
+  bootloader, not decay at runtime, and not an ECC or layout bug.
+- ECC 16 corrects 8 bytes per 128-byte block. For the hung boot, a Poisson
+  model at its rate predicts 5 % of blocks recoverable, and 3 of 96 were.
+- **The records are complete.** Each one is, to within one line, exactly the
+  journal's err-level text after about 17 s.
+  - When systemd-pstore unlinks `console-ramoops-0` (16.9 s),
+    `ramoops_pstore_erase()` zaps the live console zone.
+  - The console loglevel is 4 after sysctl.
+  - So the hung boot's 12 KB is everything that was written, not a fragment
+    of 1 MiB.
+- Linux resets with PSCI `SYSTEM_RESET`: `/sys/kernel/reboot/mode` reads
+  `cold`, and the firmware is PSCI v1.1. Whether a warm reset (`SYSTEM_RESET2`)
+  keeps DDR refreshed is untested. The kit README has it as an owner test.
+
+**The hang-log kit** (`tools/inplace/hang-log`, branch
+`claude/x710-hang-capture`, on top of the camera-bus kit) makes the next hang
+leave more:
+- **Kernel config** (`config-gts9wifi.fragment`):
+  - the hung-task detector at 60 s, with the blocker dump, which names the
+    owner of the mutex a hung task waits for, i.e. `icc_lock`'s holder;
+  - the soft-lockup, buddy hard-lockup and workqueue watchdogs, none of them
+    panicking;
+  - netconsole (=m, configfs targets);
+  - pstore ftrace;
+  - pstore compression off: a deflated panic record is unreadable from the
+    first block ECC cannot repair.
+  - `build-mainline-kernel.sh` now applies integer fragment values (no
+    fragment had one before) and ships netconsole as a single-target module.
+- **DTS:** the ramoops region keeps its address, stock's own pmsg carve-out
+  (the DTS comment explains why).
+  - It gets three 256 KiB plain oops/panic records, a 1 MiB console, 128 KiB
+    of pmsg and 128 KiB of ftrace.
+  - ECC goes to 96, which the model puts at 99.9 % of blocks recovered at
+    13.5 % decay and two thirds at 20 %, for 43 % of each zone.
+- **A sysctl drop-in:**
+  - `kernel.watchdog = 1`, because ABL appends `nowatchdog`, which would
+    leave both lockup detectors off;
+  - `kernel.printk = 5 4 1 7`, so that WARN backtraces reach ramoops. The
+    busiest minute on 2026-11-09 had 16 warning lines for the 115200 UART.
+- **`tools/inplace/cameras/hang-capture.sh`** runs on the host, before a
+  risky test:
+  - `log` streams `dmesg -w` to a host file, with the console loglevel at 7
+    and all-CPU backtraces for hung-task reports. It also traces
+    `rpmh_send_msg`/`rpmh_tx_done`, `icc_set_bw`/`icc_set_bw_end` and
+    `msm_gmu_freq_change` into a 16 KB-per-CPU buffer, which sysrq `z` or a
+    panic prints.
+  - `shell` opens a root shell that needs only builtins, for sysrq `w`, `l`,
+    `z`, a note to `/dev/pmsg0`, then `c`.
+  - `netconsole` adds a UDP channel. It refuses Wi-Fi by default.
+
+**Build:**
+- Source: commit 2718d1d (tree `eeaf4fc3…`), built from a detached worktree.
+  The kernel inputs differ from the BT UART kernel's (2d573f9) only in the
+  camera-bus DTS commits and this branch's.
+- The module key is new, `eb0ca8f0a5e7b22e41ae5244bf7c4f0294d9b26a` (serial `42:66:D5:87…`), archived and mirrored by the build. The
+  configuration moves `task_struct` and `net_device` and the kernel has no
+  MODVERSIONS, so a module from another build must not load. Under lockdown
+  the new key makes the kernel refuse it.
+- Kernel build ID `68d243e908c0…`, Image.gz `3cb91f34…`, DTB `5ff2495f…`,
+  config `4cd636e1…`. The module payload ships all 21 fragment =m requests
+  (63 modules).
+
+`make-kit.sh` self-tests, byte for byte, with the changes dropped:
+- the BT UART kernel plus the camera-bus DTB gives the camera-bus `boot.img`
+  (`5529f6e7…`);
+- the camera-bus `vendor_boot` repacked with its own DTB gives itself
+  (`51777e20…`);
+- 52cb2fc's DTS, compiled in this build's tree, gives the camera-bus DTB
+  (`4ed9c1d9…`).
+
+It then checks that every change is intended:
+- the configuration differs in 24 symbols, all listed;
+- the DTB differs only in the ramoops node;
+- the modules are the BT UART set plus netconsole, all signed with the new
+  key;
+- in `boot`, only the kernel and its appended DTB differ; in `vendor_boot`,
+  only the DTB.
+
+**Kit:** `~/ubuntu-gts9u/backups/hang-log-kit`:
+```
+d583546b5e5c33dbc48fbafc99b7eb039df33f64b0316e498d3f158f834ee968  boot.img
+9165f42917a8ee4069b878fc0c0660391b39087fc6f3ea2b607f626821a7dbd4  vendor_boot.img
+33ed5c41c7531f997889e040f7ad3f0a1d41453ed2ca28363f6b6aa506a26918  modules-7.2.0-rc3-dirty.tar
+36d2f689fb181c983bb9ac38d9192fe0b41577c20f1f2cba39074b9cf96b81f5  BUILD_ID
+4cd087c8d9509cf865cea8aa39e3019dd5a0fbf01dff1b96764186e659611868  KEY_ID
+63cabf5c18e8a1b2afe0db8173289febc984b98815cd7c3694c02c926a4b67dd  SIGNER
+7db518a3fab3f7117138fe1facad7a1f4a81a992e835939cb3c0c976ee8bb028  CONFIG.diff
+f99519c184d007f3ed73d32a19ff3954f1b9d88298cdf26b189de8623db72f52  DTB.diff
+342eb0e681d3dcdcd36346b62bf25cf5f9c96bd1e3573fdb1d195204cb272c8e  install.sh
+9e04a4ddc3ef98e5a378b807e75aad6f006c7f8f333faae22a3d87346254fe4f  rollback.sh
+ca5a896975ca59805f7ab01338cccfabdfba6a9e4e6578318aadc881fe6be2c5  verify.sh
+fd9d1ea2a88382be2692e13bfc8cb7c75a6ddefc4dff07522d622098a0d02d78  60-gts9u-hang-log.conf
+b85de5bfa477350a66bb09252451a27e4474a8d54ab2b4a7d04e9080f9daa41e  README.md
+```
+
+To install it, copy the kit to the tablet's `~/hang-log` and run `sudo sh
+~/hang-log/install.sh`, then reboot. Its preconditions and the checks that
+follow are in the kit README.
+
+**On squirtle.** The owner ran `install.sh` at 02:45 (boot `a5f2177f`). It
+wrote and read back `vendor_boot` (`9165f429…`) and `boot` (`d583546b…`),
+installed the 63-module tree and the sysctl drop-in, and saved the
+camera-bus images and the BT UART module tree to
+`/var/backups/ubuntu-gts9u-hang-log/`. There is no saved Ubuntu boot set to
+keep in step. After the owner's reboot at 02:46, boot `e0a06178` was up and
+`running` 67 s later.
+- `verify.sh` (no root) passed every check: the kit's kernel and key, the
+  detectors and sysctls (`watchdog` 1, console loglevel 5), the ramoops
+  layout registered with ECC 96, `/dev/pmsg0`, the camera-bus DTB settings,
+  the signed netconsole module, and no module failures.
+- The six `ramoops: uncorrectable error in header` lines are this first boot
+  reading the old layout's contents.
+- No failed units. Wi-Fi and USB networking are up, hci0 has its EFS address
+  and no interrupt or HCI errors, and the audio sink is present.
+- The BT UART kit's `verify.sh` fails only its build-ID check, which is
+  expected now that its kernel has been replaced.
+- The three `OVERLAP DETECTED` reserved-memory warnings (ABL's `kaslr` and
+  `uh` regions) were there in earlier boots too.
+
+`sudo verify.sh hung-test` passed. The detector reported the write blocked on
+the frozen loop file system (pid 5310, state D, waiting in
+`percpu_rwsem_wait` from `mnt_want_write`) about 75 s after it started.
+
+**Each console line costs 0.1 to 0.25 s.** The detector's report showed the
+problem:
+- Its three err lines came 231, 108 and 243 ms apart, with no code between
+  the three `pr_err` calls. Its info-level stack lines, which no console
+  prints, came out within microseconds.
+- So each line the consoles print costs 0.1 to 0.25 s on this tablet, and
+  legacy consoles are written with interrupts off.
+- The cs35l45 control errors at boot are 0.24 to 0.28 s apart on the old
+  kernel too, so this predates the kit.
+- Suspects, not tested: fbcon on `tty0`, which takes the 2560x1600 panel at
+  12.28 s as a 320x100 console, and the earlycon boot console `qcom_geni0`,
+  still registered beside `ttyMSM0`.
+
+Because of that, the kit changed:
+- The drop-in no longer sets `kernel.printk = 5 4 1 7`. That setting would
+  have put every warning through the cost, ath11k's `msdu_done` bursts in the
+  Wi-Fi receive path among them.
+- `hang-capture.sh log` no longer raises the console loglevel to 7 (that is
+  now `--console-level`) and no longer sets `ftrace_dump_on_oops`.
+- `shell` no longer suggests sysrq `z`. It reads the trace with builtins
+  instead, into a host log file.
+- A panic still writes the log's tail to pstore whatever the loglevel.
+
+The re-staged kit is `~/ubuntu-gts9u/backups/hang-log-kit-r2`. Its images
+and module tree are byte-identical to the installed ones; only these three
+files changed:
+```
+4739f9282ac118a8363dc6ae4020a7f1cdc6e6ad26f3e4142eb4376e36bdeeba  verify.sh
+dd98c7b29ee687320ab77f9890726e41183ef5be97bf0adb15203fe7aae6d679  60-gts9u-hang-log.conf
+29299fe351e0e8caf8e1765ca275898002a1f619a73b1b12cc742d88d363b49a  README.md
+```
+
+**Not done:**
+- Still to run on squirtle, with sudo:
+  - update the installed drop-in (`kernel.printk` back to 4);
+  - `sudo verify.sh`;
+  - a dry run of `hang-capture.sh`.
+- Finding the slow console is a separate task.
+- Still to run by hand: the camera at a known size and audio playback. The
+  kit README also has the optional sysrq-`c` panic to prove the chain, and
+  the warm-reset test.
+- netconsole over ath11k is untested.
+- The kernel was not rebuilt with the changes dropped to compare `Image.gz`
+  byte for byte, because a new key changes the image anyway. The
+  configuration comparison stands in for it.
+
 ### Powered USB-C docks: the roles (2026-11-20)
 
 Two powered docks on the SM-X910, an Anker hub and a Satechi Thunderbolt 4

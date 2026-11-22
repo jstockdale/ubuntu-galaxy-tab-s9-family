@@ -146,6 +146,41 @@ CONFIG_PSTORE=y
 CONFIG_PSTORE_RAM=y
 CONFIG_PSTORE_CONSOLE=y
 CONFIG_PSTORE_PMSG=y
+# The ramoops region has an ftrace zone (sm8550-samsung-gts9wifi.dts).  Under
+# integrity lockdown its debugfs switch is refused, so recording starts only
+# with pstore.record_ftrace=1 on the command line, which traces every kernel
+# function: kept off, for a reset that leaves nothing else.
+CONFIG_PSTORE_FTRACE=y
+# Every reset on this board decays 7 to 20 % of the region's bytes (measured
+# on five boots, 2026-11-10).  A deflated oops/panic record is unreadable
+# from the first block ECC cannot repair; a plain one stays legible.
+# CONFIG_PSTORE_COMPRESS is not set
+
+# Hang evidence.  On 2026-11-10 squirtle hung with 30+ tasks in D state and
+# the disk stalled, so the journal kept nothing; the console record held only
+# err and above (an RPMh timeout from the interconnect's BCM voter, the WARN
+# backtrace before it lost).  These detectors only print, never panic.  ABL
+# appends "nowatchdog", which turns the soft- and hard-lockup detectors off at
+# boot: the hang-log kit turns them back on with kernel.watchdog=1.  The
+# blocker dump names the task holding the mutex or semaphore a hung task
+# waits for, and the workqueue watchdog reports pools that stopped moving
+# (ufs_clk_gating, kblockd and pm were stuck kworkers).  The hard-lockup
+# detector is the buddy one (each CPU watches the next CPU's timer), the only
+# kind this kernel offers: without pseudo-NMI there is no perf one.
+CONFIG_DETECT_HUNG_TASK=y
+CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=60
+CONFIG_BOOTPARAM_HUNG_TASK_PANIC=0
+CONFIG_DETECT_HUNG_TASK_BLOCKER=y
+CONFIG_SOFTLOCKUP_DETECTOR=y
+CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=0
+CONFIG_HARDLOCKUP_DETECTOR=y
+# CONFIG_BOOTPARAM_HARDLOCKUP_PANIC is not set
+CONFIG_WQ_WATCHDOG=y
+# The kernel log over UDP, from printk itself, for a hang that stops sshd or
+# the disk.  A module loaded and pointed at a host only for a test
+# (tools/inplace/cameras/hang-capture.sh netconsole); configfs targets.
+CONFIG_NETCONSOLE=m
+CONFIG_NETCONSOLE_DYNAMIC=y
 
 # Adreno 740 GPU bring-up.  gpucc built-in gives the GPU SMMU (3da0000) and the
 # GMU their clocks so they stop failing probe with -110.  drm/msm is built-in

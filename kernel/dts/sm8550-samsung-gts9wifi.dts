@@ -160,14 +160,47 @@
 		 * to move or shrink the region.  systemd-pstore's copies are kept
 		 * per boot by ubuntu-gts9u-pstore-archive.service (the device
 		 * package).
+		 *
+		 * Rechecked for the hang-log kit (2026-11-10): the address stays.
+		 * Stock's overlay keeps this carve-out for samsung,pstore_pmsg and
+		 * disables the vendor DTB's dynamic ramoops_region; sm8550.dtsi
+		 * reserves nothing above 4 GiB; ABL's /memory puts it in the bank
+		 * at 0x880000000; and it is boxed in by carve-outs, sec-debug-bl
+		 * ending at its base and google-debug-kinfo starting at its end.
+		 * A new address could be DDR that XBL or ABL writes, which no DT
+		 * would show.
+		 *
+		 * "Survived" above means present, not intact.  Aligned against the
+		 * journal, the console records of five boots (four ended by a
+		 * clean reboot, one by a forced restart after the 00:19 hang) had
+		 * 7 to 20 % of their bytes changed, 81 to 86 % of the changes by
+		 * cleared bits only, evenly from the oldest line to the newest and
+		 * whatever the uptime: DRAM decay across the reset, not an
+		 * overwrite and not ECC or layout trouble.  Each record held
+		 * exactly the err-level text the journal has after 17 s, when
+		 * systemd-pstore's unlink zaps the live console zone.  ECC 16
+		 * (8 bytes per 128-byte block) left 77 to 99 % of blocks
+		 * unrecoverable.  ECC 96 corrects 48 bytes per block: a Poisson
+		 * model at 13.5 % keeps 99.9 % of blocks, at 20 % two thirds, for
+		 * 43 % of each zone.  Linux resets with PSCI SYSTEM_RESET (reboot
+		 * mode cold); whether a warm reset keeps DDR refreshed is untested.
+		 *
+		 * Zones, in ramoops' order: three 256 KiB oops/panic records
+		 * (uncompressed, see config-gts9wifi.fragment), the 1 MiB console
+		 * (now at offset 768 KiB), 128 KiB of pmsg (/dev/pmsg0, for test
+		 * markers) and 128 KiB of ftrace (off).  Sizes are powers of two,
+		 * as ramoops requires.  The first boot after a layout change reads
+		 * the old contents as noise.
 		 */
 		sec_pmsg_mem: sec-pmsg@880900000 {
 			compatible = "ramoops";
 			reg = <0x8 0x80900000 0x0 0x200000>;
 			no-map;
-			record-size = <0x20000>;
+			record-size = <0x40000>;
 			console-size = <0x100000>;
-			ecc-size = <16>;
+			pmsg-size = <0x20000>;
+			ftrace-size = <0x20000>;
+			ecc-size = <96>;
 		};
 
 		google_debug_kinfo_mem: google-debug-kinfo@880b00000 {
@@ -2014,6 +2047,20 @@
 };
 
 /*
+ * The GCC's GDSCs (UFS, PCIe and USB) are powered from CX, but sm8550.dtsi
+ * does not say so.  A GDSC without a parent records the performance state
+ * its devices ask for and passes it to no rail, which would leave the CX
+ * levels in the UFS and PCIe OPPs and the UFS and USB required-opps unvoted.
+ * Name CX here, as sc7280, sc8280xp and x1e80100 do: every GCC GDSC becomes
+ * a CX subdomain, and their levels reach rpmhpd.  genpd keeps them through
+ * system sleep, so the UFS and USB drivers drop their own (ufshcd- and
+ * dwc3-qcom-*-system-suspend.patch).
+ */
+&gcc {
+	power-domains = <&rpmhpd RPMHPD_CX>;
+};
+
+/*
  * Internal UFS.  The rootfs boots from the microSD; this only exists so pmOS
  * can reach the on-device boot partition and flash new builds over SSH without
  * a TWRP round-trip.  A UFS probe failure does not affect the SD boot.
@@ -2033,9 +2080,17 @@
 	 * 19.2 MHz it moved at most ~300 MB/s, the ceiling every read and write
 	 * hit at HS-G4 x2 (2026-11-07).  Scale it with the controller instead,
 	 * at the corners of Samsung's gcc-kalama.c (rate_max 100 MHz at
-	 * VDD_LOWER, 201.5 MHz at VDD_LOW, 403 MHz at VDD_NOMINAL): the low SVS,
-	 * SVS and nominal levels the OPPs below already vote.  Measured after:
-	 * 1.84 GB/s sequential read, 1.6 GB/s write, 197k random-read IOPS.
+	 * VDD_LOWER, 201.5 MHz at VDD_LOW, 403 MHz at VDD_NOMINAL).  Measured
+	 * after: 1.84 GB/s sequential read, 1.6 GB/s write, 197k random-read
+	 * IOPS.
+	 *
+	 * Those corners are the low SVS, SVS and nominal CX levels in the
+	 * required-opps of the OPPs below.  The OPP core sets each level on
+	 * this device's power domain, UFS_PHY_GDSC, and the GDSC passes it to
+	 * CX only because &gcc names CX (above).  Without that, the level stops
+	 * at the GDSC, as it does in mainline sm8550 for the controller's own
+	 * 300 MHz clocks, and 403 MHz would run at whatever CX level the other
+	 * consumers happen to hold once rpmhpd has synced.
 	 */
 	clocks = <&gcc GCC_UFS_PHY_AXI_CLK>,
 		 <&gcc GCC_AGGRE_UFS_PHY_AXI_CLK>,
@@ -2298,6 +2353,14 @@
 		vin-supply = <&vreg_l4b_1p8>;
 		gpio = <&tlmm 15 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
+		/*
+		 * Samsung's CamX data for the DW9808 (X710XXS5CYG1, the same on
+		 * the SM-X910) powers it RCAM_LDO_EN, 1 ms, VIO 1.8 V, 10 ms, and
+		 * only then writes to it; dw9808_vcm waits 1 ms.  With 1 ms the
+		 * lens's first write after a power-up timed out on CCI1 again and
+		 * again, at 1 MHz and at 400 kHz (squirtle, 2026-11-08).
+		 */
+		startup-delay-us = <10000>;
 		status = "disabled";
 	};
 };
@@ -2333,6 +2396,8 @@
 };
 
 &cci0_i2c1 {
+	clock-frequency = <400000>;
+
 	gts9_rear_cam: camera@21 {
 		compatible = "hynix,hi1337-gts9u-rear";
 		reg = <0x21>;
@@ -2376,7 +2441,42 @@
 	};
 };
 
+/*
+ * The rear camera's two buses as stock sets them: 400 kHz (i2c-freq-mode 1),
+ * 4 mA and the TLMM's weak pull-up.  sm8550.dtsi runs them at 1 MHz with 2 mA
+ * and the strong 2.2 kOhm pull-up.  The two go together: with the weak
+ * pull-up at 1 MHz the lens's status reads failed ("busy"), and with the
+ * strong one the lens's first write after a quick power-down timed out now
+ * and then (squirtle, 2026-11-08).  The front camera's bus keeps the dtsi's
+ * until that camera is tested.
+ */
+&cci0_1_default {	/* CCI0 master 1: the rear HI1337 */
+	sda-pins {
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+
+	scl-pins {
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+};
+
+&cci1_0_default {	/* CCI1 master 0: the rear DW9808 lens and its EEPROM */
+	sda-pins {
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+
+	scl-pins {
+		drive-strength = <4>;
+		bias-pull-up;
+	};
+};
+
 &cci1_i2c0 {
+	clock-frequency = <400000>;
+
 	/* Stock actuator0: slave-addr 0x18 (8-bit), CCI1 master 0. */
 	gts9_rear_focus: lens@c {
 		compatible = "dongwoon,dw9808-vcm";

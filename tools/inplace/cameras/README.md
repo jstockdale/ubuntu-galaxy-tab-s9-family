@@ -115,3 +115,18 @@ python3 ~/camerabin-photos.py --mode patched --pictures 10
   Python.
 - Both fail with "Pipeline handler in use by another process" while
   another libcamera client, such as `cam`, holds the camera.
+
+## Before a risky camera test
+
+An untested stream size hung squirtle on 2026-11-10 (30+ tasks in D state,
+the disk stalled). Before trying a new size, start
+[`hang-capture.sh`](hang-capture.sh) on the host, in two terminals: `log`
+streams the kernel log to a file there, and `shell` keeps a root shell open
+that can trigger sysrq without the disk. With the
+[hang-log kit](../hang-log/README.md#before-a-risky-test-hang-capturesh-host)
+installed, `netconsole` adds a channel that does not depend on sshd.
+
+```sh
+sh tools/inplace/cameras/hang-capture.sh log <user>@<tablet>
+sh tools/inplace/cameras/hang-capture.sh shell <user>@<tablet>
+```

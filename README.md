@@ -275,6 +275,15 @@ SM-X710 (this branch):
   `ubuntu-gts9u-icc-late-release`: releasing it earlier hangs the cycle. The
   DDR bandwidth monitor (`icc_bwmon`) is a module and blacklisted
   ([interconnect notes](docs/gts9wifi-interconnect.md)).
+- **The USB controller may runtime-suspend after that cycle** (device package
+  2.58, not yet tested on hardware). It suspends 5 s after it is left
+  unconnected. To keep it on, create `/etc/ubuntu-gts9u/usb-runtime-pm-off`.
+- **Bluetooth recovers from a UART IRQ storm by itself** (device package
+  2.59, not yet tested on hardware). A suspend, the boot-time cycle
+  included, can leave the BT UART with its IRQ disabled. After that cycle
+  and after every resume, `ubuntu-gts9u-bt-uart-recover` checks for this
+  and rebinds the UART once. To turn it off, create
+  `/etc/ubuntu-gts9u/bt-uart-recover-off`.
 - Only the EF-DX720 cover keyboard has been tested.
 
 ## Galaxy Tab S9 (SM-X710)
