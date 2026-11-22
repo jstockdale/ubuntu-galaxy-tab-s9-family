@@ -1,0 +1,53 @@
+[Unit]
+Description=Stall watch: a 1 s system sampler that records desktop freezes
+Documentation=file:/usr/local/lib/gts9u-stall-watch/README.md
+After=local-fs.target systemd-journald.socket
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I -S /usr/local/lib/gts9u-stall-watch/stall_watch.py run
+Environment=LC_ALL=C.UTF-8 PYTHONDONTWRITEBYTECODE=1
+Restart=always
+RestartSec=10
+# It has to keep running when everything else is starved:
+#  - real-time FIFO priority 1: above every ordinary task, below the kernel's
+#    own interrupt threads (FIFO 50); its helper threads and anything it runs
+#    start as ordinary tasks (reset on fork) and drop to nice 10 themselves;
+#  - it locks its memory (mlockall), so no page of it can be reclaimed and a
+#    memory stall cannot make it fault; OOMScoreAdjust keeps the OOM killer off it.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=1
+CPUSchedulingResetOnFork=yes
+IOSchedulingClass=best-effort
+IOSchedulingPriority=4
+OOMScoreAdjust=-900
+# A guard, not a budget: it uses about 30 MB.  Its locked memory never swaps.
+MemoryMax=192M
+MemorySwapMax=0
+TasksMax=16
+RuntimeDirectory=gts9u-stall-watch
+RuntimeDirectoryMode=0755
+UMask=0027
+# It reads /proc, /sys, /dev/kmsg and the journal, and writes only its own data.
+ProtectSystem=strict
+ReadWritePaths=/var/log/gts9u-stall-watch
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# No ProtectClock= and no PrivateDevices= here: both imply a DeviceAllow= list,
+# and with one systemd closes every device but the standard pseudo devices,
+# /dev/kmsg included, which the sampler reads live.
+ProtectHostname=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SyslogIdentifier=gts9u-stall-watch
+
+[Install]
+WantedBy=multi-user.target

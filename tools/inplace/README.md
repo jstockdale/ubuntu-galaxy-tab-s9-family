@@ -36,6 +36,13 @@ cite their procedures and results.  They are not an install or update path.
 | [`suspendkit/`](suspendkit/README.md) | suspend reliability runs, the ADSP-start sleep lock | [`scripts/diagnostics/suspend/README.md`](../../scripts/diagnostics/suspend/README.md) |
 | [`wifi/`](wifi/README.md) | the Wi-Fi address from EFS, firmware at the first probe, the L1 substates | [`docs/gts9wifi-wifi.md`](../../docs/gts9wifi-wifi.md) |
 
+One directory is not such a record: [`stall-watch/`](stall-watch/README.md)
+is a diagnostic kit for both boards (SM-X910 and SM-X710), in use.  It
+installs a 1 s system sampler as one service, which saves a record whenever
+the desktop stalls; it changes nothing else, needs no reboot and none of the
+unit-only state above, and its `install.sh` also upgrades an earlier revision
+in place.
+
 The commands in the kit READMEs use `<user>@10.42.0.2`, where `<user>` is the
 desktop user on the tablet.  10.42.0.2 is the tablet's end of the development
 USB network, which only an image built with `GTS9U_USB_GADGET=1` has

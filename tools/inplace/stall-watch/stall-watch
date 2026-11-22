@@ -1,0 +1,3 @@
+#!/bin/sh
+# stall-watch: status, list, report, at, mark (see /usr/local/lib/gts9u-stall-watch/README.md)
+exec /usr/bin/python3 -I -S /usr/local/lib/gts9u-stall-watch/stall_watch.py "$@"
