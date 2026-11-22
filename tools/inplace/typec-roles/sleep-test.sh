@@ -117,6 +117,18 @@
 #     warning, at fs/super.c:1919 (the kernel's own thaw of the frozen
 #     filesystems, with freeze_filesystems 0, finds nothing of its own to
 #     thaw: may_unfreeze); it is expected, and no rule here counts it;
+#   - around each cycle, reads only (debugfs, sysfs, /proc, the kernel
+#     log), evidence of how deep the sleep went and what may have kept the
+#     SoC up: every qcom_stats file before and after (the SoC's states, each
+#     subsystem's, DDR's modes and frequencies), the wakeup sources and the
+#     interrupts that fired, whether the PCIe link went down and came back,
+#     the power domains of the rails, the UFS, USB and PCIe, the runtime
+#     state of the UFS host and of the USB controller, the DSPs, the panel's
+#     backlight, the warmest thermal zone, and the cycle's kernel lines;
+#     once before the first sleep, every power domain, the rails in use, the
+#     bandwidth votes (those in the sleep set marked) and the PCIe
+#     functions.  The terminal gets all of it ("evidence:" lines), pmsg two
+#     short lines per cycle; a read that fails changes nothing;
 #   - a suspend that the kernel gave up before the tablet slept (a wakeup
 #     on the way down, such as the touchscreen's double tap, or a device
 #     that refused to suspend), with the storage reading back as before and
@@ -275,8 +287,40 @@ mount_deadline=60
 # come to well under 20 KiB with their verdicts; an aborted attempt adds its
 # entry lines and its verdict, about 1 KiB, and a run has at most 21 of them.
 # ext4's own lines, when it recorded or logged an error, add at most 6.
+# Each cycle that was not given up before its sleep adds two evidence lines
+# (ev_keep), at most 700 bytes: 7 KiB for ten.
 diag_head=12
 diag_tail=4
+# Evidence around each cycle (added after the r7 baselines of 2026-11-22,
+# whose 13 cycles all resumed with aosd, cxsd and ddr at +0): how deep each
+# sleep went and what may have kept the SoC out of AOSS sleep, CX collapse
+# and DDR low power.  Reads only, of debugfs (not on the disk), sysfs, /proc
+# and the kernel log, with the RAM root's tools; a read that fails gives "-"
+# or nothing and changes nothing in the run.  The terminal and the run's log
+# get every line ("cycle N/M: evidence: ..."), pmsg two short ones per cycle
+# (ev_pmsg).  One read is not passive: ddr_stats asks the AOSS to bring its
+# numbers up to date (a QMP message, qcom_ddr_stats_show in
+# drivers/soc/qcom/qcom_stats.c), as every read of that file does.
+genpd_sum=/sys/kernel/debug/pm_genpd/pm_genpd_summary
+reg_sum=/sys/kernel/debug/regulator/regulator_summary
+icc_sum=/sys/kernel/debug/interconnect/interconnect_summary
+wake_sum=/sys/kernel/debug/wakeup_sources
+ufs_ctl=/sys/bus/platform/devices/1d84000.ufshc
+usb_ctl=/sys/bus/platform/devices/a600000.usb
+pci_devs=/sys/bus/pci/devices
+# The power domains each cycle shows (pm_genpd_summary): the rails, the
+# UFS, USB and PCIe (Wi-Fi) domains, the display's and the CPU cluster's;
+# any domain that is on as well.
+ev_domains='^(cx|mx|mxc|mmcx|lcx|lmx|gfx|ebi|ufs_|usb|pcie|mdss|power-domain-cluster)'
+# The kernel lines of a cycle the terminal gets (dmesg, all levels; the run
+# sets pm_debug_messages): the PM core's, the CPUs', the storage's and the
+# diagnostic's, the USB host's, the PCIe link's and the Wi-Fi's, the DSPs',
+# the clocks', rails' and votes', warnings and errors.  At most ev_klines,
+# and not the Wi-Fi's per-packet noise, the CPUs' feature lines or the
+# hung-task reports of writers waiting on the frozen disk.
+ev_kernel='PM: |psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110'
+ev_kernel_skip='msdu_done|SANITY CHECK|blocked for more than|hung_task_timeout_secs|Tainted:'
+ev_klines=150
 # How to reach TWRP from a running or looping tablet (docs/porting-log.md,
 # the TWRP flash: Volume Down + Power, then at once Volume Up + Power).
 recovery_keys='hold Power and Volume Down until the screen goes dark, then at once Power and Volume Up, for TWRP'
@@ -634,6 +678,298 @@ verdict() {
 keep() {
 	printf '%s\n' "$*" >> "$ramdir/result" 2>/dev/null
 	[ ! -e /dev/pmsg0 ] || printf 'gts9u sleep-test: %s %.300s\n' "$stamp" "$*" >> /dev/pmsg0 2>/dev/null
+}
+
+# ------------------------------------------------- evidence, reads only ---
+# Each of these reads and prints; none of them changes what the run decides.
+# A redirection that fails is said before a 2>/dev/null after it takes
+# effect (dash), so the reads put 2>/dev/null first.
+
+# An evidence line for the next boot: pmsg only, cut at 300 characters like
+# keep's (the terminal and the log have the long form; not the result file,
+# not the kernel log).
+ev_pmsg() {
+	[ ! -e /dev/pmsg0 ] || printf 'gts9u sleep-test: %s %.300s\n' "$stamp" "$*" 2>/dev/null >> /dev/pmsg0
+}
+
+# The first line of FILE, or -.
+ev_val() { # FILE
+	evv=
+	read -r evv 2>/dev/null < "$1" || :
+	echo "${evv:--}"
+}
+
+# Every file of qcom_stats as "NAME COUNT TICKS" lines: the SoC's sleep
+# states (aosd, cxsd, ddr), each subsystem's (apss is the CPUs'; adsp, cdsp,
+# gpu, display, ...; the file of one that is not up is empty) and ddr_stats'
+# low-power modes and frequencies ("ddr_stats:lpm:0xd4",
+# "ddr_stats:freq:547").  TICKS count the 19.2 MHz always-on timer.
+ev_stats() { # OUT
+	for evf in "$qstats"/*; do
+		[ -f "$evf" ] || continue
+		awk -v n="${evf##*/}" '
+			function val(key,   p, s) {
+				p = index($0, key)
+				if (!p) return 0
+				s = substr($0, p + length(key))
+				sub(/^[ \t]*/, "", s)
+				sub(/[^0-9].*$/, "", s)
+				return s == "" ? 0 : s
+			}
+			/^Count:/ { c = $2 }
+			/^Accumulated Duration:/ { a = $3 }
+			/^DDR LPM Stat Name:/ {
+				k = $0
+				sub(/^DDR LPM Stat Name:/, "", k)
+				sub(/[ \t].*$/, "", k)
+				print n ":lpm:" k, val("count:"), val("Duration (ticks):")
+			}
+			/^DDR Freq / {
+				k = $0
+				sub(/^DDR Freq /, "", k)
+				sub(/[^0-9].*$/, "", k)
+				print n ":freq:" k, val("count:"), val("Duration (ticks):")
+			}
+			END { if (c != "") print n, c, (a == "" ? 0 : a) }' "$evf" 2>/dev/null
+	done 2>/dev/null > "$1"
+}
+
+# What changed between two ev_stats snapshots, one line: the SoC's states,
+# the subsystems (count, and the time spent in their sleep), ddr_stats'
+# modes and the time at each DDR frequency.  "-" when nothing was read.
+ev_stats_delta() { # BEFORE AFTER
+	awk -v hz=19200000 '
+		function one(k, dc, dt) {
+			return sprintf("%s %s%d%s", k, dc < 0 ? "" : "+", dc, dt > 0 ? sprintf(" %.1fs", dt) : "")
+		}
+		FILENAME == ARGV[1] { c0[$1] = $2; t0[$1] = $3; next }
+		{
+			k = $1
+			dc = $2 - ((k in c0) ? c0[k] : 0)
+			dt = ($3 - ((k in t0) ? t0[k] : 0)) / hz
+			if (k == "aosd" || k == "cxsd" || k == "ddr")
+				soc = soc (soc == "" ? "" : ", ") one(k, dc, dt)
+			else if (k ~ /:lpm:/) {
+				sub(/.*:lpm:/, "", k)
+				lpm = lpm (lpm == "" ? "" : ", ") one(k, dc, dt)
+			} else if (k ~ /:freq:/) {
+				sub(/.*:freq:/, "", k)
+				if (dt > 0) frq = frq (frq == "" ? "" : ", ") sprintf("%sMHz %.1fs", k, dt)
+			} else
+				ss = ss (ss == "" ? "" : ", ") one(k, dc, dt)
+		}
+		END {
+			s = soc
+			if (ss != "") s = s (s == "" ? "" : "; ") "subsystems " ss
+			if (lpm != "") s = s (s == "" ? "" : "; ") "ddr modes " lpm
+			if (frq != "") s = s (s == "" ? "" : "; ") "ddr time at " frq
+			print s == "" ? "-" : s
+		}' "$1" "$2" 2>/dev/null
+}
+
+# /proc/interrupts as "IRQ TOTAL NAME" lines: TOTAL over every CPU, NAME
+# the action's (what follows Level or Edge and a flow handler's -name), or
+# the rest of the line, spaces made _.
+ev_irqs() { # OUT
+	awk 'NR > 1 && NF > 1 {
+		irq = $1
+		sub(/:$/, "", irq)
+		t = 0
+		for (i = 2; i <= NF && $i ~ /^[0-9]+$/; i++) t += $i
+		for (j = i; j <= NF; j++) if ($j ~ /^(Level|Edge)$/) break
+		if (j < NF) {
+			i = j + 1
+			if (i < NF && $i ~ /^-/) i++
+		}
+		nm = ""
+		for (; i <= NF; i++) nm = nm (nm == "" ? "" : "_") $i
+		printf "%s %.0f %s\n", irq, t, nm == "" ? "-" : nm
+	}' /proc/interrupts 2>/dev/null > "$1"
+}
+
+# The interrupts that fired between two ev_irqs snapshots, the most first,
+# at most TOP of them: "21 pm8xxx_rtc_alarm +1, ...".
+ev_irq_delta() { # BEFORE AFTER TOP
+	awk -v top="$3" '
+		FILENAME == ARGV[1] { b[$1] = $2; next }
+		{
+			d = $2 - (($1 in b) ? b[$1] : 0)
+			if (d > 0) { n++; id[n] = $1; dv[n] = d; nm[n] = $3 }
+		}
+		END {
+			for (j = 1; j <= top && j <= n; j++) {
+				m = 0
+				for (i = 1; i <= n; i++) if (!(i in used) && (m == 0 || dv[i] > dv[m])) m = i
+				used[m] = 1
+				printf "%s%s %s +%.0f", j == 1 ? "" : ", ", id[m], nm[m], dv[m]
+			}
+			if (n > top) printf ", and %d more", n - top
+			if (!n) printf "none"
+			printf "\n"
+		}' "$1" "$2" 2>/dev/null
+}
+
+# The kernel's wakeup sources as "NAME EVENTS WAKEUPS" lines (the name is
+# what comes before the nine numbers of each line, spaces made _).
+ev_wake() { # OUT
+	awk 'NR > 1 && NF >= 10 {
+		nm = $1
+		for (i = 2; i <= NF - 9; i++) nm = nm "_" $i
+		print nm, $(NF - 7), $(NF - 6)
+	}' "$wake_sum" 2>/dev/null > "$1"
+}
+
+# The wakeup sources that had events between two ev_wake snapshots:
+# "NAME +EVENTS (wakeup +N)", or none.
+ev_wake_delta() { # BEFORE AFTER
+	awk '
+		FILENAME == ARGV[1] { e[$1] = $2; w[$1] = $3; next }
+		{
+			de = $2 - (($1 in e) ? e[$1] : 0)
+			dw = $3 - (($1 in w) ? w[$1] : 0)
+			if (de > 0 || dw > 0)
+				s = s (s == "" ? "" : ", ") sprintf("%s +%.0f%s", $1, de, dw > 0 ? sprintf(" (wakeup +%.0f)", dw) : "")
+		}
+		END { print s == "" ? "none" : s }' "$1" "$2" 2>/dev/null
+}
+
+# pm_genpd_summary: the domains of ev_domains and every domain that is on,
+# each with its devices (domains), or the whole of it (all).
+ev_genpd() { # domains|all
+	awk -v re="$ev_domains" -v all="$1" '
+		NR <= 3 { next }
+		/^[^ ]/ {
+			show = all == "all" || $1 ~ re || $2 == "on"
+			if (show) print
+			next
+		}
+		show && (all == "all" || /^    [^ ]/) { print }' "$genpd_sum" 2>/dev/null
+}
+
+# The state of what can keep the SoC up, read right before a sleep, one
+# line: the UFS host's runtime state and clock, the USB controller's, each
+# PCIe function's power state, the DSPs, the panel, the warmest thermal zone.
+ev_state() {
+	evs="ufs $(ev_val "$ufs_ctl/power/runtime_status")"
+	for evd in "$ufs_ctl"/devfreq/*/cur_freq; do
+		[ -f "$evd" ] || continue
+		evs="$evs $(ev_val "$evd")Hz"
+	done
+	evs="$evs; usb $(ev_val "$usb_ctl/power/runtime_status") wakeup $(ev_val "$usb_ctl/power/wakeup")"
+	evp=
+	for evd in "$pci_devs"/*; do
+		[ -e "$evd" ] || continue
+		evp="$evp ${evd##*/} $(ev_val "$evd/power_state")"
+	done
+	evs="$evs; pci${evp:- none}"
+	evr=
+	for evd in /sys/class/remoteproc/remoteproc*; do
+		[ -e "$evd" ] || continue
+		evr="$evr $(ev_val "$evd/name")=$(ev_val "$evd/state")"
+	done
+	evs="$evs; remoteproc${evr:- none}"
+	evb=
+	for evd in /sys/class/backlight/*; do
+		[ -e "$evd" ] || continue
+		evb="$evb ${evd##*/} power=$(ev_val "$evd/bl_power") brightness=$(ev_val "$evd/brightness")"
+	done
+	evs="$evs; backlight${evb:- none}"
+	evt=$(for evd in /sys/class/thermal/thermal_zone*; do
+		[ -e "$evd" ] || continue
+		printf '%s %s\n' "$(ev_val "$evd/temp")" "$(ev_val "$evd/type")"
+	done | awk '$1 ~ /^-?[0-9]+$/ && (n == 0 || $1 + 0 > m + 0) { m = $1; t = $2; n = 1 }
+		END { if (n) printf "%.1fC %s", m / 1000, t; else printf "-" }')
+	echo "$evs; warmest $evt"
+}
+
+# Once, before the first sleep: the domains, the rails, the bandwidth votes,
+# the wakeup sources and the PCIe functions as they are with the disk frozen.
+# A request on an interconnect node whose tag is 0 or has bit 2
+# (QCOM_ICC_TAG_SLEEP, include/dt-bindings/interconnect/qcom,icc.h) votes in
+# the sleep set as well (qcom_icc_aggregate), the one the CPUs' RSC sends
+# when they sleep.
+ev_once() {
+	say "evidence: power domains (pm_genpd_summary; every line):"
+	ev_genpd all | while IFS= read -r evl; do say "evidence:   $evl"; done
+	say "evidence: rails in use (regulator_summary: the regulators with users, and those users):"
+	awk 'NR <= 2 { next }
+		NF >= 7 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { show = $2 > 0; if (show) print; next }
+		show && NF == 5 && $2 ~ /^[0-9]+$/ && $2 > 0 { print }' "$reg_sum" 2>/dev/null |
+		while IFS= read -r evl; do say "evidence:   $evl"; done
+	say "evidence: bandwidth (interconnect_summary: the nodes with a vote and the requests that make it):"
+	awk 'NR <= 2 { next }
+		/^[^ ]/ { show = $2 + 0 > 0 || $3 + 0 > 0; if (show) print; next }
+		show && /^  [^ ]/ && ($3 + 0 > 0 || $4 + 0 > 0) {
+			t = $2 + 0
+			print $0 ((t == 0 || int(t / 4) % 2 == 1) ? "   (sleep set too)" : "")
+		}' "$icc_sum" 2>/dev/null |
+		while IFS= read -r evl; do say "evidence:   $evl"; done
+	say "evidence: wakeup sources with events so far (name, events, wakeups):"
+	ev_wake "$ramdir/ev-wake-once"
+	awk '$2 > 0 || $3 > 0' "$ramdir/ev-wake-once" 2>/dev/null |
+		while IFS= read -r evl; do say "evidence:   $evl"; done
+	for evd in "$pci_devs"/*; do
+		[ -e "$evd" ] || continue
+		say "evidence: pci ${evd##*/}: $(ev_val "$evd/power_state"), link $(ev_val "$evd/current_link_speed"), d3cold_allowed $(ev_val "$evd/d3cold_allowed"), wakeup $(ev_val "$evd/power/wakeup"), runtime $(ev_val "$evd/power/runtime_status")"
+	done
+	say "evidence: state: $(ev_state)"
+}
+
+# Before a sleep: the snapshots ev_after compares with, and the domains.
+ev_before() { # SFX
+	ev_stats "$ramdir/ev-stats-$1.0"
+	ev_irqs "$ramdir/ev-irqs-$1.0"
+	ev_wake "$ramdir/ev-wake-$1.0"
+	evstate=$(ev_state)
+	say "$cyc: evidence: before: $evstate"
+	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: before: genpd: $evl"; done
+}
+
+# Right after rtcwake returns: the same snapshots.
+ev_resumed() { # SFX
+	ev_stats "$ramdir/ev-stats-$1.1"
+	ev_irqs "$ramdir/ev-irqs-$1.1"
+	ev_wake "$ramdir/ev-wake-$1.1"
+}
+
+# Once the cycle's kernel lines are in K: what the sleep reached, what woke
+# or kept it, whether the PCIe link went down and came back, the domains
+# now, and the cycle's kernel lines.  ev_keep then puts two short lines of
+# it in pmsg, for an attempt that was not given up before the sleep.
+ev_after() { # SFX K
+	evdepth=$(ev_stats_delta "$ramdir/ev-stats-$1.0" "$ramdir/ev-stats-$1.1")
+	evwake=$(ev_wake_delta "$ramdir/ev-wake-$1.0" "$ramdir/ev-wake-$1.1")
+	evirq=$(ev_irq_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1" 12)
+	# A PCIe host that went to L2 at suspend logs its link coming up again
+	# at resume (dw_pcie_wait_for_link); one that kept its link logs nothing
+	# and kept its clocks, PHY and votes through the sleep
+	# (dw_pcie_suspend_noirq, qcom_pcie_suspend_noirq).
+	evlink=$(awk '/PCIe Gen\.[0-9]+ x[0-9]+ link up|Timeout waiting for L2 entry|Link failed to come up|Device not found|Device found, but not active/ {
+		sub(/^\[[^]]*\] /, ""); s = s (s == "" ? "" : "; ") $0 } END { print s }' "$2" 2>/dev/null)
+	if [ -z "$evlink" ]; then
+		evlink='no link-up line: the PCIe host kept its link, clocks and votes through the sleep'
+		evpcie='pcie link kept'
+	else
+		case $evlink in
+		*' link up'*) evpcie='pcie link down and up again' ;;
+		*) evpcie="pcie: $evlink" ;;
+		esac
+	fi
+	say "$cyc: evidence: qcom_stats: $evdepth"
+	say "$cyc: evidence: wakeup sources: $evwake"
+	say "$cyc: evidence: interrupts: $evirq"
+	say "$cyc: evidence: pcie: $evlink"
+	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: after: genpd: $evl"; done
+	awk -v re="$ev_kernel" -v skip="$ev_kernel_skip" -v max="$ev_klines" '
+		$0 ~ skip { next }
+		$0 ~ re { if (++n <= max) print; next }
+		END { if (n > max) printf "(%d more kernel lines of this cycle left out; its kmsg file in the run directory has them all)\n", n - max }' "$2" 2>/dev/null |
+		while IFS= read -r evl; do say "$cyc: evidence: kernel: $evl"; done
+}
+
+ev_keep() { # SFX
+	ev_pmsg "$cyc: evidence: qcom_stats: $evdepth"
+	ev_pmsg "$cyc: evidence: $evpcie; irq $(ev_irq_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1" 3); wakeup $evwake; before: $evstate"
 }
 
 # The failure lines of a kernel log excerpt: the UFS ones, the block layer's
@@ -1224,6 +1560,9 @@ run_from_ram() { # CONFIG
 	say "$me: from here on the run cannot be stopped, and it ends with a restart (sysrq b)"
 	dmarker="gts9u sleep-test: $stamp protected"
 	printf '%s\n' "$dmarker" >> /dev/kmsg
+	# The state the sleeps start from (reads only), before the first read so
+	# that the first sleep follows that read as closely as before.
+	[ "$dry" = 1 ] || ev_once
 	read_check 0
 	if [ -z "$read_hash" ]; then
 		verdict "SLEEP-TEST RESULT: FAIL before any sleep: the first read of $part failed ($read_why); floor $floor; kernel $kernel"
@@ -1304,6 +1643,7 @@ run_from_ram() { # CONFIG
 			verdict "SLEEP-TEST RESULT: ABORTED at $cyc, before its sleep ($why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel"
 			finish healthy
 		fi
+		ev_before "$sfx"
 		ok0=$(stat_of success) fail0=$(stat_of fail)
 		a0=$(count_of aosd) x0=$(count_of cxsd) d0=$(count_of ddr)
 		# Each attempt's marker is its own: the kernel lines after it are
@@ -1315,6 +1655,8 @@ run_from_ram() { # CONFIG
 		slept=1
 		rtcwake -u -d "$rtc" -m mem -s "$seconds" > "$ramdir/rtcwake-$sfx" 2>&1
 		rtc_rc=$?
+		# The sleep statistics as the sleep left them (reads only).
+		ev_resumed "$sfx"
 		# Right after the resume: is everything still frozen?
 		still_frozen
 		[ -z "$prot_why" ] || prot_bad=$prot_why
@@ -1383,6 +1725,7 @@ run_from_ram() { # CONFIG
 			fi
 		done < "$ramdir/diag-$sfx"
 		say "$cyc: asleep ${asleep:-?}s, woken by IRQ ${wake:-?}, rtcwake $rtc_rc, suspend_stats success $(delta "$ok0" "$ok1") fail $(delta "$fail0" "$fail1"), $dline, $(roles), USB devices $(usb_count)"
+		ev_after "$sfx" "$k"
 		# A suspend the kernel gave up before the sleep, the storage as it
 		# was: not a FAIL.  The same cycle again, or, past the budget, the
 		# end of the run without a storage verdict.
@@ -1402,6 +1745,7 @@ run_from_ram() { # CONFIG
 			sleep "$abort_pause"
 			continue
 		fi
+		ev_keep "$sfx"
 		# A suspend whose task freezer gave up, the storage as it was: no
 		# storage verdict, and not tried again.
 		if [ -n "$reasons" ] && freezer_failed; then

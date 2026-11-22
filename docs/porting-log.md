@@ -9210,4 +9210,96 @@ Tests: `tests/test_typec_roles_kit.py` runs every new branch against fakes
 baseline never slept, and none has run on revision 8), the freeze has not
 run there at all, and the `errors=continue` behaviour is read from the
 source only. The first `dry` shows whether a second freeze fails with
-`EBUSY` and whether the remount takes.
+`EBUSY` and whether the remount takes. (Later the same day all of that ran:
+next section.)
+
+### The sleep test on the tablet: 13 deep sleeps on revision 7, none deep enough to count (2026-11-22)
+
+All on squirtle with kit revision 7's kernel (build ID `84c2748b5ee4`),
+the logs in `~/ubuntu-gts9u/backups/`; the details are in
+[resume-recovery.md](resume-recovery.md#what-ran-on-the-tablet-2026-11-22).
+
+**The freeze proof (09:18,** `squirtle-freeze-proof-20261122/run-1.log`**).**
+Throwaway ext4 images with the root's features, deleted files held open:
+- A, a power loss, and B, a freeze with `blockdev --setro`: both mount; B
+  with no journal to replay, only the orphan cleanup.
+- C, the error flag set by hand: the mount fails with the 03:28 boot loop's
+  lines, and `e2fsck -p` (the boot's automatic check) repairs it.
+- D, an ext4 error while frozen and read-only under `errors=remount-ro`:
+  the copy mounted, against the expectation. The error came from
+  `trigger_fs_error`, whose handler calls `ext4_error()`, which passes error
+  number 0; the journal abort then wrote `s_errno` 0 to the journal's
+  superblock (the write was attempted: "Trying to write to read-only
+  block-device"), and the next mount found nothing recorded
+  (`ext4_clear_journal_err()`). An error with an errno, as a lost disk's
+  read errors are, would be recorded; the proof cannot raise one, so that
+  stays read from the source (`fs/ext4/super.c`, `fs/jbd2/journal.c`).
+- E, the same with `errors=continue`: no abort, no write attempt, no
+  `emergency_ro`.
+
+**`dry` (09:35):** passed (floor held, `INT_MAX nodes` 43); the next boot
+mounted the root with the orphan cleanup and no error.
+
+**Baseline 09:44** (`ro 3 30 release-floor hold=60 restart-ok`, up 448 s,
+docked as power sink and USB host, floor released at 48.9 s) **and
+baseline 10:17** (`ro 10 30 release-floor hold=60 restart-ok`, up 29
+minutes, docked, no unplug of the dock's power in that boot): 13 of 13
+cycles slept 30.5 to 31.3 s, were woken by the RTC (IRQ 21) and resumed with
+the UFS reading back as before. Every one was SHALLOW: `qcom_stats` `aosd`,
+`cxsd` and `ddr` +0. The task freezer got through behind the frozen root
+each time. Each run's first resume logged the expected `WARNING:
+fs/super.c:1919 at thaw_super_locked` (`suspend_finish()` ->
+`filesystems_thaw()` finds no kernel freeze on the root userspace froze:
+`may_unfreeze()`, once per boot), and writers waiting on the frozen root
+were reported as hung tasks after 61 s. No UFS, PHY or I/O line. Each next
+boot came up with the root clean, `errors_count` 0, the floor held once by
+the loop breaker.
+
+**What it says.** The 2026-11-21 failure was not reproduced, so revision
+8's reset is still not shown to be the fix. One failure in 14 real deep
+sleeps on revision 7 fits a rare failure as well as one that needs a
+condition these runs did not have: a writable root, the dock's power
+unplugged (40 minutes as power source) and plugged back 13 minutes before,
+the panel woken 2 minutes before, 53 minutes of uptime. None of the 14
+sleeps can be shown to have gone deeper than the others: the 2026-11-21
+resume logged no `PCIe ... link up` line, so the Wi-Fi's PCIe host kept its
+link, clocks and bandwidth votes through that sleep too, and the dock's USB
+host was up in all of them.
+
+**Evidence in the sleep test.** `sleep-test.sh` now reads, around each
+cycle and only reads: every `qcom_stats` file before and after the sleep
+(the SoC's states, each subsystem's with its time asleep, `ddr_stats`' modes
+and frequencies), the wakeup sources and interrupts that fired, whether the
+PCIe link went down, the power domains of the rails, the UFS, USB and PCIe,
+the UFS host's runtime state and clock, the USB controller's, the DSPs, the
+backlight, the warmest thermal zone and the cycle's kernel lines; once
+before the first sleep, every domain, the rails in use, the bandwidth votes
+(those that also hold in the sleep set marked) and the PCIe functions. The
+terminal gets all of it, pmsg two short lines per cycle. The README of the
+kit has the list ("Evidence around each cycle"). The analysis of why the
+sleeps stay shallow, the blockers to read on the tablet, and the next runs
+are in `~/ubuntu-gts9u/backups/sleep-shallow-report-2026-11-22.md`.
+
+**The PCIe host cannot power down in a suspend on this kernel** (read from
+the 7.2-rc3 source and the tablet's sysfs after that report; it corrects the
+report's first experiment, and nothing of it has run). `dw_pcie_suspend_noirq()`
+powers the host down only if `pci_host_common_d3cold_possible()` finds every
+bound function below the bridge in D3hot, and that walk includes the root
+port. The root port advertises Hot-Plug Capable (`pcie-qcom.c` sets "no
+command completed" and leaves the bit; the port has the hotplug service
+device `0000:00:00.0:pcie004`), so `is_pciehp` is set, and the kernel has
+`CONFIG_ACPI=y` without `CONFIG_HOTPLUG_PCI_PCIE`: `pciehp_is_native()` is
+false, `pci_bridge_d3_possible()` returns false before it reads
+`pcie_port_pm=force`, `bridge_d3` stays 0 and `pci_pm_suspend_noirq()` leaves
+the root port in D0 (on the tablet: `power_state` D0, `power/control` `on`, no
+autosuspend). The host therefore keeps its link, PHY, clocks and the 1 kB/s
+`pcie-mem` vote (which is in the sleep set too) through every suspend,
+whatever the Wi-Fi driver does: unbinding `ath11k_pci` is not enough. With
+the root port removed from the bus
+(`echo 1 > /sys/bus/pci/devices/0000:00:00.0/remove`) the walk finds
+nothing, the host sends PME_Turn_Off, stops the link, powers the PHY and the
+Wi-Fi's supplies off and drops both votes: an experiment for one boot, with
+the Wi-Fi gone until the restart. A fix would be `CONFIG_HOTPLUG_PCI_PCIE=y`
+with `pcie_port_pm=force`, or the Hot-Plug Capable bit cleared for this
+board; either one then powers the Wi-Fi off in every suspend, which
+`ath11k` has to survive at resume, and that is not looked at yet.

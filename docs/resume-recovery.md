@@ -413,6 +413,10 @@ section why a freeze). The order:
    (`scripts/diagnostics/suspend/gts9u-suspend-cycles.sh`), then the suspend
    policy.
 
+Steps 1 and 2 ran on 2026-11-22: revision 7 resumed 13 of 13 deep sleeps,
+none of them deep enough to count in `qcom_stats` ("What ran on the
+tablet", below).
+
 Nobody touches the screen during a run: the touchscreen's double tap wakes
 the tablet, and in a suspend under way it makes the kernel give the suspend
 up (the script calls such an attempt ABORTED, tries the cycle again, and
@@ -564,8 +568,9 @@ The script now freezes the filesystems instead (`fsfreeze -f`, FIFREEZE):
   `s_errors`, which the next boot mounts with, is not touched (the kernel
   shows `errors=` only when it differs from it: `_ext4_show_options()`). A
   stop before any sleep puts each one back after the thaw (a frozen
-  filesystem refuses a remount, `reconfigure_super()`: `EBUSY`). This is
-  read from the source only: nothing of it has run on the tablet.
+  filesystem refuses a remount, `reconfigure_super()`: `EBUSY`). Written
+  from the source; what has since run on the tablet, and what of it is
+  still source reading, is in "What ran on the tablet" below.
 - Swap to a swap file goes to its blocks past the filesystem
   (`mm/page_io.c`), so a freeze does not stop it: the script turns swap on
   the disk off first.
@@ -584,6 +589,103 @@ probably not mount at the next boot ("probably": `JBD2: I/O error when
 updating journal superblock` means that write failed), or `SLEEP-TEST
 NOTE` (an error logged on the read-only disk under `errors=continue`,
 nothing written), and restarts in either case.
+
+#### What ran on the tablet (2026-11-22)
+
+On squirtle, kit revision 7's kernel (build ID `84c2748b5ee4`), in this
+order. The logs are in `~/ubuntu-gts9u/backups/`.
+
+**The freeze proof, 09:18** (`squirtle-freeze-proof-20261122/`, `run-1.log`;
+the script lives there, not in this tree). Throwaway ext4 images in
+`/dev/shm` with the root's features (`orphan_file`, `errors=remount-ro`),
+deleted files held open, each copied as a restart would find it and then
+mounted as the boot mounts the root:
+- A, a power loss: mounts (journal recovery, then the orphan cleanup).
+- B, `fsfreeze -f` and `blockdev --setro`: mounts cleanly; the copy has
+  `orphan_present` and no `needs_recovery`, so the mount cleans the orphans
+  and replays nothing. A `sync` with the image frozen returned at once.
+- C, the error flag set by hand (`debugfs` `ssv state 3`, "clean with
+  errors"; a plain `mount -o remount,ro` was refused first, as expected with
+  deleted files open): the mount fails with the lines of the 03:28 boot
+  loop (`ext4_mark_recovery_complete:6370: ... Orphan file not empty on
+  read-only fs`, "mount failed"). `e2fsck -p`, the boot's automatic check,
+  repaired it, and the copy then mounted: an fsck in the initramfs would
+  have ended that loop by itself.
+- D, an ext4 error raised while frozen and read-only, with
+  `errors=remount-ro`: the copy mounted, where the proof expected it not
+  to. The error came from `/sys/fs/ext4/<dev>/trigger_fs_error`, whose
+  handler (`trigger_test_error()`, `fs/ext4/sysfs.c`) calls `ext4_error()`.
+  That macro passes error number 0 (`fs/ext4/ext4.h`), so
+  `ext4_handle_error()` aborted the journal with `jbd2_journal_abort(journal,
+  -0)` and `jbd2_journal_update_sb_errno()` wrote `s_errno` 0 into the
+  journal's superblock. That write was attempted behind the read-only flag
+  ("Trying to write to read-only block-device", logged once by
+  `bio_check_ro()`, which lets it through), and the filesystem went
+  `emergency_ro`. At the next mount `ext4_clear_journal_err()` read
+  `j_errno` 0 and marked nothing. Only an error that carries an errno (an
+  `ext4_error_err()`, or the inode and block read errors that pass `-EIO`,
+  which is what a lost UFS raises) leaves a non-zero `s_errno`, and the next
+  mount then reports "Filesystem error recorded from previous mount" and
+  marks the filesystem in error. The sysfs trigger cannot raise such an
+  error, so that part, and with it the case `errors=continue` is for, is
+  still read from the source only.
+- E, the same error with `errors=continue` set before the freeze: no
+  journal abort, no write attempt, no `emergency_ro`; the copy mounted.
+
+**`dry`, 09:35** (boot `439e9851`, the floor held;
+`squirtle-sleep-dry-20261122.log`): `errors=continue` took on the root
+(`/proc/1/mounts` showed it), the root froze through `/proc/1/root`, `sda`
+went read-only, the second freeze found it still frozen (`EBUSY`), the read
+after 10 s matched, `sysrq b`. The next boot (`780e25d7`) mounted the root
+with the orphan cleanup ("6 orphan inodes deleted") and no journal replay,
+`errors_count` 0; `verify.sh` passed every check but the build ID (revision
+7 running, not the kit's).
+
+**Revision 7 baseline, 09:44** (boot `780e25d7`, up 448 s, on the powered
+dock as power sink and USB host, the floor released;
+`squirtle-sleep-r7-baseline-20261122-0945.log` and its console):
+`ro 3 30 release-floor hold=60 restart-ok`. All three cycles slept 30.5 to
+31.3 s, were woken by the RTC (IRQ 21, `pm8xxx_rtc_alarm`) and resumed with
+the UFS reading back as before; each was SHALLOW, `aosd`, `cxsd` and `ddr`
++0. The task freezer got through behind the frozen root. The console had:
+- at the first resume, the one warning expected, `WARNING: fs/super.c:1919
+  at thaw_super_locked+0x200/0x23c`, from `filesystems_thaw()` called by
+  `pm_suspend()`. `suspend_finish()` thaws filesystems after every suspend
+  (`kernel/power/suspend.c`), as the kernel's own holder
+  (`FREEZE_EXCL | FREEZE_HOLDER_KERNEL`, owner `filesystems_freeze`);
+  `may_unfreeze()` finds no kernel freeze on a filesystem only userspace
+  froze (`freeze_kcount` 0), warns once per boot (`WARN_ON_ONCE`) and
+  refuses, so the run's freeze stays. The kernel is tainted `W`;
+- hung-task reports for tasks waiting on the frozen root (`systemd-journal`,
+  `systemd-timesyn`, `bluetoothd`, rsyslogd's `rs:main Q:Reg`,
+  `NetworkManager`, `tailscaled`), as expected;
+- `ttyMSM0: Unable to drain transmitter` at the first suspend, and no UFS,
+  PHY or I/O line.
+
+The boot after it (`26a78998`) came up with the root clean, `errors_count`
+0, and held the floor once (the loop breaker).
+
+**Revision 7 baseline, 10:17** (boot `26a78998`, up 29 minutes, docked as
+before, no unplug of the dock's power in that boot, the floor released by
+the run at 1759.5 s; `squirtle-sleep-r7-baseline-20261122-1015.log`):
+`ro 10 30 release-floor hold=60 restart-ok`. Ten of ten resumed with the
+UFS readable, every one SHALLOW (`aosd`, `cxsd`, `ddr` +0), each woken by
+IRQ 21 after 30.5 to 31.3 s; the same console lines; the boot after it
+(`f2ecad3b`) mounted the root with the orphan cleanup and an empty journal,
+`errors_count` 0 (`…-1015-after-restart.log`).
+
+So revision 7, the kernel that failed on 2026-11-21, resumed the UFS 13 times
+out of 13 under this protection, and the failure was not reproduced: the
+reset of revision 8 is still not shown to be the fix. No cycle reached AOSS
+sleep, CX collapse or DDR low power. What has not run: revision 8, a cycle
+that reached those states, an ext4 error with an errno under
+`errors=continue`, and the 2026-11-21 conditions (a writable root, the dock's
+power unplugged and plugged back 13 minutes before, the panel woken 2
+minutes before, 53 minutes up). The analysis of why the sleeps stay
+shallow and what to run next is in
+`~/ubuntu-gts9u/backups/sleep-shallow-report-2026-11-22.md`; from then
+on the sleep test also prints read-only evidence around each cycle
+(`tools/inplace/typec-roles/README.md`, "The sleep test").
 
 #### Repairing the root from recovery
 
