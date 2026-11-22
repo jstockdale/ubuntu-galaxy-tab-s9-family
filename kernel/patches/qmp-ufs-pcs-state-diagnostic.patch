@@ -1,0 +1,106 @@
+Subject: [DIAGNOSTIC, test builds only] phy: qcom: qmp-ufs: log the SM8550 PCS state around calibration
+
+Not for release builds.  scripts/build-mainline-kernel.sh applies this only
+with APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, after the PCS reset of
+qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch, and refuses a
+default build in a source tree that carries it.
+
+It reads registers and logs.  It writes no register and changes no return
+value, and it adds nothing but these reads and one log line to a
+calibration that succeeds:
+
+- at the entry of every calibration of the SM8550 PHY, a debug line with
+  the PCS and SerDes state the calibration starts from.  SW_RESET 0 and
+  START 1 at the entry of a calibration after a resume mean that the PCS
+  kept its registers through the sleep;
+- after a PCS_READY timeout, warning lines with the state the timeout
+  left, whether PCS_READY came within the 1 s that the Kalama driver of
+  Samsung's kernel waits (the calibration fails all the same), and, if it
+  did not, the state at the end of that second.  That poll runs only
+  after a timeout.
+
+C_READY and CMN are the SerDes common block's QSERDES_V6_COM_C_READY_STATUS
+and QSERDES_V6_COM_CMN_STATUS, which mainline's QMP combo and eDP PHY
+drivers poll for the PLL.  The PCS offsets are the v6 layout's, the same as
+the Kalama driver's (PHY_BASE 0x400: START 0x0, POWER_DOWN_CONTROL 0x4,
+SW_RESET 0x8, PCS_READY_STATUS 0x1a8).
+
+The entry line is at KERN_DEBUG and the others at KERN_WARNING: none of
+them reaches the consoles at Ubuntu's console loglevel (4).  On the
+SM-X710 each line the consoles print costs 0.1 to 0.25 s with interrupts
+off (tools/inplace/hang-log/README.md).
+
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+@@ -1977,6 +1977,52 @@ err_disable_regulators:
+ 	return ret;
+ }
+ 
++/*
++ * Diagnostic for SM8550 resume tests, not for release builds: the PCS and
++ * SerDes state a calibration starts from, and the one a PCS_READY timeout
++ * leaves.  Reads only, of registers the calibration itself programs or
++ * polls, while the PHY's supplies and clocks are on (phy_power_on() comes
++ * first).
++ */
++static void qmp_ufs_dbg_state(struct qmp_ufs *qmp, const char *level,
++			      const char *when)
++{
++	const struct qmp_phy_cfg *cfg = qmp->cfg;
++	void __iomem *pcs = qmp->pcs;
++
++	dev_printk(level, qmp->dev,
++		   "%s: SW_RESET %#x START %#x PWRDN %#x READY %#x C_READY %#x CMN %#x\n",
++		   when, readl(pcs + cfg->regs[QPHY_SW_RESET]),
++		   readl(pcs + cfg->regs[QPHY_START_CTRL]),
++		   readl(pcs + cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL]),
++		   readl(pcs + cfg->regs[QPHY_PCS_READY_STATUS]),
++		   readl(qmp->serdes + QSERDES_V6_COM_C_READY_STATUS),
++		   readl(qmp->serdes + QSERDES_V6_COM_CMN_STATUS));
++}
++
++/*
++ * After a PCS_READY timeout: the state it left, then whether PCS_READY comes
++ * within the 1 s that the Kalama driver of Samsung's kernel waits, and the
++ * state after that second if it does not.  Measurement only: the calibration
++ * has failed, and fails all the same.
++ */
++static void qmp_ufs_dbg_timeout(struct qmp_ufs *qmp, void __iomem *status)
++{
++	ktime_t start = ktime_get();
++	unsigned int val;
++
++	qmp_ufs_dbg_state(qmp, KERN_WARNING, "after the PCS_READY timeout");
++	if (!readl_poll_timeout(status, val, (val & PCS_READY), 200,
++				USEC_PER_SEC - PHY_INIT_COMPLETE_TIMEOUT)) {
++		dev_warn(qmp->dev,
++			 "PCS_READY %lld us after the timeout, within 1 s of SERDES_START\n",
++			 ktime_us_delta(ktime_get(), start));
++		return;
++	}
++	dev_warn(qmp->dev, "no PCS_READY within 1 s of SERDES_START\n");
++	qmp_ufs_dbg_state(qmp, KERN_WARNING, "1 s after SERDES_START");
++}
++
+ static int qmp_ufs_phy_calibrate(struct phy *phy)
+ {
+ 	struct qmp_ufs *qmp = phy_get_drvdata(phy);
+@@ -1986,6 +2032,9 @@ static int qmp_ufs_phy_calibrate(struct
+ 	unsigned int val;
+ 	int ret;
+ 
++	if (cfg == &sm8550_ufsphy_cfg)
++		qmp_ufs_dbg_state(qmp, KERN_DEBUG, "calibration entry");
++
+ 	ret = reset_control_assert(qmp->ufs_reset);
+ 	if (ret)
+ 		return ret;
+@@ -2021,6 +2070,8 @@ static int qmp_ufs_phy_calibrate(struct
+ 				 PHY_INIT_COMPLETE_TIMEOUT);
+ 	if (ret) {
+ 		dev_err(qmp->dev, "phy initialization timed-out\n");
++		if (cfg == &sm8550_ufsphy_cfg)
++			qmp_ufs_dbg_timeout(qmp, status);
+ 		return ret;
+ 	}
+ 

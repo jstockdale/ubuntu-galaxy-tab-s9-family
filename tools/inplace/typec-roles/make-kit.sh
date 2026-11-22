@@ -3,9 +3,12 @@
 # hang-log kit: the hang-log kernel rebuilt with this branch's five TCPM
 # patches, the sm5714_usbpd policy that turns them on, the retention of the
 # USB power domains across suspend and the NULL check of the hcd in the
-# dwc3-qcom glue (docs/usb-c-dock-roles.md), in boot, plus the build's module
-# tree, signed with its own key.  The configuration and the DTB do not
-# change, so vendor_boot stays the hang-log kit's.
+# dwc3-qcom glue (docs/usb-c-dock-roles.md), and since revision 8 the PCS
+# reset of the SM8550 UFS PHY for both tablets with its diagnostic
+# (docs/resume-recovery.md), in boot, plus the build's module tree, signed
+# with its own key.  The configuration and the DTB do not change, so
+# vendor_boot stays the hang-log kit's.  The build for this kit sets
+# APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1.
 #
 #   bash tools/inplace/typec-roles/make-kit.sh BUILD_SCRATCH KERNEL_OUT_DIR \
 #       HANG_KERNEL_OUT_DIR HANG_KIT_DIR KIT_DIR
@@ -16,8 +19,9 @@
 # (~/ubuntu-gts9u/out/kernel-gts9wifi-hang), HANG_KIT_DIR that kit
 # (~/ubuntu-gts9u/backups/hang-log-kit-r2).  HANG_SCRATCH, when set, is the
 # hang-log build's scratch; its kernel source tree is then the reference the
-# new one is compared with, file by file, and its compiled clock controller
-# the reference for the power domain table.
+# new one is compared with, file by file, its compiled clock controller the
+# reference for the power domain table, and its vmlinux the self-test of the
+# check for the UFS PHY's board gate.
 #
 # Self-tests, each byte for byte:
 #   - boot: the hang-log kernel plus its DTB, by the kits' recipe, is the
@@ -27,12 +31,14 @@
 #   - the hang-log vendor_boot carries that same DTB.
 # Then the changes are checked to be only the intended ones: the DTB, the
 # configuration and the module list are the hang-log build's, the source
-# trees differ in the three Type-C files, the clock controller and the
-# dwc3-qcom glue alone and those are what this checkout's patches and driver
-# give, the new image has the new code and the old one does not and was
-# built after the last change to those files, the compiled power domain
-# table differs in the two power-state masks alone, and the new boot image
-# differs only in its kernel.  Nothing is flashed.
+# trees differ in the three Type-C files, the clock controller, the
+# dwc3-qcom glue and the UFS PHY driver alone and those are what this
+# checkout's patches, stage script and driver give, the new image has the
+# new code and the old one does not and was built after the last change to
+# those files, the compiled power domain table differs in the two
+# power-state masks alone, the UFS PHY's calibration in the new vmlinux no
+# longer asks which board it runs on, and the new boot image differs only in
+# its kernel.  Nothing is flashed.
 set -euo pipefail
 export LC_ALL=C
 
@@ -52,16 +58,28 @@ registry=${KERNEL_KEY_REGISTRY:-$workdir/kernel-keys}
 mkbootimg=$tools/mkbootimg.py
 avbtool=$tools/avbtool.py
 size=100663296
+# This kit's revision: revision 7 plus the UFS PHY's PCS reset for both
+# tablets and its diagnostic.  Written to the kit for people; install.sh
+# knows a revision by its boot image and kernel build ID.
+revision=8
 dts=sm8550-samsung-gts9wifi
 tcpm_dir=drivers/usb/typec/tcpm
 gcc=drivers/clk/qcom/gcc-sm8550
 dwc3=drivers/usb/dwc3/dwc3-qcom
-patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
+qmp=drivers/phy/qualcomm/phy-qcom-qmp-ufs
+# The USB-C dock changes, each applied to the hang-log tree's file as it is.
+typec_patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
 	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch
 	tcpm-keep-queued-swap-pending.patch gcc-sm8550-usb-gdscs-retention.patch
 	dwc3-qcom-check-hcd-before-reading-port-speed.patch)
+# The UFS PHY's two.  The hang-log tree carries the earlier, SM-X910-only
+# form of the first, which scripts/stage-ufs-resume-experiment.sh replaces;
+# the diagnostic goes on top, with APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1.
+ufs_patches=(qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch
+	qmp-ufs-pcs-state-diagnostic.patch)
+patches=("${typec_patches[@]}" "${ufs_patches[@]}")
 # The files those patches change.
-patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c")
+patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c")
 
 # The base on the tablet: the hang-log kit, which a first install saves and
 # rollback.sh puts back.
@@ -80,17 +98,20 @@ hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
 # for from userspace (the third has three; its PR_Swap line is in no earlier
 # revision of that patch), and policy_open, a member of the driver's
 # structure, which only a driver that reads its parameters at each attach
-# has.
+# has.  Last, revision 8's UFS PHY diagnostic: the two labels of its state
+# lines and its line for a PCS_READY that never came.  The PCS reset itself
+# leaves no string; the disassembly check below is for it.
 new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
 	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
 	'Swap is still queued, left pending' 'Partner swapped first, queued DR_SWAP_SEND dropped'
 	'Partner swapped first, queued PR_SWAP_SEND dropped'
-	policy_open)
+	policy_open
+	'calibration entry' 'after the PCS_READY timeout' 'no PCS_READY within 1 s of SERDES_START')
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
 	"$tcpm_dir/sm5714_usbpd.o:$tcpm_dir/sm5714_usbpd.c"
-	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h" "$dwc3.o:$dwc3.c")
+	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h" "$dwc3.o:$dwc3.c" "$qmp.o:$qmp.c")
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 die() { echo "$*" >&2; exit 1; }
@@ -99,11 +120,12 @@ for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$hangkit/vendor_boot.img" "${patched[@]/#/$tree/}" \
 	"$build/.config" "$build/certs/signing_key.x509" "$build/vmlinux" \
 	"$build/$gcc.o" "$build/$tcpm_dir/tcpm.o" "$build/$tcpm_dir/sm5714_usbpd.o" "$build/$dwc3.o" \
-	"$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
-	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}"; do
+	"$build/$qmp.o" "$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
+	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}" \
+	"$repo/scripts/stage-ufs-resume-experiment.sh"; do
 	[ -f "$f" ] || die "missing: $f"
 done
-for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy; do
+for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy llvm-objdump; do
 	command -v "$t" >/dev/null || die "missing tool: $t"
 done
 [ "$(sha "$hang/Image.gz")" = "$hang_image" ] || die "$hang is not the hang-log kit's kernel build"
@@ -167,7 +189,9 @@ echo "DTB (${hang_dtb:0:12}) and configuration (${hang_config:0:12}): the hang-l
 
 # 3. The sources.  The driver is this checkout's; the two TCPM files, the
 # clock controller and the dwc3-qcom glue are the hang-log tree's with this
-# checkout's seven patches on top; nothing else in the kernel tree differs.
+# checkout's seven patches on top, and the UFS PHY driver is the hang-log
+# tree's with its SM-X910-only PCS reset replaced by the one for every SM8550
+# PHY and the diagnostic on top; nothing else in the kernel tree differs.
 cmp -s "$tree/$tcpm_dir/sm5714_usbpd.c" "$repo/kernel/drivers/sm5714_usbpd.c" ||
 	die "the build tree's sm5714_usbpd.c is not this checkout's"
 grep -q 'request_dfp_as_sink' "$tree/include/linux/usb/tcpm.h" &&
@@ -199,6 +223,18 @@ grep -q 'Retention across system suspend, as on sm8650' "$tree/$gcc.c" ||
 # The guard adds no string to the image; its comment is the marker.
 grep -q 'no hcd and no root hub' "$tree/$dwc3.c" ||
 	die 'the build tree does not carry the dwc3-qcom guard'
+# The UFS PHY: both patches are in the build tree's file, each whole (they
+# come out again with no fuzz, the diagnostic first), and the SM-X910-only
+# form of the PCS reset is not.
+mkdir -p "$tmp/ufs/${qmp%/*}"
+cp "$tree/$qmp.c" "$tmp/ufs/$qmp.c"
+for ((i = ${#ufs_patches[@]} - 1; i >= 0; i--)); do
+	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/ufs" -p1 \
+		< "$repo/kernel/patches/${ufs_patches[$i]}" ||
+		die "the build tree's $qmp.c does not carry ${ufs_patches[$i]} whole"
+done
+! grep -q 'SM-X910 experiment: assert PCS reset before calibration tables' "$tree/$qmp.c" ||
+	die "the build tree's $qmp.c still carries the SM-X910-only PCS reset"
 source_check='marker lines only (HANG_SCRATCH not set)'
 if [ -n "${HANG_SCRATCH:-}" ]; then
 	hang_tree=$HANG_SCRATCH/linux-src-gts9wifi
@@ -215,10 +251,24 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 	! grep -q 'no hcd and no root hub' "$hang_tree/$dwc3.c" &&
 		! grep -q 'Retention across system suspend, as on sm8650' "$hang_tree/$gcc.c" ||
 		die 'the hang-log tree carries the dwc3-qcom guard or the USB power domain patch already'
-	for p in "${patches[@]}"; do
+	# Like every build before revision 8, the hang-log build gave the PCS
+	# reset to the SM-X910 alone, and has no diagnostic.
+	grep -q 'SM-X910 experiment: assert PCS reset before calibration tables' "$hang_tree/$qmp.c" &&
+		! grep -q 'SM8550: assert the PCS reset before the calibration tables' "$hang_tree/$qmp.c" &&
+		! grep -q 'Diagnostic for SM8550 resume tests' "$hang_tree/$qmp.c" ||
+		die "the hang-log tree's $qmp.c is not the one with the SM-X910-only PCS reset"
+	for p in "${typec_patches[@]}"; do
 		patch -s -d "$tmp/src" -p1 --no-backup-if-mismatch < "$repo/kernel/patches/$p" ||
 			die "$p does not apply to the hang-log tree"
 	done
+	# The UFS PHY as the build changes it: this checkout's stage script
+	# replaces the SM-X910-only PCS reset, then the diagnostic goes on top.
+	UFS_PCS_RESET_EXPERIMENTAL=1 bash "$repo/scripts/stage-ufs-resume-experiment.sh" "$tmp/src" \
+		> "$tmp/stage-ufs.log" ||
+		die "scripts/stage-ufs-resume-experiment.sh does not take the hang-log tree's $qmp.c"
+	patch -s --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
+		< "$repo/kernel/patches/qmp-ufs-pcs-state-diagnostic.patch" ||
+		die "qmp-ufs-pcs-state-diagnostic.patch does not apply to the hang-log tree's $qmp.c"
 	for f in "${patched[@]}"; do
 		cmp -s "$tmp/src/$f" "$tree/$f" ||
 			die "$f is not the hang-log tree's with this checkout's patches applied"
@@ -247,23 +297,24 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 	sort > "$tmp/trees.want" <<EOF
 $gcc.c
 $dwc3.c
+$qmp.c
 $tcpm_dir/sm5714_usbpd.c
 $tcpm_dir/tcpm.c
 include/linux/usb/tcpm.h
 EOF
 	cmp -s "$tmp/trees.changed" "$tmp/trees.want" || {
-		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c and dwc3-qcom.c:' >&2
+		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c, dwc3-qcom.c and phy-qcom-qmp-ufs.c:' >&2
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $hang_tree: five files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches"
-	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c differ from the hang-log tree, by exactly this checkout'"'"'s changes'
+	source_check="compared with $hang_tree: six files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, phy-qcom-qmp-ufs.c by its stage script and the UFS PHY diagnostic"
+	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c and phy-qcom-qmp-ufs.c differ from the hang-log tree, by exactly this checkout'"'"'s changes'
 	if [ -n "$backups" ]; then
 		source_check="$source_check; passed over, a copy of the hang-log tree's file that patch(1) kept:$backups"
 		echo "sources: passed over$backups, the hang-log tree's file as patch(1) kept it"
 	fi
 else
-	echo 'sources: the seven patches and this checkout'"'"'s driver are in the build tree (HANG_SCRATCH not set: no tree comparison)'
+	echo 'sources: the nine patches and this checkout'"'"'s driver are in the build tree (HANG_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.
@@ -316,6 +367,43 @@ build_id() {
 new_id=$(build_id "$tmp/new.Image")
 [ ${#new_id} = 40 ] && [ "$new_id" != "$hang_build_id" ] || die 'no new build ID in the new image'
 echo "build IDs: hang-log ${hang_build_id:0:12}, new ${new_id:0:12}"
+
+# 5b. The UFS PHY's board gate, which the calibration may no longer have.
+# Up to revision 7 it asked of_machine_is_compatible("samsung,gts9uwifi"),
+# an inline that calls of_machine_compatible_match(), before the PCS reset;
+# now the reset goes to every SM8550 PHY.  No string in the image tells the
+# two apart ("samsung,gts9uwifi" is there for other code), so vmlinux is
+# disassembled: the ELF the image was made from, which its build ID ties to
+# the image.  Its qmp_ufs_phy_calibrate() must call reset_control_assert(),
+# which shows the function was found, and must not call
+# of_machine_compatible_match().  With HANG_SCRATCH the hang-log build's
+# vmlinux, whose calibration has the gate, must show that call.
+notes_build_id() { # VMLINUX: the build ID of its .notes
+	llvm-objcopy -O binary --only-section=.notes "$1" "$tmp/notes.bin" &&
+		build_id "$tmp/notes.bin"
+}
+calibrate_calls() { # VMLINUX: what qmp_ufs_phy_calibrate() calls, one per line
+	llvm-objdump -d --no-show-raw-insn --disassemble-symbols=qmp_ufs_phy_calibrate "$1" |
+		sed -n 's/.*[[:space:]]bl[[:space:]].*<\([A-Za-z0-9_.]*\)>$/\1/p' | sort -u
+}
+[ "$(notes_build_id "$build/vmlinux")" = "$new_id" ] ||
+	die "$build/vmlinux is not the ELF of the new image (another build ID)"
+calibrate_calls "$build/vmlinux" > "$tmp/calibrate.calls"
+grep -qx reset_control_assert "$tmp/calibrate.calls" ||
+	die "no qmp_ufs_phy_calibrate() calling reset_control_assert() in $build/vmlinux"
+! grep -qx of_machine_compatible_match "$tmp/calibrate.calls" ||
+	die "qmp_ufs_phy_calibrate() in $build/vmlinux still asks of_machine_compatible_match(): the board gate"
+gate_check="qmp_ufs_phy_calibrate() in vmlinux (build ID ${new_id:0:12}) calls no of_machine_compatible_match()"
+if [ -n "${HANG_SCRATCH:-}" ]; then
+	[ -f "$HANG_SCRATCH/linux-gts9wifi/vmlinux" ] || die "no vmlinux in $HANG_SCRATCH"
+	[ "$(notes_build_id "$HANG_SCRATCH/linux-gts9wifi/vmlinux")" = "$hang_build_id" ] ||
+		die "self-test failed: $HANG_SCRATCH/linux-gts9wifi/vmlinux is not the hang-log kernel's"
+	calibrate_calls "$HANG_SCRATCH/linux-gts9wifi/vmlinux" > "$tmp/calibrate.hang.calls"
+	grep -qx of_machine_compatible_match "$tmp/calibrate.hang.calls" ||
+		die 'self-test failed: the hang-log calibration does not show the board gate either'
+	gate_check="$gate_check; the hang-log build's does"
+fi
+echo "UFS PHY: $gate_check"
 
 # 6. The module key and the modules.  The serial is what modinfo reports as
 # sig_key; the subject key ID is what the kernel logs and the registry files
@@ -370,8 +458,10 @@ tar --owner=0 --group=0 -C "$out/modules-root" -cf "$kit/modules-$release.tar" "
 printf '%s\n' "$new_id" > "$kit/BUILD_ID"
 printf '%s\n' "$key_id" > "$kit/KEY_ID"
 printf '%s\n' "$serial" > "$kit/SIGNER"
+printf '%s\n' "$revision" > "$kit/REVISION"
 # What was built: this checkout, and whether it had uncommitted changes.
 {
+	echo "revision: $revision"
 	echo "checkout: $(git -C "$repo" rev-parse HEAD) ($(git -C "$repo" describe --always --dirty --abbrev=12))"
 	echo "uncommitted kernel inputs (git status --porcelain kernel scripts):"
 	git -C "$repo" status --porcelain -- kernel scripts | sed 's/^/  /'
@@ -379,11 +469,14 @@ printf '%s\n' "$serial" > "$kit/SIGNER"
 	for p in "${patches[@]}"; do
 		echo "kernel/patches/$p $(sha "$repo/kernel/patches/$p")"
 	done
+	echo "scripts/stage-ufs-resume-experiment.sh $(sha "$repo/scripts/stage-ufs-resume-experiment.sh")"
 	echo "source check: $source_check"
 	echo "power domain table: $gdsc_check"
+	echo "UFS PHY board gate: $gate_check"
 } > "$kit/SOURCE"
-install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/README.md" "$kit/"
-files=(boot.img "modules-$release.tar" BUILD_ID KEY_ID SIGNER SOURCE
-	install.sh rollback.sh verify.sh README.md)
+install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/sleep-test.sh" \
+	"$here/README.md" "$kit/"
+files=(boot.img "modules-$release.tar" BUILD_ID KEY_ID SIGNER REVISION SOURCE
+	install.sh rollback.sh verify.sh sleep-test.sh README.md)
 (cd "$kit" && sha256sum "${files[@]}" > SHA256SUMS)
 cat "$kit/SHA256SUMS"

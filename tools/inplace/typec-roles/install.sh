@@ -4,9 +4,10 @@
 # host role itself before discovery, Try.SNK waits long enough for the SM5714
 # to report a source, and three fixes for a swap asked for from userspace),
 # with the USB power domains kept in retention across suspend and with a NULL
-# check in the dwc3-qcom glue, in boot, and its module tree.  The DTB and the
-# configuration are the hang-log kit's, so vendor_boot is checked but not
-# written.
+# check in the dwc3-qcom glue, and since revision 8 with the UFS PHY's PCS
+# reset before every calibration on this tablet too, and its diagnostic, in
+# boot, and its module tree.  The DTB and the configuration are the hang-log
+# kit's, so vendor_boot is checked but not written.
 #
 #   sudo sh ~/typec-roles/install.sh      then reboot
 #   sudo sh ~/typec-roles/rollback.sh     back to the hang-log kit, then reboot

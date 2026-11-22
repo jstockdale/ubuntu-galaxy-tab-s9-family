@@ -31,6 +31,9 @@ fingerprint_touch=${FINGERPRINT_TOUCH_FOD:-$enable_fingerprint}
 fingerprint_sensor=${FINGERPRINT_EL721:-$enable_fingerprint}
 qtee_admin_null_credentials=${QCOMTEE_ADMIN_NULL_CREDENTIALS:-0}
 enable_gunyah_cma=${ENABLE_GUNYAH_CMA:-0}
+# Diagnostic only, never in a release: see qmp-ufs-pcs-state-diagnostic.patch
+# below.
+apply_qmp_ufs_diagnostic=${APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC:-0}
 
 validate_bool() {
 	case "$2" in
@@ -45,6 +48,14 @@ validate_bool FINGERPRINT_TOUCH_FOD "$fingerprint_touch"
 validate_bool FINGERPRINT_EL721 "$fingerprint_sensor"
 validate_bool QCOMTEE_ADMIN_NULL_CREDENTIALS "$qtee_admin_null_credentials"
 validate_bool ENABLE_GUNYAH_CMA "$enable_gunyah_cma"
+validate_bool APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC "$apply_qmp_ufs_diagnostic"
+# The diagnostic is for the PHY with the PCS reset of
+# stage-ufs-resume-experiment.sh: it tells what a failure with that reset in
+# place looks like.  Refused here, before the tree is touched.
+if [ "$apply_qmp_ufs_diagnostic" = 1 ] && [ "${UFS_PCS_RESET_EXPERIMENTAL:-1}" != 1 ]; then
+	echo 'APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 needs the PCS reset (UFS_PCS_RESET_EXPERIMENTAL=1)' >&2
+	exit 1
+fi
 
 # Linux 7.2 requires Clang >= 17.  Prefer the versioned LLVM toolchain when it
 # is installed (the imported baseline was generated with LLVM 22), while still
@@ -248,6 +259,30 @@ apply_unless 'static void qmp_ufs_tx_pull_down_ctrl' \
 	drivers/phy/qualcomm/phy-qcom-qmp-ufs.c \
 	qmp-ufs-reset-serdes-before-power-down-gts9u.patch
 bash "$repo/scripts/stage-ufs-resume-experiment.sh" "$kernel_tree"
+# qmp-ufs-pcs-state-diagnostic.patch is deliberately NOT applied by default,
+# like ignore-console-null.patch above.  It logs the PCS and SerDes state of
+# the SM8550 UFS PHY at every calibration, and after a PCS_READY timeout the
+# state it left and whether PCS_READY came within 1 s; it only reads.  It is
+# for test builds that have to tell from one failed sleep what to try next:
+# set APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 (the SM-X710's Type-C roles kit,
+# revision 8).  It goes on top of the PCS reset staged just above, strictly.
+# Unlike the console patch, a tree that carries it is refused for a default
+# build, so that a release built in a reused test tree cannot ship it.
+qmp_ufs_source=$kernel_tree/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+qmp_ufs_diagnostic_marker='Diagnostic for SM8550 resume tests, not for release builds'
+if [ "$apply_qmp_ufs_diagnostic" = 1 ]; then
+	if grep -q "$qmp_ufs_diagnostic_marker" "$qmp_ufs_source"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/qmp-ufs-pcs-state-diagnostic.patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/qmp-ufs-pcs-state-diagnostic.patch"
+	fi
+elif grep -q "$qmp_ufs_diagnostic_marker" "$qmp_ufs_source"; then
+	echo 'The UFS PHY diagnostic remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a default build.' >&2
+	exit 1
+fi
 # genpd drops performance votes on runtime suspend only.  The UFS host is
 # runtime-active at every SM8550 system suspend and dwc3 never runtime
 # suspends, so both kept their CX votes through the sleep once the GCC GDSCs
