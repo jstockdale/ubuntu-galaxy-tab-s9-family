@@ -361,11 +361,16 @@ runtime suspend keeps the link in hibernate (`rpm_lvl` 3) and does not
 recalibrate. So a boot logs two or three entry lines, and each sleep one
 more. The entry line is at KERN_DEBUG, which no console prints, not even
 with the `loglevel=7` of the kits' command lines; the others are at
-KERN_WARNING, which a console prints only before Ubuntu sets the console
-loglevel to 4 early in boot, and only after a timeout. That matters because
-each console line costs 0.1 to 0.25 s with interrupts off on the SM-X710
-(see the [hang-log kit](../tools/inplace/hang-log/README.md)). `dmesg` and
-`journalctl -k` show all of them.
+KERN_WARNING, logged only after a timeout, which a console prints only with
+a console loglevel above 4. Ubuntu sets 4 early in boot. squirtle runs 5:
+it still has the hang-log kit's first `/etc/sysctl.d/60-gts9u-hang-log.conf`
+(`kernel.printk = 5 4 1 7`, read 2026-11-22), as it did in the failing
+sleep. That matters because each console line costs 0.1 to 0.25 s with
+interrupts off on the SM-X710 (see the
+[hang-log kit](../tools/inplace/hang-log/README.md)): a resume there whose
+15 calibrations all fail prints about 45 more lines, 5 to 11 s, and the time
+the diagnostic reports for a late PCS_READY includes the line before its
+poll. `dmesg` and `journalctl -k` show all of them.
 
 The source compiled with the recorded flags of both kit builds (the
 SM-X710's and the SM-X910's), without a warning; the test script runs its
