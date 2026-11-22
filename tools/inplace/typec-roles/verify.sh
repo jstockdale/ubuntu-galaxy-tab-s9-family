@@ -364,7 +364,9 @@ esac
 echo "kernel: $(uname -v)"
 id=$(build_id)
 want=$(cat "$kit/BUILD_ID" 2>/dev/null)
-[ -n "$want" ] && [ "$id" = "$want" ] && ok "running the kit's kernel (build ID $(echo "$id" | cut -c1-12))" ||
+rev=$(cat "$kit/REVISION" 2>/dev/null)
+[ -n "$want" ] && [ "$id" = "$want" ] &&
+	ok "running the kit's kernel (build ID $(echo "$id" | cut -c1-12)${rev:+, revision $rev})" ||
 	bad "build ID $id, the kit's is ${want:-unknown}"
 # ext4 that gave up on a failing disk keeps "rw" among its options and adds
 # emergency_ro or shutdown: that root takes no write.
@@ -420,6 +422,32 @@ if [ -n "$k" ]; then
 	[ "$n" = 0 ] && ok 'no module was refused, and no symbol failures this boot' ||
 		{ bad 'modules refused or symbol failures this boot:'
 		  printf '%s\n' "$k" | grep -iE "$modfail" | tail -10; }
+fi
+
+# The UFS PHY (revision 8).  The PCS reset before each calibration leaves no
+# trace of its own in the log.  The diagnostic built into the kit's kernel
+# logs a line at every calibration, from inside the function that now resets
+# the PCS on every SM8550 PHY: on the kit's kernel those lines are what can
+# be seen of the change, and make-kit.sh checked on the build that this
+# calibration has no board check.  On any other kernel nothing tells.
+ufs_fail='phy initialization timed-out|Failed to calibrate PHY|Enabling the controller failed|Host init failed|ufshcd_wl_resume failed'
+ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET'
+if [ -n "$k" ]; then
+	cal=$(printf '%s\n' "$k" | grep -c 'calibration entry: SW_RESET')
+	n=$(printf '%s\n' "$k" | grep -cE "$ufs_fail")
+	if [ "$n" != 0 ]; then
+		bad "the UFS PHY or host failed to come up this boot ($n lines; the diagnostic's lines follow theirs):"
+		printf '%s\n' "$k" | grep -E "$ufs_fail|$ufs_diag" | tail -12
+	elif [ "$cal" != 0 ]; then
+		ok "UFS PHY: $cal calibrations this boot, each logged by the diagnostic of the kit's kernel, none failed"
+		note "last calibration: $(printf '%s\n' "$k" | grep 'calibration entry: SW_RESET' | tail -n 1 |
+			sed 's/.*calibration entry: //')"
+	elif [ -n "$want" ] && [ "$id" = "$want" ]; then
+		bad "no UFS PHY calibration line this boot: the kit's kernel logs one at every calibration" \
+			"(the kernel's own log: sudo dmesg | grep 'calibration entry')"
+	else
+		note 'the running kernel is not the kit'"'"'s: whether it resets the UFS PHY'"'"'s PCS before calibration cannot be seen from userspace'
+	fi
 fi
 
 [ -d "$port" ] && ok "Type-C port registered: data $(role data_role), power $(role power_role)," \

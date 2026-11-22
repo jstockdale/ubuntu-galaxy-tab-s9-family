@@ -49,6 +49,8 @@ MODULES = ("modules.dep", "kernel/net/a.ko", "updates/b.ko")
 TCPM_DIR = "drivers/usb/typec/tcpm"
 GCC = "drivers/clk/qcom/gcc-sm8550"
 DWC3 = "drivers/usb/dwc3/dwc3-qcom"
+QMP = "drivers/phy/qualcomm/phy-qcom-qmp-ufs"
+PCS_PATCH = "qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch"
 
 PREFIXES = (
     "/dev/disk/by-partlabel/", "/usr/lib/modules/", "/var/backups", "/var/log/", "/run/",
@@ -2114,6 +2116,190 @@ class VerifyTest(FakeTablet):
         self.assertIn("FAIL sm5714_usbpd.try_snk_extra_wait_ms is 0, expected 600", result.stdout)
 
 
+# llvm-objdump --no-show-raw-insn of qmp_ufs_phy_calibrate in a vmlinux, as
+# the release's shows it (abridged): the board gate is the call of
+# of_machine_compatible_match.
+CALIBRATE_RELEASE = """
+vmlinux:\tfile format elf64-littleaarch64
+
+Disassembly of section .text:
+
+ffff800080964020 <qmp_ufs_phy_calibrate>:
+ffff800080964020:      \tbti\tc
+ffff800080964064:      \tbl\t0xffff800080cbcf30 <reset_control_assert>
+ffff800080964068:      \tcbnz\tw0, 0xffff800080964280 <qmp_ufs_phy_calibrate+0x260>
+ffff80008096408c:      \tbl\t0xffff800081578e48 <of_machine_compatible_match>
+ffff8000809640d4:      \tbl\t0xffff8000809642cc <qmp_ufs_init_all>
+ffff800080964170:      \tbl\t0xffff800080cbd1e4 <reset_control_deassert>
+ffff8000809642bc:      \tbl\t0xffff80008002bdbc <_dev_err>
+ffff8000809642c8:      \tbl\t0xffff800081b71520 <__stack_chk_fail>
+"""
+# The new one, without the gate.
+CALIBRATE_NEW = CALIBRATE_RELEASE.replace(
+    "ffff80008096408c:      \tbl\t0xffff800081578e48 <of_machine_compatible_match>\n", "")
+
+
+class UfsGateTest(unittest.TestCase):
+    """make-kit.sh's checks of the UFS PHY driver, which the build changes
+    since 2026-11-22: the PCS reset whole in the build tree's file, neither
+    the release's SM-X910-only form nor the SM-X710 kit's diagnostic there,
+    the tree comparison replaying the stage script on the release tree's
+    file, and the disassembly of the calibration in vmlinux, which tells the
+    new code (no board check) from the release's."""
+
+    text = (KIT_SRC / "make-kit.sh").read_text()
+
+    def gate(self, vmlinux, new_id, base=None):
+        """Section 5b on stand-in vmlinux files: an "id=" line (what
+        llvm-objcopy gives as .notes) and the disassembly (what llvm-objdump
+        gives)."""
+        build_id = re.search(r"^build_id\(\) \{.*?^\}\n", self.text, re.M | re.S).group(0)
+        section = re.search(r"^notes_build_id\(\) \{.*?^echo \"UFS PHY: \$gate_check\"\n", self.text,
+                            re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            bin_ = tmp / "bin"
+            bin_.mkdir()
+            (bin_ / "llvm-objcopy").write_text(
+                '#!/bin/sh\nfor last; do :; done\nid=$(sed -n "s/^id=//p" "$4")\n'
+                'printf "040000001400000003000000474e5500%s" "$id" | xxd -r -p > "$last"\n')
+            (bin_ / "llvm-objdump").write_text('#!/bin/sh\nfor last; do :; done\nsed "/^id=/d" "$last"\n')
+            for stub in bin_.iterdir():
+                stub.chmod(0o755)
+            (tmp / "build").mkdir()
+            (tmp / "build/vmlinux").write_text(f"id={vmlinux[0]}\n{vmlinux[1]}")
+            env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}")
+            prefix = (f'set -euo pipefail; export LC_ALL=C\ndie() {{ echo "$*" >&2; exit 1; }}\n'
+                      f'build={tmp}/build tmp={tmp} new_id={new_id} base_build_id={BASE_BUILD_ID}\n')
+            if base:
+                (tmp / "base/linux-gts9uwifi").mkdir(parents=True)
+                (tmp / "base/linux-gts9uwifi/vmlinux").write_text(f"id={base[0]}\n{base[1]}")
+                prefix += f"BASE_SCRATCH={tmp}/base\n"
+            result = subprocess.run(["bash", "-c", prefix + build_id + section], capture_output=True,
+                                    text=True, env=env)
+            return result.returncode, result.stdout + result.stderr
+
+    def test_the_new_calibration_passes_and_the_release_s_does_not(self):
+        new = "1" * 40
+        self.assertEqual(self.gate((new, CALIBRATE_NEW), new),
+                         (0, f"UFS PHY: qmp_ufs_phy_calibrate() in vmlinux (build ID {new[:12]}) calls no "
+                             "of_machine_compatible_match()\n"))
+        self.assertEqual(self.gate((new, CALIBRATE_NEW), new, base=(BASE_BUILD_ID, CALIBRATE_RELEASE)),
+                         (0, f"UFS PHY: qmp_ufs_phy_calibrate() in vmlinux (build ID {new[:12]}) calls no "
+                             "of_machine_compatible_match(); the release build's does\n"))
+        for name, args, message in (
+                ("the release's calibration", ((new, CALIBRATE_RELEASE), new),
+                 "still asks of_machine_compatible_match(): the board gate"),
+                ("no such function", ((new, "Disassembly of section .text:\n"), new),
+                 "no qmp_ufs_phy_calibrate() calling reset_control_assert()"),
+                ("another build's vmlinux", (("2" * 40, CALIBRATE_NEW), new),
+                 "is not the ELF of the new image (another build ID)"),
+                ("a release vmlinux without the gate", ((new, CALIBRATE_NEW), new, (BASE_BUILD_ID, CALIBRATE_NEW)),
+                 "self-test failed: the release calibration does not show the board gate either"),
+                ("another release vmlinux", ((new, CALIBRATE_NEW), new, ("3" * 40, CALIBRATE_RELEASE)),
+                 "is not the release kernel's")):
+            with self.subTest(name):
+                code, out = self.gate(*args)
+                self.assertEqual(code, 1, out)
+                self.assertIn(message, out)
+
+    def flows(self, tmp):
+        """The UFS PHY driver as builds leave it: the release's (SERDES, then
+        the SM-X910-only reset), the new one (SERDES, the stage script), the
+        SM-X710 kit's (the new one and the diagnostic), and the new one with
+        the old form's marker left in a comment."""
+        source = subprocess.run(["git", "-C", str(kernel_source()), "show",
+                                 f"HEAD:{QMP}.c"], check=True, capture_output=True, text=True).stdout
+        legacy = re.search(r"<<'LEGACY_PCS_RESET'\n(.*?\n)LEGACY_PCS_RESET\n",
+                           (REPO / "scripts/stage-ufs-resume-experiment.sh").read_text(), re.S).group(1)
+        trees = {}
+        for name in ("release", "new", "diagnostic", "stale-marker"):
+            root = tmp / name
+            (root / QMP).parent.mkdir(parents=True)
+            (root / f"{QMP}.c").write_text(source)
+            subprocess.run(["patch", "-s", "-d", str(root), "-p1"],
+                           input=(REPO / "kernel/patches/qmp-ufs-reset-serdes-before-power-down-gts9u.patch")
+                           .read_text(), check=True, text=True)
+            if name == "release":
+                subprocess.run(["patch", "-s", "--fuzz=0", "-d", str(root), "-p1"], input=legacy,
+                               check=True, text=True)
+            else:
+                subprocess.run(["bash", str(REPO / "scripts/stage-ufs-resume-experiment.sh"), str(root)],
+                               check=True, capture_output=True)
+            if name == "diagnostic":
+                subprocess.run(["patch", "-s", "--fuzz=0", "-d", str(root), "-p1"],
+                               input=(REPO / "kernel/patches/qmp-ufs-pcs-state-diagnostic.patch").read_text(),
+                               check=True, text=True)
+            if name == "stale-marker":
+                with (root / f"{QMP}.c").open("a") as source_file:
+                    source_file.write("/* SM-X910 experiment: assert PCS reset before calibration tables. */\n")
+            trees[name] = root
+        return trees
+
+    def defined(self):
+        """make-kit.sh's own definitions of the names the checks use."""
+        return "".join(re.search(rf"^{name}=.*\n", self.text, re.M).group(0)
+                       for name in ("qmp", "pcs_patch", "pcs_legacy_marker", "qmp_diag_marker"))
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_build_tree_has_to_carry_the_pcs_reset_whole_and_nothing_else(self):
+        start = self.text.index('mkdir -p "$tmp/ufs/${qmp%/*}"')
+        end = self.text.index("or the UFS PHY diagnostic\"\n") + len("or the UFS PHY diagnostic\"\n")
+        check = self.text[start:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            trees = self.flows(tmp)
+            for name, message in (("new", None),
+                                  ("release", f"does not carry {PCS_PATCH} whole"),
+                                  ("diagnostic", "carries the SM-X910-only PCS reset or the UFS PHY diagnostic"),
+                                  ("stale-marker", "carries the SM-X910-only PCS reset or the UFS PHY diagnostic")):
+                with self.subTest(name):
+                    work = tmp / f"work-{name}"
+                    work.mkdir()
+                    result = subprocess.run(
+                        ["bash", "-c", 'set -euo pipefail\ndie() { echo "$*" >&2; exit 1; }\n'
+                         f'tree={trees[name]} tmp={work} repo={REPO}\n' + self.defined() + check],
+                        capture_output=True, text=True)
+                    if message is None:
+                        self.assertEqual((result.returncode, result.stderr), (0, ""))
+                    else:
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn(message, result.stderr)
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_tree_comparison_replays_the_stage_script_on_the_release_tree_s_file(self):
+        start = self.text.index("\t# The UFS PHY driver as the build changes it: the release build gave the")
+        end = self.text.index("with this checkout's stage script run on it\"\n", start) + len(
+            "with this checkout's stage script run on it\"\n")
+        replay = self.text[start:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            trees = self.flows(tmp)
+            for name, base, tree, message in (
+                    ("the release tree and a default build", "release", "new", None),
+                    ("a base tree with the new reset", "new", "new",
+                     "is not the one with the SM-X910-only PCS reset"),
+                    ("a base tree with the diagnostic", "diagnostic", "diagnostic",
+                     "is not the one with the SM-X910-only PCS reset"),
+                    ("a build tree with the diagnostic", "release", "diagnostic",
+                     "is not the release tree's with this checkout's stage script run on it")):
+                with self.subTest(name):
+                    work = tmp / f"replay-{base}-{tree}"
+                    (work / "src").mkdir(parents=True)
+                    result = subprocess.run(
+                        ["bash", "-c", 'set -euo pipefail\ndie() { echo "$*" >&2; exit 1; }\n'
+                         f'base_tree={trees[base]} tree={trees[tree]} tmp={work} repo={REPO}\n'
+                         + self.defined() + replay],
+                        capture_output=True, text=True)
+                    if message is None:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual((work / "src" / f"{QMP}.c").read_text(),
+                                         (trees["new"] / f"{QMP}.c").read_text())
+                    else:
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn(message, result.stderr)
+
+
 class ScriptsTest(unittest.TestCase):
     def test_scripts_parse(self):
         for name, shell in (("install.sh", "sh"), ("rollback.sh", "sh"), ("verify.sh", "sh"),
@@ -2186,13 +2372,14 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn("\ndwc3=drivers/usb/dwc3/dwc3-qcom\n", text)
 
     def test_every_changed_source_is_required_dated_and_compared(self):
-        """The kit's changes to the kernel tree are the patched files and the
-        driver.  Each source is required, its object is dated against it,
-        and with BASE_SCRATCH each is what may differ from the release tree.
-        The dwc3-qcom guard adds no string to the image: the marker in the
-        build tree's source and the date of its object are its proof."""
+        """The kit's changes to the kernel tree are the patched files, the
+        driver and the UFS PHY driver, which the stage script changes.  Each
+        source is required, its object is dated against it, and with
+        BASE_SCRATCH each is what may differ from the release tree.  The
+        dwc3-qcom guard adds no string to the image: the marker in the build
+        tree's source and the date of its object are its proof."""
         text = (KIT_SRC / "make-kit.sh").read_text()
-        names = {"tcpm_dir": TCPM_DIR, "gcc": GCC, "dwc3": DWC3}
+        names = {"tcpm_dir": TCPM_DIR, "gcc": GCC, "dwc3": DWC3, "qmp": QMP}
 
         def expand(word):
             return re.sub(r"\$\{?(\w+)\}?", lambda match: names[match.group(1)], word)
@@ -2200,15 +2387,17 @@ class ScriptsTest(unittest.TestCase):
         patched = [expand(word) for word in shlex.split(
             re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1))]
         driver = f"{TCPM_DIR}/sm5714_usbpd.c"
+        staged = f"{QMP}.c"
         want = re.search(r'^\tsort > "\$tmp/trees\.want" <<EOF\n(.*?)^EOF$', text, re.M | re.S)
         self.assertEqual(sorted(expand(word) for word in want.group(1).split()),
-                         sorted(patched + [driver]))
+                         sorted(patched + [driver, staged]))
         objects = [expand(pair) for pair in shlex.split(
             re.search(r"^objects=\((.*?)\)$", text, re.M | re.S).group(1))]
         required = text[text.index('for f in "$mkbootimg"'):]
         required = required[:required.index("; do\n")]
         self.assertIn('"${patched[@]/#/$tree/}"', required)
-        for source in patched + [driver]:
+        self.assertIn('"$tree/$qmp.c"', required)
+        for source in patched + [driver, staged]:
             if source.endswith(".c"):
                 with self.subTest(source):
                     self.assertIn(f"{source[:-2]}.o:{source}", objects)
@@ -2218,7 +2407,11 @@ class ScriptsTest(unittest.TestCase):
                     self.assertIn(f'"$build/{obj}"', required)
         self.assertIn("grep -q 'no hcd and no root hub' \"$tree/$dwc3.c\" ||\n"
                       "\tdie 'the build tree does not carry the dwc3-qcom guard'", text)
-        self.assertNotIn("llvm-objdump", text)
+        # One disassembly, of the UFS PHY's calibration (UfsGateTest).
+        self.assertEqual(re.findall(r"^.*llvm-objdump.*$", text, re.M), [
+            "for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git "
+            "llvm-objcopy llvm-objdump; do",
+            "\tllvm-objdump -d --no-show-raw-insn --disassemble-symbols=qmp_ufs_phy_calibrate \"$1\" |"])
 
     def test_the_stopgap_is_the_same_service_everywhere(self):
         self.assertEqual(constant("install.sh", "stopgap"), "typec-sink-host.service")
@@ -2461,6 +2654,7 @@ class ScriptsTest(unittest.TestCase):
         files = {f"tree/{GCC}.c": 100, f"tree/{TCPM_DIR}/tcpm.c": 100,
                  f"tree/{TCPM_DIR}/sm5714_usbpd.c": 100, "tree/include/linux/usb/tcpm.h": 100,
                  f"tree/{DWC3}.c": 100, f"build/{DWC3}.o": 200,
+                 f"tree/{QMP}.c": 100, f"build/{QMP}.o": 200,
                  f"build/{GCC}.o": 200, f"build/{TCPM_DIR}/tcpm.o": 200,
                  f"build/{TCPM_DIR}/sm5714_usbpd.o": 200, "build/vmlinux": 300,
                  "build/arch/arm64/boot/Image.gz": 400, "out/Image.gz": 400}
@@ -2475,7 +2669,8 @@ class ScriptsTest(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-c", 'set -euo pipefail; export LC_ALL=C\n'
                  'die() { echo "$*" >&2; exit 1; }\ntree=$1/tree build=$1/build out=$1/out\n'
-                 f'tcpm_dir={TCPM_DIR}\ngcc={GCC}\ndwc3={DWC3}\n' + objects.group(0) + "\n" + gate.group(0),
+                 f'tcpm_dir={TCPM_DIR}\ngcc={GCC}\ndwc3={DWC3}\nqmp={QMP}\n' + objects.group(0) + "\n"
+                 + gate.group(0),
                  "gate", tmp], capture_output=True, text=True)
             return result.returncode, result.stdout, result.stderr.replace(tmp, "TMP")
 
@@ -2494,6 +2689,10 @@ class ScriptsTest(unittest.TestCase):
             "gcc-sm8550.c changed since": ({f"tree/{GCC}.c": 250}, stale % (GCC, GCC + ".c")),
             "dwc3-qcom.c changed since": ({f"tree/{DWC3}.c": 250}, stale % (DWC3, DWC3 + ".c")),
             "no dwc3-qcom object": ({f"build/{DWC3}.o": None}, stale % (DWC3, DWC3 + ".c")),
+            # The UFS PHY driver, which the stage script changes in a reused
+            # tree.
+            "phy-qcom-qmp-ufs.c changed since": ({f"tree/{QMP}.c": 250}, stale % (QMP, QMP + ".c")),
+            "no phy-qcom-qmp-ufs object": ({f"build/{QMP}.o": None}, stale % (QMP, QMP + ".c")),
             # The driver includes the header too.
             "the driver's object alone is old": (
                 {f"build/{driver}.o": 50, f"tree/{driver}.c": 40}, stale % (driver, header)),

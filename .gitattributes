@@ -21,3 +21,6 @@
 # with checkpatch instead of treating those markers as defects in the patch
 # container itself.
 *.patch whitespace=-blank-at-eol,-space-before-tab
+# The stage script carries the old PCS-reset hunk verbatim in a heredoc, to
+# remove it from trees prepared before 2026-11-22; same rule for its lines.
+scripts/stage-ufs-resume-experiment.sh whitespace=-blank-at-eol,-space-before-tab

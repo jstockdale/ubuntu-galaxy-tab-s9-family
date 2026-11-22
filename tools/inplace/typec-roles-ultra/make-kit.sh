@@ -6,7 +6,9 @@
 # dwc3-qcom glue (docs/usb-c-dock-roles.md), in boot, plus the build's module
 # tree, signed with its own key.  The
 # configuration and the DTB do not change, so vendor_boot stays the
-# release's.
+# release's.  Since 2026-11-22 the build also replaces the release's
+# SM-X910-only PCS reset of the UFS PHY with the same write for every SM8550
+# PHY (docs/resume-recovery.md): no change at run time on this tablet.
 #
 #   bash tools/inplace/typec-roles-ultra/make-kit.sh BUILD_SCRATCH \
 #       KERNEL_OUT_DIR BASE_KERNEL_OUT_DIR BASE_BUNDLE_DIR KIT_DIR
@@ -27,11 +29,12 @@
 # Then the changes are checked to be only the intended ones: the DTB, the
 # configuration, the fingerprint layers and the module list are the release
 # build's, the source trees differ in the three Type-C files, the clock
-# controller and the dwc3-qcom glue alone and those are what this checkout's
-# patches and driver give, the new image has the new code and the old one
-# does not, the
-# compiled power domain table differs in the two power-state masks alone, and
-# the new boot image differs only in its kernel.  Nothing is flashed.
+# controller, the dwc3-qcom glue and the UFS PHY driver alone and those are
+# what this checkout's patches, stage script and driver give, the new image
+# has the new code and the old one does not, the
+# compiled power domain table differs in the two power-state masks alone, the
+# UFS PHY's calibration in the new vmlinux no longer asks which board it runs
+# on, and the new boot image differs only in its kernel.  Nothing is flashed.
 set -euo pipefail
 export LC_ALL=C
 
@@ -55,12 +58,19 @@ dts=sm8550-samsung-gts9uwifi
 tcpm_dir=drivers/usb/typec/tcpm
 gcc=drivers/clk/qcom/gcc-sm8550
 dwc3=drivers/usb/dwc3/dwc3-qcom
+qmp=drivers/phy/qualcomm/phy-qcom-qmp-ufs
 patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
 	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch
 	tcpm-keep-queued-swap-pending.patch gcc-sm8550-usb-gdscs-retention.patch
 	dwc3-qcom-check-hcd-before-reading-port-speed.patch)
 # The files those patches change.
 patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c")
+# The UFS PHY driver: the release tree has the PCS reset in its SM-X910-only
+# form, which scripts/stage-ufs-resume-experiment.sh replaces with this
+# checkout's patch.  The diagnostic of the SM-X710's kit is not in this kit.
+pcs_patch=qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch
+pcs_legacy_marker='SM-X910 experiment: assert PCS reset before calibration tables'
+qmp_diag_marker='Diagnostic for SM8550 resume tests'
 
 # The tablet's current set: release v1.2.5 (out/bundle of 2026-11-10).
 base_boot=d09cb64ff411ca39feab17c1c4330081619df9304b6a5b974bf23ccab915bdac
@@ -88,7 +98,7 @@ new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
 	"$tcpm_dir/sm5714_usbpd.o:$tcpm_dir/sm5714_usbpd.c"
-	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h" "$dwc3.o:$dwc3.c")
+	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h" "$dwc3.o:$dwc3.c" "$qmp.o:$qmp.c")
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 die() { echo "$*" >&2; exit 1; }
@@ -98,11 +108,12 @@ for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$bundle/vendor_boot.img" "${patched[@]/#/$tree/}" \
 	"$build/.config" "$build/certs/signing_key.x509" "$build/vmlinux" \
 	"$build/$gcc.o" "$build/$tcpm_dir/tcpm.o" "$build/$tcpm_dir/sm5714_usbpd.o" "$build/$dwc3.o" \
-	"$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
-	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}"; do
+	"$tree/$qmp.c" "$build/$qmp.o" "$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
+	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}" \
+	"$repo/kernel/patches/$pcs_patch" "$repo/scripts/stage-ufs-resume-experiment.sh"; do
 	[ -f "$f" ] || die "missing: $f"
 done
-for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy; do
+for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy llvm-objdump; do
 	command -v "$t" >/dev/null || die "missing tool: $t"
 done
 [ "$(sha "$base/Image.gz")" = "$base_image" ] || die "$base is not release v1.2.5's kernel build"
@@ -169,7 +180,9 @@ echo "DTB (${base_dtb:0:12}), configuration (${base_config:0:12}) and fingerprin
 
 # 3. The sources.  The driver is this checkout's; the two TCPM files, the
 # clock controller and the dwc3-qcom glue are the release tree's with this
-# checkout's seven patches on top; nothing else in the kernel tree differs.
+# checkout's seven patches on top, and the UFS PHY driver is the release
+# tree's with its SM-X910-only PCS reset replaced by the one for every SM8550
+# PHY; nothing else in the kernel tree differs.
 cmp -s "$tree/$tcpm_dir/sm5714_usbpd.c" "$repo/kernel/drivers/sm5714_usbpd.c" ||
 	die "the build tree's sm5714_usbpd.c is not this checkout's"
 grep -q 'request_dfp_as_sink' "$tree/include/linux/usb/tcpm.h" &&
@@ -201,6 +214,17 @@ grep -q 'Retention across system suspend, as on sm8650' "$tree/$gcc.c" ||
 # The guard adds no string to the image; its comment is the marker.
 grep -q 'no hcd and no root hub' "$tree/$dwc3.c" ||
 	die 'the build tree does not carry the dwc3-qcom guard'
+# The UFS PHY: the PCS reset is in the build tree's file, whole (it comes out
+# again with no fuzz), and neither its SM-X910-only form nor the diagnostic
+# is.  --force, not --batch: given a patch that is not in the tree but would
+# go in, patch --reverse --batch applies it forward.
+mkdir -p "$tmp/ufs/${qmp%/*}"
+cp "$tree/$qmp.c" "$tmp/ufs/$qmp.c"
+patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/ufs" -p1 \
+	< "$repo/kernel/patches/$pcs_patch" ||
+	die "the build tree's $qmp.c does not carry $pcs_patch whole"
+! grep -q -e "$pcs_legacy_marker" -e "$qmp_diag_marker" "$tree/$qmp.c" ||
+	die "the build tree's $qmp.c carries the SM-X910-only PCS reset or the UFS PHY diagnostic"
 source_check='marker lines only (BASE_SCRATCH not set)'
 if [ -n "${BASE_SCRATCH:-}" ]; then
 	base_tree=$BASE_SCRATCH/linux-src-gts9uwifi
@@ -217,6 +241,20 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 		cmp -s "$tmp/src/$f" "$tree/$f" ||
 			die "$f is not the release tree's with this checkout's patches applied"
 	done
+	# The UFS PHY driver as the build changes it: the release build gave the
+	# PCS reset to the SM-X910 alone, and this checkout's stage script
+	# replaces that form.
+	[ -f "$base_tree/$qmp.c" ] || die "no $qmp.c in $base_tree"
+	grep -q "$pcs_legacy_marker" "$base_tree/$qmp.c" &&
+		! grep -q "$qmp_diag_marker" "$base_tree/$qmp.c" ||
+		die "the release tree's $qmp.c is not the one with the SM-X910-only PCS reset"
+	mkdir -p "$tmp/src/${qmp%/*}"
+	cp "$base_tree/$qmp.c" "$tmp/src/$qmp.c"
+	UFS_PCS_RESET_EXPERIMENTAL=1 bash "$repo/scripts/stage-ufs-resume-experiment.sh" "$tmp/src" \
+		> "$tmp/stage-ufs.log" ||
+		die "scripts/stage-ufs-resume-experiment.sh does not take the release tree's $qmp.c"
+	cmp -s "$tmp/src/$qmp.c" "$tree/$qmp.c" ||
+		die "$qmp.c is not the release tree's with this checkout's stage script run on it"
 	# The isolated M= module builds leave their products next to the
 	# sources (net/netfilter, ath12k, ...), and those differ with every
 	# build: they are signed with the build's own key.
@@ -241,23 +279,24 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 	sort > "$tmp/trees.want" <<EOF
 $gcc.c
 $dwc3.c
+$qmp.c
 $tcpm_dir/sm5714_usbpd.c
 $tcpm_dir/tcpm.c
 include/linux/usb/tcpm.h
 EOF
 	cmp -s "$tmp/trees.changed" "$tmp/trees.want" || {
-		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c and dwc3-qcom.c:' >&2
+		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c, dwc3-qcom.c and phy-qcom-qmp-ufs.c:' >&2
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $base_tree: five files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches"
-	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c differ from the release tree, by exactly this checkout'"'"'s changes'
+	source_check="compared with $base_tree: six files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, phy-qcom-qmp-ufs.c by its stage script"
+	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c and phy-qcom-qmp-ufs.c differ from the release tree, by exactly this checkout'"'"'s changes'
 	if [ -n "$backups" ]; then
 		source_check="$source_check; passed over, a copy of the release tree's file that patch(1) kept:$backups"
 		echo "sources: passed over$backups, the release tree's file as patch(1) kept it"
 	fi
 else
-	echo 'sources: the seven patches and this checkout'"'"'s driver are in the build tree (BASE_SCRATCH not set: no tree comparison)'
+	echo 'sources: the seven patches, the PCS reset and this checkout'"'"'s driver are in the build tree (BASE_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.
@@ -309,6 +348,43 @@ build_id() {
 new_id=$(build_id "$tmp/new.Image")
 [ ${#new_id} = 40 ] && [ "$new_id" != "$base_build_id" ] || die 'no new build ID in the new image'
 echo "build IDs: release ${base_build_id:0:12}, new ${new_id:0:12}"
+
+# 5b. The UFS PHY's board gate, which the calibration may no longer have.
+# The release's asked of_machine_is_compatible("samsung,gts9uwifi"), an
+# inline that calls of_machine_compatible_match(), before the PCS reset; it
+# was true here, so the reset ran, and now it goes to every SM8550 PHY.  No
+# string in the image tells the two apart ("samsung,gts9uwifi" is there for
+# other code), so vmlinux is disassembled: the ELF the image was made from,
+# which its build ID ties to the image.  Its qmp_ufs_phy_calibrate() must
+# call reset_control_assert(), which shows the function was found, and must
+# not call of_machine_compatible_match().  With BASE_SCRATCH the release
+# build's vmlinux, whose calibration has the gate, must show that call.
+notes_build_id() { # VMLINUX: the build ID of its .notes
+	llvm-objcopy -O binary --only-section=.notes "$1" "$tmp/notes.bin" &&
+		build_id "$tmp/notes.bin"
+}
+calibrate_calls() { # VMLINUX: what qmp_ufs_phy_calibrate() calls, one per line
+	llvm-objdump -d --no-show-raw-insn --disassemble-symbols=qmp_ufs_phy_calibrate "$1" |
+		sed -n 's/.*[[:space:]]bl[[:space:]].*<\([A-Za-z0-9_.]*\)>$/\1/p' | sort -u
+}
+[ "$(notes_build_id "$build/vmlinux")" = "$new_id" ] ||
+	die "$build/vmlinux is not the ELF of the new image (another build ID)"
+calibrate_calls "$build/vmlinux" > "$tmp/calibrate.calls"
+grep -qx reset_control_assert "$tmp/calibrate.calls" ||
+	die "no qmp_ufs_phy_calibrate() calling reset_control_assert() in $build/vmlinux"
+! grep -qx of_machine_compatible_match "$tmp/calibrate.calls" ||
+	die "qmp_ufs_phy_calibrate() in $build/vmlinux still asks of_machine_compatible_match(): the board gate"
+gate_check="qmp_ufs_phy_calibrate() in vmlinux (build ID ${new_id:0:12}) calls no of_machine_compatible_match()"
+if [ -n "${BASE_SCRATCH:-}" ]; then
+	[ -f "$BASE_SCRATCH/linux-gts9uwifi/vmlinux" ] || die "no vmlinux in $BASE_SCRATCH"
+	[ "$(notes_build_id "$BASE_SCRATCH/linux-gts9uwifi/vmlinux")" = "$base_build_id" ] ||
+		die "self-test failed: $BASE_SCRATCH/linux-gts9uwifi/vmlinux is not the release kernel's"
+	calibrate_calls "$BASE_SCRATCH/linux-gts9uwifi/vmlinux" > "$tmp/calibrate.base.calls"
+	grep -qx of_machine_compatible_match "$tmp/calibrate.base.calls" ||
+		die 'self-test failed: the release calibration does not show the board gate either'
+	gate_check="$gate_check; the release build's does"
+fi
+echo "UFS PHY: $gate_check"
 
 # 6. The module key and the modules.  The serial is what modinfo reports as
 # sig_key; the subject key ID is what the kernel logs and the registry files
@@ -370,11 +446,13 @@ printf '%s\n' "$serial" > "$kit/SIGNER"
 	echo "uncommitted kernel inputs (git status --porcelain kernel scripts):"
 	git -C "$repo" status --porcelain -- kernel scripts | sed 's/^/  /'
 	echo "kernel/drivers/sm5714_usbpd.c $(sha "$repo/kernel/drivers/sm5714_usbpd.c")"
-	for p in "${patches[@]}"; do
+	for p in "${patches[@]}" "$pcs_patch"; do
 		echo "kernel/patches/$p $(sha "$repo/kernel/patches/$p")"
 	done
+	echo "scripts/stage-ufs-resume-experiment.sh $(sha "$repo/scripts/stage-ufs-resume-experiment.sh")"
 	echo "source check: $source_check"
 	echo "power domain table: $gdsc_check"
+	echo "UFS PHY board gate: $gate_check"
 } > "$kit/SOURCE"
 install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/README.md" "$kit/"
 files=(boot.img "modules-$release.tar" BUILD_ID KEY_ID SIGNER SOURCE

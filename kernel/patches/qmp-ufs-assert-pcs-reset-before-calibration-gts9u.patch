@@ -1,24 +1,46 @@
-Subject: [EXPERIMENTAL] phy: qcom: qmp-ufs: reset SM-X910 PCS before calibration
+Subject: phy: qcom: qmp-ufs: reset the SM8550 PCS before calibration
 
-The Kalama downstream calibration sequence asserts PCS SW_RESET before
-programming the tables. Mainline clears this reset but no longer asserts
-it on power-off. Test the missing assertion on this board only, without
-changing power-off sequencing, timeouts, tables or other PHY variants.
+The Kalama UFS PHY driver in Samsung's kernel writes UFS_PHY_SW_RESET = 1
+before the calibration tables, on the SM-X710 and the SM-X910 alike (the
+two kernels carry the same phy-qcom-ufs-qmp-v4-kalama.c).  Mainline never
+asserts the PCS reset of a PHY that has one: qmp_ufs_phy_init() returns
+before taking the external reset, and calibrate only clears SW_RESET and
+sets SERDES_START.  Nothing else writes either bit, so once the first
+calibration has run, both writes change nothing on a PCS that kept its
+registers.
 
-This is a candidate for the intermittent resume PCS_READY timeout, not a
-validated fix. Keep out of default builds until offline-root resume tests
-pass. qphy_setbits() includes a readback before subsequent table writes.
+Without it a resume ended in a PCS_READY timeout on both boards: the
+SM-X910 in a pm_test=devices cycle and in a deep suspend on 2026-09-09
+(kernel #8); the SM-X710 in its first deep sleep since rpmhpd syncs at
+boot, on 2026-11-21 (Type-C kit revision 7), where all 15 recalibrations
+of the UFS host's reset and restore timed out and the root went read-only.
+The SM-X910 has carried this assertion since kernel #10, through its
+RAM-root and normal-root deep cycles.  That the missing assertion caused
+the timeouts is probable, not proven.
+
+Assert it for every SM8550 PHY, without a board check: the PHY, its tables
+and the stock sequence are the same on both tablets.  Nothing changes at
+run time on the SM-X910, which already ran this write; its compiled
+calibration loses only the of_machine_is_compatible() call.
+qphy_setbits() reads the register back before the tables go in.
 
 --- a/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
 +++ b/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
-@@ -1964,6 +1964,12 @@ static int qmp_ufs_phy_calibrate(struct phy *phy)
+@@ -1990,6 +1990,19 @@ static int qmp_ufs_phy_calibrate(struct
  	if (ret)
  		return ret;
  
-+	/* SM-X910 experiment: assert PCS reset before calibration tables. */
-+	if (cfg == &sm8550_ufsphy_cfg &&
-+	    of_machine_is_compatible("samsung,gts9uwifi") &&
-+	    !cfg->no_pcs_sw_reset)
++	/*
++	 * SM8550: assert the PCS reset before the calibration tables, as the
++	 * Kalama driver in Samsung's kernel does on the SM-X710 and the
++	 * SM-X910 alike.  Nothing else asserts it after the first
++	 * calibration, so on a PCS that kept its registers through a power
++	 * collapse (its GDSC has RETAIN_FF_ENABLE) the clear and SERDES_START
++	 * below change nothing.  That is the probable cause of the PCS_READY
++	 * timeouts that ended a resume on both tablets.  qphy_setbits() reads
++	 * the register back before the tables go in.
++	 */
++	if (cfg == &sm8550_ufsphy_cfg && !cfg->no_pcs_sw_reset)
 +		qphy_setbits(pcs, cfg->regs[QPHY_SW_RESET], SW_RESET);
 +
  	qmp_ufs_init_registers(qmp, cfg);

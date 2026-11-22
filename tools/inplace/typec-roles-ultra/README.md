@@ -63,7 +63,13 @@ yet**, and neither has a real sleep with the dock attached.
   which lets the USB controller's glue suspend when an xHCI failed to
   start: seven patches, five of them to TCPM. In the kernel source tree five
   files differ from the release build: `tcpm.c`, `tcpm.h`, the driver,
-  `gcc-sm8550.c` and `dwc3-qcom.c`. `make-kit.sh` checks that, and that the
+  `gcc-sm8550.c` and `dwc3-qcom.c`. A kit built from this tree since
+  2026-11-22 has a sixth, `phy-qcom-qmp-ufs.c`: the build replaces the
+  release's SM-X910-only PCS reset of the UFS PHY with the same write for
+  every SM8550 PHY, which changes nothing at run time on this tablet
+  ([`docs/resume-recovery.md`](../../../docs/resume-recovery.md#sm-x710-gts9wifi)).
+  `make-kit.sh` checks all of that, that the UFS PHY's calibration in the
+  new `vmlinux` no longer asks which board it runs on, and that the
   configuration, the DTB and the fingerprint layers are byte for byte the
   release build's.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries

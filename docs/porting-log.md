@@ -9128,3 +9128,113 @@ by that build. Both Type-C roles kits say not to upgrade this package while
 they are installed.
 
 No 2.74 package has been built for a tablet, and none is installed.
+
+### The storage did not come back from a deep sleep (2026-11-22)
+
+**What failed.** On 2026-11-21 at 23:34 squirtle went into one real deep
+sleep (`sudo rtcwake -m mem -s 30`) on a powered dock, on Type-C kit
+revision 7 (kernel build ID `84c2748b5ee4…`, boot `82555513`). The USB host
+came back; the storage did not:
+- all 15 PHY calibrations of the UFS host's reset and restore timed out
+  (`phy initialization timed-out`, `Failed to calibrate PHY: -110`), and
+  five `Host init failed -5` and `ufshcd_wl_resume failed: -5` followed;
+- then 10 I/O errors on `sda`, two of them writes that ext4 reported as
+  `potential data loss`, a journal abort on `sda34` and a read-only root;
+- sysrq `b` restarted it. The kernel log is in
+  `~/ubuntu-gts9u/backups/squirtle-sleep-20261121-2334/`.
+
+These are the SM-X910's messages of 2026-09-09
+([resume-recovery.md](resume-recovery.md)).
+
+**Why this sleep.** It was the first real deep sleep on the SM-X710 with the
+interconnect floor released (at 46.81 s of that boot, `INT_MAX nodes 43 ->
+0`) and rpmhpd synced. The two real sleeps of 2026-11-06 that came back ran
+on the baseline kernel with the floor held and rpmhpd unsynced. The boot's
+own `pm_test=platform` cycle, at 22:40:48 with the floor still held,
+recalibrated the PHY without an error, as on every boot.
+
+**Probable cause.** The SM-X910's fix for those messages asserts the PCS
+reset before the calibration tables, as Samsung's Kalama driver does. It
+was gated on `samsung,gts9uwifi`: revision 7's `vmlinux` calls
+`of_machine_compatible_match()` in `qmp_ufs_phy_calibrate()` before the
+write, so squirtle never got it. Without it mainline never asserts the PCS
+reset after the first calibration, and a PCS that kept its registers through
+the sleep sees two writes that change nothing. Samsung's two kernels carry
+the same Kalama driver byte for byte. That this caused the failure is
+probable, not proven: it is one failure, on one sleep.
+
+**The fix.**
+- `qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch` loses its board
+  check: every SM8550 PHY gets the reset.
+- On the SM-X910 nothing changes at run time. Compiled with the recorded
+  flags of its Type-C kit build, the new `qmp_ufs_phy_calibrate()` differs
+  from the old one only by the board check's call, its branch and the stack
+  slot and canary that came with it.
+- `stage-ufs-resume-experiment.sh` replaces the board-gated form in an
+  incremental kit tree with the current one. The old hunk is pinned by its
+  sha256.
+- Its reverse checks now use `--force`. `patch --reverse --batch` on a
+  patch that is not in the tree but would go in says "Unreversed patch
+  detected!  Ignoring -R." and applies it forward, so the stage script's
+  dry run found a patch "already in the tree" that was not there. The
+  other scripts in this tree did not use `patch --reverse --batch`.
+
+**The diagnostic.** `qmp-ufs-pcs-state-diagnostic.patch`, applied only with
+`APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1`:
+- a KERN_DEBUG line at every SM8550 calibration with the PCS's SW_RESET,
+  START, POWER_DOWN_CONTROL and READY_STATUS and the SerDes C_READY_STATUS
+  and CMN_STATUS;
+- after a PCS_READY timeout, warning lines with the state, a poll of the
+  rest of the Kalama driver's 1 s, and the state at its end. The
+  calibration still fails;
+- it only reads. The build refuses it without the PCS reset, and refuses a
+  default build in a tree that carries it.
+
+One failed sleep then tells which next step: a longer poll, the external
+`ufsphy` reset, or the PHY's L1D supply, which the stock device tree has
+and both mainline trees do not describe. The reading guide is in
+[resume-recovery.md](resume-recovery.md#reading-the-diagnostic).
+
+**Kit revision 8** (`tools/inplace/typec-roles/`) is revision 7 plus the two
+patches, nothing else in the kernel:
+- `make-kit.sh` checks the source tree (six files differ from the hang-log
+  build, `phy-qcom-qmp-ufs.c` by the two patches), and the built `vmlinux`:
+  its build ID must be the kit's, its `qmp_ufs_phy_calibrate()` must call
+  `reset_control_assert()` and must not call `of_machine_compatible_match()`.
+  It checks the same disassembly shows the call in the hang-log `vmlinux`.
+- `install.sh` installs it over revision 7 with one command and one reboot.
+  A test builds squirtle's state as revision 7's own scripts left it
+  (revision 6 rolled back, revision 7 installed) and upgrades it.
+- `verify.sh` counts the diagnostic's entry lines, fails on a UFS failure
+  line, and says so when the running kernel is not the kit's.
+
+**`sleep-test.sh`** (`sudo sh ~/typec-roles/sleep-test.sh ro 3 30
+restart-ok`):
+- runs from a RAM root (a tmpfs with every tool, library and the loader, a
+  chroot in a mount namespace of its own), in a session of its own, so it
+  needs nothing from the disk and survives an SSH drop;
+- switches disk swap off, syncs, runs sysrq `u`, checks
+  `/proc/1/mounts` that every disk filesystem is read-only, and marks the
+  disk read-only at the block layer, so a late write is logged;
+- reads 64 MiB of `userdata` with O_DIRECT before and after each sleep and
+  compares the hashes;
+- sleeps with `rtcwake -m mem`, stops at the first failure, and labels each
+  cycle PASS, SHALLOW (no AOSS sleep, CX collapse or DDR low power in
+  qcom_stats), DEPTH-UNKNOWN or FAIL, with the floor's state on every line;
+- logs to `/run/gts9u-sleep-test/`, the kernel log and `/dev/pmsg0`, then
+  restarts: a clean reboot while the storage reads back, sysrq `b`
+  otherwise.
+
+It also runs on revision 7, for a baseline. A boot after a forced restart
+holds the floor (the loop breaker), so a run there needs `release-floor`;
+the run itself ends in a way the breaker counts as unclean.
+
+**Not done:**
+- Revision 8 is not built yet. The build, the kit and its checks come after
+  the commit.
+- Nothing of this has run on the tablet: not the reset, not the diagnostic,
+  not the sleep test. Its sysrq `u`, the block-layer read-only flag, the
+  clean reboot through `ctrl-alt-del.target` and the RAM root are tested on
+  the host with fakes only.
+- The SM-X910's kit (`typec-roles-ultra`) needs its tree comparison changed
+  for `phy-qcom-qmp-ufs.c` before it is rebuilt from this tree.
