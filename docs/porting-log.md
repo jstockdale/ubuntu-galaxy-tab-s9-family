@@ -7210,8 +7210,32 @@ sm8650 keeps them in retention;
 `kernel/patches/gcc-sm8550-usb-gdscs-retention.patch` does the same here and
 the kernel build applies it.
 
-The deadline and the power domain change are compiled into test kernels and
-have not run on a tablet yet; nothing of this has run on the SM-X710. The
-verification steps, what changes for laptops, phones and unpowered
-accessories, and what is still open are in
+A second test kernel, with the deadline and the power domain change, ran the
+same day: two boots with the Satechi attached and four plug-ins into the
+running tablet, two with each dock. All six ended with the tablet as power
+sink and USB host, and both boots kept the xHCI through the suspend cycle.
+One Satechi plug-in took the path the first revision lost: the Rp went away
+47 ms after its report, with 528 ms of the deadline left, and the lasting
+one was reported 407 ms after Rd. Over the three test kernels the tablet's
+request for the host role was accepted on each of the nine attaches whose
+log was kept, six with the Satechi and three with the Anker hub.
+
+A swap asked for from userspace, a write to the port's `data_role`, got two
+fixes of its own, for every TCPM port. `tcpm-no-dr-swap-during-vdm.patch`
+turns it down with `EAGAIN` while one of TCPM's VDM sequences is running,
+where it used to go out over the discovery message that was waiting for its
+reply (30 failures of 30 in the traces).
+`tcpm-dr-set-checks-data-role.patch` returns `EAGAIN` when the swap ended
+with the role unchanged, where the writer used to be told that it was done.
+The driver now takes its two switches as they are when a partner shows and
+keeps them until the port is empty again. A third test kernel with these
+has booted once with the Satechi attached, with the same outcome as the
+second; the two fixes and the switches have not been tried on a tablet yet.
+
+The SM-X710 has the third kernel's TCPM changes installed, without the power
+domain change. Before that, with the standard wait, the Satechi left it as
+the power source, as on the SM-X910. No dock has been plugged into it since,
+and a boot with the dock attached there will show whether it needs the power
+domain change too. The verification steps, what changes for laptops, phones
+and unpowered accessories, and what is still open are in
 [`usb-c-dock-roles.md`](usb-c-dock-roles.md).

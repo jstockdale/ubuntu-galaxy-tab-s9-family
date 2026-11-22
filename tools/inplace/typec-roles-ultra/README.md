@@ -15,7 +15,7 @@ did not get there:
   mismatch and one hard reset);
 - a dock seen as a sink first kept the tablet as power source, because
   Try.SNK gives up after 100 ms and the SM5714 reports a source later than
-  that: 123 to 147 ms after Rd in the seven attaches measured;
+  that: 123 to 147 ms after Rd in the eight attaches measured;
 - a boot with the dock attached lost its USB host controller in the suspend
   cycle the boot runs for the panel (`HC died`), and plugging the dock in
   again did not bring it back.
@@ -37,12 +37,14 @@ Satechi attached and four plug-ins into the running tablet, two with each
 dock. All six ended with the tablet as USB host and power sink, and both
 boots kept the USB host controller through the boot's suspend cycle. One of
 the two Satechi plug-ins took the path the first revision lost: the Rp went
-away after 46 ms and was back 407 ms after Rd, with 528 ms of the wait left.
+away after 47 ms and was back 407 ms after Rd, with 528 ms of the wait left.
 
 This revision adds two fixes for a data role swap asked for from userspace
 (a write to the port's `data_role`) and a driver that reads its two switches
-at each attach. **None of the three has run on a tablet yet**, and neither
-has a real sleep with the dock attached.
+at each attach. One boot with the Satechi attached has run on it and ended
+as the two before it did, the Rp going away once on the way. **The two fixes
+and the switches have not been tried on a tablet yet**, and neither has a
+real sleep with the dock attached.
 
 **What changes:**
 - **Kernel:** the release kernel rebuilt with

@@ -685,7 +685,7 @@ class WriteUpTests(unittest.TestCase):
         # After an Rp that did not stay the port waits for what is left of
         # the deadline, in steps of a jiffy (4 ms at this kernel's HZ=250).
         default = int(re.search(r"try_snk_extra_wait_ms = (\d+);", DRIVER.read_text()).group(1))
-        block = block_after(self.doc, "should now show the port")
+        block = block_after(self.doc, "going back to waiting and taking the Rp that follows")
         self.assertEqual(block[0], "state change SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS -> SNK_TRY_WAIT")
         left = [int(n) for line in block
                 for n in re.findall(r"^pending state change SNK_TRY_WAIT -> SRC_TRYWAIT @ (\d+) ms$", line)]
@@ -695,17 +695,18 @@ class WriteUpTests(unittest.TestCase):
 
     def test_it_does_not_claim_more_than_was_measured(self):
         # By hand one hub accepted the tablet's swap, twice.  With the patch
-        # both docks did, on three attaches; the write-up gives the counts
-        # and names what has not run on a tablet.
+        # both docks did, on every attach whose log was kept; the write-up
+        # gives the counts and names what has not been tried on a tablet.
         flat = " ".join(self.doc.split())
         self.assertIn("both times it was tried (the Anker hub)", flat)
-        self.assertIn("twice by the Satechi dock and once by the Anker hub", flat)
+        self.assertIn("each of the nine attaches whose log was kept, six times by the Satechi "
+                      "dock and three times by the Anker hub", flat)
         self.assertNotIn("Both docks did this on every attach", flat)
         self.assertNotIn("once per attach", flat)
-        self.assertNotIn("they have not run on a tablet yet", flat)
-        self.assertIn("**Both are compiled into test kernels and have not run on a tablet yet.**", flat)
-        self.assertIn("**This revision has not run on a tablet yet.**", flat)
-        self.assertIn("**It has not run on a tablet yet**", flat)
+        self.assertNotIn("have not run on a tablet yet", flat)
+        self.assertIn("**The two fixes and the switches have not been tried on a tablet yet.**", flat)
+        self.assertIn("**No dock has been plugged into it yet.**", flat)
+        self.assertIn("**a boot with the dock attached has not been tried there yet**", flat)
         self.assertIn("This is read from the timing; nothing has watched the CC line itself.", flat)
 
     def test_links_resolve(self):
