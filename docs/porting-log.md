@@ -9303,3 +9303,73 @@ the Wi-Fi gone until the restart. A fix would be `CONFIG_HOTPLUG_PCI_PCIE=y`
 with `pcie_port_pm=force`, or the Hot-Plug Capable bit cleared for this
 board; either one then powers the Wi-Fi off in every suspend, which
 `ath11k` has to survive at resume, and that is not looked at yet.
+
+### With the PCIe root port removed the tablet did not come back from the sleep (2026-11-22)
+
+Two runs on squirtle, kit revision 7's kernel (build ID `84c2748b5ee4`),
+undocked, on the PC's USB cable (USB in device role, SSH over `usb0`), the
+floor released by the run; the records are in `~/ubuntu-gts9u/backups/`.
+
+**12:05, the root port removed by hand** (`echo 1 >
+/sys/bus/pci/devices/0000:00:00.0/remove`, then `ro 3 30 release-floor
+hold=60 restart-ok`; `squirtle-sleep-r7-nopcie-20261122{.log,/}`). The bus
+was empty (`pci none` in the evidence), the floor was released at 5890 s and
+cycle 1 entered `rtcwake -m mem -s 30` at 5954.6 s. That marker is the last
+record. The tablet did not resume; it restarted by itself and the new kernel
+was up about 71 s after the marker. Nobody touched it. No panic record
+(`panic=10` would have left one), no Linux watchdog device on this kernel,
+no pmsg file (the script of that run wrote nothing to pmsg before a cycle's
+verdict, and an empty zone gives no file), and the console record ends at
+the marker without the `ttyMSM0: Unable to drain transmitter` line every
+earlier run has from the device suspend phase: the console never resumed.
+So the reset came from below Linux (firmware or PMIC), between the entry
+and the devices' resume. The next boot mounted the root clean
+(`errors_count` 0): the frozen, read-only root did its job.
+
+**12:56, the control: the same with the PCI devices kept**
+(`squirtle-sleep-r7-cable-control-20261122{.log,/}`). 3 of 3 cycles
+resumed, 30.8 to 31.2 s asleep, all SHALLOW (`aosd`, `cxsd`, `ddr` +0,
+`apss` +1 each), root clean afterwards. So the cable and the USB device role
+are not what stopped the 12:05 run; the removed root port is.
+
+**What the removal changes** (read from the source, nothing of it shown on
+the tablet; the whole analysis is in
+`~/ubuntu-gts9u/backups/deep-sleep-pcie-analysis-2026-11-22.md`). With the
+bus empty `dw_pcie_suspend_noirq()` takes its power-off branch for the first
+time on this port: PERST, the Wi-Fi's supplies and the PHY off, and
+`qcom_pcie_suspend_noirq()` then drops the host's bandwidth votes (the
+`pcie-mem` one is in the sleep set) and its CX level. USB in device role does
+a full `dwc3_core_exit` and drops its XO and rail votes, where the docked
+host keeps them. That sleep was therefore the first one on this port with
+nothing of PCIe or USB left in the sleep set, the first that could reach XO
+off or a CX collapse. Every wait on the PCIe path is bounded, and a link
+that fails to come back gives an error (`qcom-pcie 1c00000.pcie: PM: failed
+to resume async noirq: error -110`), not a hang. The likeliest reading is a
+stall in firmware on the way into or out of the deeper state, ended by a
+watchdog below the kernel; a kernel path that hangs with interrupts off is
+the other one. The stock system uses s2idle, so PSCI SYSTEM_SUSPEND at that
+depth may never have run on this firmware.
+
+**The options that tell the two apart**, added to `sleep-test.sh`:
+- `pci=remove` does the removal inside the run, after the root is protected,
+  refuses a bus it does not understand, and ends the run (`PCIE-DOWN`) when
+  the host's resume failed, because the next suspend would read the powered
+  down controller.
+- `pm_test=LEVEL` sets `/sys/power/pm_test` around each `rtcwake`. At `core`
+  the kernel runs the whole suspend path (devices through noirq, CPUs
+  offline, syscore, the sleep-set flush) and then busy-waits 5 s
+  (`suspend_test()` uses `mdelay` at that level), so nothing can enter a
+  low-power state: it tests the kernel path alone. At `platform` the devices
+  are suspended and the CPUs idle for the 5 s (`msleep`), so cpuidle may
+  take the SoC down without SYSTEM_SUSPEND. The verdict is `PM-TEST LEVEL`,
+  never PASS or DEEP.
+- `trace` raises the console loglevel around each sleep so the PM core's
+  lines reach the ramoops console; `trace=live` also keeps the consoles
+  running through the suspend (slow, and it may itself keep the SoC awake).
+- Progress lines go to pmsg from the start of the run, and the RESULT line
+  carries the options.
+
+**The order of the next runs** (one cycle each, a fresh boot each, on the
+cable): `pci=remove pm_test=core trace`, then `pm_test=platform`, then the
+real sleep docked (the USB host keeps XO: an intermediate depth), then the
+undocked real sleep again with `trace`.

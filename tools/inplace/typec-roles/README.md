@@ -295,6 +295,15 @@ sudo sh ~/typec-roles/sleep-test.sh ro 3 30 release-floor restart-ok   # release
 sh ~/typec-roles/sleep-test.sh status                                  # the result, no root
 ```
 
+The whole form, with the experiment options (each off unless given; below,
+"The experiment options"):
+
+```sh
+sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
+     [pci=remove] [pm_test=LEVEL] [trace|trace=live] restart-ok
+sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok
+```
+
 Each run freezes every disk filesystem and **ends with a restart of the
 tablet** (`sysrq b`), whatever happens: `restart-ok` says that is fine, and
 without it nothing is done. One exception, always before any sleep: a
@@ -373,7 +382,9 @@ In order:
    `errors=continue` until the next restart, and the line gives the command
    to put it back). A restart needs nothing put back. A filesystem mounted
    after this step (a stick after a resume) is frozen without it.
-5. It freezes every writable disk filesystem (`fsfreeze -f`, through
+5. With `pci=remove`, the PCI root ports go off the bus first, in RAM, the
+   disk still writable (below, "The experiment options"). It freezes every
+   writable disk filesystem (`fsfreeze -f`, through
    `/proc/1/root`): one on a loop device first, then the deepest mount
    first, the root last, each once. A freeze flushes the journal and
    records nothing (below). Then the UFS disk is made read-only at the block
@@ -488,7 +499,16 @@ In order:
    last 4 (a failed resume retries its calibration 15 times, up to four
    lines each, and pmsg is a small ring). The terminal and the run's log in
    `/run` have every line until the restart. The diagnostic lines do not go
-   to the kernel log, which has the driver's own.
+   to the kernel log, which has the driver's own. Every `RESULT` line ends
+   with the experiment options in force (`; options: none` without them).
+   pmsg alone also gets progress lines (`progress: ...`): the run's start
+   in RAM with its options, the PCI removal, the protection complete, and
+   right before each sleep (each attempt) the cycle it enters, with the
+   knobs in force. A run that never comes back from a sleep therefore
+   still leaves its start and the sleep it entered in the next boot's
+   pstore archive. Before 2026-11-22 nothing went to pmsg before the first
+   verdict, and the boot's `systemd-pstore` empties the zone when it
+   archives it, so such a run left no pmsg file at all.
 10. Once the verdict is out it looks at ext4 again, as in step 5. A journal
     that aborted, a filesystem ext4 gave up on, or an error saved (on a disk
     that is not read-only, a stick's) gives `SLEEP-TEST ERROR-STATE: ...`,
@@ -611,6 +631,91 @@ wakeup sources and the state before), between the cycle's diagnostic lines
 and its verdict. Reading `qcom_stats/ddr_stats` sends the AOSS a request to
 update its numbers, as every read of that file does; everything else is a
 plain read.
+
+**The experiment options** (2026-11-22). Each is off unless given, so a run
+without them does what it did before. They are for telling apart why a deep
+sleep with the PCIe root port removed, on a USB cable to a PC, never came
+back. The run's header line, its first pmsg line and every `RESULT` line
+name the ones in force (`options: none` without them).
+- **`pci=remove`** (`ro` and `dry`): the run removes every PCI root port
+  itself, and with it everything below it (the Wi-Fi). While the root port
+  is on the bus the PCIe host keeps its link, PHY, clocks and bandwidth
+  votes through every suspend; with the bus empty it powers down. A root
+  port is a PCI device directly on a host bridge (its sysfs parent is
+  `pciDDDD:BB`) with the class of a PCI bridge (`0x0604xx`); on the SM-X710
+  that is `0000:00:00.0`, with the Wi-Fi `0000:01:00.0` below it (pcie1 is
+  disabled). The run is refused, with nothing changed, if there is no root
+  port, or if a PCI device is neither a root port nor below one (removing
+  the ports would not empty the bus). The removal is the last step before
+  the first freeze, in RAM, with the disk still writable: `echo 1 >
+  /sys/bus/pci/devices/<port>/remove` for each port, the device count
+  before and after in the log and in pmsg, then 10 s to settle. A bus that
+  is not empty after it stops the run before anything is frozen, with no
+  restart. **Wi-Fi is gone until the restart**, and an SSH session over
+  Wi-Fi drops at that point while the run goes on: run it over the USB
+  cable (`usb0`), or read the result in pstore after the restart. The run
+  says so before it moves to RAM. With the bus empty the host powers down
+  in every suspend and comes back at the resume; if its link does not
+  come back, the host is left powered down but marked suspended, and the
+  next suspend would read its registers with its clocks off. So a cycle
+  (or an aborted attempt) whose kernel lines say the PCIe host did not come
+  back (`Link failed to come up`, `Host init failed`, `failed to resume
+  ...: error`) ends the run with `SLEEP-TEST RESULT: PCIE-DOWN after cycle
+  N/M: ...` and the restart. Until a run has shown the link back (`PCIe
+  Gen.2 x1 link up` in a cycle's `pcie` evidence), give `pci=remove` one
+  cycle.
+- **`pm_test=LEVEL`** (`ro`; `freezer`, `devices`, `platform`,
+  `processors` or `core`): each cycle's suspend stops at LEVEL, waits there
+  5 s (`pm_test_delay`) and resumes, with no SoC sleep call. `freezer` stops
+  after the task freeze; `devices` after the devices' suspend phase, before
+  their late and noirq phases; `platform` after their noirq phase;
+  `processors` with the other CPUs offline as well; `core` after the
+  syscore suspend with interrupts off, short of the SoC sleep call (PSCI
+  `SYSTEM_SUSPEND`) alone. `/sys/power/pm_test` is set right before each
+  `rtcwake` and back to `none` right after it returns, so no end of the run
+  leaves it set. `rtcwake` returns 0 and disables the RTC alarm it set. A
+  cycle is **PM-TEST** (`SLEEP-TEST cycle 1/3: PM-TEST platform: the
+  suspend went as far as pm_test=platform (...), waited there and came
+  back with no SoC sleep call, and the UFS read back as before; qcom_stats
+  aosd +0 cxsd +0 ddr +0 (CPU idle during the wait, not a depth test);
+  ...`), never PASS, SHALLOW or DEEP: no sleep is asked for, so no depth is
+  tested. cpuidle is paused only when the other CPUs go offline, so at
+  `freezer`, `devices` and `platform` the idle CPUs may still take the SoC
+  into a low-power state during the wait; the counts show it. A cycle
+  whose kernel lines lack `suspend debug: Waiting for N second(s).` (the
+  kernel's line at the level) fails. Refused with `dry`, when the kernel
+  does not offer the level, or when a level is selected already.
+- **`trace`** (`ro`): for each sleep, the console loglevel (the first number
+  of `kernel.printk`) goes to 8, and back right after `rtcwake` returns;
+  `pm_debug_messages` is 1, as every run sets it. The PM core's lines and
+  its phase lines (`PM: noirq suspend of devices complete after ...`) then
+  reach the consoles, ramoops' among them. With `console_suspend` at its
+  default the consoles are suspended from `printk: Suspending console(s)`
+  until the resume: what reaches ramoops while it happens are the lines up
+  to that one (the freezer's); the rest is printed at the resume. If the
+  tablet never comes back, the last line of the console record says
+  whether it got past the task freeze (`Suspending console(s)` last: the
+  hang is in the devices' suspend, the sleep or the devices' resume).
+  Each console line costs 0.1 to 0.25 s here with interrupts off (the
+  hang-log kit measured it): about 10 lines before the consoles are
+  suspended and, estimated, 60 to 100 at the resume, so a sleep takes up to
+  half a minute longer to return. `pm_print_times` is not used: it prints
+  two lines per device callback, thousands per sleep, which at that cost
+  would take minutes; `trace` is refused while it is 1.
+- **`trace=live`** (`ro`): `trace`, and `console_suspend` N for each sleep
+  (back right after), so that the lines reach ramoops while the devices
+  suspend and resume, and a hang leaves its last phase line. **Read the
+  risks first**, all read from the source, none tried on this tablet: each
+  line's 0.1 to 0.25 s with interrupts off now falls inside the suspend and
+  resume, the noirq phase included, which can stretch timeouts there; the
+  debug UART stays powered through the sleep (serial core keeps a console
+  port awake when `console_suspend` is N and never turns its clocks off),
+  so the SoC may not reach the state a run without it reaches, and the
+  run says nothing about depth; the boot console `qcom_geni0` writes the
+  same UART with no power management of its own, which is safe only while
+  that port stays clocked. Writing to ramoops and to `sec_log` is a copy
+  into reserved memory, safe at any point. Use it after a `trace` run left
+  `Suspending console(s)` as the last line.
 
 **The interconnect floor.** `ubuntu-gts9u-icc-late-release` releases it
 about 45 s into a boot. After a boot that released it and then ended
