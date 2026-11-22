@@ -1808,6 +1808,7 @@ class ScriptsTest(unittest.TestCase):
                                  "tcpm-try-snk-extra-wait.patch",
                                  "tcpm-no-dr-swap-during-vdm.patch",
                                  "tcpm-dr-set-checks-data-role.patch",
+                                 "tcpm-keep-queued-swap-pending.patch",
                                  "gcc-sm8550-usb-gdscs-retention.patch"])
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text().replace("\\\n", " ")
         for name in names:
@@ -1941,15 +1942,18 @@ class ScriptsTest(unittest.TestCase):
     def test_the_image_check_looks_for_what_only_this_revision_has(self):
         """Revision 3's image has the first three strings as well, and the
         deadline of the Try.SNK wait is in the second revision of that patch
-        alone.  The last three came after it: the log lines of the two fixes
-        for a swap asked for from userspace, and the driver's mark for
-        reading its parameters at each attach."""
+        alone.  The last five came after it: the log lines of the three fixes
+        for a swap asked for from userspace, of which the third has two, and
+        the driver's mark for reading its parameters at each attach."""
         text = (KIT_SRC / "make-kit.sh").read_text()
         strings = shlex.split(re.search(r"^new_strings=\((.*?)\)$", text, re.M | re.S).group(1))
         self.assertEqual(strings, ["Requesting DFP before discovery", "sink_host_swap",
                                    "try_snk_extra_wait_ms", "try_snk_wait_until",
                                    "VDM in progress, DATA_ROLE_SWAP not started",
-                                   "Data role swap ended with the role unchanged", "policy_open"])
+                                   "Data role swap ended with the role unchanged",
+                                   "Swap is still queued, left pending",
+                                   "Partner swapped first, queued DR_SWAP_SEND dropped",
+                                   "policy_open"])
         tcpm_c = "drivers/usb/typec/tcpm/tcpm.c"
         wait = added_lines("tcpm-try-snk-extra-wait.patch")
         # A member of a structure: its name is in the image's type information.
@@ -1960,6 +1964,7 @@ class ScriptsTest(unittest.TestCase):
                   for name in ("tcpm-request-dfp-as-sink-before-discovery.patch",
                                "tcpm-no-dr-swap-during-vdm.patch",
                                "tcpm-dr-set-checks-data-role.patch",
+                               "tcpm-keep-queued-swap-pending.patch",
                                "gcc-sm8550-usb-gdscs-retention.patch")]
         driver = (REPO / "kernel/drivers/sm5714_usbpd.c").read_text()
         others.append(driver)
@@ -1968,11 +1973,13 @@ class ScriptsTest(unittest.TestCase):
                 self.assertFalse([other[:40] for other in others if name in other])
         # The build tree is checked for the same revision of the patch.
         self.assertIn("grep -q 'tcpm_try_snk_wait_left' \"$tree/$tcpm_dir/tcpm.c\"", text)
-        # Each of the two log lines is its own patch's, there once, and the
+        # Each of the four log lines is its own patch's, there once, and the
         # build tree is checked for it.
         for name, line in (("tcpm-no-dr-swap-during-vdm.patch", strings[4]),
-                           ("tcpm-dr-set-checks-data-role.patch", strings[5])):
-            with self.subTest(name):
+                           ("tcpm-dr-set-checks-data-role.patch", strings[5]),
+                           ("tcpm-keep-queued-swap-pending.patch", strings[6]),
+                           ("tcpm-keep-queued-swap-pending.patch", strings[7])):
+            with self.subTest(line):
                 calls = [added.strip() for added in added_lines(name)[tcpm_c] if line in added]
                 self.assertEqual(calls, [f'tcpm_log(port, "{line}");'])
                 self.assertEqual([patch.name for patch in (REPO / "kernel/patches").glob("*.patch")

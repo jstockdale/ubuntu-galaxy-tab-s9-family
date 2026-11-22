@@ -1,6 +1,6 @@
 #!/bin/bash
 # Pack the Type-C roles kit for the SM-X910 on the build host.  It goes on
-# top of release v1.2.5: the release kernel rebuilt with this branch's four
+# top of release v1.2.5: the release kernel rebuilt with this branch's five
 # TCPM patches, the sm5714_usbpd policy that turns them on and the retention
 # of the USB power domains across suspend (docs/usb-c-dock-roles.md), in
 # boot, plus the build's module tree, signed with its own key.  The
@@ -54,7 +54,7 @@ tcpm_dir=drivers/usb/typec/tcpm
 gcc=drivers/clk/qcom/gcc-sm8550
 patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
 	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch
-	gcc-sm8550-usb-gdscs-retention.patch)
+	tcpm-keep-queued-swap-pending.patch gcc-sm8550-usb-gdscs-retention.patch)
 # The files those patches change.
 patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c")
 
@@ -69,12 +69,14 @@ base_build_id=3447147dc203542e441eebfa4d62e60c57100f50
 # What only the new kernel may contain: the patch's log line, the driver's
 # two parameters, and the deadline of the Try.SNK wait, a member of tcpm_port
 # whose name is in the image's type information; that one tells the wait
-# with a deadline from the plain longer timeout before it.  Then what this
-# revision adds: the log lines of the two fixes for a data role swap asked
-# for from userspace, and policy_open, a member of the driver's structure,
-# which only a driver that reads its parameters at each attach has.
+# with a deadline from the plain longer timeout before it.  Then what the
+# revisions after it add: the log lines of the three fixes for a swap asked
+# for from userspace (the third has two), and policy_open, a member of the
+# driver's structure, which only a driver that reads its parameters at each
+# attach has.
 new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
 	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
+	'Swap is still queued, left pending' 'Partner swapped first, queued DR_SWAP_SEND dropped'
 	policy_open)
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
@@ -160,7 +162,7 @@ cmp -s "$out/fingerprint.layers" "$base/fingerprint.layers" ||
 echo "DTB (${base_dtb:0:12}), configuration (${base_config:0:12}) and fingerprint layers: the release build's, byte for byte"
 
 # 3. The sources.  The driver is this checkout's; the two TCPM files and the
-# clock controller are the release tree's with this checkout's five patches
+# clock controller are the release tree's with this checkout's six patches
 # on top; nothing else in the kernel tree differs.
 cmp -s "$tree/$tcpm_dir/sm5714_usbpd.c" "$repo/kernel/drivers/sm5714_usbpd.c" ||
 	die "the build tree's sm5714_usbpd.c is not this checkout's"
@@ -169,8 +171,10 @@ grep -q 'request_dfp_as_sink' "$tree/include/linux/usb/tcpm.h" &&
 	grep -q 'tcpm_try_snk_wait_left' "$tree/$tcpm_dir/tcpm.c" &&
 	grep -q 'Requesting DFP before discovery' "$tree/$tcpm_dir/tcpm.c" &&
 	grep -q 'VDM in progress, DATA_ROLE_SWAP not started' "$tree/$tcpm_dir/tcpm.c" &&
-	grep -q 'Data role swap ended with the role unchanged' "$tree/$tcpm_dir/tcpm.c" ||
-	die 'the build tree does not carry the four TCPM patches'
+	grep -q 'Data role swap ended with the role unchanged' "$tree/$tcpm_dir/tcpm.c" &&
+	grep -q 'Swap is still queued, left pending' "$tree/$tcpm_dir/tcpm.c" &&
+	grep -q 'Partner swapped first, queued DR_SWAP_SEND dropped' "$tree/$tcpm_dir/tcpm.c" ||
+	die 'the build tree does not carry the five TCPM patches'
 # The power state the source gives one power domain.  Counting the
 # PWRSTS_RET_ON lines of the file does not do: the four PCIe domains carry
 # it upstream.
@@ -221,10 +225,10 @@ EOF
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $base_tree: four files differ, tcpm.c, tcpm.h and gcc-sm8550.c by this checkout's five patches"
+	source_check="compared with $base_tree: four files differ, tcpm.c, tcpm.h and gcc-sm8550.c by this checkout's six patches"
 	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h and gcc-sm8550.c differ from the release tree, by exactly this checkout'"'"'s changes'
 else
-	echo 'sources: the five patches and this checkout'"'"'s driver are in the build tree (BASE_SCRATCH not set: no tree comparison)'
+	echo 'sources: the six patches and this checkout'"'"'s driver are in the build tree (BASE_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.

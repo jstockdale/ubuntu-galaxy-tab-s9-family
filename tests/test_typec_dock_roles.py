@@ -1,7 +1,7 @@
 """The roles the tablet takes on a powered USB-C dock.
 
-Two TCPM patches and the SM5714 policy that switches them on, and two fixes
-for a data role swap asked for from userspace:
+Two TCPM patches and the SM5714 policy that switches them on, and three fixes
+for a swap asked for from userspace:
 
 - request_dfp_as_sink: as PD sink, ask for the USB host role before discovery
   (a charge-through dock otherwise flaps over its own DR_Swap), a few times
@@ -10,8 +10,10 @@ for a data role swap asked for from userspace:
   source after TCPM's 100 ms have run out, so a dual-role dock ended up being
   powered by the tablet), as one deadline, so that an Rp which goes away
   again does not end the attempt;
-- no DATA_ROLE_SWAP is started while a VDM waits for its reply, and a write
-  to data_role that changed no role fails (both for every TCPM port).
+- no DATA_ROLE_SWAP is started while a VDM waits for its reply, a write to
+  data_role that changed no role fails, and a swap that is still queued
+  behind a message of the partner's is neither reported done before it is
+  sent nor sent after the partner's own DR_Swap (all for every TCPM port).
 
 The driver sets tcpc_dev fields that only these patches declare, so a kernel
 without the hooks does not compile; the tests keep driver, patches and hooks
@@ -46,11 +48,14 @@ FIELDS = [
 ]
 
 # The log line a later patch adds to tcpm.c -> that patch, in build order.
-# These two declare no field: they are for every TCPM port.
+# These declare no field: they are for every TCPM port.
 LATER = [
     ("VDM in progress, DATA_ROLE_SWAP not started", "tcpm-no-dr-swap-during-vdm.patch"),
     ("Data role swap ended with the role unchanged", "tcpm-dr-set-checks-data-role.patch"),
+    ("Swap is still queued, left pending", "tcpm-keep-queued-swap-pending.patch"),
 ]
+# The last one's second log line, where the partner's DR_Swap came first.
+PARTNER_FIRST = "Partner swapped first, queued DR_SWAP_SEND dropped"
 
 
 def added(patch, path):
@@ -323,7 +328,7 @@ def kernel_source():
 
 @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
 class AppliedTests(unittest.TestCase):
-    """The six TCPM patches on the pinned kernel, applied as the build does."""
+    """The seven TCPM patches on the pinned kernel, applied as the build does."""
 
     @classmethod
     def setUpClass(cls):
@@ -598,9 +603,9 @@ class AppliedTests(unittest.TestCase):
                       function(self.source, "tcpm_dr_set"))
 
     def test_a_write_to_data_role_that_changed_no_role_fails(self):
-        # The next ready state completes a pending swap with status 0,
-        # whatever became of it.  Only a status of 0 is looked into, after
-        # the wait and under the port lock, which the wait had given up.
+        # A ready state completes a pending swap with status 0, whatever
+        # became of it.  Only a status of 0 is looked into, after the wait
+        # and under the port lock, which the wait had given up.
         dr_set = function(self.source, "tcpm_dr_set")
         self.assertRegex(dr_set, r"\t\tret = port->swap_status;\n\n"
                                  r"(?:\t ?/?\*.*\n)+"
@@ -620,6 +625,68 @@ class AppliedTests(unittest.TestCase):
         # upstream has them.
         for name in ("tcpm_pr_set", "tcpm_vconn_set"):
             self.assertNotIn("if (!ret) {", function(self.source, name), name)
+
+    def test_a_queued_swap_is_not_completed_before_it_is_sent(self):
+        # A write puts its swap in upcoming_state and starts the AMS.  A
+        # message of the partner's that is handled before AMS_START makes
+        # the port leave the ready state and come back to it with the swap
+        # still queued: that ready state must not tell the write that it is
+        # done.  Left pending only while a write waits and a state is
+        # queued; completed as upstream does in every other case.
+        helper = function(self.source, "tcpm_swap_complete_ready")
+        self.assertEqual(helper,
+                         "\tif (port->swap_pending && port->upcoming_state != INVALID_STATE) {\n"
+                         '\t\ttcpm_log(port, "%s");\n'
+                         "\t\treturn;\n"
+                         "\t}\n\n"
+                         "\ttcpm_swap_complete(port, 0);" % LATER[2][0])
+        self.assertEqual(self.source.count(LATER[2][0]), 1)
+        # Both ready states complete through the helper, before they take
+        # the queued state out of upcoming_state, and nothing else completes
+        # a swap with status 0.
+        machine = function(self.source, "run_state_machine")
+        for label, following in (("SRC_READY", "SRC_WAIT_NEW_CAPABILITIES"),
+                                 ("SNK_READY", "SNK_HARD_RESET_SINK_OFF")):
+            ready = case(machine, label, following)
+            self.assertEqual(ready.count("tcpm_swap_complete_ready(port);"), 1, label)
+            self.assertLess(ready.index("tcpm_swap_complete_ready(port);"),
+                            ready.index("upcoming_state = port->upcoming_state;"), label)
+            self.assertNotIn("tcpm_swap_complete(port", ready, label)
+        self.assertEqual(self.source.count("tcpm_swap_complete_ready(port);"), 2)
+        self.assertEqual(self.source.count("tcpm_swap_complete(port, 0);"), 1)
+        # A swap that was sent is completed by the states it ends in: the
+        # refusal, the timeout, a cut connection.  Those are upstream's.
+        for label, following, status in (("DR_SWAP_CANCEL", "FR_SWAP_CANCEL", "port->swap_status"),
+                                         ("DR_SWAP_SEND_TIMEOUT", "DR_SWAP_CHANGE_DR", "-ETIMEDOUT")):
+            self.assertIn("tcpm_swap_complete(port, %s);" % status,
+                          case(machine, label, following), label)
+
+    def test_a_queued_dr_swap_does_not_undo_the_partner_s(self):
+        # When the message that got in first is the partner's DR_Swap, the
+        # port accepts it and has the role its queued DR_Swap was for; sent
+        # after it, that one would put the role back.  Dropped where a swap
+        # changes the role, before the next ready state acts on what is
+        # queued.  A queued state of another kind stays.
+        machine = function(self.source, "run_state_machine")
+        changed = case(machine, "DR_SWAP_CHANGE_DR", "FR_SWAP_SEND")
+        self.assertRegex(changed, r"\t\tif \(port->upcoming_state == DR_SWAP_SEND\) \{\n"
+                                  r"\t\t\ttcpm_log\(port, \"%s\"\);\n"
+                                  r"\t\t\tport->upcoming_state = INVALID_STATE;\n"
+                                  r"\t\t\}\n" % PARTNER_FIRST)
+        self.assertEqual(changed.count("upcoming_state"), 2)
+        self.assertLess(changed.index("port->upcoming_state = INVALID_STATE;"),
+                        changed.index("tcpm_set_state(port, ready_state(port), 0);"))
+        self.assertEqual(self.source.count(PARTNER_FIRST), 1)
+        self.assertEqual(added(LATER[2][1], TCPM_C).count('tcpm_log(port, "%s");' % PARTNER_FIRST), 1)
+        # The port's own swap gets there with nothing queued: AMS_START takes
+        # the state out of upcoming_state before it moves to it, and so do
+        # the ready states.
+        start = machine[machine.index("case AMS_START:"):]
+        start = start[:start.index("break;\n\n")]
+        self.assertTrue(start.rstrip().endswith(
+            "upcoming_state = port->upcoming_state;\n"
+            "\t\tport->upcoming_state = INVALID_STATE;\n"
+            "\t\ttcpm_set_state(port, upcoming_state, 0);"), start)
 
     def test_states_the_write_up_names_exist(self):
         names = set(re.findall(r"\b[A-Z]+(?:_[A-Z]+)+\b", DOC.read_text()))

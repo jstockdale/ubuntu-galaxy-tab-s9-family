@@ -402,6 +402,16 @@ apply_unless 'VDM in progress, DATA_ROLE_SWAP not started' \
 	drivers/usb/typec/tcpm/tcpm.c tcpm-no-dr-swap-during-vdm.patch
 apply_unless 'Data role swap ended with the role unchanged' \
 	drivers/usb/typec/tcpm/tcpm.c tcpm-dr-set-checks-data-role.patch
+# A third one, for a write to data_role, power_role or vconn_source whose
+# swap is still queued when a message of the partner's makes the port change
+# state first.  The ready state after that message completed the write before
+# the swap was sent, which the role check above then answers with -EAGAIN for
+# a swap accepted a moment later: the write now waits until the swap has run.
+# And when that message is the partner's own DR_Swap, the queued DR_Swap went
+# out after it and put the data role back: it is dropped.  Read from the
+# code; neither has been seen on a tablet.
+apply_unless 'Swap is still queued, left pending' \
+	drivers/usb/typec/tcpm/tcpm.c tcpm-keep-queued-swap-pending.patch
 # A dock's DisplayPort alternate mode is discovered while the tablet is still
 # UFP; typec_displayport then refuses to bind (-EPROTO) and the mode sat
 # driverless until a physical re-plug.  Impatient adapters hard-reset around
