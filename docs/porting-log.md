@@ -7243,15 +7243,71 @@ queued behind a message of the partner's
 `power_role` and `vconn_source`, and drops a queued DR_Swap when the
 partner's own DR_Swap got in first and changed the role
 (`Partner swapped first, queued DR_SWAP_SEND dropped`); sent afterwards, it
-would have put the role back. Neither case has been seen on a tablet. Test
-kernels with it were built for both tablets on 2026-11-21 and are installed
-on neither. None of the three fixes and neither switch has been tried on a
-tablet yet.
+would have put the role back. A review widened it the same day (next
+entry). None of it has been seen on a tablet, and it is in no kernel that
+has run on one. None of the three fixes and neither switch has been tried
+on a tablet yet.
 
 The SM-X710 has the third kernel's TCPM changes installed, without the power
 domain change. Before that, with the standard wait, the Satechi left it as
-the power source, as on the SM-X910. No dock has been plugged into it since,
-and a boot with the dock attached there will show whether it needs the power
-domain change too. The verification steps, what changes for laptops, phones
-and unpowered accessories, and what is still open are in
+the power source, as on the SM-X910. A boot with a dock attached on the
+kit's kernel showed that it needs the power domain change too (next entry).
+The verification steps, what changes for laptops, phones and unpowered
+accessories, and what is still open are in
 [`usb-c-dock-roles.md`](usb-c-dock-roles.md).
+
+### Powered USB-C docks: the SM-X710's docked boot, a NULL check, the third fix widened (2026-11-21)
+
+On the kernel before its kit the SM-X710 was recorded with both docks at
+15:49 (`verify.sh dock 2`). The Satechi left it power source and USB host
+after Try.SNK gave up, with the dock's devices on the bus and the battery
+discharging. The Anker hub without its charger left it power source and
+host with nothing on the bus. That hub enumerates no device while the tablet
+powers it, on either tablet, with a 5 V 900 mA contract and DisplayPort
+alternate mode entered; why is not known. With its charger it enumerated 13
+devices on the SM-X910.
+
+On the kit's kernel, the previous revision without the power domain change,
+the SM-X710 was booted at 18:01 with the Anker hub attached and the hub's
+charger unplugged. The port was source and host from 14.7 s, the boot's
+suspend cycle ran from 22.7 to 26.8 s, and the bus stayed empty. At 718 s
+the charger went into the hub. The port attached again, the kernel's own
+request for the host role was accepted 3.5 ms after it went out (host role
+requested 1, swapped 1, no role mismatch), and the tablet charged as sink on
+9 V. The new xHCI's probe failed (`Host halt failed, -110`, `can't setup:
+-110`), so no device came up. In the boot before, whose suspend cycle ran in
+device role, the same hub attached at 6846 s and the xHCI started without
+error. That is the SM-X910's fault, seen once on the SM-X710:
+`gcc-sm8550-usb-gdscs-retention.patch` now goes into the SM-X710 line as
+well, with its build hook and the kit's checks. That kernel has not run on
+the tablet, and idle and suspend power with retention there are not
+measured.
+
+6.6 s after the failed probe the controller runtime-suspended, and the
+dwc3-qcom glue read the port speeds through the hcd that the failed probe
+had left NULL: an oops at `dwc3_qcom_suspend+0x118` on the pm workqueue.
+The next reboot stalled for 7.5 minutes behind the stop job of the service
+that writes the controller's runtime power setting.
+`dwc3-qcom-check-hcd-before-reading-port-speed.patch`, for both tablets,
+treats a port without an hcd as empty, so the suspend completes. On the
+SM-X710 line it goes after the dwc3-qcom CX vote patch, and applies 4 lines
+lower there. It does not bring the xHCI back. It adds no string to the
+image, so the kits check the marker in the build tree's source and the date
+of its object.
+
+A review of the third fix found more of the same kind, from the code alone.
+A swap request of the partner's that takes the queued swap's place in
+`upcoming_state` now keeps the write waiting too, so that the role check
+sees the role the partner's swap left. The state that ends a VCONN swap
+turning VCONN on no longer completes a swap that is still queued. And a
+queued PR_Swap or VCONN_Swap is dropped where the port accepts the
+partner's swap of the same kind, as the DR_Swap was
+(`Partner swapped first, queued PR_SWAP_SEND dropped`,
+`Partner swapped first, queued VCONN_SWAP_SEND dropped`). The kits look for
+the PR_Swap line in the build tree and in the image, since a tree with the
+earlier revision of the patch has the other two lines, and the swap test
+counts the drops of all three kinds. None of it has been seen on a tablet.
+
+Not done on the SM-X710: `dock` and `swap` runs on a kit kernel, the Satechi
+on a kit kernel, and a boot with the dock attached and devices on the bus.
+These changes are in no kernel that has run on a tablet.

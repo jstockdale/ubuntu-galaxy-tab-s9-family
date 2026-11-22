@@ -267,7 +267,8 @@ plug_test() { # dock|record|now|swap [COUNT]
 			unchanged=$(count 'Data role swap ended with the role unchanged' "$out.tcpm.log")
 			cut=$(count '\] state change DR_SWAP_SEND -> [A-Z_]*SOFT_RESET' "$out.tcpm.log")
 			queued=$(count 'Swap is still queued, left pending' "$out.tcpm.log")
-			dropped=$(count 'Partner swapped first, queued DR_SWAP_SEND dropped' "$out.tcpm.log")
+			# A queued DR_SWAP_SEND, PR_SWAP_SEND or VCONN_SWAP_SEND.
+			dropped=$(count 'Partner swapped first, queued [A-Z_]+ dropped' "$out.tcpm.log")
 			overflow=$(echo "$c" | cut -f10)
 			wrote=$(cat "$writes" 2> /dev/null)
 			refused_total=$((refused_total + refused))

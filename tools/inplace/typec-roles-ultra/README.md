@@ -43,10 +43,11 @@ The revision before this one added two fixes for a data role swap asked for
 from userspace (a write to the port's `data_role`) and a driver that reads
 its two switches at each attach. One boot with the Satechi attached has run
 on it and ended as the two before it did, the Rp going away once on the
-way. This revision adds a third fix of that kind; its kernel was built on
-2026-11-21 and has not run on a tablet. **None of the three fixes and
-neither switch has been tried on a tablet yet**, and neither has a real
-sleep with the dock attached.
+way. This revision adds a third fix of that kind and a NULL check in the
+dwc3-qcom glue, for what the SM-X710 showed in a boot with a dock attached
+(the write-up has it); neither is in a kernel that has run on a tablet.
+**None of the three fixes and neither switch has been tried on a tablet
+yet**, and neither has a real sleep with the dock attached.
 
 **What changes:**
 - **Kernel:** the release kernel rebuilt with
@@ -57,11 +58,14 @@ sleep with the dock attached.
   of switching them off, and the three fixes for a swap asked for from
   userspace, `kernel/patches/tcpm-no-dr-swap-during-vdm.patch`,
   `kernel/patches/tcpm-dr-set-checks-data-role.patch` and
-  `kernel/patches/tcpm-keep-queued-swap-pending.patch`: six patches, five
-  of them to TCPM. In the kernel source tree four files differ from the
-  release build: `tcpm.c`, `tcpm.h`, the driver and `gcc-sm8550.c`.
-  `make-kit.sh` checks that, and that the configuration, the DTB and the
-  fingerprint layers are byte for byte the release build's.
+  `kernel/patches/tcpm-keep-queued-swap-pending.patch`, and
+  `kernel/patches/dwc3-qcom-check-hcd-before-reading-port-speed.patch`,
+  which lets the USB controller's glue suspend when an xHCI failed to
+  start: seven patches, five of them to TCPM. In the kernel source tree five
+  files differ from the release build: `tcpm.c`, `tcpm.h`, the driver,
+  `gcc-sm8550.c` and `dwc3-qcom.c`. `make-kit.sh` checks that, and that the
+  configuration, the DTB and the fingerprint layers are byte for byte the
+  release build's.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
   the DTB, which did not change. `install.sh` checks that it still holds the
   release's image.
@@ -98,7 +102,8 @@ sleep with the dock attached.
   echo 0 | sudo tee /sys/module/sm5714_usbpd/parameters/try_snk_extra_wait_ms
   ```
 
-  The power domain change has no switch; `rollback.sh` is the way back.
+  The power domain change and the NULL check have no switch; `rollback.sh`
+  is the way back.
 
 **What it can change for other things you plug in** (the write-up has the
 detail):
@@ -239,9 +244,10 @@ the dock's own swap can still end them as it used to.
 `N refused during a VDM exchange` in a plug-in's line counts the writes the
 first fix turned away (`VDM in progress, DATA_ROLE_SWAP not started` in the
 TCPM log); a run in which no write met a VDM exchange says so and asks for
-another plug-in. The third fix's two lines are counted under the plug-in when
-they show (`left pending`, `dropped because the partner swapped first`); they
-do not decide, and the run cannot bring about the race they come from. A
+another plug-in. The third fix's lines are counted under the plug-in when
+they show (`left pending`, and `dropped because the partner swapped first`
+for a queued swap of any kind); they do not decide, and the run cannot bring
+about the race they come from. A
 plug-in without a verdict says why: no swap asked for, every write refused
 before TCPM started one, or a log that lost lines. A run in which no plug-in
 got a verdict fails. Start the run with nothing plugged in: the first plug-in
@@ -268,6 +274,9 @@ controller that died (`HC died`, a stop endpoint command without an answer,
 and fails if it did. After a boot with the dock attached that is the check
 for the third change. It needs a suspend cycle to have run: before the
 boot's own cycle, about half a minute in, it prints a note and no verdict.
+And it needs devices on the bus: with nothing behind the dock a controller
+that lost its state can go unseen until the next attach, as on the SM-X710
+on 2026-11-21.
 A controller that came back without its state and was set up again (`xHC
 error in resume`) is a note too: USB works, the devices were enumerated
 again. A module the kernel refused fails the check, and so does a kernel log
@@ -280,10 +289,12 @@ the dock attached, four plug-ins); this revision's kernel is a new build, so
 they are worth one more run. Check 4 has not been run on any revision.
 
 1. After installing and rebooting: `verify.sh`.
-2. **A boot with the dock attached**, then `sh ~/typec-roles/verify.sh` and
-   `sudo sh ~/typec-roles/verify.sh now`. The keyboard and the hub behind the
-   dock work, the battery charges, and `verify.sh` says `the USB host
-   controller did not die this boot` with at least one suspend cycle counted.
+2. **A boot with the dock attached and devices behind it**, then
+   `sh ~/typec-roles/verify.sh` and `sudo sh ~/typec-roles/verify.sh now`.
+   The keyboard and the hub behind the dock work, the battery charges, and
+   `verify.sh` says `the USB host controller did not die this boot` with at
+   least one suspend cycle counted. A boot with nothing on the bus does not
+   test the host controller.
 3. `sudo sh ~/typec-roles/verify.sh dock 10` with each powered dock, plugged
    into the running tablet. Keep the dock's own charger plugged in: without
    it the dock has no power to give and the tablet ends as power source, as
@@ -307,7 +318,8 @@ they are worth one more run. Check 4 has not been run on any revision.
    requested 1`: the kernel asks by itself again from the next attach.
 5. `sudo sh ~/typec-roles/verify.sh record` once each with: a plain PD
    charger (charges; a swap only if the charger offers one), an unpowered hub
-   and a USB stick (enumerate), a DisplayPort monitor or dock (the picture
+   (not the Anker hub: without its charger it enumerates nothing) and a USB
+   stick (enumerate), a DisplayPort monitor or dock (the picture
    comes up), the A-to-C cable to the build host (`usb0` comes up, the gadget
    network works).
 6. Suspend and resume with the dock attached, then with the charger. The

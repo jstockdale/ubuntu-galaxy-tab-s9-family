@@ -13,7 +13,12 @@ for a swap asked for from userspace:
 - no DATA_ROLE_SWAP is started while a VDM waits for its reply, a write to
   data_role that changed no role fails, and a swap that is still queued
   behind a message of the partner's is neither reported done before it is
-  sent nor sent after the partner's own DR_Swap (all for every TCPM port).
+  sent nor sent after the partner's own swap of the same kind (all for
+  every TCPM port).
+
+Two patches for what a boot with a dock attached showed on both tablets: the
+USB power domains kept in retention across suspend, and a NULL check in the
+dwc3-qcom glue for the hcd that a failed xHCI probe leaves without.
 
 The driver sets tcpc_dev fields that only these patches declare, so a kernel
 without the hooks does not compile; the tests keep driver, patches and hooks
@@ -38,6 +43,13 @@ DRIVER = ROOT / "kernel/drivers/sm5714_usbpd.c"
 DOC = ROOT / "docs/usb-c-dock-roles.md"
 TCPM_C = "drivers/usb/typec/tcpm/tcpm.c"
 TCPM_H = "include/linux/usb/tcpm.h"
+GCC_C = "drivers/clk/qcom/gcc-sm8550.c"
+DWC3_C = "drivers/usb/dwc3/dwc3-qcom.c"
+# (marker, patch) of the patches for the USB host after a docked boot.
+GDSC = ("Retention across system suspend, as on sm8650", "gcc-sm8550-usb-gdscs-retention.patch")
+DWC3_GUARD = ("no hcd and no root hub", "dwc3-qcom-check-hcd-before-reading-port-speed.patch")
+# The SM-X710 line's patch to the same file, hooked before the guard there.
+DWC3_OPPS = ("dwc3_qcom_set_pstate", "dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch")
 
 # tcpc_dev field -> the patch that declares it, in build order.
 FIELDS = [
@@ -56,6 +68,14 @@ LATER = [
 ]
 # The last one's second log line, where the partner's DR_Swap came first.
 PARTNER_FIRST = "Partner swapped first, queued DR_SWAP_SEND dropped"
+# And its lines for the other two kinds, where the port accepts the
+# partner's PR_Swap or VCONN_Swap: (state, the next case, queued swap, line).
+PARTNER_FIRST_ACCEPT = [
+    ("PR_SWAP_ACCEPT", "PR_SWAP_SEND", "PR_SWAP_SEND",
+     "Partner swapped first, queued PR_SWAP_SEND dropped"),
+    ("VCONN_SWAP_ACCEPT", "VCONN_SWAP_SEND", "VCONN_SWAP_SEND",
+     "Partner swapped first, queued VCONN_SWAP_SEND dropped"),
+]
 
 
 def added(patch, path):
@@ -121,17 +141,17 @@ class BuildHookTests(unittest.TestCase):
             files = re.findall(r"^\+\+\+ b/(\S+)", (PATCHES / patch).read_text(), re.M)
             self.assertEqual(files, [TCPM_C], patch)
 
-    def test_usb_power_domain_patch_is_applied_where_it_is_carried(self):
+    def test_usb_power_domain_patch_is_applied(self):
         # What lets the USB host live through the suspend cycle of a boot
-        # with a dock attached.  The SM-X910's branch carries it; a branch
-        # without the patch file has no hook for it either.
-        patch = "gcc-sm8550-usb-gdscs-retention.patch"
-        path = "drivers/clk/qcom/gcc-sm8550.c"
+        # with a dock attached.  Both tablets' branches carry it: the
+        # SM-X710 lost its xHCI after such a cycle as the SM-X910 did.
+        marker, patch = GDSC
+        path = GCC_C
+        self.assertTrue((PATCHES / patch).is_file())
         mine = [(marker, target) for marker, target, name in hooks() if name == patch]
-        if not (PATCHES / patch).is_file():
-            self.assertEqual(mine, [])
-            return
-        self.assertEqual(mine, [("Retention across system suspend, as on sm8650", path)])
+        self.assertEqual(mine, [(marker, path)])
+        # Nothing else patches the clock controller.
+        self.assertEqual([name for _, target, name in hooks() if target == path], [patch])
         text = (PATCHES / patch).read_text()
         self.assertEqual(re.findall(r"^\+\+\+ b/(\S+)", text, re.M), [path])
         # The marker is a line of the patch's own; the change is the power
@@ -142,6 +162,46 @@ class BuildHookTests(unittest.TestCase):
         self.assertEqual(changed, ["-\t.pwrsts = PWRSTS_OFF_ON,", "+\t.pwrsts = PWRSTS_RET_ON,"] * 2)
         for name in ("usb30_prim_gdsc", "usb3_phy_gdsc"):
             self.assertIn('.name = "%s",' % name, text)
+
+
+class Dwc3GuardTests(unittest.TestCase):
+    """The NULL check of the hcd in the dwc3-qcom glue, for both tablets."""
+
+    def test_the_guard_is_hooked_last_on_its_file_and_after_the_power_domains(self):
+        mine = [hook for hook in hooks() if hook[2] == DWC3_GUARD[1]]
+        self.assertEqual(mine, [(DWC3_GUARD[0], DWC3_C, DWC3_GUARD[1])])
+        # On the SM-X710 line the opps patch changes the file first and the
+        # guard goes right after it; on the SM-X910 line nothing else
+        # patches the file and the guard follows the power domain patch.
+        order = hooks()
+        guard = order.index(mine[0])
+        on_file = [name for _, target, name in order if target == DWC3_C]
+        if (PATCHES / DWC3_OPPS[1]).is_file():
+            self.assertEqual(on_file, [DWC3_OPPS[1], DWC3_GUARD[1]])
+            self.assertEqual(order[guard - 1], (DWC3_OPPS[0], DWC3_C, DWC3_OPPS[1]))
+        else:
+            self.assertEqual(on_file, [DWC3_GUARD[1]])
+            self.assertEqual(order[guard - 1], (GDSC[0], GCC_C, GDSC[1]))
+
+    def test_the_marker_is_this_patch_s_alone(self):
+        # A grep pattern: plain text, added once, in the guard's comment, by
+        # this patch and by nothing else in the checkout.
+        marker, patch = DWC3_GUARD
+        self.assertRegex(marker, r"^[A-Za-z ]+$")
+        lines = added(patch, DWC3_C).splitlines()
+        self.assertEqual([line for line in lines if marker in line], ["\t * there is no hcd and no root hub to read the speed from."])
+        self.assertEqual([path.name for path in PATCHES.glob("*.patch") if marker in path.read_text()],
+                         [patch])
+        for source in (ROOT / "kernel/drivers").rglob("*"):
+            if source.is_file():
+                self.assertNotIn(marker, source.read_text(errors="replace"), source)
+
+    def test_the_guard_changes_dwc3_qcom_alone(self):
+        text = (PATCHES / DWC3_GUARD[1]).read_text()
+        self.assertEqual(re.findall(r"^\+\+\+ b/(\S+)", text, re.M), [DWC3_C])
+        # It only adds: no line of the file is removed or changed.
+        body = text[text.index("\n--- a/"):].splitlines()[2:]
+        self.assertEqual([line for line in body if line.startswith("-")], [])
 
 
 class PatchTests(unittest.TestCase):
@@ -631,16 +691,33 @@ class AppliedTests(unittest.TestCase):
         # message of the partner's that is handled before AMS_START makes
         # the port leave the ready state and come back to it with the swap
         # still queued: that ready state must not tell the write that it is
-        # done.  Left pending only while a write waits and a state is
-        # queued; completed as upstream does in every other case.
+        # done.  Left pending only while a write waits and a swap is what
+        # is queued (its own, or the partner's request that took its
+        # place); completed as upstream does in every other case.
         helper = function(self.source, "tcpm_swap_complete_ready")
         self.assertEqual(helper,
-                         "\tif (port->swap_pending && port->upcoming_state != INVALID_STATE) {\n"
+                         "\tif (tcpm_swap_is_queued(port)) {\n"
                          '\t\ttcpm_log(port, "%s");\n'
                          "\t\treturn;\n"
                          "\t}\n\n"
                          "\ttcpm_swap_complete(port, 0);" % LATER[2][0])
         self.assertEqual(self.source.count(LATER[2][0]), 1)
+        # Queued means a swap state while a write waits: which ones, the
+        # next test says.
+        queued = function(self.source, "tcpm_swap_is_queued")
+        self.assertRegex(queued, r"^\tif \(!port->swap_pending\)\n"
+                                 r"\t\treturn false;\n\n"
+                                 r"\tswitch \(port->upcoming_state\) \{\n"
+                                 r"(?:\tcase [A-Z_]+:\n)+"
+                                 r"\t\treturn true;\n"
+                                 r"\tdefault:\n"
+                                 r"\t\treturn false;\n"
+                                 r"\t\}$")
+        self.assertLess(self.source.index("static bool tcpm_swap_is_queued("),
+                        self.source.index("static void tcpm_swap_complete_ready("))
+        # Asked in the two ready states (through the helper) and where a
+        # VCONN swap that turned VCONN on ends, nowhere else.
+        self.assertEqual(self.source.count("tcpm_swap_is_queued(port)"), 2)
         # Both ready states complete through the helper, before they take
         # the queued state out of upcoming_state, and nothing else completes
         # a swap with status 0.
@@ -660,6 +737,23 @@ class AppliedTests(unittest.TestCase):
                                          ("DR_SWAP_SEND_TIMEOUT", "DR_SWAP_CHANGE_DR", "-ETIMEDOUT")):
             self.assertIn("tcpm_swap_complete(port, %s);" % status,
                           case(machine, label, following), label)
+
+    def test_a_write_waits_behind_the_partner_s_swap_request(self):
+        # The write waits while its own swap is queued and about to be
+        # sent, and while a swap request of the partner's took its place
+        # there and is about to be accepted: answered before that swap, the
+        # role check in tcpm_dr_set() runs while the Accept is sent and sees
+        # the old role.  Every other queued state completes the write.
+        queued = function(self.source, "tcpm_swap_is_queued")
+        self.assertEqual(re.findall(r"^\tcase ([A-Z_]+):$", queued, re.M),
+                         ["DR_SWAP_SEND", "PR_SWAP_SEND", "VCONN_SWAP_SEND",
+                          "DR_SWAP_ACCEPT", "PR_SWAP_ACCEPT", "VCONN_SWAP_ACCEPT"])
+        # A partner's request gets there through tcpm_pd_handle_state()
+        # alone, which queues it when the port is not in a ready state.
+        for state in ("DR_SWAP_ACCEPT", "PR_SWAP_ACCEPT", "VCONN_SWAP_ACCEPT"):
+            with self.subTest(state):
+                self.assertEqual(self.source.count("tcpm_pd_handle_state(port, %s," % state), 1)
+                self.assertEqual(self.source.count("port->upcoming_state = %s;" % state), 0)
 
     def test_a_queued_dr_swap_does_not_undo_the_partner_s(self):
         # When the message that got in first is the partner's DR_Swap, the
@@ -688,12 +782,102 @@ class AppliedTests(unittest.TestCase):
             "\t\tport->upcoming_state = INVALID_STATE;\n"
             "\t\ttcpm_set_state(port, upcoming_state, 0);"), start)
 
+    def test_a_queued_pr_or_vconn_swap_does_not_undo_the_partner_s(self):
+        # The same for the other two kinds.  Only the partner's PR_Swap or
+        # VCONN_Swap leads to these states, and the drop comes before the
+        # Accept, while nothing else can run.  A queued state of another
+        # kind stays.
+        machine = function(self.source, "run_state_machine")
+        for label, following, queued, line in PARTNER_FIRST_ACCEPT:
+            with self.subTest(label):
+                accept = case(machine, label, following)
+                self.assertRegex(accept, r"\t\tif \(port->upcoming_state == %s\) \{\n"
+                                         r"\t\t\ttcpm_log\(port, \"%s\"\);\n"
+                                         r"\t\t\tport->upcoming_state = INVALID_STATE;\n"
+                                         r"\t\t\}\n"
+                                         r"\t\ttcpm_pd_send_control\(port, PD_CTRL_ACCEPT, TCPC_TX_SOP\);\n"
+                                         % (queued, line))
+                self.assertEqual(accept.count("upcoming_state"), 2)
+                self.assertEqual(self.source.count(line), 1)
+                self.assertEqual(added(LATER[2][1], TCPM_C).count('tcpm_log(port, "%s");' % line), 1)
+                # Entered from the partner's request alone: no state change
+                # and no queued state names it otherwise.
+                self.assertEqual(self.source.count("tcpm_pd_handle_state(port, %s," % label), 1)
+                self.assertNotRegex(self.source, r"tcpm_set_state(?:_cond)?\(port, %s\b|"
+                                                 r"upcoming_state = %s;" % (label, label))
+
+    def test_the_vconn_soft_reset_leaves_a_queued_swap_alone(self):
+        # A VCONN swap that turns VCONN on ends here, the partner's as well
+        # as the port's own.  A swap still queued behind the partner's has
+        # not been sent; the port's own VCONN swap is no longer queued here
+        # and is completed as before.
+        machine = function(self.source, "run_state_machine")
+        reset = case(machine, "VCONN_SWAP_SEND_SOFT_RESET", "DR_SWAP_CANCEL")
+        self.assertRegex(reset, r"\*/\n"
+                                r"\t\tif \(!tcpm_swap_is_queued\(port\)\)\n"
+                                r"\t\t\ttcpm_swap_complete\(port, port->swap_status\);\n"
+                                r"\t\tif \(tcpm_can_communicate_sop_prime\(port\)\) \{\n")
+        self.assertEqual(reset.count("tcpm_swap_complete("), 1)
+
     def test_states_the_write_up_names_exist(self):
         names = set(re.findall(r"\b[A-Z]+(?:_[A-Z]+)+\b", DOC.read_text()))
         states = set(re.findall(r"^\tS\(([A-Z_]+)\),", self.source, re.M))
         for name in names:
             if re.match(r"(SNK|SRC|DR_SWAP|PR_SWAP|AMS|ERROR|PORT|HARD|SOFT)_", name):
                 self.assertIn(name, states)
+
+
+@unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+class Dwc3GuardAppliedTests(unittest.TestCase):
+    """The guard on the pinned dwc3-qcom.c, after what the build applies to
+    that file before it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        tree = Path(cls.tmp.name)
+        (tree / DWC3_C).parent.mkdir(parents=True)
+        (tree / DWC3_C).write_bytes(subprocess.run(
+            ["git", "-C", str(kernel_source()), "show", "HEAD:" + DWC3_C],
+            check=True, capture_output=True).stdout)
+        cls.unpatched = (tree / DWC3_C).read_text()
+        cls.log = {}
+        for marker, target, patch in hooks():
+            if target != DWC3_C:
+                continue
+            assert marker not in (tree / DWC3_C).read_text(), marker
+            with open(PATCHES / patch, "rb") as stream:
+                cls.log[patch] = subprocess.run(
+                    ["patch", "-d", str(tree), "-p1", "--no-backup-if-mismatch"],
+                    stdin=stream, check=True, capture_output=True, text=True).stdout
+        cls.source = (tree / DWC3_C).read_text()
+
+    def test_it_applies_without_fuzz(self):
+        # On the SM-X710 line the opps patch above the function moves the
+        # hunk by its four added lines; on the SM-X910 line it is exact.
+        log = self.log[DWC3_GUARD[1]]
+        self.assertNotIn("fuzz", log)
+        if DWC3_OPPS[1] in self.log:
+            self.assertEqual(re.findall(r"offset -?\d+ lines?", log), ["offset 4 lines"])
+        else:
+            self.assertNotIn("offset", log)
+
+    def test_the_hcd_is_checked_before_the_root_hub_is_read(self):
+        body = function(self.source, "dwc3_qcom_read_usb2_speed")
+        guard = re.search(r"\thcd = platform_get_drvdata\(dwc->xhci\);\n\n"
+                          r"\t/\*\n(?:\t \*.*\n)+\t \*/\n"
+                          r"\tif \(!hcd\)\n"
+                          r"\t\treturn USB_SPEED_UNKNOWN;\n\n"
+                          r"#ifdef CONFIG_USB\n"
+                          r"\tudev = usb_hub_find_child\(hcd->self\.root_hub, port_index \+ 1\);\n",
+                          body)
+        self.assertIsNotNone(guard, body)
+        self.assertIn(DWC3_GUARD[0], body[:guard.end()])
+        self.assertEqual(self.source.count(DWC3_GUARD[0]), 1)
+        self.assertEqual(body.count("hcd->"), 1)
+        # The unpatched function reads the root hub right after the drvdata.
+        self.assertNotIn("if (!hcd)", function(self.unpatched, "dwc3_qcom_read_usb2_speed"))
 
 
 def block_after(text, marker):
@@ -773,15 +957,47 @@ class WriteUpTests(unittest.TestCase):
         self.assertNotIn("have not run on a tablet yet", flat)
         self.assertIn("**None of the three fixes and neither switch has been tried on a tablet "
                       "yet.**", flat)
-        self.assertIn("Test kernels with it were built for both tablets on 2026-11-21 and are "
-                      "installed on neither.", flat)
-        self.assertIn("the third fix is in no kernel that has run.", flat)
+        # True before any kernel with the newest changes is built: no build
+        # date, no kernel that is said to wait for a tablet.
+        self.assertIn("No kernel with the third fix or the NULL check has run on a tablet, and "
+                      "the power domain change has run on the SM-X910 only.", flat)
+        self.assertIn("the third fix and the NULL check are in no kernel that has run.", flat)
         for stale in ("the third is what the tree carries now", "The two fixes and the switches",
-                      "Neither fix has been tried"):
+                      "Neither fix has been tried", "installed on neither",
+                      "were built for both tablets", "No dock has been plugged into",
+                      "has not been tried there yet", "Everything measured here comes from"):
             self.assertNotIn(stale, flat)
-        self.assertIn("**No dock has been plugged into it yet.**", flat)
-        self.assertIn("**a boot with the dock attached has not been tried there yet**", flat)
         self.assertIn("This is read from the timing; nothing has watched the CC line itself.", flat)
+
+    def test_the_sm_x710_is_told_as_it_was_recorded(self):
+        # 2026-11-21: a baseline with both docks, then a boot with the Anker
+        # hub attached on the kit's kernel, whose next xHCI failed to start.
+        flat = " ".join(self.doc.split())
+        for said in ("On 2026-11-21 it was recorded with both docks on the kernel before the "
+                     "kit, and booted with the Anker hub attached on the kit's kernel.",
+                     "The SM-X710 needs it as well.",
+                     "the probe of the new xHCI failed (`Host halt failed, -110`, "
+                     "`can't setup: -110`), so no device came up.",
+                     "That is one observation, with the SM-X910's signature.",
+                     "The SM-X710's kernel kit now carries the patch, and that kernel has not "
+                     "run on the tablet.",
+                     "A boot whose bus stays empty does not put the host controller to the test.",
+                     "Not done on the SM-X710: `dock` and `swap` runs on a kit kernel, the "
+                     "Satechi on a kit kernel, and a boot with the dock attached and devices on "
+                     "the bus.",
+                     "Idle and suspend power with retention on the SM-X710 are not measured.",
+                     "The Anker hub cannot serve as the unpowered hub: without its charger it "
+                     "enumerates nothing",
+                     "With its charger it enumerated 13 devices on the SM-X910."):
+            with self.subTest(said):
+                self.assertIn(said, flat)
+
+    def test_the_dwc3_qcom_guard_is_said_to_fix_the_oops_and_not_the_host(self):
+        flat = " ".join(self.doc.split())
+        self.assertIn("`%s`, for both tablets, treats a port without that data as empty, so the "
+                      "suspend completes. It does not bring the host controller back"
+                      % DWC3_GUARD[1], flat)
+        self.assertIn("It has not run on a tablet.", flat)
 
     def test_the_fixes_for_a_write_are_described_as_the_patches_have_them(self):
         flat = " ".join(self.doc.split())
@@ -803,9 +1019,17 @@ class WriteUpTests(unittest.TestCase):
                       "the code after those two; no trace showed the fault.", flat)
         self.assertIn("A write to `data_role`, `power_role` or `vconn_source` puts its swap in "
                       "`upcoming_state`", flat)
-        self.assertIn("Both parts are for every TCPM port, the first for all three role "
-                      "attributes, the second for the data role. Neither case has been seen on "
-                      "a tablet.", flat)
+        self.assertIn("All of it is for every TCPM port and all three role attributes. None "
+                      "of it has been seen on a tablet.", flat)
+        for _, _, _, line in PARTNER_FIRST_ACCEPT:
+            self.assertIn("`%s`" % line, flat)
+        self.assertIn("`VCONN_SWAP_SEND_SOFT_RESET`", flat)
+        self.assertNotIn("the second for the data role", flat)
+        # The gaps the fixes leave.
+        self.assertIn("a VDM exchange that starts in that time is not looked at again.", flat)
+        self.assertIn("so none of its checks run for it.", flat)
+        self.assertIn("A Soft Reset or a Hard Reset does not complete a pending swap with an "
+                      "error", flat)
         # What the power role and VCONN writes still go without.
         self.assertIn("Writes to `power_role` and `vconn_source` (`tcpm_pr_set()`, "
                       "`tcpm_vconn_set()`) have neither of the first two fixes", flat)

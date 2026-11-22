@@ -1,11 +1,12 @@
 #!/bin/sh
 # Type-C roles kit for the SM-X910, on top of release v1.2.5: the release
-# kernel rebuilt with the two TCPM changes for powered USB-C docks (the
-# tablet asks for the USB host role itself before discovery, and Try.SNK
-# waits long enough for the SM5714 to report a source) and with the USB
-# power domains kept in retention across suspend, in boot, and its module
-# tree.  The DTB and the configuration are the release's, so vendor_boot is
-# checked but not written.
+# kernel rebuilt with the TCPM changes for powered USB-C docks (the tablet
+# asks for the USB host role itself before discovery, Try.SNK waits long
+# enough for the SM5714 to report a source, and three fixes for a swap asked
+# for from userspace), with the USB power domains kept in retention across
+# suspend and with a NULL check in the dwc3-qcom glue, in boot, and its
+# module tree.  The DTB and the configuration are the release's, so
+# vendor_boot is checked but not written.
 #
 #   sudo sh ~/typec-roles/install.sh      then reboot
 #   sudo sh ~/typec-roles/rollback.sh     back to the release kernel, then reboot

@@ -41,7 +41,7 @@ v1.2.5 and needs nothing else on the tablet:
 
 | kit | what it tries | results |
 |---|---|---|
-| [`typec-roles-ultra/`](typec-roles-ultra/README.md) | the kernel changes for powered USB-C docks: the tablet asks for the USB host role itself before discovery, Try.SNK waits for the SM5714 to report a source, and the USB power domains stay in retention across suspend (a boot with the dock attached); a plug-in recorder with a verdict for each plug-in | [`docs/usb-c-dock-roles.md`](../../docs/usb-c-dock-roles.md) |
+| [`typec-roles-ultra/`](typec-roles-ultra/README.md) | the kernel changes for powered USB-C docks: the tablet asks for the USB host role itself before discovery, Try.SNK waits for the SM5714 to report a source, three fixes for a swap asked for from userspace, the USB power domains stay in retention across suspend (a boot with the dock attached), and a NULL check in the dwc3-qcom glue; a plug-in recorder with a verdict for each plug-in | [`docs/usb-c-dock-roles.md`](../../docs/usb-c-dock-roles.md) |
 
 The commands in the kit READMEs use `<user>@10.42.0.2`, where `<user>` is the
 desktop user on the tablet.  10.42.0.2 is the tablet's end of the development
