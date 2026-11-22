@@ -111,14 +111,19 @@ PREFIXES = (
     "/proc/uptime", "/proc/1/mounts", "/proc/swaps", "/proc/sysrq-trigger", "/sys/power/",
     "/sys/class/rtc/", "/sys/class/block/", "/sys/kernel/debug/qcom_stats",
     "/sys/kernel/debug/interconnect/", "/sys/bus/platform/devices/", "/dev/pmsg0",
-    "/etc/ubuntu-gts9u/", "/var/lib/ubuntu-gts9u/", "/usr/libexec/",
+    "/etc/ubuntu-gts9u/", "/var/lib/ubuntu-gts9u/", "/usr/libexec/", "/sys/fs/ext4/",
+    "/proc/interrupts",
 )
 
 STUBS = {
     "id": 'echo 0',
     "uname": 'case $1 in -r) echo %s ;; *) echo "#1 SMP PREEMPT test" ;; esac' % RELEASE,
     "flock": 'exit 0',
-    "findmnt": 'cat "$FAKE_ROOT/mount-options" 2>/dev/null || echo rw,relatime',
+    # The root's options (-no OPTIONS /), or its source (-no SOURCE /).
+    "findmnt": '''case $* in
+*SOURCE*) cat "$FAKE_ROOT/mount-source" 2>/dev/null || echo /dev/sda34 ;;
+*) cat "$FAKE_ROOT/mount-options" 2>/dev/null || echo rw,relatime ;;
+esac''',
     "fuser": '[ -e "$FAKE_ROOT/dpkg-busy" ]',
     "dpkg": 'exit 0',
     "depmod": '[ ! -e "$FAKE_ROOT/depmod-fails" ]',
@@ -657,8 +662,9 @@ class FakeTablet(unittest.TestCase):
             body = re.compile(r"^in_ram_root\(\) \{ # CMD \[ARGS\]\n.*?^\}\n", re.M | re.S)
             self.assertEqual(len(body.findall(text)), 1)
             text = body.sub(lambda m: 'in_ram_root() { # CMD [ARGS]\n\t$ram_prefix "$@"\n}\n', text)
-            self.assertEqual(text.count("\ninit_pid=1\n"), 1)
-            text = text.replace("\ninit_pid=1\n", f"\ninit_pid={getattr(self, 'init_pid', None) or 99999999}\n")
+            # The freeze reaches the system's mounts through /proc/1/root:
+            # the stubs take that path as it is.
+            self.assertEqual(text.count("\nsysroot=/proc/1/root\n"), 1)
         text = text.replace(pinned("install.sh", "hang_boot"), sha(self.hang_boot))
         text = text.replace(pinned("install.sh", "hang_vendor_boot"), sha(self.hang_vendor_boot))
         for real, standin in self.standins.items():
@@ -2722,9 +2728,123 @@ class VerifyTest(FakeTablet):
                     self.assertNotIn("ok   root is rw", result.stdout)
                     self.assertNotIn("all checks passed", result.stdout)
 
+    def ext4_record(self, count, func="", line="0"):
+        """ext4's record of the root, as /sys/fs/ext4/sda34 shows it."""
+        d = self.root / "sys/fs/ext4/sda34"
+        d.mkdir(parents=True, exist_ok=True)
+        for name, value in (("errors_count", count), ("last_error_func", func), ("last_error_line", line)):
+            (d / name).write_text(f"{value}\n")
 
-# sleep-test.sh copies the tools it needs once the disk is read-only to RAM
-# and runs them through the copied dynamic loader, so they have to be real
+    def test_an_error_ext4_recorded_on_the_root_fails_in_any_boot(self):
+        """With an error recorded and deleted files held open, the root does
+        not mount after a reset (this port's initramfs has no fsck): an
+        error count above 0, an error the mount found recorded (in the
+        superblock or the journal's), or one recorded since, fails; a
+        stick's does not, nor sleep-test.sh's own lines that quote one."""
+        self.boot_kit()
+        result = self.run_script("verify.sh")
+        self.assertIn("note cannot read ", result.stdout)
+        self.assertIn("ok   the root (sda34) was mounted with no ext4 error found or recorded this boot",
+                      result.stdout)
+        self.ext4_record(0)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   ext4 has recorded no error on the root (sda34: errors_count 0)", result.stdout)
+        self.ext4_record(5, "ext4_mark_recovery_complete", 6370)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL ext4 has recorded 5 errors on the root (sda34, the last in "
+                      "ext4_mark_recovery_complete:6370): e2fsck -f it from recovery", result.stdout)
+        self.ext4_record(0)
+        own = "kernel: gts9u sleep-test: 20261122-031500 SLEEP-TEST ERROR-STATE: ... "
+        for line, fails in (
+                ("kernel: EXT4-fs warning (device sda34): ext4_clear_journal_err:6412: Filesystem error recorded "
+                 "from previous mount: IO failure", True),
+                ("kernel: EXT4-fs (sda34): warning: mounting fs with errors, running e2fsck is recommended", True),
+                ("kernel: EXT4-fs error (device sda34): ext4_mark_recovery_complete:6370: comm mount: Orphan file "
+                 "not empty on read-only fs.", True),
+                ("kernel: EXT4-fs error (device sdg2): __ext4_find_entry:1622: inode #2: comm gvfsd: reading "
+                 "directory lblock 0", False),
+                (own + "EXT4-fs error (device sda34): __ext4_find_entry:1622", False)):
+            with self.subTest(line):
+                self.boot_kit()
+                self.journal_add(line + "\n")
+                result = self.run_script("verify.sh")
+                if fails:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+                    self.assertIn("FAIL ext4 found or recorded an error on the root (sda34) this boot: e2fsck -f it "
+                                  f"from recovery before the next reset (docs/resume-recovery.md, \"Repairing the "
+                                  f"root from recovery\"):\n{line}\n", result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("ok   the root (sda34) was mounted with no ext4 error", result.stdout)
+
+    def test_a_replayed_journal_fails_only_the_boot_right_after_a_sleep_test(self):
+        """"recovery required on readonly filesystem" is what a power loss
+        leaves; after sleep-test.sh's restart, whose root was frozen (the
+        journal flushed, needs_recovery clear), it means the freeze did not
+        hold to the restart.  That boot is known by the run's RESTART line in
+        the pmsg this boot archived; without the archive it cannot be told."""
+        replayed = ("kernel: EXT4-fs (sda34): INFO: recovery required on readonly filesystem\n"
+                    "kernel: EXT4-fs (sda34): write access will be enabled during recovery\n"
+                    "kernel: EXT4-fs (sda34): recovery complete\n")
+        clean = ("kernel: EXT4-fs (sda34): orphan cleanup on readonly fs\n"
+                 "kernel: EXT4-fs (sda34): mounted filesystem 3c5f-uuid ro with ordered data mode. Quota mode: "
+                 "none.\n")
+        boot = (self.root / "proc/sys/kernel/random/boot_id").read_text().strip()
+        archive = self.root / "var/lib/ubuntu-gts9u/pstore"
+
+        def archived(name, by, pmsg):
+            d = archive / name
+            d.mkdir(parents=True)
+            (d / "INFO").write_text(f"archived:      2026-11-22 11:47:20 UTC by boot {by}\n")
+            (d / "pmsg-ramoops-0").write_text(pmsg)
+
+        restart = "gts9u sleep-test: 20261122-031500 SLEEP-TEST RESTART: sysrq b; frozen: /media/stick /\n"
+        # No archive: a replayed journal is noted, whatever came before.
+        self.boot_kit()
+        self.journal_add(replayed)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"whether this boot is one cannot be told (there is no {archive})", result.stdout)
+        # This boot archived a sleep test's restart: the same lines fail.
+        archived("000009-20261122T100000Z-boot-0aa11bb2", "0aa11bb2-0000", restart)
+        archived("000010-20261122T114720Z-boot-788ce779", boot, "gts9u sleep-test: 20261122-031500 SLEEP-TEST "
+                 "RESULT: DRY: no sleep tried\n" + restart)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL this is the boot after a sleep test's restart, and a journal was not empty at the "
+                      "mount: the root was not frozen at the restart, or something wrote to it while it was; check "
+                      "it with e2fsck -fn from recovery:\nkernel: EXT4-fs (sda34): INFO: recovery required on "
+                      "readonly filesystem\n", result.stdout)
+        # A journal ext4 did not ask to replay, the same.
+        self.boot_kit()
+        self.journal_add("kernel: JBD2: Clearing recovery information on journal\n" + clean)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL this is the boot after a sleep test's restart", result.stdout)
+        # The boot after a sleep test whose root was frozen to the restart.
+        self.boot_kit()
+        self.journal_add(clean)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   the boot after a sleep test's restart: the root's journal was empty at the mount "
+                      "(frozen to the restart)\nnote the root's mount: orphan cleanup on readonly fs;mounted "
+                      "filesystem 3c5f-uuid ro with ordered data mode. Quota mode: none.\n", result.stdout)
+        # The archive of an earlier boot: this boot is not the one after a run.
+        shutil.rmtree(archive / "000010-20261122T114720Z-boot-788ce779")
+        self.boot_kit()
+        self.journal_add(replayed)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("note the root's journal was replayed at this boot's mount (EXT4-fs (sda34): INFO: recovery "
+                      "required on readonly filesystem): what a power loss or a forced restart leaves",
+                      result.stdout)
+
+
+# sleep-test.sh copies the tools it needs from the freeze on to RAM and runs
+# them through the copied dynamic loader, so they have to be real
 # executables.  The fake kernel's tools are this launcher, under each tool's
 # name, which runs the shell stub of that name with the tool's arguments,
 # and passes on the file it was run from.
@@ -2751,36 +2871,79 @@ int main(int argc, char **argv)
 	return 127;
 }
 '''
+# Each RAM tool notes whether it ran before or after the first freeze, from
+# where, and with which PATH.
+RAM_CALL = 'echo "$([ -e "$T/disk-at-freeze" ] && echo after || echo before) $STUB_EXE $CALLER_PATH" >> "$T/ram-calls"\n'
 # The fake kernel, in the tools the run calls.  F is the fake root, T the
 # test's directory.  Every call is noted; what breaks the rules of the run
 # goes to $T/violations.  STUB_EXE is the file the tool ran from: the copy in
-# the RAM root.
+# the RAM root.  $T/frozen lists the mount points that are frozen.
 SLEEP_STUBS = {
-    # sysrq u makes every disk filesystem read-only but those named in
-    # $T/stay-rw, and logs it, unless $T/no-remount asks otherwise; the disk
-    # as it was at that moment is noted.
-    "dmesg": r'''echo "$([ -e "$T/disk-at-remount" ] && echo after || echo before) $STUB_EXE $CALLER_PATH" >> "$T/ram-calls"
-done=$(cat "$T/u.done" 2>/dev/null || echo 0)
-want=$(tr -cd u < "$F/proc/sysrq-trigger" | wc -c)
-if [ "$want" -gt "$done" ] && [ ! -e "$T/no-remount" ]; then
-	echo "$want" > "$T/u.done"
-	awk -v keep=" $(cat "$T/stay-rw" 2>/dev/null) " '$1 ~ /^\/dev\// && $3 !~ /^fuse/ && index(keep, " " $2 " ") == 0 { sub(/^rw/, "ro", $4) } { print }' \
-		"$F/proc/1/mounts" > "$T/mounts.new" && mv "$T/mounts.new" "$F/proc/1/mounts"
-	[ -e "$T/disk-at-remount" ] || manifest > "$T/disk-at-remount"
-	printf '[  600.000000] sysrq: Emergency Remount R/O\n[  600.000100] Emergency Remount complete\n' >> "$F/dev/kmsg"
+    "dmesg": RAM_CALL + 'cat "$F/dev/kmsg"',
+    # FIFREEZE and FITHAW on a mount point below /proc/1/root: fails for one
+    # named in $T/freeze-fails or $T/thaw-fails, and as the kernel does for
+    # a second freeze or a thaw of what is not frozen.  The first freeze
+    # notes the disk as it is.  $T/freeze-records-error: an ext4 error on the
+    # root while it is frozen and its disk still writable (a reader's, as the
+    # root is frozen), which ext4 logs and saves (save_error_info: sysfs's
+    # count rises); $T/freeze-warns: a journal handle started on the frozen
+    # root (ext4_journal_check_start's warning).
+    "fsfreeze": RAM_CALL + r'''echo "$*" >> "$T/fsfreeze.calls"
+case $1 in
+--version) echo 'fsfreeze from util-linux 2.39.3'; exit 0 ;;
+-f|-u) ;;
+*) echo "fsfreeze $*" >> "$T/violations"; exit 1 ;;
+esac
+case $2 in
+/proc/1/root/*) mp=${2#/proc/1/root} ;;
+*) echo "fsfreeze $* (not through /proc/1/root)" >> "$T/violations"; exit 1 ;;
+esac
+awk -v m="$mp" '$2 == m { f = 1 } END { exit !f }' "$F/proc/1/mounts" || { echo "fsfreeze: $2: not a mount point" >&2; exit 1; }
+touch "$T/frozen"
+if [ "$1" = -f ]; then
+	# One superblock per source: frozen through any of its mount points.
+	src=$(awk -v m="$mp" '$2 == m { s = $1 } END { print s }' "$F/proc/1/mounts")
+	if awk -v fz=" $(tr '\n' ' ' < "$T/frozen") " 'index(fz, " " $2 " ") { print $1 }' "$F/proc/1/mounts" | grep -qxF -- "$src"; then
+		echo "fsfreeze: $2: freeze failed: Device or resource busy" >&2; exit 1
+	fi
+	if grep -qxF -- "$mp" "$T/freeze-fails" 2>/dev/null; then echo "fsfreeze: $2: freeze failed: Operation not supported" >&2; exit 1; fi
+	if grep -qxF -- "$mp" "$T/freeze-hangs" 2>/dev/null; then /usr/bin/sleep 3; exit 1; fi
+	[ -e "$T/disk-at-freeze" ] || manifest > "$T/disk-at-freeze"
+	echo "$mp" >> "$T/frozen"
+	[ ! -e "$T/freeze-records-error" ] || [ "$mp" != / ] || {
+		kl 'EXT4-fs error (device sda34): ext4_lookup:1817: inode #393217: comm systemd-journal: iget: checksum invalid'
+		echo 1 > "$F/sys/fs/ext4/sda34/errors_count"
+		echo ext4_lookup > "$F/sys/fs/ext4/sda34/last_error_func"
+		echo 1817 > "$F/sys/fs/ext4/sda34/last_error_line"
+	}
+	[ ! -e "$T/freeze-warns" ] || [ "$mp" != / ] ||
+		kl 'WARNING: fs/ext4/ext4_jbd2.c:78 at ext4_journal_check_start+0x6c/0xa0, CPU#3: kworker/u16:2/1234'
+	exit 0
 fi
-cat "$F/dev/kmsg"''',
+grep -qxF -- "$mp" "$T/frozen" || { echo "fsfreeze: $2: unfreeze failed: Invalid argument" >&2; exit 1; }
+if grep -qxF -- "$mp" "$T/thaw-fails" 2>/dev/null; then echo "fsfreeze: $2: unfreeze failed: Input/output error" >&2; exit 1; fi
+grep -vxF -- "$mp" "$T/frozen" > "$T/frozen.new"
+mv "$T/frozen.new" "$T/frozen"''',
     # A sleep: the rules checked at its start, then cycle N's scenario in
-    # $T/cycle-N (log, rc, suspend-failed, no-aosd/no-cxsd/no-ddr,
-    # storage-dead, rw-again).
-    "rtcwake": r'''echo "$([ -e "$T/disk-at-remount" ] && echo after || echo before) $STUB_EXE $CALLER_PATH" >> "$T/ram-calls"
-echo "$*" >> "$T/rtcwake.calls"
+    # $T/cycle-N (log, rc, out, wakeup-irq, suspend-failed,
+    # no-aosd/no-cxsd/no-ddr, storage-dead, other-data, new-mount,
+    # new-mount-unfreezable, thawed: a mount point the sleep thawed; and
+    # ext4's errors, logged as fs/ext4 and fs/jbd2 log them: ext4-error, an
+    # error on the root, handled as ext4_handle_error does with the
+    # behaviour the root runs with in the fake mount table; journal-abort,
+    # jbd2 aborting the root's journal on its own (a forced read-only that
+    # no errors= changes) and ext4 following it, jsb-fails with jbd2's write
+    # of the error failing; stick-error, an error on the stick, whose disk
+    # is writable: saved, its count rises).
+    "rtcwake": RAM_CALL + r'''echo "$*" >> "$T/rtcwake.calls"
 case $* in *--version*) exit 0 ;; esac
 n=$(grep -c -- '-m mem' "$T/rtcwake.calls")
-w=$(awk '$1 ~ /^\/dev\// && $3 !~ /^fuse/ && $4 !~ /^ro(,|$)/ {print $2}' "$F/proc/1/mounts")
-[ -z "$w" ] || echo "cycle $n slept with $w writable" >> "$T/violations"
+fz=$(awk -v fz=" $(tr '\n' ' ' < "$T/frozen" 2>/dev/null) " 'index(fz, " " $2 " ") {print $1}' "$F/proc/1/mounts" | tr '\n' ' ')
+w=$(awk -v fz=" $fz " '$1 ~ /^\/dev\// && $3 !~ /^fuse/ && $4 !~ /^ro(,|$)/ && index(fz, " " $1 " ") == 0 {print $2}' "$F/proc/1/mounts")
+[ -z "$w" ] || echo "cycle $n slept with $w writable and not frozen" >> "$T/violations"
 awk 'NR > 1 && $1 !~ /^\/dev\/zram/' "$F/proc/swaps" | grep -q . && echo "cycle $n slept with swap on the disk" >> "$T/violations"
 [ "$(cat "$F/sys/class/block/sda/ro")" = 1 ] || echo "cycle $n slept with sda writable at the block layer" >> "$T/violations"
+grep -q u "$F/proc/sysrq-trigger" && echo "cycle $n slept after a sysrq u" >> "$T/violations"
 # The kernel shows "s2idle [deep]" once "deep" is written; the stand-in, what was written.
 case $(cat "$F/sys/power/mem_sleep") in *'[deep]'*|deep) ;; *) echo "cycle $n slept with mem_sleep $(cat "$F/sys/power/mem_sleep")" >> "$T/violations" ;; esac
 case $* in "-u -d rtc0 -m mem -s "*) ;; *) echo "rtcwake $*" >> "$T/violations" ;; esac
@@ -2793,13 +2956,42 @@ for q in aosd cxsd ddr; do
 	[ -e "$s/no-$q" ] || [ ! -e "$F/sys/kernel/debug/qcom_stats/$q" ] ||
 		sed -i "s/^Count: \(.*\)/echo Count: \$((\1 + 1))/e" "$F/sys/kernel/debug/qcom_stats/$q"
 done
+# pm_wakeup_irq: the cycle's, or the RTC's.
+if [ -e "$s/wakeup-irq" ]; then cat "$s/wakeup-irq" > "$F/sys/power/pm_wakeup_irq"; else echo 21 > "$F/sys/power/pm_wakeup_irq"; fi
 [ ! -e "$s/storage-dead" ] || touch "$T/storage-dead"
 [ ! -e "$s/other-data" ] || touch "$T/other-data"
-[ ! -e "$s/rw-again" ] || sed -i 's|^\(/dev/sdg2 [^ ]* [^ ]*\) ro|\1 rw|' "$F/proc/1/mounts"
-[ ! -e "$s/stays-rw" ] || echo /media/stick > "$T/stay-rw"
+[ ! -e "$s/new-mount" ] || echo '/dev/sdh1 /media/stick2 ext4 rw,relatime 0 0' >> "$F/proc/1/mounts"
+[ ! -e "$s/new-mount-unfreezable" ] || echo /media/stick2 >> "$T/freeze-fails"
+if [ -e "$s/thawed" ]; then
+	grep -vxF -- "$(cat "$s/thawed")" "$T/frozen" > "$T/frozen.new"
+	mv "$T/frozen.new" "$T/frozen"
+fi
+if [ -e "$s/ext4-error" ]; then
+	kl 'EXT4-fs error (device sda34): __ext4_find_entry:1622: inode #2: comm systemd: reading directory lblock 0'
+	if [ "$(mode_of /dev/sda34)" != continue ]; then
+		kl 'Aborting journal on device sda34-8.'
+		kl 'Trying to write to read-only block-device sda34'
+		kl 'EXT4-fs (sda34): Remounting filesystem read-only'
+		add_opt /dev/sda34 emergency_ro
+	fi
+fi
+if [ -e "$s/journal-abort" ]; then
+	kl 'Aborting journal on device sda34-8.'
+	kl 'Trying to write to read-only block-device sda34'
+	[ ! -e "$s/jsb-fails" ] || kl 'JBD2: I/O error when updating journal superblock for sda34-8.'
+	kl 'EXT4-fs error (device sda34): ext4_journal_check_start:86: comm kworker/u16:3: Detected aborted journal'
+	kl 'EXT4-fs (sda34): Remounting filesystem read-only'
+	add_opt /dev/sda34 emergency_ro
+fi
+if [ -e "$s/stick-error" ]; then
+	kl 'EXT4-fs error (device sdg2): __ext4_find_entry:1622: inode #2: comm gvfsd-trash: reading directory lblock 0'
+	echo $(($(cat "$F/sys/fs/ext4/sdg2/errors_count") + 1)) > "$F/sys/fs/ext4/sdg2/errors_count"
+	echo __ext4_find_entry > "$F/sys/fs/ext4/sdg2/last_error_func"
+	echo 1622 > "$F/sys/fs/ext4/sdg2/last_error_line"
+fi
+[ ! -e "$s/out" ] || cat "$s/out"
 exit "$(cat "$s/rc" 2>/dev/null || echo 0)"''',
-    "dd": r'''echo "$([ -e "$T/disk-at-remount" ] && echo after || echo before) $STUB_EXE $CALLER_PATH" >> "$T/ram-calls"
-echo "$*" >> "$T/dd.calls"
+    "dd": RAM_CALL + r'''echo "$*" >> "$T/dd.calls"
 inf=
 for a; do
 	case $a in
@@ -2822,32 +3014,98 @@ case $inf in
 esac
 echo "dd $*" >> "$T/violations"
 exit 1''',
-    "blockdev": r'''echo "$([ -e "$T/disk-at-remount" ] && echo after || echo before) $STUB_EXE $CALLER_PATH" >> "$T/ram-calls"
-echo "$*" >> "$T/blockdev.calls"
+    "blockdev": RAM_CALL + r'''echo "$*" >> "$T/blockdev.calls"
 case $1 in
 --setro)
 	[ ! -e "$T/setro-fails" ] || exit 1
 	echo 1 > "$F/sys/class/block/${2#/dev/}/ro" ;;
+--setrw) echo 0 > "$F/sys/class/block/${2#/dev/}/ro" ;;
 --getro) cat "$F/sys/class/block/${2#/dev/}/ro" ;;
 *) echo "blockdev $*" >> "$T/violations"; exit 1 ;;
 esac''',
-    "sync": r'''echo "$([ -e "$T/disk-at-remount" ] && echo after || echo before) $STUB_EXE $CALLER_PATH" >> "$T/ram-calls"
-echo "sync $*" >> "$T/sync.calls"''',
-    "sleep": r'''echo "$([ -e "$T/disk-at-remount" ] && echo after || echo before) $STUB_EXE $CALLER_PATH" >> "$T/ram-calls"
+    "sync": RAM_CALL + 'echo "sync $*" >> "$T/sync.calls"',
+    # $T/abort-at-hold: jbd2 aborts the root's journal during the hold, once
+    # the run's RESULT line is out (the hold's sleep 1).
+    "sleep": RAM_CALL + r'''if [ -e "$T/abort-at-hold" ] && [ "${1:-}" = 1 ] &&
+	grep -qs '^SLEEP-TEST RESULT: ' "$F"/run/gts9u-sleep-test/latest/result; then
+	rm "$T/abort-at-hold"
+	kl 'Aborting journal on device sda34-8.'
+	kl 'EXT4-fs (sda34): Remounting filesystem read-only'
+	add_opt /dev/sda34 emergency_ro
+fi
 exit 0''',
+    # setns into PID 1's mount namespace, then the command: here it runs in
+    # the test's own (mount is a stub).
+    "nsenter": RAM_CALL + r'''echo "$*" >> "$T/nsenter.calls"
+case $1 in --version) echo 'nsenter from util-linux 2.39.3'; exit 0 ;; esac
+[ "$1 $2 $3 $4" = "-t 1 -m --" ] || { echo "nsenter $*" >> "$T/violations"; exit 1; }
+shift 4
+exec "$@"''',
 }
 # The tools of the disk part of the run, as plain scripts in PATH.
 SLEEP_PLAIN_STUBS = {
-    "mount": 'echo "$*" >> "$T/mount.calls"',
+    # The tmpfs of the run's RAM directory, and the remounts of errors= as
+    # util-linux 2.39.3 makes them with a mount point alone: the options of
+    # fstab or of the mount table first, -o's after, so that the last
+    # errors= is the one ext4 keeps; then the fake kernel shows errors= only
+    # when it differs from the superblock's default (_ext4_show_options).
+    # $T/remount-fails names the errors= words (or "WORD MOUNTPOINT") for
+    # which the remount fails, as mount(8) says it, status 32;
+    # $T/remount-ignored those for which it goes through and changes
+    # nothing.  Never while anything is frozen.
+    "mount": r'''echo "$*" >> "$T/mount.calls"
+case $1 in
+-t) exit 0 ;;
+-o) ;;
+*) echo "mount $*" >> "$T/violations"; exit 1 ;;
+esac
+[ ! -s "$T/frozen" ] || echo "mount $* with $(tr '\n' ' ' < "$T/frozen")frozen" >> "$T/violations"
+case $2 in
+remount,errors=continue|remount,errors=remount-ro|remount,errors=panic) want=${2#remount,errors=} ;;
+*) echo "mount $*" >> "$T/violations"; exit 1 ;;
+esac
+[ $# = 3 ] || { echo "mount $* (not a mount point alone)" >> "$T/violations"; exit 1; }
+src=$(awk -v m="$3" '$2 == m { s = $1 } END { print s }' "$F/proc/1/mounts")
+if [ -z "$src" ] || grep -qxF -e "$want" -e "$want $3" "$T/remount-fails" 2>/dev/null; then
+	echo "mount: $3: mount point not mounted or bad option." >&2
+	echo "       dmesg(1) may have more information after failed mount system call." >&2
+	exit 32
+fi
+! grep -qxF -- "$want" "$T/remount-ignored" 2>/dev/null || exit 0
+word=
+[ "$want" = "$(sb_default "${src##*/}")" ] || word=errors=$want
+# errors= before emergency_ro and shutdown, as _ext4_show_options prints them.
+awk -v s="$src" -v w="$word" '$1 == s {
+	n = split($4, o, ","); r = ""; late = ""
+	for (i = 1; i <= n; i++)
+		if (o[i] ~ /^(emergency_ro|shutdown)$/) late = late "," o[i]
+		else if (o[i] !~ /^errors=/) r = r (r == "" ? "" : ",") o[i]
+	if (w != "") r = r "," w
+	$4 = r late
+} { print }' "$F/proc/1/mounts" > "$T/mounts.new" && mv "$T/mounts.new" "$F/proc/1/mounts"''',
+    "setsid": '[ ! -e "$T/setsid-fails" ] || exit 125\nexec /usr/bin/setsid "$@"',
     # Never run here: in_ram_root is replaced (RamRootTest runs the real one).
     "chroot": 'echo "chroot $*" >> "$T/violations"; exit 1',
+    # $T/error-at-swapoff: an ext4 error on the root in the minutes between
+    # the checks and the first freeze (here while swap goes off), saved, as
+    # its disk is writable; $T/abort-at-swapoff: the same error with ext4
+    # giving up on the root, as it does with remount-ro, its behaviour then.
     "swapoff": '''echo "$*" >> "$T/swapoff.calls"
 [ ! -e "$T/swapoff-fails" ] || exit 1
-awk -v s="$1" '$1 != s' "$F/proc/swaps" > "$T/swaps.new" && mv "$T/swaps.new" "$F/proc/swaps"''',
+awk -v s="$1" '$1 != s' "$F/proc/swaps" > "$T/swaps.new" && mv "$T/swaps.new" "$F/proc/swaps"
+if [ -e "$T/error-at-swapoff" ] || [ -e "$T/abort-at-swapoff" ]; then
+	kl 'EXT4-fs error (device sda34): ext4_lookup:1817: inode #393217: comm tracker-miner-f: iget: checksum invalid'
+	echo 1 > "$F/sys/fs/ext4/sda34/errors_count"
+	echo ext4_lookup > "$F/sys/fs/ext4/sda34/last_error_func"
+	echo 1817 > "$F/sys/fs/ext4/sda34/last_error_line"
+fi
+if [ -e "$T/abort-at-swapoff" ]; then
+	kl 'Aborting journal on device sda34-8.'
+	kl 'EXT4-fs (sda34): Remounting filesystem read-only'
+	add_opt /dev/sda34 emergency_ro
+fi''',
     "systemctl": r'''echo "$*" >> "$T/systemctl.calls"
 case $1 in
-show)
-	[ -e "$T/no-cad" ] && echo poweroff.target || echo reboot.target ;;
 is-active)
 	[ "${2:-}" != --quiet ] || shift
 	if [ -e "$T/active-$2" ]; then cat "$T/active-$2"; exit 0; fi
@@ -2866,33 +3124,155 @@ restart)
 	printf 'result=released\nreason=restarted\n' > "$F/run/ubuntu-gts9u/icc-release"
 	echo 'releasing: 24100000.interconnect interconnect-1' >> "$F/var/log/ubuntu-gts9u-icc-release.log" ;;
 esac''',
+    # A superblock's header: its state from $T/fs-state, clean unless a test
+    # says otherwise, and its default error behaviour (sb_default), as
+    # e2fsprogs 1.47.0 prints them (lib/e2p/ls.c).
+    "dumpe2fs": '''echo "$*" >> "$T/dumpe2fs.calls"
+echo 'dumpe2fs 1.47.0 (5-Feb-2023)' >&2
+[ "$1" = -h ] || exit 1
+echo 'Filesystem volume name:   UBTS9_UFS'
+echo "Filesystem state:         $(cat "$T/fs-state" 2>/dev/null || echo clean)"
+case $(sb_default "${2##*/}") in
+continue) echo 'Errors behavior:          Continue' ;;
+remount-ro) echo 'Errors behavior:          Remount read-only' ;;
+panic) echo 'Errors behavior:          Panic' ;;
+*) echo 'Errors behavior:          Unknown (continue)' ;;
+esac''',
 }
-# The disk as the run must leave it after the remount: everything but /run,
-# /proc, /sys and /dev of the fake root, and the kit with its logs.
+# The disk as the run must leave it after the first freeze: everything but
+# /run, /proc, /sys and /dev of the fake root, and the kit with its logs.
+# And the fake kernel's ext4: a line in its log (kl), a superblock's default
+# error behaviour ($T/sb-errors-NAME, remount-ro if there is none), the one
+# a filesystem runs with (its errors= in the mount table, else that
+# default), and an option ext4 adds to its mount (emergency_ro).
 MANIFEST = r'''manifest() {
 	(cd "$F" && find . -path ./run -prune -o -path ./proc -prune -o -path ./sys -prune \
 		-o -path ./dev -prune -o -type f -exec sha256sum {} +) | sort
 	(cd "$T/kit" && find . -type f -exec sha256sum {} +) | sed 's|  \./|  kit/|' | sort
 }
+kl() { printf '[  731.500000] %s\n' "$*" >> "$F/dev/kmsg"; }
+sb_default() { cat "$T/sb-errors-$1" 2>/dev/null || echo remount-ro; }
+mode_of() {
+	m=$(awk -v s="$1" '$1 == s { n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] ~ /^errors=/) { sub(/^errors=/, "", o[i]); print o[i] }; exit }' "$F/proc/1/mounts")
+	[ -n "$m" ] || m=$(sb_default "${1##*/}")
+	echo "$m"
+}
+add_opt() {
+	awk -v s="$1" -v o="$2" '$1 == s { $4 = $4 "," o } { print }' "$F/proc/1/mounts" > "$T/mounts.new" &&
+		mv "$T/mounts.new" "$F/proc/1/mounts"
+}
 '''
+# The 2026-11-22 03:29 attempt on squirtle (kit revision 7's kernel, docked
+# and powered): the touchscreen's double tap came in the noirq phase, and
+# the kernel gave the suspend up before the tablet slept.  The kernel lines
+# that tell it, from that run's kmsg-1
+# (~/ubuntu-gts9u/backups/squirtle-sleep-r7-baseline-20261122-0328/run),
+# and rtcwake's output.
+TOUCH_ABORT = """\
+[13851.674165] PM: suspend entry (deep)
+[13858.770514] PM: suspend of devices complete after 186.566 msecs
+[13858.980061] PM: late suspend of devices complete after 209.497 msecs
+[13858.996988] PM: Triggering wakeup from IRQ 199
+[13859.007192] PM: noirq suspend of devices complete after 26.474 msecs
+[13859.007458] Disabling non-boot CPUs ...
+[13859.007463] Wakeup pending. Abort CPU freeze
+[13859.007466] Non-boot CPUs are not disabled
+[13859.031732] PM: noirq resume of devices complete after 24.259 msecs
+[13859.037881] samsung_fts1ba90a 9-0049: double tap to wake
+[13860.845153] PM: resume of devices complete after 631.666 msecs
+[13861.416262] PM: suspend exit
+"""
+TOUCH_ABORT_OUT = 'rtcwake: wakeup from "mem" using rtc0 at Thu Mar  5 05:27:35 1970\nrtcwake: write error\n'
+TOUCH_HINT = "IRQ 199 (fts1ba90a, the touchscreen: do not touch the screen during the run)"
+# /proc/interrupts: IRQ 199 as squirtle showed it (its counts made up here),
+# and made-up lines for the rest: the RTC's, a named one that is not the
+# touchscreen, a shared one, one with a flow handler's name, and one with no
+# action.
+INTERRUPTS = (
+    "           CPU0       CPU1       CPU2       CPU3       CPU4       CPU5       CPU6       CPU7       \n"
+    " 21:          4          0          0          0          0          0          0          0  pmic_arb 1 Edge      pm8xxx_rtc_alarm\n"
+    " 37:          2          0          0          0          0          0          0          0  pmic_arb 2 Edge      pm8550_pwrkey\n"
+    " 40:          0          0          0          0          0          0          0          0     GICv3  72 Level     foo, bar\n"
+    " 41:          0          0          0          0          0          0          0          0     GICv3  73 Level   -edge      baz\n"
+    "199:          9          0          0          0          0          0          0          0   msmgpio  25 Level     fts1ba90a\n"
+    "251:          0          0          0          0          0          0          0          0     GICv3 300 Level   \n"
+)
+# A journal handle started on a frozen ext4: ext4_journal_check_start's
+# WARN_ON (fs/ext4/ext4_jbd2.c:78) in 7.2's format (__warn, kernel/panic.c).
+JOURNAL_WARN = "WARNING: fs/ext4/ext4_jbd2.c:78 at ext4_journal_check_start+0x6c/0xa0, CPU#3: kworker/u16:2/1234"
+# What the first resume with a filesystem frozen from userspace logs, with
+# freeze_filesystems 0: the suspend's own thaw (filesystems_thaw) finds no
+# freeze of its own, WARN_ON_ONCE in may_unfreeze (fs/super.c:1919),
+# inlined in thaw_super_locked.  Made from the source; not seen on a
+# tablet.  Its module list names the UFS driver, and modules whose names
+# say "fail" (net_failover and failover are real ones): a list, not a
+# storage line.
+SUPER_WARN = """\
+[  730.050000] ------------[ cut here ]------------
+[  730.050001] WARNING: fs/super.c:1919 at thaw_super_locked+0x1a8/0x1f0, CPU#4: rtcwake/4321
+[  730.050002] Modules linked in: snd_soc_wcd938x qcom_pd_mapper ufs_qcom phy_qcom_qmp_ufs net_failover failover
+[  730.050003] CPU: 4 UID: 0 PID: 4321 Comm: rtcwake Not tainted 7.2.0-rc3-dirty #8 PREEMPT
+[  730.050004] Hardware name: Samsung Galaxy Tab S9 (SM-X710) (DT)
+[  730.050005] pc : thaw_super_locked+0x1a8/0x1f0
+[  730.050006] lr : thaw_super_locked+0x40/0x1f0
+[  730.050007] Call trace:
+[  730.050008]  thaw_super_locked+0x1a8/0x1f0 (P)
+[  730.050009]  thaw_super+0x2c/0x40
+[  730.050010]  filesystems_thaw_callback+0x5c/0x80
+[  730.050011]  __iterate_supers+0xc4/0x120
+[  730.050012]  filesystems_thaw+0x20/0x30
+[  730.050013]  suspend_finish+0x24/0x40
+[  730.050014]  enter_state+0x2a0/0x3c0
+[  730.050015]  pm_suspend+0x5c/0xd0
+[  730.050016] ---[ end trace 0000000000000000 ]---
+"""
+# A suspend whose task freezer gave up after its 20 s (try_to_freeze_tasks,
+# kernel/power/process.c): the tasks that did not freeze, each named by
+# sched_show_task, then the tasks restarted (freeze_processes), the
+# suspend's own thaw of the filesystems (its warning) and the end.  A
+# hung-task report before it names a task the same way, and is not the
+# freezer's.  Made from the source; not seen on a tablet.
+FREEZER_FAIL = """\
+[  690.000000] INFO: task gsd-housekeepin:2601 blocked for more than 61 seconds.
+[  690.000001] task:gsd-housekeepin state:D stack:0     pid:2601  tgid:2601  ppid:2287   task_flags:0x400000 flags:0x00000008
+[  700.000000] PM: suspend entry (deep)
+[  700.000100] Filesystems sync: 0.002 seconds
+[  700.000200] Freezing user space processes
+[  720.003000] Freezing user space processes failed after 20.003 seconds (2 tasks refusing to freeze, wq_busy=0):
+[  720.003100] task:gnome-shell     state:D stack:0     pid:2412  tgid:2412  ppid:2287   task_flags:0x400100 flags:0x00000009
+[  720.003200] Call trace:
+[  720.003300]  __switch_to+0x100/0x1c0 (T)
+[  720.003400]  __schedule+0x2f0/0x7a0
+[  720.003500]  rwsem_down_read_slowpath+0x1d8/0x5c0
+[  720.003600]  lock_mm_and_find_vma+0x88/0x1a0
+[  720.003700] task:pool-gnome-shel state:D stack:0     pid:2431  tgid:2412  ppid:2287   task_flags:0x400040 flags:0x00000009
+[  720.003800] Call trace:
+[  720.003900]  __switch_to+0x100/0x1c0 (T)
+[  720.004000] OOM killer enabled.
+[  720.004100] Restarting tasks: Starting
+[  720.004200] Restarting tasks: Done
+""" + SUPER_WARN.replace("[  730.", "[  720.1") + """\
+[  720.200000] PM: suspend exit
+"""
+FREEZER_LINE = ("Freezing user space processes failed after 20.003 seconds (2 tasks refusing to freeze, "
+                "wq_busy=0):")
 
 
 class SleepTestTest(FakeTablet):
     """sleep-test.sh against a fake SM-X710: the fake kernel's tools are
     stubs (SLEEP_STUBS) that the run copies to its RAM directory with the
     host's dynamic loader and libraries, as it copies the real ones on the
-    tablet; grep, awk, sha256sum and the shell are the host's own."""
+    tablet; grep, awk, sha256sum, tail and the shell are the host's own."""
 
     def setUp(self):
         super().setUp()
         if not shutil.which("cc"):
             self.skipTest("no C compiler for the stub launcher")
         F, T = self.root, self.tmp
-        # No host tool from /usr/sbin (rtcwake, blockdev, swapoff, chroot):
-        # a tool the stubs do not provide is missing, not the host's.
+        # No host tool from /usr/sbin (rtcwake, blockdev, swapoff, chroot,
+        # fsfreeze, dumpe2fs): a tool the stubs do not provide is missing,
+        # not the host's.
         self.host_path = "/usr/bin:/bin"
-        # Each fake tablet gets its own stand-in for systemd (run_test).
-        self.init_pid = None
         stubs = T / "stubs"
         stubs.mkdir()
         launcher = T / "launcher"
@@ -2919,13 +3299,21 @@ class SleepTestTest(FakeTablet):
                 (F / "sys/bus/platform/devices" / p / "of_node/#interconnect-cells").write_bytes(b"\0\0\0\1")
         (F / "proc/uptime").write_text("600.25 4000.00\n")
         (F / "proc/1").mkdir()
+        # As squirtle had them on 2026-11-22: the root runs with its
+        # superblock's default, remount-ro, which ext4 does not show; the
+        # dock's stick with errors=remount-ro over a default of continue.
         (F / "proc/1/mounts").write_text(
             "/dev/sda34 / ext4 rw,noatime 0 0\n"
             "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
             "tmpfs /run tmpfs rw,nosuid,nodev,size=1135504k,mode=755 0 0\n"
-            "/dev/sdg2 /media/stick ext4 rw,relatime 0 0\n"
+            "/dev/sdg2 /media/stick ext4 rw,nosuid,nodev,relatime,errors=remount-ro 0 0\n"
             "/dev/fuse /run/user/1000/doc fuse.portal rw,nosuid,nodev 0 0\n"
             "/dev/loop3 /snap/core/1 squashfs ro,nodev,relatime 0 0\n")
+        for dev, default in (("sda34", "remount-ro"), ("sdg2", "continue"), ("sdh1", "continue"),
+                             ("loop5", "remount-ro")):
+            (T / f"sb-errors-{dev}").write_text(default + "\n")
+        for sysctl in ("panic_on_warn", "hung_task_panic"):
+            (F / "proc/sys/kernel" / sysctl).write_text("0\n")
         (F / "proc/swaps").write_text(
             "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
             "/swapfile                               file\t\t4194300\t\t0\t\t-2\n"
@@ -2945,6 +3333,12 @@ class SleepTestTest(FakeTablet):
             (F / "sys/kernel/debug/qcom_stats" / q).write_text(
                 f"Count: {n}\nLast Entered At: 0\nLast Exited At: 0\nAccumulated Duration: 0\n")
         (F / "sys/kernel/debug/interconnect/interconnect_summary").write_text("node tag avg peak\n")
+        # ext4's error records of the two ext4 filesystems: none.
+        for dev in ("sda34", "sdg2", "sdh1", "loop5"):
+            (F / "sys/fs/ext4" / dev).mkdir(parents=True)
+            for attr, value in (("errors_count", "0"), ("last_error_func", ""), ("last_error_line", "0")):
+                (F / "sys/fs/ext4" / dev / attr).write_text(value + "\n")
+        (T / "frozen").write_text("")
         # userdata is sda34, on the UFS LUN sda.
         (F / "dev/sda34").write_bytes(b"userdata " * 1000)
         self.part("userdata").symlink_to("../../sda34")
@@ -2952,6 +3346,9 @@ class SleepTestTest(FakeTablet):
         (F / "sys/class/block/sda34").symlink_to("../../devices/soc/ufshc/block/sda/sda34")
         (F / "sys/class/block/sda").symlink_to("../../devices/soc/ufshc/block/sda")
         (F / "sys/devices/soc/ufshc/block/sda/ro").write_text("0\n")
+        # The UFS LUN's SCSI device, 0:0:0:0 (host 0); the stick is on host 1.
+        (F / "sys/devices/soc/ufshc/host0/target0:0:0/0:0:0:0").mkdir(parents=True)
+        (F / "sys/devices/soc/ufshc/block/sda/device").symlink_to("../../host0/target0:0:0/0:0:0:0")
         (F / "run/ubuntu-gts9u/icc-release").write_text(
             "boot_id=df92b567-0000\nuptime=46.81\nresult=released\nreason=finished\n")
         (F / "var/log/ubuntu-gts9u-icc-release.log").write_text(
@@ -2976,7 +3373,9 @@ class SleepTestTest(FakeTablet):
             "boot_id=df92b567-0000\nresult=held\nreason=loop breaker: boot 82555513 released the "
             "floor at 46.81 s and then ended without a clean shutdown\n")
 
-    def cycle(self, n, *flags, log=None, rc=None):
+    def cycle(self, n, *flags, log=None, rc=None, out=None, irq=None):
+        """The scenario of the Nth sleep (rtcwake -m mem call) of a run: an
+        attempt that the kernel gave up is a sleep of its own."""
         d = self.tmp / f"cycle-{n}"
         d.mkdir(exist_ok=True)
         for flag in flags:
@@ -2985,6 +3384,15 @@ class SleepTestTest(FakeTablet):
             (d / "log").write_text(log)
         if rc is not None:
             (d / "rc").write_text(f"{rc}\n")
+        if out is not None:
+            (d / "out").write_text(out)
+        if irq is not None:
+            (d / "wakeup-irq").write_text(f"{irq}\n" if irq else "")
+
+    def touch_abort(self, n, log=TOUCH_ABORT, irq=199):
+        """The Nth sleep given up as on 2026-11-22 03:29."""
+        self.cycle(n, "suspend-failed", "no-aosd", "no-cxsd", "no-ddr", rc=1, log=log,
+                   out=TOUCH_ABORT_OUT, irq=irq)
 
     def manifest(self):
         return subprocess.run(["sh", "-c", f"F={self.root}; T={self.tmp}\n{MANIFEST}manifest"],
@@ -2994,47 +3402,38 @@ class SleepTestTest(FakeTablet):
         path = self.tmp / name
         return path.read_text() if path.exists() else ""
 
-    def stand_in_for_systemd(self):
-        """A process that notes the SIGINT the run sends systemd for a clean
-        reboot."""
-        ready = self.tmp / "init-ready"
-        init = subprocess.Popen(
-            ["python3", "-I", "-c", "import pathlib, signal, sys, time\n"
-             "note = lambda *a: open(sys.argv[1], 'a').write('reboot\\n')\n"
-             "signal.signal(signal.SIGINT, note)\n"
-             "pathlib.Path(sys.argv[2]).touch()\n"
-             "while True: time.sleep(1)\n", str(self.tmp / "reboots"), str(ready)],
-            start_new_session=True)
-        self.addCleanup(init.wait)
-        self.addCleanup(init.kill)
-        deadline = time.monotonic() + 10
-        while not ready.exists():
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.01)
-        self.init_pid = init.pid
+    def sysrq(self):
+        return (self.root / "proc/sysrq-trigger").read_text()
 
     def run_test(self, *args):
-        if not getattr(self, "init_pid", None):
-            self.stand_in_for_systemd()
         before = self.manifest()
         result = self.run_script("sleep-test.sh", *args)
         self.out = result.stdout + result.stderr
         self.before = before
+        # Whatever the run did, in RAM it ran nothing but the RAM root's
+        # tools: a command that is not one of them says "not found".
+        for log in (self.root / "run/gts9u-sleep-test").glob("2*/log"):
+            self.assertNotIn(": not found", log.read_text(), log)
         return result
 
     def ramdir(self):
         (run,) = (self.root / "run/gts9u-sleep-test").glob("2*")
         return run
 
-    def assert_read_only_rules(self):
-        """What the run must never do: sleep with a disk filesystem, swap or
-        the UFS disk writable, write to the disk after the remount, read
-        userdata through the page cache or open it for writing, or run a
-        tool from anywhere but its RAM copy once read-only."""
+    def assert_read_only_rules(self, frozen="/media/stick\n/\n"):
+        """What the run must never do: sleep with a disk filesystem writable
+        and not frozen, with swap or the UFS disk writable, write to the disk
+        after the first freeze, read userdata through the page cache or open
+        it for writing, run a tool from anywhere but its RAM copy from the
+        freeze on, or remount anything (sysrq u).  At the end every writable
+        disk filesystem is still frozen, in the order frozen: the deepest
+        mount first and the root last."""
         self.assertEqual(self.read("violations"), "", self.out)
-        self.assertEqual(self.manifest(), self.read("disk-at-remount"), self.out)
-        # Every tool called once the disk is read-only, and every one called
-        # from the RAM root's tools, ran from the RAM root.
+        self.assertEqual(self.manifest(), self.read("disk-at-freeze"), self.out)
+        self.assertNotIn("u", self.sysrq())
+        self.assertEqual(self.read("frozen"), frozen, self.out)
+        # Every tool called from the freeze on, and every one called from
+        # the RAM root's tools, ran from the RAM root.
         ram = str(self.ramdir())
         calls = [line.split(" ", 2) for line in self.read("ram-calls").splitlines()]
         self.assertIn("after", [when for when, _, _ in calls])
@@ -3046,8 +3445,20 @@ class SleepTestTest(FakeTablet):
             if "userdata" in call:
                 self.assertEqual(call, f"if={self.part('userdata')} iflag=direct bs=4M count=16 "
                                        "status=none")
+        # The run in RAM has nothing in its PATH but the RAM root's tools: a
+        # command that is not one of them says "not found" in its log.
+        self.assertNotIn(": not found", (self.ramdir() / "log").read_text())
 
-    def test_a_healthy_run_passes_every_cycle_and_reboots_cleanly(self):
+    def errors_mode(self):
+        """The errors= of the root and of the stick in the fake mount table."""
+        found = {}
+        for line in (self.root / "proc/1/mounts").read_text().splitlines():
+            src, mp, _, opts, *_ = line.split()
+            if mp in ("/", "/media/stick"):
+                found[mp] = [o for o in opts.split(",") if o.startswith("errors=")]
+        return found
+
+    def test_a_healthy_run_passes_every_cycle_and_restarts_with_sysrq_b(self):
         result = self.run_test("ro", "restart-ok")
         self.assertEqual(result.returncode, 1, self.out)
         self.assert_read_only_rules()
@@ -3057,30 +3468,88 @@ class SleepTestTest(FakeTablet):
         self.assertIn("SLEEP-TEST RESULT: PASS: 3 of 3 cycles resumed with the UFS readable, 3 of them "
                       "deep; floor released; kernel 68d243e908c0", self.out)
         self.assertIn("NEXT: the boot after this restart holds the interconnect floor once", self.out)
-        # In order: the tools copied, sync, sysrq u, blockdev --setro, the
-        # first read, then the sleeps; at the end a clean reboot (the stub
-        # does not reboot, so after 300 s the run falls back to sysrq b).
+        # (The paths below /sys and /proc are the fake root's here.)
+        self.assertIn("NEXT: after the restart, sh ~/typec-roles/verify.sh and cat "
+                      f"{self.root}/sys/fs/ext4/sda34/errors_count (it must say 0)", self.out)
+        # In order: the tools copied, errors=continue on the stick and on the
+        # root, the freezes (the stick, then the root), blockdev --setro,
+        # the first read, then the sleeps, each followed by a second freeze
+        # of each that finds it frozen; at the end sysrq b with everything
+        # still frozen, and no thaw.
         self.assertEqual(self.read("rtcwake.calls").count("-m mem -s 30"), 3)
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "ub")
-        self.assertEqual(self.read("reboots"), "reboot\n")
+        self.assertEqual(self.read("fsfreeze.calls"),
+                         "--version\n" + "-f /proc/1/root/media/stick\n-f /proc/1/root/\n" * 4)
+        self.assertEqual(self.sysrq(), "b")
+        self.assertIn("restart: sysrq b; every disk filesystem frozen; the storage read back as before",
+                      self.out)
         self.assertEqual(self.read("blockdev.calls").splitlines()[-1], "--setro /dev/sda")
         self.assertEqual(self.read("swapoff.calls"), "/swapfile\n")
         self.assertEqual(self.read("mount.calls"),
-                         f"-t tmpfs -o size=256m,mode=0755,nosuid,nodev gts9u-sleep-test {self.ramdir()}\n")
+                         f"-t tmpfs -o size=256m,mode=0755,nosuid,nodev gts9u-sleep-test {self.ramdir()}\n"
+                         "-o remount,errors=continue /media/stick\n-o remount,errors=continue /\n")
+        # Through the system's own mount(8), in PID 1's mount namespace.
+        self.assertEqual(self.read("nsenter.calls"),
+                         f"--version\n-t 1 -m -- {self.bin}/mount -o remount,errors=continue /media/stick\n"
+                         f"-t 1 -m -- {self.bin}/mount -o remount,errors=continue /\n")
+        # The kernel shows errors=continue on the root, whose default is
+        # remount-ro, and nothing on the stick, whose default is continue.
+        self.assertEqual(self.errors_mode(), {"/": ["errors=continue"], "/media/stick": []})
         self.assertEqual(self.read("dd.calls").count("userdata"), 4)
         log = (self.ramdir() / "log").read_text()
-        self.assertLess(log.index("every disk filesystem is read-only"),
-                        log.index("/dev/sda is read-only at the block layer too"))
-        self.assertLess(log.index("read-only at the block layer too"), log.index("cycle 1/3: deep sleep"))
+        order = ["swapoff /swapfile", "do not touch the screen until the restart",
+                 "errors=continue: /media/stick (/dev/sdg2), until the restart (it ran with errors=remount-ro)",
+                 "errors=continue: / (/dev/sda34), until the restart (it ran with errors=remount-ro)",
+                 "frozen: /media/stick (/dev/sdg2, ext4)", "frozen: / (/dev/sda34, ext4)",
+                 "every writable disk filesystem is frozen: /media/stick /",
+                 "/dev/sda is read-only at the block layer too",
+                 "ext4: no error recorded, logged or given up on since the run began; error counts: "
+                 "/media/stick 0 / 0",
+                 "from here on the run cannot be stopped", "cycle 1/3: deep sleep"]
+        self.assertEqual([log.index(said) for said in order], sorted(log.index(said) for said in order))
+        self.assertEqual(log.count("errors=continue: /media/stick"), 1)
+        # Before the restart, the line that tells verify.sh in the next boot.
+        self.assertEqual((self.ramdir() / "result").read_text().splitlines()[-1],
+                         "SLEEP-TEST RESTART: sysrq b; frozen: /media/stick /")
+        self.assertNotIn("ERROR-STATE", self.out)
+        self.assertNotIn("SLEEP-TEST NOTE", self.out)
+        # The terminal showed the run's log (the part on the disk relays it).
+        self.assertIn("SLEEP-TEST RESULT: PASS", result.stdout)
+        self.assertEqual(log.count("SLEEP-TEST RESULT: PASS"), 1)
         # The verdict lines are in /run, in the kernel log and in pmsg.
         result_file = (self.ramdir() / "result").read_text()
         self.assertIn("SLEEP-TEST RESULT: PASS", result_file)
         self.assertIn("gts9u sleep-test: ", (self.root / "dev/kmsg").read_text())
-        (self.root / "dev/pmsg0").exists() or None
         # The record before, on the disk, owned by nobody else (no SUDO_UID).
         (logs,) = (self.kit / "logs").glob("*-sleep")
-        self.assertIn("interconnect floor: released", (logs / "before").read_text())
-        self.assertIn("(not running: a baseline run)", (logs / "before").read_text())
+        before = (logs / "before").read_text()
+        self.assertIn("interconnect floor: released", before)
+        self.assertIn("(not running: a baseline run)", before)
+        self.assertIn("root: /dev/sda34 ext4, ext4 errors_count 0, state clean; to freeze, the root "
+                      "last: /media/stick /", before)
+        self.assertIn("  /media/stick (/dev/sdg2, sdg2): errors_count 0, errors=remount-ro, default continue\n"
+                      "  / (/dev/sda34, sda34): errors_count 0, errors=remount-ro, default remount-ro\n", before)
+        # The root's state, then each filesystem's default error behaviour.
+        self.assertEqual(self.read("dumpe2fs.calls"), "-h /dev/sda34\n-h /dev/sdg2\n-h /dev/sda34\n")
+
+    def test_nothing_remounts_and_nothing_asks_systemd_to_reboot(self):
+        """2026-11-22: sysrq u's remount read-only recorded an ext4 error on
+        the live root (the orphan file was not empty), and the tablet could
+        not boot.  No remount but of errors= is left, and no clean reboot
+        either: systemd would wait on the frozen disk."""
+        text = (KIT_SRC / "sleep-test.sh").read_text()
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        for gone in ("printf u", "sysrq u", "kill -INT", "ctrl-alt-del", "init_pid", "tune2fs", "remount,ro",
+                     "remount -o ro", ",ro,"):
+            self.assertNotIn(gone, code)
+        self.assertEqual(code.count("printf b >> /proc/sysrq-trigger"), 1)
+        self.assertIn("fsfreeze -f \"$sysroot$fmp\"", code)
+        # The one remount there is: errors=, the mount option alone.
+        self.assertEqual([line.strip() for line in code.splitlines() if "sys_mount " in line],
+                         ['deadline "$mount_deadline" sys_mount -o "remount,errors=$3" "$2" > "$ramdir/mount.out" 2>&1'])
+        # Any other "remount" is a word of errors= ("remount-ro").
+        for line in code.splitlines():
+            for word in re.finditer(r"remount(?!-ro\b)", line):
+                self.assertTrue(line.startswith("remount,errors=", word.start()), line)
 
     def test_the_verdicts_also_go_to_pmsg_when_there_is_one(self):
         (self.root / "dev/pmsg0").write_text("")
@@ -3093,6 +3562,14 @@ class SleepTestTest(FakeTablet):
     def diag_re(self):
         """sleep-test.sh's pattern for the diagnostic's lines."""
         return re.compile(re.search(r"^ufs_diag='([^']*)'$", self.script("sleep-test.sh"), re.M).group(1))
+
+    def fail_re(self):
+        """sleep-test.sh's pattern for a failure line, the disk sda."""
+        text = self.script("sleep-test.sh")
+        fail = re.search(r'^fail_re\(\) \{\n\techo "(.*)"\n\}', text, re.M).group(1)
+        for name in ("ufs_fail", "journal_warn"):
+            fail = fail.replace(f"${name}", re.search(rf"^{name}='([^']*)'$", text, re.M).group(1))
+        return re.compile(fail.replace("$disk", "sda").replace("\\\\", "\\"))
 
     def pmsg_lines(self):
         """What the run wrote to pmsg, without its prefix and stamp."""
@@ -3134,13 +3611,17 @@ class SleepTestTest(FakeTablet):
             self.assertEqual(kmsg.count(line), 1)
         # Nothing the run itself wrote to the kernel log is a diagnostic or
         # a failure line by its own patterns.
-        fail = re.search(r'^fail_re\(\) \{\n\techo "(.*)"\n\}', self.script("sleep-test.sh"), re.M).group(1)
-        ufs_fail = re.search(r"^ufs_fail='([^']*)'$", self.script("sleep-test.sh"), re.M).group(1)
-        fail = re.compile(fail.replace("$ufs_fail", ufs_fail).replace("$disk", "sda").replace("\\\\", "\\"))
+        fail = self.fail_re()
         for line in ("[  1.0] I/O error, dev sda, sector 8 op 0x0:(READ)",
                      "[  1.0] EXT4-fs error (device sda34): ext4_journal_check_start:86",
-                     "[  1.0] " + UFS_TIMEOUT[1][len("kernel: "):]):
+                     "[  1.0] " + UFS_TIMEOUT[1][len("kernel: "):], "[  1.0] " + JOURNAL_WARN,
+                     "[  1.0] WARNING: CPU: 3 PID: 1234 at fs/ext4/ext4_jbd2.c:78 "
+                     "ext4_journal_check_start+0x6c/0xa0"):
             self.assertIsNotNone(fail.search(line), line)
+        # The warning every first resume with a frozen filesystem gives is
+        # not one.
+        for line in SUPER_WARN.splitlines():
+            self.assertIsNone(fail.search(line), line)
         own = [line for line in kmsg.splitlines() if "gts9u sleep-test: " in line]
         self.assertTrue(own)
         for line in own:
@@ -3182,7 +3663,7 @@ class SleepTestTest(FakeTablet):
         self.assertNotIn("left out", "\n".join(pmsg))
         self.assertEqual((self.ramdir() / "result").read_text().splitlines()[:4], want)
         self.assertNotIn("diagnostic:", (self.root / "dev/kmsg").read_text())
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "ub")
+        self.assertEqual(self.sysrq(), "b")
 
     def test_a_failed_resume_s_retries_are_capped_in_pmsg(self):
         """Fifteen failed calibrations: sixty diagnostic lines, all on the
@@ -3232,7 +3713,7 @@ class SleepTestTest(FakeTablet):
         self.assertNotIn("holds the interconnect floor once", self.out)
         self.assertNotIn("restart ubuntu-gts9u-icc-late-release.service", self.read("systemctl.calls"))
 
-    def test_release_floor_releases_it_the_documented_way_before_going_read_only(self):
+    def test_release_floor_releases_it_the_documented_way_before_freezing(self):
         self.floor_held()
         result = self.run_test("ro", "1", "release-floor", "restart-ok")
         self.assertEqual(result.returncode, 1, self.out)
@@ -3242,8 +3723,8 @@ class SleepTestTest(FakeTablet):
         self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1 cycles resumed with the UFS readable, 1 of them "
                       "deep; floor released;", self.out)
         self.assertIn("NEXT: the boot after this restart holds the interconnect floor once", self.out)
-        # The release wrote its marker and log before the remount.
-        self.assertIn("icc-release.pending", self.read("disk-at-remount"))
+        # The release wrote its marker and log before the first freeze.
+        self.assertIn("icc-release.pending", self.read("disk-at-freeze"))
 
     def test_release_floor_leaves_the_owner_s_hold_file_alone(self):
         self.floor_held()
@@ -3255,21 +3736,23 @@ class SleepTestTest(FakeTablet):
         self.assert_nothing_done()
         self.assertTrue((self.root / "etc/ubuntu-gts9u/icc-hold").exists())
 
-    def test_a_release_that_does_not_take_stops_before_anything_goes_read_only(self):
+    def test_a_release_that_does_not_take_stops_before_anything_is_frozen(self):
         self.floor_held()
         (self.tmp / "release-fails").touch()
         result = self.run_test("ro", "release-floor", "restart-ok")
         self.assertEqual(result.returncode, 1, self.out)
-        self.assertIn("STOPPED before going read-only: the floor could not be released (the panel cycle "
+        self.assertIn("STOPPED before freezing anything: the floor could not be released (the panel cycle "
                       "did not succeed)", self.out)
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "")
+        self.assertEqual(self.sysrq(), "")
+        # The RAM root's check ran fsfreeze --version, and nothing else.
+        self.assertEqual(self.read("fsfreeze.calls"), "--version\n")
         self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
         self.assertEqual(self.read("swapoff.calls"), "")
 
     def test_a_storage_that_does_not_come_back_fails_the_cycle_and_restarts_with_sysrq_b(self):
         """The 2026-11-21 failure on a revision 8 kernel: the run stops at
-        that cycle, shows the diagnostic's lines, and does not ask systemd,
-        which would need the disk, to reboot."""
+        that cycle, shows the diagnostic's lines, and restarts with the disk
+        still frozen."""
         self.cycle(2, "storage-dead", log="".join(
             f"[  800.{n:06d}] {line[len('kernel: '):]}\n" for n, line in enumerate(
                 ("kernel: PM: suspend entry (deep)",) + UFS_TIMEOUT + (
@@ -3290,28 +3773,193 @@ class SleepTestTest(FakeTablet):
                       "SERDES_START", self.out)
         self.assertIn('NEXT: the storage did not come back', self.out)
         self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 2)
-        self.assertEqual(self.read("reboots"), "")
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "ub")
-        self.assertIn("restart: sysrq b (immediate;", self.out)
+        self.assertEqual(self.sysrq(), "b")
+        self.assertIn("restart: sysrq b; every disk filesystem frozen since before the first sleep", self.out)
 
     def test_a_read_that_differs_after_a_resume_fails_the_cycle(self):
         self.cycle(1, "other-data")
         self.run_test("restart-ok", "2")
         self.assertIn("SLEEP-TEST cycle 1/2: FAIL: the read differs from the first one", self.out)
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "ub")
-        self.assertEqual(self.read("reboots"), "")
+        self.assertEqual(self.sysrq(), "b")
 
     def test_a_sleep_that_did_not_happen_fails_with_the_storage_healthy(self):
-        """A device refused the suspend: not the storage, so the restart is
-        the clean one."""
-        self.cycle(1, "suspend-failed", rc=1, log="[  700.000000] PM: suspend entry (deep)\n"
-                   "[  700.100000] PM: Some devices failed to suspend, or early wake event detected\n"
-                   "[  700.200000] PM: suspend exit\n")
-        self.run_test("restart-ok", "2")
-        self.assertIn("SLEEP-TEST cycle 1/2: FAIL: rtcwake returned 1", self.out)
-        self.assertIn("suspend_stats success 4 -> 4; suspend_stats fail 0 -> 1", self.out)
-        self.assertEqual(self.read("reboots"), "reboot\n")
-        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 1)
+        """The kernel failed the suspend, and its log shows no wakeup and no
+        device that refused (a CPU that would not go down, a firmware that
+        said no): a FAIL as before, with the storage healthy."""
+        for name, lines in (
+                ("a CPU", "[  700.100000] Error taking CPU5 down: -16\n"
+                          "[  700.100001] Non-boot CPUs are not disabled\n"),
+                ("nothing said", "")):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.cycle(1, "suspend-failed", rc=1, out=TOUCH_ABORT_OUT,
+                           log=f"[  700.000000] PM: suspend entry (deep)\n{lines}"
+                               "[  700.200000] PM: suspend exit\n")
+                result = self.run_test("restart-ok", "2")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                self.assertIn('SLEEP-TEST cycle 1/2: FAIL: rtcwake returned 1 (rtcwake: wakeup from "mem" '
+                              "using rtc0 at Thu Mar  5 05:27:35 1970); suspend_stats success 4 -> 4; "
+                              "suspend_stats fail 0 -> 1 (", self.out)
+                self.assertNotIn("ABORTED", self.out)
+                self.assertIn("SLEEP-TEST RESULT: FAIL at cycle 1/2:", self.out)
+                self.assertIn("restart: sysrq b; every disk filesystem frozen; the storage read back as "
+                              "before", self.out)
+                self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 1)
+
+    def test_a_suspend_whose_tasks_did_not_freeze_is_no_sleep_and_not_tried_again(self):
+        """A task queued behind a writer of the frozen root (on a memory
+        map's lock) is not freezable, and after 20 s the freezer gives up:
+        no sleep, no storage verdict, not retried; the tasks are named from
+        the freezer's own lines, not from a hung-task report before it.
+        The suspend's own thaw then warns (fs/super.c:1919), and nothing
+        counts that."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.cycle(2, "suspend-failed", "no-aosd", "no-cxsd", "no-ddr", rc=1, log=FREEZER_FAIL,
+                   out=TOUCH_ABORT_OUT, irq="")
+        result = self.run_test("ro", "3", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        stuck = "gnome-shell (state D), pool-gnome-shel (state D)"
+        self.assertIn("SLEEP-TEST cycle 2/3: NO-SLEEP (freezer): the kernel gave up the suspend before the tablet "
+                      "slept because a task did not freeze (rtcwake 1, suspend_stats success +0 fail +1): "
+                      f"{FREEZER_LINE}; stuck: {stuck}; the UFS read back as before; not tried again; floor "
+                      "released", self.out)
+        self.assertIn(f"SLEEP-TEST RESULT: NO-SLEEP (freezer) at cycle 2/3: a task did not freeze ({stuck}); 1 of 3 "
+                      "cycles passed before it; this run does not answer whether the storage comes back from a deep "
+                      "sleep; floor released; kernel 68d243e908c0", self.out)
+        self.assertIn("NEXT: no storage verdict: a task that waits behind a writer of the frozen disk (on a memory "
+                      "map's lock) cannot be frozen; touch nothing during the run, and if it happens again, run the "
+                      'test from multi-user.target, without the desktop (README, "The sleep test")', self.out)
+        self.assertNotIn("gsd-housekeepin", self.out.split("SLEEP-TEST cycle 2/3", 1)[1])
+        self.assertNotIn("FAIL", self.out)
+        self.assertNotIn("ABORTED", self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 2)
+        self.assertIn("SLEEP-TEST RESULT: NO-SLEEP (freezer)", "\n".join(self.pmsg_lines()))
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_a_freezer_that_gave_up_with_trouble_on_the_storage_is_still_a_fail(self):
+        """Any doubt about the storage leaves the attempt a FAIL: a UFS
+        failure line, a read that differs, a filesystem that was thawed."""
+        timeout = UFS_TIMEOUT[1][len("kernel: "):]
+        exit_line = "[  720.200000] PM: suspend exit\n"
+        cases = {
+            "a PHY timeout": ((), FREEZER_FAIL.replace(exit_line, f"[  720.150000] {timeout}\n{exit_line}"),
+                              f"1 failure lines in the kernel log, the first: {timeout}"),
+            "the read differs": (("other-data",), FREEZER_FAIL, "the read differs from the first one"),
+            "a thawed filesystem": (("thawed",), FREEZER_FAIL, "the protection failed: /media/stick (/dev/sdg2) had "
+                                                               "been thawed"),
+        }
+        for name, (flags, log, said) in cases.items():
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.cycle(1, "suspend-failed", *flags, rc=1, log=log, out=TOUCH_ABORT_OUT, irq="")
+                if "thawed" in flags:
+                    (self.tmp / "cycle-1/thawed").write_text("/media/stick\n")
+                result = self.run_test("ro", "2", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("SLEEP-TEST cycle 1/2: FAIL: ", self.out)
+                self.assertIn(said, self.out)
+                self.assertIn(f"the suspend could not freeze every task: {FREEZER_LINE}", self.out)
+                self.assertNotIn("NO-SLEEP", self.out)
+                self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 1)
+                self.assertEqual(self.read("violations"), "")
+
+    def test_a_filesystem_thawed_during_a_sleep_fails_the_protection(self):
+        """The design rests on the filesystems staying frozen through each
+        sleep (the kernel's own thaw at resume leaves a freeze from
+        userspace alone).  A second freeze after the resume that succeeds
+        shows one had been thawed: a FAIL of the protection, in a cycle and
+        in an aborted attempt alike, and the filesystem frozen again."""
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        for name in ("a sleep", "an aborted attempt"):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "proc/interrupts").write_text(INTERRUPTS)
+                if name == "an aborted attempt":
+                    self.touch_abort(1)
+                self.cycle(1, "thawed")
+                (self.tmp / "cycle-1/thawed").write_text("/media/stick\n")
+                result = self.run_test("ro", "2", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("SLEEP-TEST cycle 1/2: FAIL: ", self.out)
+                self.assertIn("the protection failed: /media/stick (/dev/sdg2) had been thawed: a second fsfreeze -f "
+                              "succeeded (frozen again now), so it was writable after the resume", self.out)
+                self.assertIn("NEXT: the protection failed in this run (/media/stick (/dev/sdg2) had been thawed",
+                              self.out)
+                self.assertNotIn("ABORTED", self.out)
+                self.assertEqual(self.read("frozen"), "/\n/media/stick\n")
+                self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 1)
+                self.assertEqual(self.sysrq(), "b")
+
+    def test_the_warning_of_the_first_resume_counts_for_nothing(self):
+        """fs/super.c:1919 at the first resume, as expected with
+        freeze_filesystems 0: a sleep with it passes, an aborted attempt
+        with it is still ABORTED."""
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        self.cycle(1, log="[  700.000000] PM: suspend entry (deep)\n"
+                          "[  730.000000] Timekeeping suspended for 30.002 seconds\n" + SUPER_WARN +
+                          "[  730.100000] PM: suspend exit\n")
+        self.touch_abort(2, log=TOUCH_ABORT.replace("[13861.416262] PM: suspend exit\n",
+                                                    SUPER_WARN + "[13861.416262] PM: suspend exit\n"))
+        result = self.run_test("ro", "2", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("SLEEP-TEST cycle 1/2: PASS: deep", self.out)
+        self.assertIn("SLEEP-TEST cycle 2/2: ABORTED: ", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2", self.out)
+        self.assertNotIn("FAIL", self.out)
+
+    def test_storage_lines_of_the_scsi_layer_are_never_an_aborted_attempt(self):
+        """The SCSI layer's lines about the UFS: a command timing out, I/O
+        rejected to an offline device, a UFS disk that refused to suspend
+        (named "sd 0:0:0:0", no "ufs" and no "[sda]" in it).  The same kind
+        of line about the stick, on another SCSI host, does not decide."""
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        exit_line = "[13861.416262] PM: suspend exit\n"
+        for line, aborted in (("sd 0:0:0:0: [sda] tag#7 timing out command, waited 30s", False),
+                              ("sd 0:0:0:0: rejecting I/O to offline device", False),
+                              ("sd 0:0:0:0: failed to suspend async: error -5", False),
+                              ("scsi 0:0:0:1: rejecting I/O to offline device", False),
+                              ("sd 1:0:0:0: [sdg] Synchronize Cache(10) failed: Result: hostbyte=DID_ERROR "
+                               "driverbyte=DRIVER_OK", True)):
+            with self.subTest(line):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "proc/interrupts").write_text(INTERRUPTS)
+                self.touch_abort(1, log=TOUCH_ABORT.replace(exit_line, f"[13860.000000] {line}\n{exit_line}"))
+                result = self.run_test("ro", "1", "aborts=0", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                if aborted:
+                    self.assertIn("SLEEP-TEST cycle 1/1: ABORTED: ", self.out)
+                    self.assertNotIn("FAIL", self.out)
+                else:
+                    self.assertIn("SLEEP-TEST cycle 1/1: FAIL: ", self.out)
+                    self.assertNotIn("ABORTED", self.out)
+
+    def test_a_journal_started_on_a_frozen_ext4_fails_the_run(self):
+        """ext4_journal_check_start's warning: a transaction on a frozen
+        filesystem, which the next mount would discard.  In a cycle's lines
+        it fails the cycle; before the first sleep it fails the run there."""
+        self.cycle(1, log="[  700.000000] PM: suspend entry (deep)\n"
+                          "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+                          f"[  730.050000] {JOURNAL_WARN}\n[  730.100000] PM: suspend exit\n")
+        result = self.run_test("ro", "2", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn(f"SLEEP-TEST cycle 1/2: FAIL: 1 failure lines in the kernel log, the first: {JOURNAL_WARN}",
+                      self.out)
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        (self.tmp / "freeze-warns").touch()
+        result = self.run_test("ro", "2", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: FAIL before any sleep: 1 failure lines in the kernel log since the run "
+                      f"began, the first: {JOURNAL_WARN}; floor released", self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+        self.assertEqual(self.sysrq(), "b")
 
     def test_a_write_the_block_layer_logged_fails_the_cycle(self):
         self.cycle(1, log="[  700.000000] PM: suspend entry (deep)\n"
@@ -3329,7 +3977,7 @@ class SleepTestTest(FakeTablet):
         self.assertIn("SLEEP-TEST cycle 3/3: PASS", self.out)
         self.assertIn("SLEEP-TEST RESULT: SHALLOW: 3 of 3 cycles resumed with the UFS readable, 2 of them "
                       "deep; floor released;", self.out)
-        self.assertEqual(self.read("reboots"), "reboot\n")
+        self.assertEqual(self.sysrq(), "b")
 
     def test_without_qcom_stats_the_depth_is_unknown_and_no_pass(self):
         shutil.rmtree(self.root / "sys/kernel/debug/qcom_stats")
@@ -3339,69 +3987,631 @@ class SleepTestTest(FakeTablet):
                       "qcom_stats not readable (aosd ? cxsd ? ddr ?)", self.out)
         self.assertIn("SLEEP-TEST RESULT: DEPTH-UNKNOWN:", self.out)
 
-    def test_it_never_sleeps_while_a_disk_filesystem_stays_writable(self):
-        (self.tmp / "stay-rw").write_text("/media/stick")
+    def assert_stopped_unfrozen(self, why):
+        """The protection stopped before any sleep: everything thawed, the
+        disk writable again, errors= back as it was (after the thaw: a
+        frozen filesystem refuses a remount), no sleep, no restart."""
+        self.assertIn(f"SLEEP-TEST RESULT: STOPPED before any sleep: {why}; every filesystem this run "
+                      "froze is thawed again, errors= is back as it was on: /media/stick /, and the tablet "
+                      "is not restarted; floor released; kernel 68d243e908c0", self.out)
+        self.assertEqual(self.read("frozen"), "")
+        self.assertEqual(self.sysrq(), "")
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+        self.assertEqual((self.root / "sys/devices/soc/ufshc/block/sda/ro").read_text().strip(), "0")
+        self.assertEqual(self.read("violations"), "")
+        self.assertIn("stopped: swap on the disk stays off until the next boot", self.out)
+        self.assertEqual(self.errors_mode(), {"/": [], "/media/stick": ["errors=remount-ro"]})
+        self.assertEqual(self.read("mount.calls").splitlines()[-4:],
+                         ["-o remount,errors=continue /media/stick", "-o remount,errors=continue /",
+                          "-o remount,errors=remount-ro /media/stick", "-o remount,errors=remount-ro /"])
+        self.assertNotIn(": not found", (self.ramdir() / "log").read_text())
+
+    def test_a_freeze_that_fails_thaws_what_was_frozen_and_stops_without_a_restart(self):
+        """The root is frozen last: the stick was frozen before it, and is
+        thawed again."""
+        (self.tmp / "freeze-fails").write_text("/\n")
         result = self.run_test("restart-ok")
         self.assertEqual(result.returncode, 1, self.out)
-        self.assertIn("SLEEP-TEST RESULT: ABORTED before any sleep: still writable after sysrq u: "
-                      "/media/stick(/dev/sdg2)", self.out)
-        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
-        self.assertEqual(self.read("violations"), "")
-        self.assertEqual(self.read("reboots"), "reboot\n")
+        self.assert_stopped_unfrozen("fsfreeze -f / (/dev/sda34) failed: fsfreeze: /proc/1/root/: freeze "
+                                     "failed: Operation not supported")
+        self.assertEqual(self.read("fsfreeze.calls"), "--version\n-f /proc/1/root/media/stick\n"
+                                                      "-f /proc/1/root/\n-u /proc/1/root/media/stick\n")
+        # Only ext4 is frozen, and an ext4 that cannot be: no unmounting
+        # will help; the kernel log says why.
+        self.assertIn("NEXT: nothing slept; the kernel log says why the freeze failed (sudo dmesg | tail -n 40); "
+                      "run again once that is understood", self.out)
+        self.assertNotIn("unmount", self.out)
+        self.assertEqual(self.read("blockdev.calls"), "--getro /dev/sda\n")
 
-    def test_it_never_sleeps_when_sysrq_u_did_not_take(self):
-        (self.tmp / "no-remount").touch()
-        self.run_test("restart-ok")
-        self.assertIn('sysrq u: no "Emergency Remount complete" within 60 s', self.out)
-        self.assertIn("ABORTED before any sleep: still writable after sysrq u: /(/dev/sda34) "
-                      "/media/stick(/dev/sdg2)", self.out)
+    def test_a_thaw_that_fails_restarts_rather_than_leave_a_frozen_system_running(self):
+        (self.tmp / "freeze-fails").write_text("/\n")
+        (self.tmp / "thaw-fails").write_text("/media/stick\n")
+        self.run_test("restart-ok", "hold=0")
+        self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep: fsfreeze -f / (/dev/sda34) failed: "
+                      "fsfreeze: /proc/1/root/: freeze failed: Operation not supported; and fsfreeze -u "
+                      "/media/stick (/dev/sdg2) failed: fsfreeze: /proc/1/root/media/stick: unfreeze failed: "
+                      "Input/output error: restarting (sysrq b), a filesystem stays frozen", self.out)
         self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+        self.assertEqual(self.sysrq(), "b")
+        # The restart's line names what is still frozen; errors= is left to
+        # the restart.
+        self.assertEqual((self.ramdir() / "result").read_text().splitlines()[-1],
+                         "SLEEP-TEST RESTART: sysrq b; frozen: /media/stick")
+        self.assertNotIn("remount-ro", self.read("mount.calls"))
 
-    def test_a_filesystem_writable_again_between_cycles_is_made_read_only_again_or_ends_the_run(self):
+    def test_a_loop_device_s_filesystem_is_frozen_first_and_the_root_last(self):
+        """A filesystem on a loop device writes through to its backing file,
+        on the root, say: it is frozen before anything else.  A bind mount of
+        the root is the root's superblock: frozen once, by "/", last."""
+        mounts = self.root / "proc/1/mounts"
+        mounts.write_text(mounts.read_text() + "/dev/loop5 /mnt/image ext4 rw,relatime 0 0\n"
+                          "/dev/sda34 /var/bind ext4 rw,noatime 0 0\n")
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertEqual(self.read("fsfreeze.calls"), "--version\n" + "-f /proc/1/root/mnt/image\n"
+                                                      "-f /proc/1/root/media/stick\n-f /proc/1/root/\n" * 2)
+        self.assert_read_only_rules(frozen="/mnt/image\n/media/stick\n/\n")
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("to freeze, the root last: /mnt/image /media/stick /\n", (logs / "before").read_text())
+
+    def test_a_freeze_that_does_not_end_restarts_the_tablet(self):
+        """Nothing undoes a freeze still under way (thaw_super waits for
+        it): a restart, as after a power loss."""
+        (self.tmp / "freeze-hangs").write_text("/\n")
+        result = self.run_test("restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep: fsfreeze -f / (/dev/sda34) had not ended "
+                      "after 120s, and cannot be undone: restarting (sysrq b) with what this run froze still "
+                      "frozen", self.out)
+        # What a hung freeze means, and not the advice for another failure.
+        self.assertIn("NEXT: a freeze waits for every writer in flight and for the disk; one that does not end "
+                      "has a writer that does not finish, or a disk that does not answer", self.out)
+        self.assertNotIn("unmount", self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+        self.assertNotIn("-u ", self.read("fsfreeze.calls"))
+        self.assertEqual(self.sysrq(), "b")
+        # A restart puts errors= back by itself: no remount after the freeze.
+        self.assertNotIn("remount-ro", self.read("mount.calls"))
+
+    def test_a_filesystem_mounted_between_cycles_is_frozen_too_or_ends_the_run(self):
         """The dock's stick mounted again after a resume, say."""
-        self.cycle(1, "rw-again")
+        self.cycle(1, "new-mount")
         self.run_test("restart-ok", "2")
-        self.assertIn("cycle 2/2: writable again: /media/stick(/dev/sdg2); sysrq u once more", self.out)
+        self.assertIn("cycle 2/2: writable and not frozen: /media/stick2(/dev/sdh1); freezing it", self.out)
+        self.assertIn("frozen: /media/stick2 (/dev/sdh1, ext4)", self.out)
         self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2", self.out)
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "uub")
-        self.assert_read_only_rules()
-        # And one that a second sysrq u does not make read-only.
+        self.assert_read_only_rules(frozen="/media/stick\n/\n/media/stick2\n")
+        self.assertEqual(self.sysrq(), "b")
+        # And one that cannot be frozen.
         FakeTablet.setUp(self)
         SleepTestTest.setUp(self)
-        self.cycle(1, "rw-again", "stays-rw")
+        self.cycle(1, "new-mount", "new-mount-unfreezable")
         self.run_test("restart-ok", "2")
-        self.assertIn("SLEEP-TEST cycle 2/2: NOT STARTED: writable: /media/stick(/dev/sdg2); disk swap: "
-                      "none; /dev/sda ro=1; mem_sleep deep", self.out)
+        self.assertIn("SLEEP-TEST cycle 2/2: NOT STARTED: writable and not frozen: /media/stick2(/dev/sdh1); "
+                      "disk swap: none; /dev/sda ro=1; mem_sleep deep", self.out)
         self.assertIn("SLEEP-TEST RESULT: ABORTED at cycle 2/2, before its sleep", self.out)
         self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 1)
         self.assertEqual(self.read("violations"), "")
-        self.assertEqual(self.read("reboots"), "reboot\n")
+        self.assertEqual(self.sysrq(), "b")
 
     def test_the_disk_is_made_read_only_at_the_block_layer_or_nothing_sleeps(self):
         (self.tmp / "setro-fails").touch()
-        self.run_test("restart-ok")
-        self.assertIn("SLEEP-TEST RESULT: ABORTED before any sleep: blockdev --setro /dev/sda failed", self.out)
-        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+        result = self.run_test("restart-ok")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_stopped_unfrozen("blockdev --setro /dev/sda failed")
+        self.assertEqual(self.read("fsfreeze.calls").count("-u "), 2)
 
     def test_a_first_read_that_fails_ends_the_run_before_any_sleep(self):
         (self.tmp / "storage-dead").touch()
         self.run_test("restart-ok")
         self.assertIn("SLEEP-TEST RESULT: FAIL before any sleep: the first read of", self.out)
         self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "ub")
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_an_error_saved_while_the_root_is_frozen_stops_the_run_with_the_owner_told_to_e2fsck(self):
+        """An ext4 error on the frozen root before its disk is read-only
+        (a reader's): ext4 logs it and saves it (its count rises).  The run
+        stops before any sleep, thawed, errors= back, not restarted, and
+        says the root needs e2fsck from recovery before the next boot."""
+        (self.tmp / "freeze-records-error").touch()
+        result = self.run_test("restart-ok")
+        self.assertEqual(result.returncode, 1, self.out)
+        bad = ("/ (/dev/sda34): its error count rose 0 -> 1 (last error in ext4_lookup:1817), 1 ext4 error "
+               "lines, the first: EXT4-fs error (device sda34): ext4_lookup:1817: inode #393217: comm "
+               "systemd-journal: iget: checksum invalid")
+        self.assert_stopped_unfrozen("ext4 recorded an error on, or gave up on, a filesystem while it was being "
+                                     f"frozen: {bad}")
+        self.assertIn(f"NEXT: ext4 recorded an error on, or gave up on: {bad}; the tablet runs on, thawed: save "
+                      "what you need, then go to recovery (hold Power and Volume Down until the screen goes dark, "
+                      "then at once Power and Volume Up, for TWRP) and run e2fsck -f on it there before the next "
+                      "boot", self.out)
+        self.assertIn("--setrw /dev/sda", self.read("blockdev.calls"))
+
+    def test_an_ext4_error_before_the_freeze_stops_the_run_before_anything_is_frozen(self):
+        """Between the checks and the first freeze (swap going off, the
+        floor's release) ext4 records an error on the root, or gives up on
+        it: compared with the count the checks read, and with the kernel's
+        lines since the run began, nothing is frozen, errors= goes back, and
+        the owner is told to e2fsck, not to unmount anything."""
+        for flag, said in (
+                ("error-at-swapoff", "/ (/dev/sda34): its error count rose 0 -> 1 (last error in "
+                                     "ext4_lookup:1817), 1 ext4 error lines, the first: EXT4-fs error (device "
+                                     "sda34): ext4_lookup:1817: inode #393217: comm tracker-miner-f: iget: "
+                                     "checksum invalid"),
+                ("abort-at-swapoff", "/ (/dev/sda34): mounted rw,noatime,errors=continue,emergency_ro, its error "
+                                     "count rose 0 -> 1 (last error in ext4_lookup:1817), the kernel logged: "
+                                     "Aborting journal on device sda34-8., 1 ext4 error lines")):
+            with self.subTest(flag):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.tmp / flag).touch()
+                result = self.run_test("ro", "1", "restart-ok")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep: ext4 recorded an error on, or gave up "
+                              f"on, a filesystem before anything was frozen: {said}", self.out)
+                self.assertEqual(self.read("fsfreeze.calls"), "--version\n")
+                self.assert_stopped_unfrozen("ext4 recorded an error on, or gave up on, a filesystem before "
+                                             "anything was frozen: " + self.out.split(
+                                                 "a filesystem before anything was frozen: ", 1)[1].split(
+                                                 "; every filesystem this run froze", 1)[0])
+                self.assertIn("run e2fsck -f on it there before the next boot", self.out)
+                self.assertNotIn("unmount", self.out)
+
+    # errors=continue: the remount, its check, and putting it back.
+
+    def test_errors_continue_that_does_not_take_stops_before_anything_is_frozen(self):
+        """The remount goes through and changes nothing, or fails: what it
+        changed already is put back, and nothing is frozen."""
+        for name, damage, said, back in (
+                ("ignored", ("remount-ignored", "continue\n"),
+                 "errors=continue did not take on /media/stick (/dev/sdg2): mount -o remount,errors=continue "
+                 "/media/stick went through, but /media/stick runs with errors=remount-ro (ROOT/proc/1/mounts: "
+                 "rw,nosuid,nodev,relatime,errors=remount-ro)", ""),
+                ("fails on the root", ("remount-fails", "continue /\n"),
+                 "errors=continue did not take on / (/dev/sda34): mount -o remount,errors=continue / failed "
+                 "(status 32): mount: /: mount point not mounted or bad option.",
+                 "; errors= is back as it was on: /media/stick")):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.tmp / damage[0]).write_text(damage[1])
+                result = self.run_test("ro", "1", "restart-ok")
+                self.assertEqual(result.returncode, 1, self.out)
+                (logs,) = (self.kit / "logs").glob("*-sleep")
+                said = said.replace("ROOT/", f"{self.root}/")
+                self.assertIn(f"STOPPED before freezing anything: {said}{back}; nothing on the disk changed but "
+                              f"{logs}", self.out)
+                self.assertEqual(self.errors_mode(), {"/": [], "/media/stick": ["errors=remount-ro"]})
+                self.assertEqual(self.read("fsfreeze.calls"), "--version\n")
+                self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+                self.assertEqual(self.sysrq(), "")
+                self.assertFalse((self.ramdir() / "started").exists())
+                self.assertEqual(self.read("violations"), "")
+
+    def test_a_stop_that_cannot_put_errors_back_says_so(self):
+        """A stop before any sleep whose remount back fails: the filesystem
+        keeps errors=continue until the next restart, and the run says
+        which, and how to put it back by hand."""
+        (self.tmp / "setro-fails").touch()
+        (self.tmp / "remount-fails").write_text("remount-ro /media/stick\n")
+        result = self.run_test("restart-ok")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep: blockdev --setro /dev/sda failed; every "
+                      "filesystem this run froze is thawed again, and the tablet is not restarted; but "
+                      "/media/stick (/dev/sdg2) keeps errors=continue until the next restart (mount -o "
+                      "remount,errors=remount-ro /media/stick failed (status 32): mount: /media/stick: mount "
+                      "point not mounted or bad option.; by hand: sudo mount -o "
+                      "remount,errors=remount-ro /media/stick); floor released", self.out)
+        self.assertIn("NEXT: put errors= back by hand as said above, or restart the tablet (sudo reboot)", self.out)
+        self.assertEqual(self.errors_mode(), {"/": [], "/media/stick": []})
+        self.assertEqual(self.read("frozen"), "")
+        self.assertEqual(self.sysrq(), "")
+
+    def test_a_filesystem_that_runs_with_errors_continue_is_left_as_it_is(self):
+        """The stick without errors= among its options, its superblock's
+        default continue: ext4 runs it with continue already."""
+        mounts = self.root / "proc/1/mounts"
+        mounts.write_text(mounts.read_text().replace("rw,nosuid,nodev,relatime,errors=remount-ro",
+                                                     "rw,nosuid,nodev,relatime"))
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("mount.calls").splitlines()[1:], ["-o remount,errors=continue /"])
+        self.assertEqual(self.errors_mode(), {"/": ["errors=continue"], "/media/stick": []})
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", self.out)
+
+    def test_a_run_that_does_not_start_in_ram_puts_errors_back(self):
+        """The part on the disk set errors=continue, and the run in RAM never
+        started: nothing was frozen, and the part on the disk puts errors=
+        back itself."""
+        (self.tmp / "setsid-fails").touch()
+        result = self.run_test("ro", "1", "restart-ok")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("STOPPED: the run did not start from RAM (status 125): nothing was frozen; errors= is back "
+                      "as it was on: /media/stick /", self.out)
+        self.assertEqual(self.errors_mode(), {"/": [], "/media/stick": ["errors=remount-ro"]})
+        self.assertEqual(self.read("fsfreeze.calls"), "--version\n")
+        self.assertEqual(self.sysrq(), "")
+
+    # ext4 after a sleep: what it did, said, and the restart all the same.
+
+    def test_an_ext4_error_on_the_read_only_disk_is_noted_and_nothing_was_written(self):
+        """errors=continue at work: the root's reads failed after a resume,
+        ext4 logged an error, and with the disk read-only it neither aborted
+        its journal nor saved anything.  The cycle fails (an ext4 error on
+        the UFS disk), and the next boot is expected to mount the root."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.cycle(1, "ext4-error")
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        line = ("EXT4-fs error (device sda34): __ext4_find_entry:1622: inode #2: comm systemd: reading directory "
+                "lblock 0")
+        self.assertIn(f"SLEEP-TEST cycle 1/1: FAIL: 1 failure lines in the kernel log, the first: {line}", self.out)
+        self.assertIn("SLEEP-TEST NOTE: ext4 logged errors on a filesystem of the read-only UFS disk, and with "
+                      "errors=continue it neither aborted its journal nor saved them: / (/dev/sda34): 1 ext4 error "
+                      f"lines, the first: {line}", self.out)
+        self.assertIn("NEXT: nothing of those errors was written: the boot after this restart is expected to mount "
+                      "the root as usual", self.out)
+        self.assertNotIn("ERROR-STATE", self.out)
+        self.assertNotIn("emergency_ro", (self.root / "proc/1/mounts").read_text())
+        self.assertIn(f"ext4: {line}", self.pmsg_lines())
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_a_journal_abort_is_an_error_state_whose_next_steps_say_the_root_will_probably_not_mount(self):
+        """jbd2 aborts the root's journal on its own (no errors= stops that),
+        and writes the error into the journal's superblock: the next mount
+        would mark the root in error and fail.  ERROR-STATE, the evidence in
+        pmsg, NEXT lines for recovery, and the restart all the same."""
+        for jsb in (False, True):
+            with self.subTest(jsb_write_failed=jsb):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "dev/pmsg0").write_text("")
+                self.cycle(1, "journal-abort", *(("jsb-fails",) if jsb else ()))
+                result = self.run_test("ro", "2", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                self.assertIn("SLEEP-TEST cycle 1/2: FAIL: ", self.out)
+                self.assertIn("SLEEP-TEST ERROR-STATE: ext4 recorded an error on, or gave up on, a filesystem of "
+                              "this run: / (/dev/sda34): mounted rw,noatime,errors=continue,emergency_ro, the "
+                              "kernel logged: Aborting journal on device sda34-8., 1 ext4 error lines, the first: "
+                              "EXT4-fs error (device sda34): ext4_journal_check_start:86: comm kworker/u16:3: "
+                              "Detected aborted journal", self.out)
+                pmsg = self.pmsg_lines()
+                self.assertIn("ext4: Aborting journal on device sda34-8.", pmsg)
+                if jsb:
+                    self.assertIn("NEXT: ext4 gave up on the root; jbd2 writes the error into the journal's "
+                                  "superblock even with the disk read-only, but the kernel logged that a journal "
+                                  "superblock write failed (JBD2: I/O error when updating journal superblock for "
+                                  "sda34-8.), so it may not have reached the disk", self.out)
+                else:
+                    self.assertIn("NEXT: ext4 gave up on the root, and jbd2 writes the error into the journal's "
+                                  "superblock even with the disk read-only: the boot after this restart will "
+                                  "probably not mount the root", self.out)
+                self.assertIn("go to recovery (hold Power and Volume Down until the screen goes dark, then at "
+                              "once Power and Volume Up, for TWRP) and repair the root with e2fsck -f", self.out)
+                self.assertIn('NEXT: the storage did not come back: read the diagnostic lines above', self.out)
+                # Not the next steps of a root that is fine.
+                self.assertNotIn("(it must say 0)", self.out)
+                self.assertNotIn("errors_count (0)", self.out)
+                self.assertEqual(self.sysrq(), "b")
+                self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 1)
+
+    def test_an_error_on_another_disk_s_filesystem_is_saved_and_said_but_not_the_root_s(self):
+        """The stick's disk is not read-only: ext4 saves an error there (its
+        count rises).  The UFS cycle passes; the stick needs e2fsck before
+        it is mounted again, and the root's next steps are as usual."""
+        self.cycle(1, "stick-error")
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", self.out)
+        self.assertIn("SLEEP-TEST ERROR-STATE: ext4 recorded an error on, or gave up on, a filesystem of this run: "
+                      "/media/stick (/dev/sdg2): its error count rose 0 -> 1 (last error in __ext4_find_entry:1622), "
+                      "1 ext4 error lines, the first: EXT4-fs error (device sdg2):", self.out)
+        self.assertIn("NEXT: run e2fsck -f on each filesystem named above (not the root) before it is mounted again",
+                      self.out)
+        self.assertIn("(it must say 0)", self.out)
+        self.assertNotIn("will probably not mount the root", self.out)
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_ext4_is_looked_at_again_right_before_the_restart(self):
+        """What ext4 did during the hold is said before sysrq b, in a run
+        with sleeps and in dry."""
+        for args in (("ro", "1"), ("dry",)):
+            with self.subTest(args[0]):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.tmp / "abort-at-hold").touch()
+                result = self.run_test(*args, "restart-ok", "hold=1")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("SLEEP-TEST ERROR-STATE (right before the restart): ext4 recorded an error on, or "
+                              "gave up on, a filesystem of this run: / (/dev/sda34): mounted "
+                              "rw,noatime,errors=continue,emergency_ro, the kernel logged: Aborting journal on "
+                              "device sda34-8.", self.out)
+                result_file = (self.ramdir() / "result").read_text()
+                self.assertLess(result_file.index("ERROR-STATE (right before the restart)"),
+                                result_file.index("SLEEP-TEST RESTART: sysrq b"))
+                self.assertIn("will probably not mount the root", result_file)
+                self.assertEqual(self.sysrq(), "b")
+
+    def test_dry_freezes_reads_twice_and_restarts_without_a_sleep(self):
+        (self.root / "dev/pmsg0").write_text("")
+        result = self.run_test("dry", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("rtcwake.calls"), "--version\n")
+        self.assertEqual(self.read("dd.calls").count("userdata"), 2)
+        # The second freeze of each finds it frozen: what a run with sleeps
+        # relies on, seen on the tablet before any sleep.
+        self.assertEqual(self.read("fsfreeze.calls"),
+                         "--version\n" + "-f /proc/1/root/media/stick\n-f /proc/1/root/\n" * 2)
+        self.assertIn("SLEEP-TEST RESULT: DRY: no sleep tried; frozen: /media/stick /; /dev/sda read-only at "
+                      "the block layer; a second freeze found each still frozen; the UFS read back as before "
+                      "after 10s; no failure line in the kernel log, and ext4 recorded, logged and gave up on "
+                      "nothing (looked at again right before the restart); floor released; kernel 68d243e908c0",
+                      self.out)
+        self.assertIn("NEXT: the boot after this restart (sysrq b, everything frozen) must come up as after a "
+                      "power loss; sh ~/typec-roles/verify.sh then says so (it knows the boot after a sleep test); "
+                      "only then a run with sleeps", self.out)
+        self.assertNotIn("PASS", self.out)
+        self.assertEqual(self.sysrq(), "b")
+        self.assertIn("SLEEP-TEST RESULT: DRY", "\n".join(self.pmsg_lines()))
+        self.assertEqual(self.pmsg_lines()[-1], "SLEEP-TEST RESTART: sysrq b; frozen: /media/stick /")
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("dry: every disk filesystem frozen and no sleep", (logs / "before").read_text())
+
+    def test_dry_fails_on_a_filesystem_that_is_not_frozen_any_more(self):
+        """dry's own check of the freeze: a second freeze that succeeds."""
+        # The settling sleep after the first read thaws the root.
+        sleep = self.tmp / "stubs/sleep"
+        self.assertEqual(sleep.read_text().count("\nexit 0\n"), 1)
+        sleep.write_text(sleep.read_text().replace("\nexit 0\n", """
+if [ "${1:-}" = 10 ]; then grep -vxF / "$T/frozen" > "$T/f.new"; mv "$T/f.new" "$T/frozen"; fi
+exit 0
+"""))
+        result = self.run_test("dry", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: FAIL (dry, no sleep tried): the protection failed: / (/dev/sda34) had "
+                      "been thawed: a second fsfreeze -f succeeded (frozen again now), so it was writable after "
+                      "the resume", self.out)
+        self.assertIn("NEXT: the protection failed in this run", self.out)
+        self.assertEqual(self.read("frozen"), "/media/stick\n/\n")
+        self.assertEqual(self.sysrq(), "b")
+
+    # ABORTED: a suspend that the kernel gave up before the tablet slept.
+
+    def test_an_aborted_attempt_is_tried_again_and_the_run_still_passes(self):
+        """2026-11-22 03:29: the touchscreen's double tap in the noirq phase.
+        Not a FAIL: the same cycle again, and a pass counts only real
+        sleeps."""
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        (self.root / "dev/pmsg0").write_text("")
+        self.touch_abort(1)
+        result = self.run_test("ro", "3", "restart-ok")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        line = ("SLEEP-TEST cycle 1/3: ABORTED: the kernel gave up the suspend before the tablet slept "
+                f"(rtcwake 1, suspend_stats success +0 fail +1): a wakeup from {TOUCH_HINT}; the UFS read "
+                "back as before; aborted attempt 1 (aborts=5): cycle 1/3 again in 5 s; floor released")
+        self.assertIn(line, self.out)
+        self.assertNotIn("FAIL", self.out)
+        self.assertIn("cycle 1/3: deep sleep for 30s (rtcwake -m mem), attempt 2;", self.out)
+        for i in (1, 2, 3):
+            self.assertEqual(self.out.count(f"SLEEP-TEST cycle {i}/3: PASS: deep"), 1)
+        self.assertIn("SLEEP-TEST RESULT: PASS: 3 of 3 cycles resumed with the UFS readable, 3 of them deep; "
+                      "1 attempt aborted before the sleep (IRQ 199 (fts1ba90a, the touchscreen) once) and tried "
+                      "again; floor released; kernel 68d243e908c0", self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 4)
+        self.assertEqual(self.read("dd.calls").count("userdata"), 5)
+        self.assertEqual(self.sysrq(), "b")
+        # Kept like the other verdicts, before the retry's.
+        pmsg = self.pmsg_lines()
+        self.assertIn(line, pmsg)
+        self.assertLess(pmsg.index(line), pmsg.index(
+            "SLEEP-TEST cycle 1/3: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back as before; "
+            "floor released"))
+        self.assertIn(line, (self.ramdir() / "result").read_text())
+        # The attempt and the retry each have files of their own, and the
+        # retry's kernel lines are its own.
+        run = self.ramdir()
+        self.assertEqual((run / "rtcwake-1").read_text(), TOUCH_ABORT_OUT)
+        self.assertEqual((run / "rtcwake-1.2").read_text(), "")
+        self.assertIn("Wakeup pending. Abort CPU freeze", (run / "kmsg-1").read_text())
+        self.assertNotIn("Wakeup pending", (run / "kmsg-1.2").read_text())
+        self.assertEqual((run / "kmsg-1.2").read_text().count("PM: suspend entry (deep)"), 1)
+
+    def test_aborted_attempts_past_the_budget_end_the_run_with_no_sleep_not_fail(self):
+        """The first cycle passes, then six attempts at the second are given
+        up (aborts=5 tries five again): NO-SLEEP, with the storage question
+        open, and the restart as after a healthy run."""
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        for n in range(2, 8):
+            self.touch_abort(n)
+        result = self.run_test("ro", "3", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 7)
+        self.assertEqual(self.out.count("SLEEP-TEST cycle 2/3: ABORTED: "), 6)
+        for n in range(1, 6):
+            self.assertIn(f"aborted attempt {n} (aborts=5): cycle 2/3 again in 5 s; floor released", self.out)
+        self.assertIn("aborted attempt 6, more than aborts=5: the run ends; floor released", self.out)
+        self.assertIn("SLEEP-TEST RESULT: NO-SLEEP at cycle 2/3: 6 attempts aborted before the sleep (IRQ 199 "
+                      "(fts1ba90a, the touchscreen) 6 times), more than aborts=5; 1 of 3 cycles passed before "
+                      "it; this run does not answer whether the storage comes back from a deep sleep; floor "
+                      "released; kernel 68d243e908c0", self.out)
+        self.assertIn("NEXT: no storage verdict: after the restart run the test again, without touching the "
+                      "screen", self.out)
+        self.assertNotIn("FAIL", self.out)
+        self.assertNotIn("RESULT: PASS", self.out)
+        self.assertNotIn("cycle 3/3", self.out)
+        self.assertIn("restart: sysrq b; every disk filesystem frozen; the storage read back as before",
+                      self.out)
+        self.assertEqual(self.sysrq(), "b")
+        for n in range(2, 7):
+            self.assertTrue((self.ramdir() / f"kmsg-2.{n}").exists())
+
+    def test_aborts_0_ends_the_run_at_the_first_abort(self):
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        self.touch_abort(1)
+        result = self.run_test("ro", "3", "aborts=0", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn(f"SLEEP-TEST cycle 1/3: ABORTED: the kernel gave up the suspend before the tablet slept "
+                      f"(rtcwake 1, suspend_stats success +0 fail +1): a wakeup from {TOUCH_HINT}; the UFS read "
+                      "back as before; aborted attempt 1, more than aborts=0: the run ends; floor released",
+                      self.out)
+        self.assertIn("SLEEP-TEST RESULT: NO-SLEEP at cycle 1/3: 1 attempt aborted before the sleep (IRQ 199 "
+                      "(fts1ba90a, the touchscreen) once), more than aborts=0; 0 of 3 cycles passed before it;",
+                      self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 1)
+        self.assertNotIn("FAIL", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("(aborted attempts tried again: up to 0)", (logs / "before").read_text())
+
+    def test_an_aborted_attempt_with_storage_trouble_or_a_real_sleep_is_still_a_fail(self):
+        """Every doubt is a FAIL: the read differs, a PHY timeout line, a
+        UFS device that refused to suspend, a diagnostic timeout line, a
+        sleep that the kernel counted as a success, or a long suspended
+        timekeeping."""
+        timeout = UFS_TIMEOUT[1][len("kernel: "):]
+        exit_line = "[13861.416262] PM: suspend exit\n"
+        cases = {
+            "the read differs": ((), TOUCH_ABORT, "the read differs from the first one"),
+            "a PHY timeout": ((), TOUCH_ABORT.replace(exit_line, f"[13860.000000] {timeout}\n{exit_line}"),
+                              f"1 failure lines in the kernel log, the first: {timeout}"),
+            "a UFS device refused": ((), TOUCH_ABORT.replace(
+                exit_line, "[13860.000000] ufs_device_wlun 0:0:0:49488: failed to suspend: error -5\n"
+                           f"{exit_line}"), "rtcwake returned 1"),
+            "a diagnostic timeout line": ((), TOUCH_ABORT.replace(
+                exit_line, "[13860.000000] " + UFS_TIMEOUT[2][len("kernel: "):] + "\n" + exit_line),
+                "rtcwake returned 1"),
+            "a counted success": (("no-fail",), TOUCH_ABORT, "rtcwake returned 1"),
+            "a long sleep": ((), TOUCH_ABORT.replace(
+                exit_line, "[13860.000000] Timekeeping suspended for 30.002 seconds\n" + exit_line),
+                "rtcwake returned 1"),
+        }
+        for name, (flags, log, said) in cases.items():
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "proc/interrupts").write_text(INTERRUPTS)
+                if "no-fail" in flags:
+                    self.cycle(1, rc=1, log=log, out=TOUCH_ABORT_OUT, irq=199)
+                else:
+                    self.touch_abort(1, log=log)
+                if name == "the read differs":
+                    self.cycle(1, "other-data")
+                result = self.run_test("ro", "2", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("SLEEP-TEST cycle 1/2: FAIL: ", self.out)
+                self.assertIn(said, self.out)
+                self.assertNotIn("ABORTED", self.out)
+                self.assertIn("SLEEP-TEST RESULT: FAIL at cycle 1/2:", self.out)
+                self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 1)
+                self.assertEqual(self.read("violations"), "")
+
+    def test_an_rtcwake_failure_without_a_sign_of_the_suspend_given_up_is_still_a_fail(self):
+        """rtcwake failed and suspend_stats counted a failure, but the kernel
+        log shows no pending wakeup and no device that refused: a FAIL, as
+        on 2026-11-22 before this change."""
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        log = "".join(line + "\n" for line in TOUCH_ABORT.splitlines()
+                      if "Triggering wakeup" not in line and "Wakeup pending" not in line)
+        self.touch_abort(1, log=log, irq="")
+        self.run_test("ro", "3", "restart-ok", "hold=0")
+        self.assertIn('SLEEP-TEST cycle 1/3: FAIL: rtcwake returned 1 (rtcwake: wakeup from "mem" using rtc0 at '
+                      "Thu Mar  5 05:27:35 1970); suspend_stats success 4 -> 4; suspend_stats fail 0 -> 1 "
+                      "(aosd +0 cxsd +0 ddr +0; floor released)", self.out)
+        self.assertIn("SLEEP-TEST RESULT: FAIL at cycle 1/3:", self.out)
+        self.assertNotIn("ABORTED", self.out)
+
+    def test_the_cause_of_an_abort_is_named(self):
+        """The wakeup IRQ by its name in /proc/interrupts, the touchscreen
+        with its hint and no other; an IRQ with no name; a device that
+        refused to suspend; a wakeup source."""
+        triggering = "[13858.996988] PM: Triggering wakeup from IRQ 199\n"
+        no_irq = TOUCH_ABORT.replace(triggering, "")
+        cases = {
+            "the touchscreen": (TOUCH_ABORT, 199, INTERRUPTS, f"a wakeup from {TOUCH_HINT}",
+                                "IRQ 199 (fts1ba90a, the touchscreen) once"),
+            "another named IRQ": (TOUCH_ABORT.replace("IRQ 199", "IRQ 37"), 37, INTERRUPTS,
+                                  "a wakeup from IRQ 37 (pm8550_pwrkey)", "IRQ 37 (pm8550_pwrkey) once"),
+            "a shared IRQ": (TOUCH_ABORT.replace("IRQ 199", "IRQ 40"), 40, INTERRUPTS,
+                             "a wakeup from IRQ 40 (foo, bar)", "IRQ 40 (foo, bar) once"),
+            "a flow handler's name": (TOUCH_ABORT.replace("IRQ 199", "IRQ 41"), 41, INTERRUPTS,
+                                      "a wakeup from IRQ 41 (baz)", "IRQ 41 (baz) once"),
+            "an IRQ with no action": (TOUCH_ABORT.replace("IRQ 199", "IRQ 251"), 251, INTERRUPTS,
+                                      "a wakeup from IRQ 251 (no name for it in ROOT/proc/interrupts)", "IRQ 251 once"),
+            "an IRQ not listed": (TOUCH_ABORT.replace("IRQ 199", "IRQ 250"), 250, INTERRUPTS,
+                                  "a wakeup from IRQ 250 (no name for it in ROOT/proc/interrupts)", "IRQ 250 once"),
+            "no /proc/interrupts": (TOUCH_ABORT, 199, None,
+                                    "a wakeup from IRQ 199 (no name for it in ROOT/proc/interrupts)", "IRQ 199 once"),
+            "pm_wakeup_irq only": (no_irq, 199, INTERRUPTS, f"a wakeup from {TOUCH_HINT}",
+                                   "IRQ 199 (fts1ba90a, the touchscreen) once"),
+            "a device that refused": (
+                "[  700.000000] PM: suspend entry (deep)\n"
+                "[  700.100000] samsung_fts1ba90a 9-0049: failed to suspend async: error -16\n"
+                "[  700.100001] PM: Some devices failed to suspend, or early wake event detected\n"
+                "[  700.200000] PM: suspend exit\n", "", INTERRUPTS,
+                "samsung_fts1ba90a 9-0049 refused to suspend (async, error -16)",
+                "samsung_fts1ba90a 9-0049 refused to suspend (async, error -16) once"),
+            "a wakeup source": (
+                "[  700.000000] PM: suspend entry (deep)\n"
+                "[  700.050000] PM: Wakeup pending, aborting suspend\n"
+                "[  700.050001] PM: active wakeup source: event2\n"
+                "[  700.050002] Freezing user space processes aborted after 0.004 seconds (1 tasks refusing "
+                "to freeze, wq_busy=0):\n"
+                "[  700.200000] PM: suspend exit\n", "", INTERRUPTS,
+                "a pending wakeup (wakeup source event2)", "wakeup source event2 once"),
+            "only the kernel's line": (
+                "[  700.000000] PM: suspend entry (deep)\n"
+                "[  700.050000] Wakeup pending. Abort CPU freeze\n"
+                "[  700.200000] PM: suspend exit\n", "", INTERRUPTS,
+                "the kernel logged: Wakeup pending. Abort CPU freeze",
+                '"Wakeup pending. Abort CPU freeze" once'),
+        }
+        for name, (log, irq, interrupts, why, by) in cases.items():
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                if interrupts is not None:
+                    (self.root / "proc/interrupts").write_text(interrupts)
+                self.touch_abort(1, log=log, irq=irq)
+                # The fake root's /proc/interrupts, by its path here.
+                why = why.replace("ROOT/", f"{self.root}/")
+                result = self.run_test("ro", "1", "aborts=0", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn(f"(rtcwake 1, suspend_stats success +0 fail +1): {why}; the UFS read back as "
+                              "before; aborted attempt 1, more than aborts=0", self.out)
+                if TOUCH_HINT not in why:
+                    self.assertNotIn("the touchscreen", self.out)
+                self.assertIn(f"SLEEP-TEST RESULT: NO-SLEEP at cycle 1/1: 1 attempt aborted before the sleep "
+                              f"({by}), more than aborts=0;", self.out)
+
+    def test_it_says_before_freezing_not_to_touch_the_screen(self):
+        self.run_test("ro", "1", "restart-ok", "hold=0")
+        log = (self.ramdir() / "log").read_text()
+        said = "do not touch the screen until the restart: a double tap on it wakes the tablet and aborts the sleep it is in"
+        self.assertEqual(log.count(said), 1)
+        self.assertLess(log.index(said), log.index("freezing every writable disk filesystem now"))
 
     def test_hold_0_restarts_at_once_and_the_hold_is_the_owner_s(self):
         self.run_test("restart-ok", "1", "hold=0")
         log = (self.ramdir() / "log").read_text()
         self.assertIn("readable without root) for 0s, then the tablet restarts", log)
-        for bad in ("hold=3601", "hold=x", "0", "11", "1 45", "1 30 30", "rw", "--restart-ok"):
+        for bad in ("hold=3601", "hold=x", "0", "11", "1 45", "1 30 30", "rw", "--restart-ok",
+                    "aborts=21", "aborts=x", "aborts=", "dry 1", "dry aborts=3", "ro dry", "dry dry"):
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
+                self.assertIn("sleep-test.sh dry [release-floor] [hold=S] restart-ok", result.stderr)
 
     def assert_nothing_done(self):
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "")
-        for calls in ("mount.calls", "swapoff.calls", "rtcwake.calls", "dd.calls", "blockdev.calls"):
+        self.assertEqual(self.sysrq(), "")
+        for calls in ("mount.calls", "swapoff.calls", "rtcwake.calls", "dd.calls", "blockdev.calls",
+                      "fsfreeze.calls"):
             self.assertEqual(self.read(calls), "", calls)
         self.assertNotIn("restart", self.read("systemctl.calls"))
         self.assertFalse((self.root / "run/gts9u-sleep-test").exists())
@@ -3409,6 +4619,10 @@ class SleepTestTest(FakeTablet):
         self.assertEqual(self.manifest(), self.before)
 
     def test_refusals_change_nothing(self):
+        def mounts(edit):
+            path = self.root / "proc/1/mounts"
+            path.write_text(edit(path.read_text()))
+
         cases = {
             "run it with sudo": lambda: (self.bin / "id").write_text("#!/bin/sh\necho 1000\n"),
             "this is not an SM-X710": lambda: (self.root / "proc/device-tree/compatible").write_bytes(
@@ -3427,6 +4641,25 @@ class SleepTestTest(FakeTablet):
                 self.root / "sys/devices/soc/ufshc/block/sda/ro").write_text("1\n"),
             "the root filesystem is not writable (rw,noatime,emergency_ro)": lambda: (
                 self.root / "mount-options").write_text("rw,noatime,emergency_ro\n"),
+            # 2026-11-22: the root that sysrq u left with errors.
+            "ext4 has recorded 5 errors on the root filesystem /dev/sda34 (the last in "
+            "ext4_mark_recovery_complete:6370): it needs e2fsck -f from recovery first": lambda: [
+                (self.root / "sys/fs/ext4/sda34/errors_count").write_text("5\n"),
+                (self.root / "sys/fs/ext4/sda34/last_error_func").write_text("ext4_mark_recovery_complete\n"),
+                (self.root / "sys/fs/ext4/sda34/last_error_line").write_text("6370\n")],
+            "cannot read ext4's error count of the root": lambda: (
+                self.root / "sys/fs/ext4/sda34/errors_count").unlink(),
+            "the root filesystem /dev/sda34 is 'clean with errors', not clean (dumpe2fs -h): it needs "
+            "e2fsck -f from recovery first": lambda: (self.tmp / "fs-state").write_text("clean with errors\n"),
+            "the root filesystem /dev/sda34 is 'unreadable', not clean": lambda: (
+                self.bin / "dumpe2fs").write_text("#!/bin/sh\nexit 1\n"),
+            "the root filesystem is 'btrfs', not ext4": lambda: mounts(
+                lambda text: text.replace("/dev/sda34 / ext4", "/dev/sda34 / btrfs")),
+            # The SD card as the desktop mounts it.
+            "/media/jstockdale/squirtle (/dev/mmcblk1p1, exfat) is mounted writable and cannot be frozen: "
+            "unmount it first (sudo umount /media/jstockdale/squirtle)": lambda: mounts(
+                lambda text: text + "/dev/mmcblk1p1 /media/jstockdale/squirtle exfat rw,nosuid,nodev,"
+                "relatime,uid=1000,gid=1000,fmask=0022,dmask=0022,iocharset=utf8,errors=remount-ro 0 0\n"),
             "battery at 12 %": lambda: (
                 self.root / "sys/class/power_supply/sm5714-battery/capacity").write_text("12\n"),
             "wait until the boot has settled": lambda: (self.root / "proc/uptime").write_text("70.5 9\n"),
@@ -3435,6 +4668,27 @@ class SleepTestTest(FakeTablet):
             "the audio DSP is still starting": lambda: (
                 self.tmp / "active-ubuntu-gts9u-adsp-start-inhibit.service").write_text("active\n"),
             "missing tool: rtcwake": lambda: (self.bin / "rtcwake").unlink(),
+            "missing tool: fsfreeze": lambda: (self.bin / "fsfreeze").unlink(),
+            "missing tool: dumpe2fs": lambda: (self.bin / "dumpe2fs").unlink(),
+            # The first resume's warning, and the hung tasks of a frozen disk.
+            "kernel.panic_on_warn is 1, not 0: a frozen disk gives a kernel warning at the first resume and "
+            "hung tasks after a minute, and either would panic the tablet in the middle of the run": lambda: (
+                self.root / "proc/sys/kernel/panic_on_warn").write_text("1\n"),
+            "kernel.hung_task_panic is unreadable, not 0": lambda: (
+                self.root / "proc/sys/kernel/hung_task_panic").unlink(),
+            # errors=panic, among the options or as the superblock's default.
+            "/media/stick (/dev/sdg2) runs with errors=panic: an ext4 error during the run would panic the "
+            "tablet; give it errors=remount-ro first (sudo mount -o remount,errors=remount-ro "
+            "/media/stick)": lambda: mounts(lambda text: text.replace("errors=remount-ro", "errors=panic")),
+            "/ (/dev/sda34) runs with errors=panic": lambda: (self.tmp / "sb-errors-sda34").write_text("panic\n"),
+            # Without the superblock's default, the check of errors=continue
+            # could not be judged.
+            "cannot tell ext4's error behaviour of /media/stick (/dev/sdg2): dumpe2fs -h names no default in its "
+            "superblock, or its options an unknown one": lambda: (self.tmp / "sb-errors-sdg2").write_text("unknown\n"),
+            # A mount point that /proc/1/mounts has to escape.
+            "the mount point /media/my\\040stick has a space or the like in its path, which the run cannot "
+            "name: unmount it first": lambda: mounts(
+                lambda text: text + "/dev/sdh1 /media/my\\040stick ext4 rw,relatime 0 0\n"),
         }
         for message, damage in cases.items():
             with self.subTest(message):
@@ -3455,12 +4709,13 @@ class SleepTestTest(FakeTablet):
             self.assertIn("add restart-ok to say that is fine", self.out)
             self.assert_nothing_done()
 
-    def test_swap_on_the_disk_goes_off_or_nothing_goes_read_only(self):
+    def test_swap_on_the_disk_goes_off_or_nothing_is_frozen(self):
         (self.tmp / "swapoff-fails").touch()
         result = self.run_test("restart-ok")
         self.assertEqual(result.returncode, 1, self.out)
-        self.assertIn("STOPPED before going read-only: swapoff /swapfile failed", self.out)
-        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "")
+        self.assertIn("STOPPED before freezing anything: swapoff /swapfile failed", self.out)
+        self.assertEqual(self.sysrq(), "")
+        self.assertEqual(self.read("fsfreeze.calls"), "--version\n")
 
     def test_status_reads_the_result_without_root(self):
         (self.bin / "id").write_text("#!/bin/sh\necho 1000\n")
@@ -3480,12 +4735,30 @@ class SleepTestTest(FakeTablet):
         shown = subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=True).stdout
         self.assertEqual(shown, "gts9u sleep-test: 20261122-031500 cycle 1/1: diagnostic: x\n"
                                 "gts9u sleep-test: 20261122-031500 SLEEP-TEST RESULT: FAIL at cycle 1/1: y\n")
+        # A run whose only verdict so far is an aborted attempt is still
+        # going: the cycle is tried again.
+        going = self.root / "run/gts9u-sleep-test/20261122-032843"
+        going.mkdir(parents=True)
+        (self.root / "run/gts9u-sleep-test/latest").symlink_to("20261122-032843")
+        (going / "log").write_text("[13873.80] cycle 1/3: asleep ?s\n")
+        (going / "result").write_text("SLEEP-TEST cycle 1/3: ABORTED: the kernel gave up the suspend\n")
+        result = self.run_script("sleep-test.sh", "status")
+        self.assertIn("SLEEP-TEST cycle 1/3: ABORTED: the kernel gave up the suspend\nno SLEEP-TEST RESULT "
+                      "line yet: the run is still going (an ABORTED cycle is tried again)\n", result.stdout)
+        (going / "result").write_text((going / "result").read_text() + "SLEEP-TEST RESULT: NO-SLEEP at cycle "
+                                      "1/3: x\n")
+        result = self.run_script("sleep-test.sh", "status")
+        self.assertIn("SLEEP-TEST RESULT: NO-SLEEP at cycle 1/3: x\n", result.stdout)
+        self.assertNotIn("still going", result.stdout)
+        shutil.rmtree(going)
+        (self.root / "run/gts9u-sleep-test/latest").unlink()
         (self.bin / "id").write_text("#!/bin/sh\necho 0\n")
         self.run_test("restart-ok", "1", "hold=0")
         (self.bin / "id").write_text("#!/bin/sh\necho 1000\n")
         result = self.run_script("sleep-test.sh", "status")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", result.stdout)
+        self.assertNotIn("still going", result.stdout)
         for p in [self.ramdir(), *self.ramdir().iterdir()]:
             if p.is_file():
                 self.assertTrue(p.stat().st_mode & 0o004, p)
@@ -3495,7 +4768,7 @@ class SleepTestTest(FakeTablet):
         run in its own session goes on to its result in /run."""
         path = self.tmp / "run-sleep-test.sh"
         path.write_text(self.script("sleep-test.sh"))
-        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_ROOT": str(self.root),
+        env = {"PATH": f"{self.bin}:{self.host_path}", "FAKE_ROOT": str(self.root),
                "HOME": str(self.tmp)}
         # The sleep is slow here, so that the terminal is gone in the middle.
         (self.tmp / "stubs/rtcwake").write_text(
@@ -3505,7 +4778,7 @@ class SleepTestTest(FakeTablet):
                                start_new_session=True)
         self.addCleanup(run.wait)
         seen = b""
-        while b"going read-only now" not in seen:
+        while b"freezing every writable disk filesystem now" not in seen:
             chunk = run.stdout.read1(4096)
             self.assertTrue(chunk, seen)
             seen += chunk
@@ -3517,9 +4790,16 @@ class SleepTestTest(FakeTablet):
         while "SLEEP-TEST RESULT" not in (result.read_text() if result.exists() else ""):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
-        while (self.root / "proc/sysrq-trigger").read_text() != "ub":
+        while self.sysrq() != "b":
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
+        # The run's last line, after sysrq b (here the tablet stays up):
+        # nothing of it writes to the test's directory after that.
+        log = self.root / "run/gts9u-sleep-test/latest/log"
+        while "restart: still here after sysrq b" not in log.read_text():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        time.sleep(0.2)
         self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2", result.read_text())
         self.assertEqual(self.read("violations"), "")
 
@@ -3545,7 +4825,7 @@ class RamRootTest(unittest.TestCase):
             r"^in_ram_root\(\) \{.*?^\}\n")]
         tools = re.search(r"^ram_tools='([^']*)'$", text, re.M).group(1).split()
         self.assertEqual(tools, ["rtcwake", "dmesg", "dd", "sha256sum", "sleep", "grep", "awk", "sync",
-                                 "blockdev"])
+                                 "blockdev", "fsfreeze", "nsenter", "readlink"])
         inside = r"""
             PATH=$1/tools
             set -e
@@ -3557,7 +4837,8 @@ class RamRootTest(unittest.TestCase):
             [ "$(printf 'a\nb\n' | grep -c b)" = 1 ]
             [ "$(dd if=/dev/zero bs=4096 count=4 status=none | sha256sum)" = \
                 "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe  -" ]
-            for t in dmesg rtcwake blockdev; do $t --version > /dev/null; done
+            for t in dmesg rtcwake blockdev fsfreeze nsenter; do $t --version > /dev/null; done
+            [ "$(readlink -f /tools/..)" = / ]
             # /proc, /sys and /dev are the system's.
             read -r up _ < /proc/uptime && [ -e /sys/kernel ] && [ -c /dev/null ]
             echo inside-ok
@@ -3757,9 +5038,27 @@ class UfsGateTest(unittest.TestCase):
 class ScriptsTest(unittest.TestCase):
     def test_scripts_parse(self):
         for name, shell in (("install.sh", "sh"), ("rollback.sh", "sh"), ("verify.sh", "sh"),
-                            ("make-kit.sh", "bash")):
+                            ("sleep-test.sh", "sh"), ("make-kit.sh", "bash")):
             with self.subTest(name):
                 subprocess.run([shell, "-n", str(KIT_SRC / name)], check=True)
+
+    def test_a_filesystem_is_known_by_the_kernel_s_name_of_its_device(self):
+        """sleep-test.sh reads /sys/fs/ext4/NAME and ext4's lines by the
+        device's kernel name: a /dev/mapper or /dev/disk/by-* source in
+        /proc/1/mounts is resolved to it."""
+        body = re.search(r"^dev_name\(\) \{.*?^\}\n", (KIT_SRC / "sleep-test.sh").read_text(), re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as d:
+            dev = pathlib.Path(d) / "dev"
+            for sub in ("mapper", "disk/by-uuid"):
+                (dev / sub).mkdir(parents=True)
+            for name in ("dm-0", "sda34"):
+                (dev / name).touch()
+            (dev / "mapper/root").symlink_to("../dm-0")
+            (dev / "disk/by-uuid/3c5f").symlink_to("../../sda34")
+            out = subprocess.run(["sh", "-c", body + 'for s; do dev_name "$s"; done', "sh", str(dev / "mapper/root"),
+                                  str(dev / "disk/by-uuid/3c5f"), str(dev / "sda34")],
+                                 capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out, "dm-0\nsda34\nsda34\n")
 
     def test_scripts_pin_the_same_hang_log_kit(self):
         self.assertEqual(pinned("install.sh", "hang_boot"), pinned("make-kit.sh", "hang_boot"))
@@ -4259,7 +5558,18 @@ class ScriptsTest(unittest.TestCase):
                      "The verdict and diagnostic lines are in pmsg",
                      """`grep -rah 'gts9u sleep-test' "$(ls -d /var/lib/ubuntu-gts9u/pstore/[0-9]* | """
                      """tail -n 1)"`""",
-                     "APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 \\"):
+                     "APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 \\",
+                     # 2026-11-22: the freeze, the dry mode, and the aborted
+                     # sleeps.
+                     "sudo sh ~/typec-roles/sleep-test.sh dry restart-ok",
+                     "Each run freezes every disk filesystem and **ends with a restart of the tablet** "
+                     "(`sysrq b`)",
+                     "**Why a freeze, not read-only.**",
+                     "**Do not touch the screen during a run.**",
+                     "**Keep an SSH session open before starting.**",
+                     "**`aborts=N`** (default 5, at most 20)",
+                     "`SLEEP-TEST RESULT: NO-SLEEP at cycle N/M: ...`",
+                     "`SLEEP-TEST RESULT: DRY: no sleep tried; ...`"):
             with self.subTest(said):
                 self.assertIn(said, readme if "\\" not in said else (KIT_SRC / "README.md").read_text())
         # A docked boot tests the host controller only with devices on the

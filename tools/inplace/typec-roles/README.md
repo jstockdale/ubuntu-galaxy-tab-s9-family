@@ -85,9 +85,14 @@ nothing else in the kernel:
   one failed sleep says what to try next (below, "The sleep test").
 
 `sleep-test.sh` is new in revision 8: deep sleeps with every disk
-filesystem read-only, so that a resume that loses the storage costs a
-restart and nothing else. It also runs on revision 7's kernel, for a
-baseline before the install.
+filesystem frozen, so that a resume that loses the storage costs a restart
+and nothing else. It also runs on revision 7's kernel, for a baseline
+before the install. Its first form made the filesystems read-only with
+`sysrq u`, and on 2026-11-22 that left the root unable to mount at the next
+boot (below, "The sleep test"); it freezes them now, keeps ext4 from
+recording an error during the run (`errors=continue` with the disk
+read-only), and its `dry` mode proves the protection and the restart
+without a sleep.
 
 **What changes:**
 - **Kernel:** the hang-log kernel rebuilt with
@@ -284,79 +289,276 @@ Bluetooth are built in, so it can be run over SSH; then reboot.
 ## The sleep test
 
 ```sh
+sudo sh ~/typec-roles/sleep-test.sh dry restart-ok                     # no sleep: the protection and the restart
 sudo sh ~/typec-roles/sleep-test.sh ro 3 30 restart-ok                 # floor as the boot left it
 sudo sh ~/typec-roles/sleep-test.sh ro 3 30 release-floor restart-ok   # release it first
 sh ~/typec-roles/sleep-test.sh status                                  # the result, no root
 ```
 
-Each run makes every disk filesystem read-only and **ends with a restart of
-the tablet**, whatever happens: `restart-ok` says that is fine, and without
-it nothing is done. In order:
+Each run freezes every disk filesystem and **ends with a restart of the
+tablet** (`sysrq b`), whatever happens: `restart-ok` says that is fine, and
+without it nothing is done. One exception, always before any sleep: a
+protection that cannot be completed (a freeze that fails, the disk that
+does not go read-only, `errors=continue` that does not take, an ext4 error
+found before the first sleep) is undone, `errors=` put back, and the run
+stops without a restart, saying so in its result. A freeze that does not
+end, or a thaw that fails, restarts instead. Everything after the first
+read ends in the restart, an `ERROR-STATE` too (below). Before the first
+run with sleeps after this change, run `dry` once and check that the tablet
+boots cleanly after it (`verify.sh` says so: it knows the boot after a
+sleep test).
+
+**Do not touch the screen during a run.** A double tap on it wakes the
+tablet, and in a suspend that is under way it makes the kernel give the
+suspend up (ABORTED, below). The run says so before it freezes anything.
+
+**Keep an SSH session open before starting.** While the disk is frozen,
+every program that writes to it waits: the desktop, the journal, `sudo`'s
+log, a new SSH login. Reading works: `sh ~/typec-roles/sleep-test.sh status`
+(no `sudo`) in a session that is already open shows the result.
+
+In order:
 
 1. It refuses, with nothing changed, unless it runs as root on an SM-X710,
    `/sys/power/mem_sleep` offers `deep`, the RTC can wake the tablet,
-   userdata is a partition of a writable UFS LUN, the root filesystem is
-   writable, the battery is at 30 % or more, the boot has settled (120 s,
-   the panel cycle done, the audio DSP started) and every tool it needs is
-   there.
+   userdata is a partition of a writable UFS LUN, `kernel.panic_on_warn`
+   and `kernel.hung_task_panic` are 0 (the first resume with a filesystem
+   frozen logs one kernel warning, and writers waiting on the frozen disk
+   are reported as hung tasks after 60 s: either would otherwise panic the
+   tablet in the middle of the run), the root filesystem is writable, ext4
+   has recorded no error on it (`/sys/fs/ext4/<dev>/errors_count` is 0 and
+   `dumpe2fs -h` says `clean`; otherwise it needs `e2fsck -f` from recovery
+   first), every writable disk filesystem is ext4 (exfat, the SD card's,
+   cannot be frozen: unmount it first, `sudo umount /media/<user>/<card>`),
+   none is mounted at a path with a space or the like in it, none runs
+   with `errors=panic`, the battery is at 30 % or more, the boot has
+   settled (120 s, the panel cycle done, the audio DSP started) and every
+   tool it needs is there.
 2. It records the state before in `~/typec-roles/logs/<time>-sleep/` and in
    `/run/gts9u-sleep-test/<time>/`: the kernel and whether it is the kit's,
    the interconnect floor, `suspend_stats`, `qcom_stats`, the Type-C roles,
-   the charger, the mounts and the swap.
+   the charger, the root's ext4 state, each ext4 filesystem's error count
+   and error behaviour (its `errors=`, and its superblock's default), the
+   mounts, the order it will freeze them in, and the swap. The error counts
+   read here are the ones the run compares with to the end.
 3. It copies every tool it needs from then on, the shell and itself, with
    their libraries and the dynamic loader, into a tmpfs, each at its own
-   path, and switches off every swap that is not zram (a swap file or
-   partition on the disk: the kernel writes a swap file below its
-   filesystem, read-only or not). From then on it runs in a mount
-   namespace whose root is that tmpfs, in a session of its own: nothing it
-   runs comes from the disk, and it goes on to the end when SSH drops.
-4. `sync`, `sysrq u`, and a check that every disk filesystem of the system
-   is read-only; the UFS disk is then made read-only at the block layer as
-   well, so that a write that still came would be logged. Only then does it
-   read the first 64 MiB of userdata with `O_DIRECT` and hash them.
-5. Each cycle: `rtcwake -m mem -s SECONDS`, then the kernel log since the
-   sleep, the same read, `suspend_stats` and `qcom_stats`. A cycle **fails**
-   on a UFS failure line (`phy initialization timed-out`, `Failed to
-   calibrate PHY`, `Enabling the controller failed`, `Host init failed`,
+   path, and switches off every swap that is not zram (the kernel writes a
+   swap file's blocks past its filesystem, frozen or not). From then on it
+   runs in a mount namespace whose root is that tmpfs, in a session of its
+   own: nothing it runs comes from the disk, and it goes on to the end when
+   SSH drops. It writes its lines to its log in `/run` only; the part
+   started from the terminal shows that log there (`tail -f`), so a
+   terminal or an SSH server that stops reading cannot hold the run up.
+4. **`errors=continue`**, the last step on the disk: every ext4 filesystem
+   it will freeze that does not run with `errors=continue` already is
+   remounted with it, by the system's own `mount` in PID 1's mount
+   namespace (`nsenter -t 1 -m -- mount -o remount,errors=continue
+   MOUNTPOINT`), and `/proc/1/mounts` has to show it (on this root, whose
+   superblock says remount-ro, `errors=continue` appears among the options;
+   on a stick whose superblock says continue and that was mounted with
+   `errors=remount-ro`, the word goes away). If it does not take, what was
+   changed is put back and the run stops before freezing anything. Only
+   the mount option changes: the superblock's default, which the next boot
+   mounts with, is left alone (no `tune2fs`). Why: with the disk read-only
+   at the block layer (next step), an ext4 error under `errors=continue`
+   neither aborts the journal nor saves anything to the disk. Under
+   `errors=remount-ro`, this root's default, ext4 aborts its journal, and
+   jbd2 writes the error into the journal's superblock even on a read-only
+   disk (the block layer only warns about that write); the next mount then
+   marks the root in error, skips the orphan cleanup, and fails as on
+   2026-11-22 (below). A stop before any sleep puts each filesystem's
+   previous behaviour back after the thaw, through the same `mount`, and
+   says plainly if that failed (that filesystem then runs with
+   `errors=continue` until the next restart, and the line gives the command
+   to put it back). A restart needs nothing put back. A filesystem mounted
+   after this step (a stick after a resume) is frozen without it.
+5. It freezes every writable disk filesystem (`fsfreeze -f`, through
+   `/proc/1/root`): one on a loop device first, then the deepest mount
+   first, the root last, each once. A freeze flushes the journal and
+   records nothing (below). Then the UFS disk is made read-only at the block
+   layer as well, so that a write that still came would be logged
+   (`Trying to write to read-only block-device`), and so that ext4 saves no
+   error to the superblock any more: a read-only disk skips that, but not
+   the journal abort, which is what step 4 is for. Before the first freeze
+   and again once the disk is read-only it looks at ext4: each filesystem's
+   error count against the one read in step 2, its options in
+   `/proc/1/mounts` (`emergency_ro` or `shutdown`: ext4 gave up on it), and
+   the kernel log since the run began (`EXT4-fs error (device NAME)`,
+   `Aborting journal on device NAME-`, `EXT4-fs (NAME): Remounting
+   filesystem read-only`). If a freeze fails, the disk cannot be made
+   read-only, or ext4 recorded, logged or gave up on anything, the run
+   thaws what it froze, puts `errors=` back and stops with `SLEEP-TEST
+   RESULT: STOPPED before any sleep: ...` and a NEXT line for that cause
+   (an ext4 error: `e2fsck -f` from recovery before the next boot); a
+   freeze that does not end within 120 s, or a thaw that fails, restarts.
+   Only then does it read the first 64 MiB of userdata with `O_DIRECT` and
+   hash them, and the kernel log since the run began must have no failure
+   line (`FAIL before any sleep` otherwise). **`dry`** then reads them again
+   after 10 s, freezes each filesystem a second time (it must fail with
+   `EBUSY`: still frozen), checks the kernel log since the run began for a
+   failure line and ext4 as above, and ends with `SLEEP-TEST RESULT: DRY: no
+   sleep tried; ...` and the restart.
+6. Each cycle: `rtcwake -m mem -s SECONDS`; right after it each frozen
+   filesystem is frozen a second time, which must fail with `EBUSY` (still
+   frozen); a second freeze that succeeds means something thawed it during
+   the cycle, which fails the cycle as a failure of the protection (the
+   filesystem stays frozen from then on). Then the kernel log since the
+   sleep, the same read, `suspend_stats` and `qcom_stats`. A cycle
+   **fails** on a UFS failure line (`phy initialization timed-out`, `Failed
+   to calibrate PHY`, `Enabling the controller failed`, `Host init failed`,
    `ufshcd_wl_resume failed`), an I/O or ext4 error on the UFS disk, a write
    to the disk that the block layer logged (`Trying to write to read-only
-   block-device`: it logs the first one and does not stop it), a read that
-   failed or differs, a sleep that did not happen (`rtcwake`,
-   `suspend_stats`, no `PM: suspend entry (deep)`).
-   The run stops at the first failed cycle. A cycle that passed is **PASS**
-   when AOSS sleep, CX collapse and DDR low power (`aosd`, `cxsd`, `ddr`)
-   all counted up, **SHALLOW** when one did not (it did not test the depth
-   of the 2026-11-21 failure), **DEPTH-UNKNOWN** without `qcom_stats`.
-6. The verdicts: one `SLEEP-TEST cycle N/M:` line per cycle, one
-   `SLEEP-TEST RESULT:` line, and `NEXT:` lines with the next step. They go
-   to the terminal, to `/run/gts9u-sleep-test/<time>/result` (readable
-   without root, `latest` points to the newest), to the kernel log and to
-   `/dev/pmsg0`, which pstore keeps across the restart. Each cycle's
-   diagnostic lines (`cycle N/M: diagnostic:`, revision 8's kernel) go to
-   the result file and to `/dev/pmsg0` too, just before the cycle's
-   verdict: all of them up to 16, otherwise the first 12, a line saying how
-   many were left out, and the last 4 (a failed resume retries its
-   calibration 15 times, up to four lines each, and pmsg is a small ring).
-   The terminal and the run's log in `/run` have every line until the
-   restart. The diagnostic lines do not go to the kernel log, which has the
-   driver's own.
-7. After `hold=S` (300 s unless given), the restart. While the storage reads
-   back as before, a clean reboot: SIGINT to systemd, which starts
-   `ctrl-alt-del.target` (it checks first that this is `reboot.target`). It
-   needs no program from the disk, and the kernel shuts the UFS device down.
-   After a storage failure, or if no reboot came after 300 s, `sysrq b`: it
-   needs nothing from the disk, and loses nothing, since everything was
-   synced and read-only before the first sleep.
+   block-device`: it logs the first one and does not stop it), a journal
+   started on a frozen ext4 (the kernel's `WARNING` in
+   `ext4_journal_check_start`, `fs/ext4/ext4_jbd2.c`), a read that failed
+   or differs, a sleep that did not happen (`rtcwake`, `suspend_stats`, no
+   `PM: suspend entry (deep)`). The run stops at the first failed cycle. A
+   cycle that passed is **PASS** when AOSS sleep, CX collapse and DDR low
+   power (`aosd`, `cxsd`, `ddr`) all counted up, **SHALLOW** when one did
+   not (it did not test the depth of the 2026-11-21 failure),
+   **DEPTH-UNKNOWN** without `qcom_stats`. A filesystem mounted between two
+   cycles is frozen before the next one, or that cycle does not start.
+   **Expected:** the first resume (or the first suspend given up, below)
+   logs one kernel warning with a backtrace, `WARNING: fs/super.c:1919 at
+   thaw_super_locked+...` (the suspend's own thaw of filesystems, with
+   `/sys/power/freeze_filesystems` 0, finds no freeze of its own to undo and
+   leaves the run's alone), and the kernel is tainted `W`. No rule of the run
+   counts it. Hung-task reports of writers waiting on the frozen disk, after
+   60 s, are expected too.
+7. **ABORTED**: a suspend that the kernel gave up before the tablet slept,
+   as on 2026-11-22 when the touchscreen's double tap came in the noirq
+   phase. It is not a FAIL only when all of these hold, and a FAIL
+   otherwise: `rtcwake` failed; `suspend_stats` counted no success and one
+   failure; the attempt's kernel lines have `PM: suspend entry (deep)` and
+   `PM: suspend exit` and a line that shows the suspend given up on the way
+   down (`Wakeup pending. Abort CPU freeze`, `Wakeup pending, aborting
+   suspend`, `Triggering wakeup from IRQ N`, `Freezing ... aborted after`,
+   `Some devices failed to suspend, or early wake event detected`, `late` or
+   `noirq suspend of devices failed`, `... suspend of devices aborted after`,
+   or a device's `failed to suspend ...: error N`); less than 1 s of
+   `Timekeeping suspended`; no UFS or I/O failure line, no diagnostic line
+   but calibration entries, and no line about the UFS that says something
+   failed (a line with `ufs`, `[sda]`, or a SCSI device of the UFS host
+   such as `sd 0:0:0:0:`, with `fail`, `error`, `timed out`, `timing out`,
+   `abort`, `offline` or `rejecting` in it: a UFS device that refused to
+   suspend is a FAIL); every filesystem still frozen; and the read after it
+   matches the first. The line names the cause:
+   `SLEEP-TEST cycle 1/3: ABORTED: the kernel gave up the suspend before the
+   tablet slept (rtcwake 1, suspend_stats success +0 fail +1): a wakeup from
+   IRQ 199 (fts1ba90a, the touchscreen: do not touch the screen during the
+   run); the UFS read back as before; aborted attempt 1 (aborts=5): cycle 1/3
+   again in 5 s; floor released`. Another IRQ is named by its name in
+   `/proc/interrupts` (or "no name for it" there), a device that refused by
+   its name and error, a wakeup source by its name. The same cycle is then
+   tried again after 5 s; an aborted attempt never counts as a pass.
+   **`aborts=N`** (default 5, at most 20) is how many aborted attempts a run
+   tries again; one more ends it with `SLEEP-TEST RESULT: NO-SLEEP at cycle
+   N/M: ...`, which says how many attempts were aborted and by what, how
+   many cycles passed before, and that the run does not answer the storage
+   question (not a PASS, not a FAIL). `aborts=0` ends the run at the first
+   abort. A run that gets its cycles through with aborts on the way is
+   still a PASS, and its RESULT line counts them (`1 attempt aborted before
+   the sleep (IRQ 199 (fts1ba90a, the touchscreen) once) and tried again`).
+8. **NO-SLEEP (freezer)**: a suspend whose task freezer gave up after its
+   20 s (`Freezing user space processes failed after ...` or `Freezing
+   remaining freezable tasks failed after ...`), with everything else as for
+   ABORTED (no storage line, every filesystem still frozen, the read as
+   before). A task that waits on the frozen disk can be frozen, but one
+   queued behind it on a memory map's lock (a write fault on a shared
+   mapping of a file on the root, as sqlite's and the journal's are, holds
+   that lock while it waits) cannot. Not a FAIL and not tried again (it
+   would meet the same task): `SLEEP-TEST cycle N/M: NO-SLEEP (freezer):
+   ...; stuck: gnome-shell (state D), ...` with the tasks the kernel named
+   after its line, then `SLEEP-TEST RESULT: NO-SLEEP (freezer) at cycle
+   N/M: ...` and the restart. If it happens, run the test from
+   `multi-user.target`, without the desktop: over SSH, `sudo systemctl
+   isolate multi-user.target` (it stops the desktop and its programs; SSH
+   stays), then the test; the restart at its end boots the desktop again.
+   `dry` cannot show this: it does not suspend.
+9. The verdicts: one `SLEEP-TEST cycle N/M:` line per cycle (and per
+   aborted attempt), one `SLEEP-TEST RESULT:` line, and `NEXT:` lines with
+   the next step. They go to the terminal, to
+   `/run/gts9u-sleep-test/<time>/result` (readable without root, `latest`
+   points to the newest), to the kernel log and to `/dev/pmsg0`, which
+   pstore keeps across the restart. Each cycle's diagnostic lines (`cycle
+   N/M: diagnostic:`, revision 8's kernel) go to the result file and to
+   `/dev/pmsg0` too, just before the cycle's verdict: all of them up to 16,
+   otherwise the first 12, a line saying how many were left out, and the
+   last 4 (a failed resume retries its calibration 15 times, up to four
+   lines each, and pmsg is a small ring). The terminal and the run's log in
+   `/run` have every line until the restart. The diagnostic lines do not go
+   to the kernel log, which has the driver's own.
+10. Once the verdict is out it looks at ext4 again, as in step 5. A journal
+    that aborted, a filesystem ext4 gave up on, or an error saved (on a disk
+    that is not read-only, a stick's) gives `SLEEP-TEST ERROR-STATE: ...`,
+    up to six of ext4's kernel lines in pmsg (`ext4: ...`), and NEXT lines:
+    for the root, that the boot after the restart will probably not mount
+    it (jbd2 wrote the error into the journal's superblock; "probably",
+    because the kernel may have logged that this write failed, `JBD2: I/O
+    error when updating journal superblock`, and the NEXT line then says
+    the boot may come up) and how to reach TWRP and repair it with
+    `e2fsck -f`; for another filesystem, `e2fsck -f` before it is mounted
+    again. An ext4 error logged on the read-only UFS disk with nothing
+    aborted or saved (`errors=continue` at work) gives `SLEEP-TEST NOTE:
+    ...` and a NEXT line that nothing was written and the next boot should
+    mount the root as usual, to be checked. Then, after `hold=S` (300 s
+    unless given), it looks at ext4 once more and says what is new
+    (`SLEEP-TEST ERROR-STATE (right before the restart): ...`), writes
+    `SLEEP-TEST RESTART: sysrq b; frozen: ...` (what `verify.sh` finds in the next
+    boot's pstore) and restarts with `sysrq b`, the filesystems still
+    frozen: it needs nothing from the disk, and the boot after it mounts
+    them as after a power loss, with less to do (the freeze flushed the
+    journal). An ERROR-STATE restarts too: with the disk frozen the tablet
+    cannot be used, a restart keeps every line in pstore, and the repair
+    happens in recovery anyway. A frozen filesystem is never thawed after a
+    sleep: the thaw would be the first write after a resume, which this test
+    does not make, and a clean reboot would need it (systemd stops services
+    that wait on the frozen disk).
+
+**Why a freeze, not read-only.** Until 2026-11-22 the run made the
+filesystems read-only with `sysrq u`. A remount read-only of a mounted ext4
+checks that its orphan file is empty, and while programs hold deleted files
+open, as a running desktop always does, it is not: ext4 records an error
+("Orphan file not empty on read-only fs"). With that error recorded, the
+next boot skips the orphan cleanup and the same check fails the mount, and
+this port's initramfs has no fsck: squirtle looped at boot until `e2fsck`
+ran from recovery. The same follows from any ext4 error recorded on the
+running root, which is why the run also keeps ext4 from recording one
+(`errors=continue` with the disk read-only, step 4) and says so when it
+did. A freeze flushes the journal and keeps the orphan file as it is,
+recording nothing; the next mount cleans the orphans up as after any power
+loss. The details, with the kernel functions, are in
+[`docs/resume-recovery.md`](../../../docs/resume-recovery.md#protecting-the-storage-in-a-sleep-test).
+After a run: `sh ~/typec-roles/verify.sh` (in the boot right after a run
+it also fails on a root journal that was not empty at the mount, and in
+any boot on an error ext4 recorded on the root), and
+`cat /sys/fs/ext4/<root device>/errors_count` must say 0.
 
 **What a pass means.** `SLEEP-TEST RESULT: PASS` with `floor released`: in
 each cycle the SoC reached AOSS sleep, CX collapse and DDR low power, the
-UFS came back without a single failure line, and 64 MiB read past the page
-cache matched the read before the first sleep. It says nothing about writes
-after a resume (the disk was read-only); that is the next step, a normal
-root (`scripts/diagnostics/suspend/gts9u-suspend-cycles.sh`), and not for
-the first runs. A run with the floor held says `floor held` in every verdict:
+UFS came back without a single failure line, every filesystem was still
+frozen after the resume, and 64 MiB read past the page cache matched the
+read before the first sleep. It says nothing about writes after a resume
+(the disk was frozen); that is the next step, a normal root
+(`scripts/diagnostics/suspend/gts9u-suspend-cycles.sh`), and not for the
+first runs. A run with the floor held says `floor held` in every verdict:
 it does not sleep as deep as the 2026-11-21 failure, which came with the
 floor released.
+
+**What only the tablet can show.** None of the following has run on the
+tablet yet (as of 2026-11-22 no sleep test has completed a deep sleep: the
+revision 7 baseline never slept, none has run on revision 8, and the
+freeze has not run there at all): that `fsfreeze` of util-linux
+2.39.3 freezes through `/proc/1/root` and a second freeze fails with
+`EBUSY` (`dry` shows both), that `mount -o remount,errors=continue` with
+fstab's `errors=remount-ro` merged in ends with `errors=continue` (the run
+checks it, and stops if not), what an ext4 error after a resume does under
+`errors=continue` with the disk read-only (read from the kernel source
+only), and whether the desktop's tasks let the freezer through (NO-SLEEP
+(freezer) if not). `fstrim.timer` (weekly) would, if it fired during a run,
+send discards to the read-only disk, which the block layer logs as a write
+and the run fails; it is not stopped for the run.
 
 **The interconnect floor.** `ubuntu-gts9u-icc-late-release` releases it
 about 45 s into a boot. After a boot that released it and then ended
@@ -365,8 +567,8 @@ it while `/etc/ubuntu-gts9u/icc-hold` exists. A sleep test always ends that
 way for the breaker: its marker can only be cleared by a clean stop with a
 writable disk. So the boot after a run in a boot that released the floor
 holds it once, and the next run needs `release-floor`, which restarts the
-unit, the documented way to release it now (before anything goes
-read-only). `release-floor` is refused while `icc-hold` exists; remove that
+unit, the documented way to release it now (before anything is
+frozen). `release-floor` is refused while `icc-hold` exists; remove that
 file yourself if you mean to.
 
 **The result after the restart.** `/run` is gone then. The verdict and
@@ -378,12 +580,16 @@ last (readable by group adm; otherwise prefix `sudo`):
 `/run`). From the build host:
 `ssh -o HostKeyAlias=10.42.0.2 jstockdale@192.168.1.234 'grep -rah "gts9u sleep-test" "$(ls -d /var/lib/ubuntu-gts9u/pstore/[0-9]* | tail -n 1)"'`.
 After a later restart the run's lines are in an older directory: the
-stamp in each line tells the runs apart. If SSH drops during the sleep and
-comes back before the restart,
-`sh ~/typec-roles/sleep-test.sh status` or, if the storage is gone and no
-program starts,
+stamp in each line tells the runs apart. During the run, in an SSH session
+opened before it, `sh ~/typec-roles/sleep-test.sh status` or, if the storage
+is gone and no program starts,
 `while IFS= read -r l; do echo "$l"; done < /run/gts9u-sleep-test/latest/result`
-(built into the shell).
+(built into the shell). A new SSH login may not get through while the disk
+is frozen (the login writes to it): the lines are in pmsg after the
+restart. If the tablet is still up 30 s after `sysrq b`, everything stays
+frozen (`sudo`, `reboot` and a new login may hang): force the restart with
+Power and Volume Down held; for TWRP, hold Power and Volume Down until the
+screen goes dark, then at once Power and Volume Up.
 
 **Reading the diagnostic** (revision 8's kernel only). After each resume the
 run prints the diagnostic's lines of the cycle. `calibration entry:` shows
@@ -514,7 +720,11 @@ again, up to three per attach; the verdict is still the roles.
    stick (enumerate), the A-to-C cable to the build host (`usb0` comes up,
    the gadget network works).
 6. **The sleep test**, in this order, each run in its own boot (the run
-   restarts the tablet): on revision 7, before the install, a baseline
+   restarts the tablet), without touching the screen: first `dry`, and a
+   check that the boot after it is clean (`verify.sh`, which knows the boot
+   after a sleep test and checks that the root's journal was empty at the
+   mount, and the root's ext4 `errors_count` 0); then on revision 7, before
+   the install, a baseline
    (`release-floor` if the floor is held): does revision 7 fail every time
    or one time in N? Then install revision 8, reboot, `verify.sh`, and the
    same run docked, then undocked. Only after `PASS` with `floor released`,
