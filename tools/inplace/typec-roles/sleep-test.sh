@@ -2,8 +2,8 @@
 # Deep sleeps of the SM-X710 with every disk filesystem frozen, to test
 # whether the UFS storage comes back, without risking the data on it.
 #   sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
-#        [pci=remove] [pm_test=LEVEL] [trace|trace=live] restart-ok
-#   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok
+#        [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle] restart-ok
+#   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle] restart-ok
 #   sh ~/typec-roles/sleep-test.sh status
 # ro (the default): CYCLES deep sleeps (default 3, at most 10) of SECONDS
 # each (15, 30 or 60; default 30), each woken by the RTC.  dry: the same
@@ -15,19 +15,23 @@
 # result stays on screen and in /run before the restart (default 300 s).
 # aborts=N is how many times in a run a sleep that the kernel gave up before
 # the tablet slept (ABORTED: a wakeup on the way down, a double tap on the
-# screen for one) is tried again (default 5, at most 20); one more ends the
-# run with NO-SLEEP, and aborts=0 ends it at the first.  Do not touch the
-# screen during a run.
+# screen for one; with mode=s2idle also a sleep that a wakeup other than
+# the RTC's cut short, WOKEN EARLY) is tried again (default 5, at most 20);
+# one more ends the run with NO-SLEEP, and aborts=0 ends it at the first.
+# Do not touch the screen during a run.
 # Experiments, each off unless given (below, "The experiment options"):
 # pci=remove removes every PCI root port, and the Wi-Fi with it, right
 # before the freeze, until the restart.  pm_test=LEVEL (freezer, devices,
 # platform, processors or core) makes each cycle's suspend stop at that
 # level, wait there and resume, with no SoC sleep call: a PM-TEST verdict,
-# no depth.  trace raises the console loglevel to 8 for each sleep, so that
-# the PM core's lines reach ramoops (live up to the console suspend, the
-# rest at the resume); trace=live also keeps the consoles printing while
-# devices suspend and resume (console_suspend N), at a cost: read the risks
-# below first.
+# no depth.  mode=s2idle sleeps each cycle with rtcwake -m freeze
+# (suspend-to-idle) instead of rtcwake -m mem (mode=deep, the default: PSCI
+# SYSTEM_SUSPEND); with it pm_test= is freezer, devices or platform.  trace
+# raises the console loglevel to 8 for each sleep, so that the PM core's
+# lines reach ramoops (live up to the console suspend, the rest at the
+# resume); trace=live also keeps the consoles printing while devices
+# suspend and resume (console_suspend N), at a cost: read the risks below
+# first.
 # status (no root) prints the latest run's result from /run.
 #
 # On 2026-11-21 one deep sleep (rtcwake -m mem -s 30) did not bring the UFS
@@ -36,7 +40,9 @@
 # test with the root writable can therefore cost data.  This one never sleeps
 # with a disk filesystem writable, never writes to the disk after it froze
 # them, and needs nothing from the disk after that:
-#   - before anything else: root, this board, deep in mem_sleep, the RTC, the
+#   - before anything else: root, this board, deep in mem_sleep (mode=s2idle:
+#     freeze in /sys/power/state, and a cpuidle state of cpu0 with an s2idle
+#     entry), the RTC, the
 #     userdata partition, kernel.panic_on_warn and kernel.hung_task_panic 0
 #     (the first resume with a filesystem frozen logs one kernel warning,
 #     below, and writers that wait on a frozen filesystem are reported as
@@ -114,7 +120,8 @@
 #     past the page cache), hashed, before the first sleep and after each
 #     resume (dry: once more after 10 s), and before the first sleep the
 #     kernel log since the run began must have no failure line;
-#   - each cycle: rtcwake -m mem; right after it a second fsfreeze -f of
+#   - each cycle: rtcwake -m mem (mode=s2idle: rtcwake -m freeze); right
+#     after it a second fsfreeze -f of
 #     every filesystem the run froze, which must fail with EBUSY (it is
 #     still frozen: freeze_super, fs/super.c), or the cycle fails, the
 #     protection having failed (a freeze that succeeds there froze a
@@ -260,22 +267,36 @@
 #     mdelay at core; cut short by a pending wakeup), resumes, and the write
 #     to /sys/power/state succeeds: suspend_stats counts a success and
 #     rtcwake (util-linux 2.39.3) then reads the RTC alarm and disables it
-#     before it exits 0, so no alarm is left armed.  cpuidle is paused only
-#     with the CPUs' offlining (pm_sleep_disable_secondary_cpus(),
-#     kernel/power/power.h), so at freezer, devices and platform the idle
-#     CPUs may still take the cluster, and the SoC with it, into a low-power
-#     state during the wait: the PM-TEST verdict shows qcom_stats' counts as
-#     they come, and they are idle, not a sleep.  The kernel logs
-#     "suspend debug: Waiting for N second(s)." at the level; a cycle without
-#     that line FAILs.  A pm_test cycle is PM-TEST, never PASS, SHALLOW or
-#     DEEP: no sleep is asked for, so no depth is tested; it says whether the
-#     suspend and resume path came back to that level with the UFS readable.
-#     Refused with dry, when the kernel does not offer LEVEL, or when a level
-#     is selected already.  The boot-time panel cycle runs pm_test=platform
-#     at every boot (ubuntu-gts9u-panel-coldboot-recover).
+#     before it exits 0, so no alarm is left armed.  cpuidle keeps running
+#     during the wait (it is paused only with the CPUs' offlining,
+#     pm_sleep_disable_secondary_cpus(), kernel/power/power.h), but from
+#     devices on the CPU cluster's power domain cannot power off through it:
+#     that domain's one device is the RPMh RSC (17a00000.rsc), dpm_prepare()
+#     counted it (genpd_prepare()), and genpd_power_off() does nothing while
+#     prepared_count > 0 (drivers/pmdomain/core.c; the CPUs' own devices are
+#     syscore ones and are not prepared).  So at devices and platform the
+#     CPUs reach their own power collapse at most, the cluster, the RSC and
+#     the APSS stay up, and aosd, cxsd, ddr and apss can only stay +0 (the
+#     2026-11-22 14:00 run); only at freezer, before the devices are
+#     prepared, can idle take the cluster down.  (Until 2026-11-22 evening
+#     this said idle could take the SoC down at devices and platform: wrong.)
+#     The PM-TEST verdict shows qcom_stats' counts as they come.  The kernel
+#     logs "suspend debug: Waiting for N second(s)." at the level; a cycle
+#     without that line FAILs.  A pm_test cycle is PM-TEST, never PASS,
+#     SHALLOW or DEEP: no sleep is asked for, so no depth is tested; it says
+#     whether the suspend and resume path came back to that level with the
+#     UFS readable.  With mode=s2idle the levels are freezer, devices and
+#     platform: suspend-to-idle leaves suspend_enter() for its idle loop
+#     right after the platform level, before processors and core, and the
+#     kernel refuses those two with it (enter_state(): "Unsupported test mode
+#     for suspend to idle"); the run refuses them first.  Refused with dry,
+#     when the kernel does not offer LEVEL, or when a level is selected
+#     already.  The boot-time panel cycle runs pm_test=platform at every boot
+#     (ubuntu-gts9u-panel-coldboot-recover).
 #   - trace (ro): kernel.printk's console loglevel goes to 8 right before
 #     each rtcwake and back right after it (the other three numbers as they
-#     were), and pm_debug_messages is 1 (as every run sets it): the PM
+#     were), and pm_debug_messages is 1 (as every ro run sets it, until the
+#     restart that ends it): the PM
 #     core's lines (info) and its phase lines (pm_pr_dbg, KERN_DEBUG:
 #     "PM: noirq suspend of devices complete after ...") reach the consoles,
 #     ramoops' among them.  With console_suspend Y (the default) the consoles
@@ -321,6 +342,44 @@
 #     Writing to ramoops and to sec_log is a copy into reserved DDR (no
 #     device), safe at any point.  Use it after a trace run left
 #     "Suspending console(s)" as the last line.
+#   - mode=s2idle (ro and dry; mode=deep, the default, is accepted too):
+#     each cycle is rtcwake -m freeze -s SECONDS, suspend-to-idle, instead
+#     of rtcwake -m mem, which this kernel carries out as PSCI
+#     SYSTEM_SUSPEND (mem_sleep deep).  rtcwake writes freeze to
+#     /sys/power/state; /sys/power/mem_sleep plays no part and the run
+#     leaves it as it is.  In suspend-to-idle every CPU stays online and
+#     idles in its state with an s2idle entry (state1, cpu-sleep-X-0); the
+#     last one down powers the cluster's domain off (dev_pm_genpd_suspend(),
+#     drivers/cpuidle/cpuidle-psci.c), which flushes the RSC's sleep set,
+#     and enters PSCI CPU_SUSPEND with the cluster's deepest state; an
+#     armed wakeup IRQ (the RTC's alarm) ends the loop.  Refused, before
+#     anything is done, when /sys/power/state offers no freeze or no
+#     cpuidle state of cpu0 has an s2idle entry, and with pm_test=processors
+#     or core (above).  dry checks the same and sleeps not.  Every cycle's
+#     verdict word, and every RESULT's about a sleep, carries " (s2idle)"
+#     ("SLEEP-TEST cycle 1/3: PASS (s2idle): ...", "SLEEP-TEST RESULT:
+#     SHALLOW (s2idle): ..."; STOPPED, FAIL before any sleep and DRY name it
+#     in their options alone), every line with the options names
+#     mode=s2idle, and the progress line before each sleep says rtcwake -m
+#     freeze.  Around each cycle the run also
+#     reads (evidence, reads only) each CPU's cpuidle/state*/s2idle/{usage,
+#     time}, the cluster domain's idle states (pm_genpd/power-domain-cluster/
+#     idle_states: usage, s2idle, rejected per state) and suspend_stats'
+#     last_hw_sleep if the kernel has it (this one has not); one evidence
+#     line more per cycle goes to pmsg.  Asleep is the sum of the cycle's
+#     "Timekeeping suspended for N seconds" lines, one for each time every
+#     CPU was frozen at once; s2idle/time is not the sleep (it leaves out
+#     the time every CPU was frozen: sched_clock is suspended then).
+#     Verdicts: qcom_stats' aosd, cxsd and ddr decide PASS, SHALLOW and
+#     DEPTH-UNKNOWN as in a deep run, and a cycle whose three counted is a
+#     PASS whatever else.  Otherwise a sleep the kernel counted but that a
+#     wakeup other than the RTC's alarm cut short (no CPU entered its s2idle
+#     state, or less than half of SECONDS asleep; and pm_wakeup_irq or the
+#     kernel's "Triggering wakeup from IRQ N" names an IRQ whose name has no
+#     "rtc", or a wakeup source was pending) is WOKEN EARLY, not a pass: the
+#     cycle is tried again like an ABORTED attempt, within the same aborts=N,
+#     past which the run ends with NO-SLEEP (s2idle).  A cycle in which no
+#     CPU entered its s2idle state and no such wakeup explains it FAILs.
 set -u
 export LC_ALL=C
 umask 022
@@ -354,6 +413,10 @@ console_suspend_ctl=/sys/module/printk/parameters/console_suspend
 ignore_loglevel_ctl=/sys/module/printk/parameters/ignore_loglevel
 print_times_ctl=/sys/power/pm_print_times
 debug_messages_ctl=/sys/power/pm_debug_messages
+# mode=s2idle's checks and evidence (reads only): each CPU's cpuidle states,
+# and the idle states of the CPU cluster's power domain (debugfs).
+cpu_devs=/sys/devices/system/cpu
+cluster_states=/sys/kernel/debug/pm_genpd/power-domain-cluster/idle_states
 # trace's console loglevel: KERN_DEBUG lines (the PM core's pm_pr_dbg) and
 # everything above them reach the consoles.
 trace_level=8
@@ -437,7 +500,9 @@ mount_deadline=60
 # entry lines and its verdict, about 1 KiB, and a run has at most 21 of them.
 # ext4's own lines, when it recorded or logged an error, add at most 6.
 # Each cycle that was not given up before its sleep adds two evidence lines
-# (ev_keep), at most 700 bytes: 7 KiB for ten.  The progress lines
+# (ev_keep), at most 700 bytes: 7 KiB for ten; mode=s2idle adds a third, at
+# most 300 bytes more, and a WOKEN EARLY attempt adds its evidence lines
+# and its verdict, about 1.5 KiB, within the same 21.  The progress lines
 # (progress) add the run's start, the PCI removal and the protection, under
 # 1 KiB, and one line of about 150 bytes before each attempt at a sleep, at
 # most 31 in a run: under 6 KiB in all.
@@ -450,9 +515,10 @@ diag_tail=4
 # and the kernel log, with the RAM root's tools; a read that fails gives "-"
 # or nothing and changes nothing in the run.  The terminal and the run's log
 # get every line ("cycle N/M: evidence: ..."), pmsg two short ones per cycle
-# (ev_pmsg).  One read is not passive: ddr_stats asks the AOSS to bring its
-# numbers up to date (a QMP message, qcom_ddr_stats_show in
-# drivers/soc/qcom/qcom_stats.c), as every read of that file does.
+# (three with mode=s2idle; ev_pmsg).  One read is not passive: ddr_stats
+# asks the AOSS to bring its numbers up to date (a QMP message,
+# qcom_ddr_stats_show in drivers/soc/qcom/qcom_stats.c), as every read of
+# that file does.
 genpd_sum=/sys/kernel/debug/pm_genpd/pm_genpd_summary
 reg_sum=/sys/kernel/debug/regulator/regulator_summary
 icc_sum=/sys/kernel/debug/interconnect/interconnect_summary
@@ -465,9 +531,12 @@ pci_devs=/sys/bus/pci/devices
 # any domain that is on as well.
 ev_domains='^(cx|mx|mxc|mmcx|lcx|lmx|gfx|ebi|ufs_|usb|pcie|mdss|power-domain-cluster)'
 # The kernel lines of a cycle the terminal gets (dmesg, all levels; the run
-# sets pm_debug_messages): the PM core's, the CPUs', the storage's and the
-# diagnostic's, the USB host's, the PCIe link's and the Wi-Fi's, the DSPs',
-# the clocks', rails' and votes', warnings and errors.  At most ev_klines,
+# sets pm_debug_messages): the PM core's (suspend-to-idle's too: "PM:
+# suspend-to-idle", "PM: Triggering wakeup from IRQ N", "PM: resume from
+# suspend-to-idle", "Timekeeping suspended for ..."), the CPUs', the
+# storage's and the diagnostic's, the USB host's, the PCIe link's and the
+# Wi-Fi's, the DSPs', the clocks', rails' and votes', warnings and errors.
+# At most ev_klines,
 # and not the Wi-Fi's per-packet noise, the CPUs' feature lines or the
 # hung-task reports of writers waiting on the frozen disk.
 ev_kernel='PM: |psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110'
@@ -478,7 +547,7 @@ ev_klines=150
 recovery_keys='hold Power and Volume Down until the screen goes dark, then at once Power and Volume Up, for TWRP'
 
 usage() {
-	sed -n '2,31s/^# //p' "$0" >&2
+	sed -n '2,/^# status (no root)/s/^# //p' "$0" >&2
 	exit 2
 }
 
@@ -792,6 +861,15 @@ floor_state() {
 	fi
 }
 
+# The interconnect nodes still at the floor's vote (INT_MAX), or n/a when
+# the summary cannot be read.  grep -c prints 0 and fails when there is
+# none: a "|| echo n/a" after it printed a second line, "n/a", under the 0.
+intmax_nodes() {
+	imn=$(grep -c 2147483647 /sys/kernel/debug/interconnect/interconnect_summary 2>/dev/null)
+	num "$imn" || imn=n/a
+	echo "$imn"
+}
+
 # The PCI devices, by their sysfs names: " NAME" each, or nothing.  The
 # shell reads sysfs itself; readlink is one of the RAM root's tools.
 pci_names() {
@@ -854,6 +932,50 @@ pm_test_what() { # LEVEL
 	processors) echo 'the devices suspended and the other CPUs offline' ;;
 	core) echo 'everything but the SoC sleep call (PSCI SYSTEM_SUSPEND), interrupts off' ;;
 	esac
+}
+
+# The words of the sleep mode (mode=, the header): rtcwake's -m, the label
+# of the kernel's "PM: suspend entry (LABEL)", the mark every verdict word
+# of an s2idle run carries (NO-SLEEP (freezer, s2idle) the one exception
+# to its form), and what a pm_test cycle does not do.
+mode_words() {
+	if [ "$sleep_mode" = s2idle ]; then
+		rtc_mode=freeze mem_label=s2idle mword=' (s2idle)' s2fz=', s2idle' no_sleep_call='no suspend-to-idle'
+	else
+		rtc_mode=mem mem_label=deep mword= s2fz= no_sleep_call='no SoC sleep call'
+	fi
+}
+
+# mode=s2idle, for the run's header: the cpuidle states with an s2idle
+# entry, each once, on how many CPUs; the cluster domain's idle states as
+# they stand (usage, s2idle and rejected per state).
+s2idle_summary() {
+	s2n=0 s2all=
+	for s2c in "$cpu_devs"/cpu[0-9]*; do
+		[ -d "$s2c" ] || continue
+		s2n=$((s2n + 1))
+		s2all="$s2all$(s2idle_states "${s2c##*/cpu}")"
+	done
+	printf 'the cpuidle states with an s2idle entry:%s on %s CPUs; power-domain-cluster: ' \
+		"$(printf '%s\n' $s2all | awk 'NF && !seen[$0]++ { printf " %s", $0 }')" "$s2n"
+	if [ -r "$cluster_states" ]; then
+		awk 'NR > 1 && NF >= 7 { printf "%s%s usage %s s2idle %s rejected %s", n++ ? ", " : "", $1, $3, $7, $4 }
+			END { if (!n) printf "no state" }' "$cluster_states" 2>/dev/null
+	else
+		printf 'not readable'
+	fi
+	echo
+}
+
+# The cpuidle states of CPU N that have an s2idle entry (enter_s2idle, the
+# ones suspend-to-idle uses): " stateM(NAME)" each, or nothing.
+s2idle_states() { # N
+	for sst in "$cpu_devs/cpu$1"/cpuidle/state[0-9]*; do
+		[ -d "$sst/s2idle" ] || continue
+		ssn=
+		read -r ssn 2>/dev/null < "$sst/name" || :
+		printf ' %s(%s)' "${sst##*/}" "${ssn:--}"
+	done
 }
 
 # ------------------------------------------- the run, from the RAM root ---
@@ -1012,8 +1134,20 @@ pcie_down() {
 
 pcie_down_end() {
 	pdown=$(grep -E "$pcie_down_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
-	verdict "SLEEP-TEST RESULT: PCIE-DOWN after $cyc: the PCIe host did not come back ($pdown), and with pci=remove a later suspend would read its registers with its clocks off, so the run ends here; $passes of $cycles cycles came back with the UFS readable; floor $floor; kernel $kernel$optnote"
+	verdict "SLEEP-TEST RESULT: PCIE-DOWN$mword after $cyc: the PCIe host did not come back ($pdown), and with pci=remove a later suspend would read its registers with its clocks off, so the run ends here; $passes of $cycles cycles came back with the UFS readable; floor $floor; kernel $kernel$optnote"
 	verdict 'NEXT: no further sleep in this boot: the restart brings the PCIe host back; the pcie evidence and kernel lines of that cycle say how its link failed'
+	finish healthy
+}
+
+# Past the aborts=N budget (ABORTED attempts, and with mode=s2idle WOKEN
+# EARLY ones): the end of the run, with no storage verdict.
+no_sleep_end() {
+	verdict "SLEEP-TEST RESULT: NO-SLEEP$mword at $cyc: $(abort_note), more than aborts=$aborts; $passes of $cycles cycles passed before it; this run does not answer whether the storage comes back from a deep sleep; floor $floor; kernel $kernel$optnote"
+	if [ "$sleep_mode" = s2idle ]; then
+		verdict 'NEXT: no storage verdict: after the restart run the test again, without touching the screen; the ABORTED and WOKEN EARLY lines name what ended each attempt'
+	else
+		verdict 'NEXT: no storage verdict: after the restart run the test again, without touching the screen; the ABORTED lines name what gave up each sleep'
+	fi
 	finish healthy
 }
 
@@ -1262,11 +1396,112 @@ ev_once() {
 	say "evidence: state: $(ev_state)"
 }
 
+# mode=s2idle: each CPU's cpuidle states that have an s2idle entry, as "CPU
+# STATE USAGE TIME NAME" lines (s2idle/usage, s2idle/time in us; the
+# counts enter_s2idle_proper() keeps, drivers/cpuidle/cpuidle.c).
+ev_cpuidle() { # OUT
+	for evc in "$cpu_devs"/cpu[0-9]*; do
+		for evd in "$evc"/cpuidle/state[0-9]*; do
+			[ -d "$evd/s2idle" ] || continue
+			printf '%s %s %s %s %s\n' "${evc##*/}" "${evd##*/}" "$(ev_val "$evd/s2idle/usage")" \
+				"$(ev_val "$evd/s2idle/time")" "$(ev_val "$evd/name")"
+		done
+	done 2>/dev/null > "$1"
+}
+
+# What changed between two ev_cpuidle snapshots, one line: "ENTRIES CPUS
+# OF TIME STATE NAMES...": the s2idle entries of every CPU, how many CPUs
+# entered (of how many), the seconds counted in them, the deepest state
+# entered and its names; "-" when the snapshots cannot be compared.
+ev_cpuidle_delta() { # BEFORE AFTER
+	awk '
+		FILENAME == ARGV[1] { u[$1 " " $2] = $3; t[$1 " " $2] = $4; next }
+		{
+			k = $1 " " $2
+			if (!(k in u) || $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ || u[k] !~ /^[0-9]+$/ || t[k] !~ /^[0-9]+$/) { bad = 1; next }
+			if (!($1 in cpu)) { cpu[$1] = 1; nc++ }
+			du = $3 - u[k]
+			if (du <= 0) next
+			n += du
+			tt += $4 - t[k]
+			if (!($1 in went)) { went[$1] = 1; ni++ }
+			s = substr($2, 6) + 0
+			if (st == "" || s > sn) { sn = s; st = $2; names = $5 }
+			else if (s == sn && index(" " names " ", " " $5 " ") == 0) names = names " " $5
+		}
+		END {
+			if (bad || !nc) { print "-"; exit }
+			printf "%d %d %d %.3f %s %s\n", n, ni, nc, tt / 1000000, st == "" ? "-" : st, st == "" ? "-" : names
+		}' "$1" "$2" 2>/dev/null
+}
+
+# mode=s2idle: the idle states of the CPU cluster's power domain
+# (idle_states_show(), drivers/pmdomain/core.c: "State Time(ms) Usage
+# Rejected Above Below S2idle"), as "STATE USAGE REJECTED S2IDLE" lines.
+ev_cluster() { # OUT
+	awk 'NR > 1 && NF >= 7 && $3 ~ /^[0-9]+$/ { print $1, $3, $4, $7 }' "$cluster_states" 2>/dev/null > "$1"
+}
+
+# What changed between two ev_cluster snapshots: "S0 +0 (s2idle +0,
+# rejected +0), S1 +1 (s2idle +1, rejected +0)", or "-".
+ev_cluster_delta() { # BEFORE AFTER
+	awk '
+		FILENAME == ARGV[1] { u[$1] = $2; r[$1] = $3; s[$1] = $4; next }
+		($1 in u) { o = o (o == "" ? "" : ", ") sprintf("%s +%d (s2idle +%d, rejected +%d)", $1, $2 - u[$1], $4 - s[$1], $3 - r[$1]) }
+		END { print o == "" ? "-" : o }' "$1" "$2" 2>/dev/null
+}
+
+# mode=s2idle, once the cycle's kernel lines are read: how far the CPUs got
+# into suspend-to-idle.  Sets s2u (the s2idle entries of every CPU, or ?),
+# s2v (a short account for the cycle's verdict) and s2pmsg (pmsg's line).
+# The time asleep is $asleep, the sum of the "Timekeeping suspended for"
+# lines (one each time every CPU was frozen at once); s2idle/time leaves
+# that time out (tick_freeze() suspends sched_clock, which the cpuidle core
+# measures with) and is not the sleep.
+ev_s2idle() { # SFX
+	s2cl=$(ev_cluster_delta "$ramdir/ev-cluster-$1.0" "$ramdir/ev-cluster-$1.1")
+	[ -n "$s2cl" ] && [ "$s2cl" != - ] || s2cl='not readable'
+	s2d=$(ev_cpuidle_delta "$ramdir/ev-cpuidle-$1.0" "$ramdir/ev-cpuidle-$1.1")
+	set -- ${s2d:--}
+	s2t=
+	if [ "$1" = - ]; then
+		s2u='?'
+		s2e='s2idle entries not readable'
+	else
+		s2u=$1 s2t=$4
+		s2e="s2idle entries +$1 on $2 of $3 CPUs"
+		if [ "$1" != 0 ]; then
+			s2st=$5
+			shift 5
+			s2e="$s2e in $s2st ($*)"
+		fi
+	fi
+	if [ -n "$asleep" ]; then
+		s2a="asleep ${asleep}s ($tk_n Timekeeping lines)"
+	else
+		s2a='never asleep (no Timekeeping line)'
+	fi
+	s2w='no wakeup IRQ recorded'
+	if [ -n "$wake" ]; then
+		s2irq=$(irq_name "$wake")
+		s2w="woken by IRQ $wake${s2irq:+ ($s2irq)}"
+	fi
+	s2took=$(awk -v a="$up0" -v b="$up1" 'BEGIN { if (a ~ /^[0-9.]+$/ && b ~ /^[0-9.]+$/) printf "%.1f", b - a; else printf "?" }')
+	s2hw=$(stat_of last_hw_sleep)
+	say "$cyc: evidence: s2idle: $s2e${s2t:+, ${s2t}s counted in them (not the time every CPU was frozen)}; cluster domain: $s2cl; $s2a; $s2w; rtcwake took ${s2took}s; suspend_stats last_hw_sleep $([ "$s2hw" = - ] && echo 'not offered by this kernel' || echo "${s2hw}us")"
+	s2v="$s2a, $s2e, cluster $s2cl"
+	s2pmsg="$s2e; cluster $s2cl; $s2a; $s2w"
+}
+
 # Before a sleep: the snapshots ev_after compares with, and the domains.
 ev_before() { # SFX
 	ev_stats "$ramdir/ev-stats-$1.0"
 	ev_irqs "$ramdir/ev-irqs-$1.0"
 	ev_wake "$ramdir/ev-wake-$1.0"
+	if [ "$sleep_mode" = s2idle ]; then
+		ev_cpuidle "$ramdir/ev-cpuidle-$1.0"
+		ev_cluster "$ramdir/ev-cluster-$1.0"
+	fi
 	evstate=$(ev_state)
 	say "$cyc: evidence: before: $evstate"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: before: genpd: $evl"; done
@@ -1277,12 +1512,17 @@ ev_resumed() { # SFX
 	ev_stats "$ramdir/ev-stats-$1.1"
 	ev_irqs "$ramdir/ev-irqs-$1.1"
 	ev_wake "$ramdir/ev-wake-$1.1"
+	if [ "$sleep_mode" = s2idle ]; then
+		ev_cpuidle "$ramdir/ev-cpuidle-$1.1"
+		ev_cluster "$ramdir/ev-cluster-$1.1"
+	fi
 }
 
 # Once the cycle's kernel lines are in K: what the sleep reached, what woke
 # or kept it, whether the PCIe link went down and came back, the domains
-# now, and the cycle's kernel lines.  ev_keep then puts two short lines of
-# it in pmsg, for an attempt that was not given up before the sleep.
+# now, and the cycle's kernel lines (and with mode=s2idle, ev_s2idle).
+# ev_keep then puts two short lines of it in pmsg (three with mode=s2idle),
+# for an attempt that was not given up before the sleep.
 ev_after() { # SFX K
 	evdepth=$(ev_stats_delta "$ramdir/ev-stats-$1.0" "$ramdir/ev-stats-$1.1")
 	evwake=$(ev_wake_delta "$ramdir/ev-wake-$1.0" "$ramdir/ev-wake-$1.1")
@@ -1312,11 +1552,13 @@ ev_after() { # SFX K
 		$0 ~ re { if (++n <= max) print; next }
 		END { if (n > max) printf "(%d more kernel lines of this cycle left out; its kmsg file in the run directory has them all)\n", n - max }' "$2" 2>/dev/null |
 		while IFS= read -r evl; do say "$cyc: evidence: kernel: $evl"; done
+	[ "$sleep_mode" != s2idle ] || ev_s2idle "$1"
 }
 
 ev_keep() { # SFX
 	ev_pmsg "$cyc: evidence: qcom_stats: $evdepth"
 	ev_pmsg "$cyc: evidence: $evpcie; irq $(ev_irq_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1" 3); wakeup $evwake; before: $evstate"
+	[ "$sleep_mode" != s2idle ] || ev_pmsg "$cyc: evidence: s2idle: $s2pmsg"
 }
 
 # The failure lines of a kernel log excerpt: the UFS ones, the block layer's
@@ -1344,8 +1586,8 @@ storage_lines() { # FILE
 #   2. suspend_stats: success +0 and fail +1, the kernel's own word that
 #      this suspend failed (a sleep that happened counts as a success,
 #      however badly it resumed);
-#   3. the attempt's kernel lines have "PM: suspend entry (deep)" and
-#      "PM: suspend exit";
+#   3. the attempt's kernel lines have "PM: suspend entry (deep)" (mode=
+#      s2idle: "(s2idle)") and "PM: suspend exit";
 #   4. and a line that shows the suspend given up on the way down
 #      (abort_re: a pending wakeup, a wakeup IRQ, a device that refused);
 #   5. and less than 1 s of "Timekeeping suspended for" (a real sleep of
@@ -1367,7 +1609,7 @@ aborted_attempt() {
 gave_up_early() {
 	[ "$rtc_rc" != 0 ] || return 1
 	[ "$(delta "$ok0" "$ok1")" = +0 ] && [ "$(delta "$fail0" "$fail1")" = +1 ] || return 1
-	grep -q 'PM: suspend entry (deep)' "$k" && grep -q 'PM: suspend exit' "$k" || return 1
+	grep -q "PM: suspend entry ($mem_label)" "$k" && grep -q 'PM: suspend exit' "$k" || return 1
 	if [ -n "$asleep" ]; then
 		awk -v s="$asleep" 'BEGIN { exit !(s + 0 < 1) }' || return 1
 	fi
@@ -1390,6 +1632,31 @@ gave_up_early() {
 freezer_failed() {
 	gave_up_early || return 1
 	grep -qE "$freezer_re" "$k"
+}
+
+# mode=s2idle: was this sleep, which the kernel counted (rtcwake 0, nothing
+# against the cycle), cut short by a wakeup that was not the RTC's alarm?
+# Cut short: no CPU entered its s2idle state (s2idle_loop() also ends at
+# once on a wakeup that came after the noirq phase, and the suspend still
+# counts as a success: kernel/power/suspend.c), or less than half of
+# SECONDS asleep (the "Timekeeping suspended for" lines).  And a wakeup on
+# record that is not the RTC's: an IRQ ($wake: pm_wakeup_irq, else the
+# kernel's "Triggering wakeup from IRQ N") whose name in /proc/interrupts
+# has no "rtc" (the alarm's is pm8xxx_rtc_alarm), or a pending wakeup
+# source.  Without such a record the cycle is not WOKEN EARLY: it is judged
+# as a sleep (and FAILs if no CPU entered its s2idle state).
+woken_early() {
+	wcut=
+	[ "$s2u" != 0 ] || wcut=1
+	awk -v s="${asleep:-0}" -v n="$seconds" 'BEGIN { exit !(s + 0 < n / 2) }' && wcut=1
+	[ -n "$wcut" ] || return 1
+	if [ -n "$wake" ]; then
+		case $(irq_name "$wake") in
+		*rtc*) return 1 ;;
+		esac
+		return 0
+	fi
+	grep -qE 'Wakeup pending|active wakeup source: ' "$k"
 }
 
 # The tasks the kernel named after a failed freeze, in the lines between its
@@ -1483,12 +1750,13 @@ abort_cause() {
 
 # The aborted attempts so far, by what gave them up, or nothing:
 # "6 attempts aborted before the sleep (IRQ 199 (fts1ba90a, the touchscreen)
-# 5 times, IRQ 37 (pwrkey) once)".
+# 5 times, IRQ 37 (pwrkey) once)".  A WOKEN EARLY attempt (mode=s2idle)
+# counts the same and is noted "woken early by ...".
 abort_note() {
 	[ "$aborted" != 0 ] || return 0
-	awk -v n="$aborted" '{ if (!($0 in c)) o[++k] = $0; c[$0]++ }
+	awk -v n="$aborted" '{ if (!($0 in c)) o[++k] = $0; c[$0]++; if (index($0, "woken early by ") == 1) e = 1 }
 	END {
-		printf "%d attempt%s aborted before the sleep (", n, n == 1 ? "" : "s"
+		printf "%d attempt%s %s (", n, n == 1 ? "" : "s", e ? "aborted before the sleep or woken early" : "aborted before the sleep"
 		for (j = 1; j <= k; j++)
 			printf "%s%s %s", j == 1 ? "" : ", ", o[j], c[o[j]] == 1 ? "once" : c[o[j]] " times"
 		printf ")\n"
@@ -1812,7 +2080,7 @@ unprotect_and_stop() { # WHY NEXT
 		verdict "$2"
 		[ -z "$back_why" ] ||
 			verdict 'NEXT: put errors= back by hand as said above, or restart the tablet (sudo reboot): the boot mounts every filesystem with its usual options'
-		say "stopped: swap on the disk stays off until the next boot"
+		say "stopped: swap on the disk stays off until the next boot${debug_note:+; $debug_note}"
 		exit 1
 	fi
 	verdict "SLEEP-TEST RESULT: STOPPED before any sleep: $1; and $thaw_why: restarting (sysrq b), a filesystem stays frozen; floor $floor; kernel $kernel$optnote"
@@ -1874,6 +2142,7 @@ finish() { # healthy|failed
 
 run_from_ram() { # CONFIG
 	. "$1"
+	mode_words
 	PATH=$ramdir/tools
 	TZ=UTC0
 	TZDIR=$ramdir/tz
@@ -1999,13 +2268,19 @@ run_from_ram() { # CONFIG
 			rw=$(unfrozen)
 		fi
 		sw=$(disk_swaps)
-		[ "$(selected /sys/power/mem_sleep)" = deep ] || printf deep > /sys/power/mem_sleep 2>/dev/null
+		# mode=s2idle does not use mem_sleep (rtcwake -m freeze), and leaves it.
+		ms=
+		if [ "$sleep_mode" = deep ]; then
+			[ "$(selected /sys/power/mem_sleep)" = deep ] || printf deep > /sys/power/mem_sleep 2>/dev/null
+			ms=$(selected /sys/power/mem_sleep)
+		fi
 		ro=$(selected "/sys/class/block/$disk/ro")
-		if [ -n "$rw" ] || [ -n "$sw" ] || [ "$ro" != 1 ] || [ "$(selected /sys/power/mem_sleep)" != deep ]; then
-			why="writable and not frozen:${rw:- none}; disk swap:${sw:- none}; /dev/$disk ro=${ro:-?}; mem_sleep $(selected /sys/power/mem_sleep)"
-			verdict "SLEEP-TEST $cyc: NOT STARTED: $why"
+		if [ -n "$rw" ] || [ -n "$sw" ] || [ "$ro" != 1 ] || { [ "$sleep_mode" = deep ] && [ "$ms" != deep ]; }; then
+			why="writable and not frozen:${rw:- none}; disk swap:${sw:- none}; /dev/$disk ro=${ro:-?}"
+			[ "$sleep_mode" != deep ] || why="$why; mem_sleep $ms"
+			verdict "SLEEP-TEST $cyc: NOT STARTED$mword: $why"
 			an=$(abort_note)
-			verdict "SLEEP-TEST RESULT: ABORTED at $cyc, before its sleep ($why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
+			verdict "SLEEP-TEST RESULT: ABORTED$mword at $cyc, before its sleep ($why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 			finish healthy
 		fi
 		ev_before "$sfx"
@@ -2017,7 +2292,9 @@ run_from_ram() { # CONFIG
 		[ "$try" = 1 ] || marker="$marker attempt $try"
 		printf '%s\n' "$marker" >> /dev/kmsg
 		if [ -n "$pm_test" ]; then
-			say "$cyc: pm_test=$pm_test cycle: rtcwake -m mem -s $seconds, and the suspend stops at $pm_test ($(pm_test_what "$pm_test")), waits ${pm_test_delay}s there and comes back, no SoC sleep call$attempt; $(roles)"
+			say "$cyc: pm_test=$pm_test cycle: rtcwake -m $rtc_mode -s $seconds, and the suspend stops at $pm_test ($(pm_test_what "$pm_test")), waits ${pm_test_delay}s there and comes back, $no_sleep_call$attempt; $(roles)"
+		elif [ "$sleep_mode" = s2idle ]; then
+			say "$cyc: suspend-to-idle for ${seconds}s (rtcwake -m freeze)$attempt; $(roles)"
 		else
 			say "$cyc: deep sleep for ${seconds}s (rtcwake -m mem)$attempt; $(roles)"
 		fi
@@ -2026,17 +2303,19 @@ run_from_ram() { # CONFIG
 		knobs_on
 		if [ -n "$knobs_why" ]; then
 			knobs_off
-			verdict "SLEEP-TEST $cyc: NOT STARTED: $knobs_why"
+			verdict "SLEEP-TEST $cyc: NOT STARTED$mword: $knobs_why"
 			an=$(abort_note)
-			verdict "SLEEP-TEST RESULT: ABORTED at $cyc, before its sleep ($knobs_why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
+			verdict "SLEEP-TEST RESULT: ABORTED$mword at $cyc, before its sleep ($knobs_why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 			finish healthy
 		fi
 		[ -z "$knobs_now" ] || say "$cyc: for this sleep: $knobs_now"
 		slept=1
 		# The last line before the sleep, for a run that never comes back.
-		progress "$cyc: entering the sleep, rtcwake -m mem -s $seconds$attempt; ${knobs_now:-no pm_test, no trace}; up $(uptime_s)s"
-		rtcwake -u -d "$rtc" -m mem -s "$seconds" > "$ramdir/rtcwake-$sfx" 2>&1
+		progress "$cyc: entering the sleep, rtcwake -m $rtc_mode -s $seconds$attempt; ${knobs_now:-no pm_test, no trace}; up $(uptime_s)s"
+		up0=$(uptime_s)
+		rtcwake -u -d "$rtc" -m "$rtc_mode" -s "$seconds" > "$ramdir/rtcwake-$sfx" 2>&1
 		rtc_rc=$?
+		up1=$(uptime_s)
 		knobs_off
 		# The sleep statistics as the sleep left them (reads only).
 		ev_resumed "$sfx"
@@ -2051,8 +2330,16 @@ run_from_ram() { # CONFIG
 		since "$marker" "$ramdir/kmsg.all" > "$k"
 		ok1=$(stat_of success) fail1=$(stat_of fail)
 		a1=$(count_of aosd) x1=$(count_of cxsd) d1=$(count_of ddr)
+		# The first wakeup IRQ of this suspend; pm_wakeup_irq has no data
+		# (ENODATA) when none was recorded, as after a pm_test cycle, which
+		# ends by itself.  The kernel's own line, if the file says nothing.
 		wake=$(selected /sys/power/pm_wakeup_irq)
+		[ -n "$wake" ] || wake=$(awk '/Triggering wakeup from IRQ [1-9]/ {print $NF; exit}' "$k")
+		# Asleep: the time timekeeping was suspended, one line per suspension
+		# (more than one in a suspend-to-idle whose CPUs woke and froze again).
 		asleep=$(awk '/Timekeeping suspended for/ {for (n = 1; n < NF; n++) if ($n == "for") s += $(n + 1)} END {if (s) printf "%.1f", s}' "$k")
+		tk_n=$(grep -c 'Timekeeping suspended for' "$k")
+		s2u= s2v=
 
 		reasons=
 		storage=healthy
@@ -2068,7 +2355,7 @@ run_from_ram() { # CONFIG
 		# not "aborted"); freezer_failed below.
 		tfail=$(grep -E "$freezer_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
 		[ -z "$tfail" ] || reasons="$reasons; the suspend could not freeze every task: $tfail"
-		grep -q 'PM: suspend entry (deep)' "$k" || reasons="$reasons; no 'PM: suspend entry (deep)'"
+		grep -q "PM: suspend entry ($mem_label)" "$k" || reasons="$reasons; no 'PM: suspend entry ($mem_label)'"
 		grep -q 'PM: suspend exit' "$k" || reasons="$reasons; no 'PM: suspend exit'"
 		[ "$(delta "$ok0" "$ok1")" = +1 ] || reasons="$reasons; suspend_stats success $ok0 -> $ok1"
 		[ "$(delta "$fail0" "$fail1")" = +0 ] || reasons="$reasons; suspend_stats fail $fail0 -> $fail1"
@@ -2114,7 +2401,20 @@ run_from_ram() { # CONFIG
 				keep "$cyc: diagnostic: $((dn - diag_head - diag_tail)) of $dn lines left out here (kept: the first $diag_head and the last $diag_tail); the terminal and $ramdir/log had them all"
 			fi
 		done < "$ramdir/diag-$sfx"
-		say "$cyc: asleep ${asleep:-?}s, woken by IRQ ${wake:-?}, rtcwake $rtc_rc, suspend_stats success $(delta "$ok0" "$ok1") fail $(delta "$fail0" "$fail1"), $dline, $(roles), USB devices $(usb_count)"
+		# The time asleep and the wakeup IRQ: after a pm_test cycle there may
+		# be neither (timekeeping is suspended only from core on, and nothing
+		# woke the tablet): the line says so in words, not "?".
+		if [ -n "$asleep" ]; then
+			sl="asleep ${asleep}s"
+		else
+			sl='no "Timekeeping suspended for" line (timekeeping was not suspended)'
+		fi
+		if [ -n "$wake" ]; then
+			wl="woken by IRQ $wake"
+		else
+			wl='no wakeup IRQ recorded (pm_wakeup_irq has no data)'
+		fi
+		say "$cyc: $sl, $wl, rtcwake $rtc_rc, suspend_stats success $(delta "$ok0" "$ok1") fail $(delta "$fail0" "$fail1"), $dline, $(roles), USB devices $(usb_count)"
 		ev_after "$sfx" "$k"
 		# A suspend the kernel gave up before the sleep, the storage as it
 		# was: not a FAIL.  The same cycle again, or, past the budget, the
@@ -2123,12 +2423,10 @@ run_from_ram() { # CONFIG
 			aborted=$((aborted + 1))
 			abort_cause
 			printf '%s\n' "$abort_by" >> "$ramdir/aborts"
-			gaveup="ABORTED: the kernel gave up the suspend before the tablet slept (rtcwake $rtc_rc, suspend_stats success +0 fail +1): $abort_why; the UFS read back as before"
+			gaveup="ABORTED$mword: the kernel gave up the suspend before the tablet slept (rtcwake $rtc_rc, suspend_stats success +0 fail +1): $abort_why; the UFS read back as before"
 			if [ "$aborted" -gt "$aborts" ]; then
 				verdict "SLEEP-TEST $cyc: $gaveup; aborted attempt $aborted, more than aborts=$aborts: the run ends; floor $floor"
-				verdict "SLEEP-TEST RESULT: NO-SLEEP at $cyc: $(abort_note), more than aborts=$aborts; $passes of $cycles cycles passed before it; this run does not answer whether the storage comes back from a deep sleep; floor $floor; kernel $kernel$optnote"
-				verdict 'NEXT: no storage verdict: after the restart run the test again, without touching the screen; the ABORTED lines name what gave up each sleep'
-				finish healthy
+				no_sleep_end
 			fi
 			if pcie_down; then
 				verdict "SLEEP-TEST $cyc: $gaveup; aborted attempt $aborted (aborts=$aborts); floor $floor"
@@ -2145,28 +2443,56 @@ run_from_ram() { # CONFIG
 		if [ -n "$reasons" ] && freezer_failed; then
 			stuck=$(stuck_tasks "$k")
 			an=$(abort_note)
-			verdict "SLEEP-TEST $cyc: NO-SLEEP (freezer): the kernel gave up the suspend before the tablet slept because a task did not freeze (rtcwake $rtc_rc, suspend_stats success +0 fail +1): $tfail; stuck: ${stuck:-not named}; the UFS read back as before; not tried again; floor $floor"
-			verdict "SLEEP-TEST RESULT: NO-SLEEP (freezer) at $cyc: a task did not freeze (${stuck:-not named}); $passes of $cycles cycles passed before it${an:+; $an and tried again}; this run does not answer whether the storage comes back from a deep sleep; floor $floor; kernel $kernel$optnote"
+			verdict "SLEEP-TEST $cyc: NO-SLEEP (freezer$s2fz): the kernel gave up the suspend before the tablet slept because a task did not freeze (rtcwake $rtc_rc, suspend_stats success +0 fail +1): $tfail; stuck: ${stuck:-not named}; the UFS read back as before; not tried again; floor $floor"
+			verdict "SLEEP-TEST RESULT: NO-SLEEP (freezer$s2fz) at $cyc: a task did not freeze (${stuck:-not named}); $passes of $cycles cycles passed before it${an:+; $an and tried again}; this run does not answer whether the storage comes back from a deep sleep; floor $floor; kernel $kernel$optnote"
 			verdict 'NEXT: no storage verdict: a task that waits behind a writer of the frozen disk (on a memory map'"'"'s lock) cannot be frozen; touch nothing during the run, and if it happens again, run the test from multi-user.target, without the desktop (README, "The sleep test")'
 			finish healthy
 		fi
+		# mode=s2idle: a sleep the kernel counted, cut short by a wakeup that
+		# was not the RTC's (woken_early), is no pass at any depth (unless
+		# qcom_stats counted the deep states, which is a pass as in deep):
+		# the same cycle again, within the aborted attempts' budget.
+		if [ "$sleep_mode" = s2idle ] && [ -z "$reasons" ] && [ "$depth" != pm_test ] &&
+			[ "$depth" != deep ] && woken_early; then
+			aborted=$((aborted + 1))
+			abort_cause
+			printf 'woken early by %s\n' "$abort_by" >> "$ramdir/aborts"
+			early="WOKEN EARLY$mword: the suspend-to-idle was cut short ($s2v; ${seconds}s asked for) by $abort_why; the UFS read back as before"
+			if [ "$aborted" -gt "$aborts" ]; then
+				verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted, more than aborts=$aborts: the run ends; floor $floor"
+				no_sleep_end
+			fi
+			if pcie_down; then
+				verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted (aborts=$aborts); floor $floor"
+				pcie_down_end
+			fi
+			verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted (aborts=$aborts): $cyc again in ${abort_pause} s; floor $floor"
+			try=$((try + 1))
+			sleep "$abort_pause"
+			continue
+		fi
+		# mode=s2idle: no CPU entered its s2idle state, and no wakeup other
+		# than the RTC's explains it: a FAIL (the storage as it was).
+		if [ "$sleep_mode" = s2idle ] && [ "$depth" != pm_test ] && [ "$depth" != deep ] && [ "$s2u" = 0 ]; then
+			reasons="${reasons:+$reasons; }no CPU entered its s2idle state (s2idle entries +0 on every CPU)"
+		fi
 		if [ -n "$reasons" ]; then
 			an=$(abort_note)
-			verdict "SLEEP-TEST $cyc: FAIL: $reasons ($dline; floor $floor)"
-			verdict "SLEEP-TEST RESULT: FAIL at $cyc: $reasons; $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
+			verdict "SLEEP-TEST $cyc: FAIL$mword: $reasons ($dline; floor $floor)"
+			verdict "SLEEP-TEST RESULT: FAIL$mword at $cyc: $reasons; $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 			finish "$storage"
 		fi
 		case $depth in
 		pm_test)
-			verdict "SLEEP-TEST $cyc: PM-TEST $pm_test: the suspend went as far as pm_test=$pm_test ($(pm_test_what "$pm_test")), waited there and came back with no SoC sleep call, and the UFS read back as before; qcom_stats $dline (CPU idle during the wait, not a depth test); floor $floor" ;;
+			verdict "SLEEP-TEST $cyc: PM-TEST $pm_test$mword: the suspend went as far as pm_test=$pm_test ($(pm_test_what "$pm_test")), waited there and came back with $no_sleep_call, and the UFS read back as before; qcom_stats $dline (CPU idle during the wait, not a depth test); floor $floor" ;;
 		deep)
 			deep=$((deep + 1))
-			verdict "SLEEP-TEST $cyc: PASS: deep ($dline), resumed, the UFS read back as before; floor $floor" ;;
+			verdict "SLEEP-TEST $cyc: PASS$mword: deep ($dline), resumed, the UFS read back as before${s2v:+; $s2v}; floor $floor" ;;
 		shallow)
-			verdict "SLEEP-TEST $cyc: SHALLOW: resumed and the UFS read back as before, but not every sleep state was reached ($dline); floor $floor" ;;
+			verdict "SLEEP-TEST $cyc: SHALLOW$mword: resumed and the UFS read back as before, but not every sleep state was reached ($dline${s2v:+; $s2v}); floor $floor" ;;
 		*)
 			unknown=$((unknown + 1))
-			verdict "SLEEP-TEST $cyc: DEPTH-UNKNOWN: resumed and the UFS read back as before; qcom_stats not readable ($dline); floor $floor" ;;
+			verdict "SLEEP-TEST $cyc: DEPTH-UNKNOWN$mword: resumed and the UFS read back as before; qcom_stats not readable ($dline${s2v:+; $s2v}); floor $floor" ;;
 		esac
 		passes=$((passes + 1))
 		! pcie_down || pcie_down_end
@@ -2175,7 +2501,7 @@ run_from_ram() { # CONFIG
 
 	an=$(abort_note)
 	if [ -n "$pm_test" ]; then
-		verdict "SLEEP-TEST RESULT: PM-TEST $pm_test: $passes of $cycles cycles went as far as pm_test=$pm_test and came back with the UFS readable; no SoC sleep call, so no depth was tested${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
+		verdict "SLEEP-TEST RESULT: PM-TEST $pm_test$mword: $passes of $cycles cycles went as far as pm_test=$pm_test and came back with the UFS readable; $no_sleep_call, so no depth was tested${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 		finish healthy
 	fi
 	if [ "$deep" = "$cycles" ]; then
@@ -2187,7 +2513,7 @@ run_from_ram() { # CONFIG
 	fi
 	heldnote=
 	[ "$floor" = released ] || heldnote=' (not the depth of the 2026-11-21 failure, which came with the floor released)'
-	verdict "SLEEP-TEST RESULT: $word: $passes of $cycles cycles resumed with the UFS readable, $deep of them deep${an:+; $an and tried again}; floor $floor$heldnote; kernel $kernel$optnote"
+	verdict "SLEEP-TEST RESULT: $word$mword: $passes of $cycles cycles resumed with the UFS readable, $deep of them deep${an:+; $an and tried again}; floor $floor$heldnote; kernel $kernel$optnote"
 	finish healthy
 }
 
@@ -2198,7 +2524,7 @@ fi
 
 # ------------------------------------------------------ before: the disk ---
 cycles=3 seconds=30 hold=300 aborts=5 release=0 confirmed=0 numbers=0 dry=0 mode= aborts_given=0
-pci_remove=0 pm_test= trace=
+pci_remove=0 pm_test= trace= sleep_mode=
 for a in "$@"; do
 	case $a in
 	ro|dry)
@@ -2223,6 +2549,10 @@ for a in "$@"; do
 		trace=on
 		[ "$a" = trace ] || trace=live ;;
 	trace=*) echo "$me: trace or trace=live, not '$a'" >&2; usage ;;
+	mode=deep|mode=s2idle)
+		[ -z "$sleep_mode" ] || { echo "$me: one mode= at most" >&2; usage; }
+		sleep_mode=${a#mode=} ;;
+	mode=*) echo "$me: mode= is deep or s2idle, not '${a#mode=}'" >&2; usage ;;
 	*)
 		num "$a" || { echo "$me: unknown argument '$a'" >&2; usage; }
 		numbers=$((numbers + 1))
@@ -2243,8 +2573,19 @@ fi
 case $seconds in 15|30|60) ;; *) echo "$me: SECONDS is 15, 30 or 60, not $seconds" >&2; usage ;; esac
 num "$hold" && [ "$hold" -le 3600 ] || { echo "$me: hold=S is 0 to 3600 seconds" >&2; usage; }
 num "$aborts" && [ "$aborts" -le 20 ] || { echo "$me: aborts=N is 0 to 20" >&2; usage; }
+sleep_mode=${sleep_mode:-deep}
+# Suspend-to-idle leaves suspend_enter() for its idle loop right after the
+# platform level, before processors and core (kernel/power/suspend.c), and
+# enter_state() refuses those two levels with it.
+if [ "$sleep_mode" = s2idle ]; then
+	case $pm_test in
+	processors|core) echo "$me: pm_test=$pm_test with mode=s2idle: suspend-to-idle never gets there (it enters its idle loop after the devices' noirq phase, before the other CPUs would go offline), and the kernel refuses that level with it; use freezer, devices or platform" >&2; usage ;;
+	esac
+fi
+mode_words
 # The experiment options in force, as every RESULT line names them.
 options= trace_word=
+[ "$sleep_mode" = deep ] || options="$options mode=s2idle"
 [ "$pci_remove" = 0 ] || options="$options pci=remove"
 [ -z "$pm_test" ] || options="$options pm_test=$pm_test"
 case $trace in
@@ -2265,9 +2606,20 @@ tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null | grep -qx "$board" ||
 	refuse "this is not an SM-X710 ($board); the SM-X910 has scripts/diagnostics/kernel10-ramroot-test"
 [ "$confirmed" = 1 ] ||
 	refuse 'the run ends with a restart of the tablet in any case: add restart-ok to say that is fine'
-grep -qw deep /sys/power/mem_sleep 2>/dev/null ||
-	refuse "/sys/power/mem_sleep offers no deep ($(cat /sys/power/mem_sleep 2>/dev/null))"
-grep -qw mem /sys/power/state 2>/dev/null || refuse '/sys/power/state offers no mem'
+if [ "$sleep_mode" = s2idle ]; then
+	# rtcwake -m freeze writes freeze to /sys/power/state; mem_sleep plays no
+	# part.  The CPUs need a cpuidle state with an s2idle entry
+	# (enter_s2idle): without one they would idle as usual, and the run's
+	# s2idle counts would say nothing.
+	grep -qw freeze /sys/power/state 2>/dev/null ||
+		refuse "mode=s2idle: /sys/power/state offers no freeze ($(cat /sys/power/state 2>/dev/null))"
+	[ -n "$(s2idle_states 0)" ] ||
+		refuse "mode=s2idle: no cpuidle state of cpu0 has an s2idle entry ($cpu_devs/cpu0/cpuidle/state*/s2idle): the CPUs would not enter suspend-to-idle's own state"
+else
+	grep -qw deep /sys/power/mem_sleep 2>/dev/null ||
+		refuse "/sys/power/mem_sleep offers no deep ($(cat /sys/power/mem_sleep 2>/dev/null))"
+	grep -qw mem /sys/power/state 2>/dev/null || refuse '/sys/power/state offers no mem'
+fi
 if [ -e /sys/power/pm_test ]; then
 	[ "$(selected /sys/power/pm_test)" = none ] || refuse "a pm_test level is selected ($(cat /sys/power/pm_test))"
 fi
@@ -2430,7 +2782,7 @@ fi
 # rest (a tmpfs, swap off, the floor) goes with the next restart, and
 # errors=continue, the last step here, is put back by any stop before a
 # sleep.
-stop() { printf '%s\n' "$me: STOPPED before freezing anything: $*; nothing on the disk changed but $logs" >&2; exit 1; }
+stop() { printf '%s\n' "$me: STOPPED before freezing anything: $*; nothing on the disk changed but $logs${debug_note:+; $debug_note}" >&2; exit 1; }
 stamp=$(date +%Y%m%d-%H%M%S)
 ramdir=$base/$stamp
 logs=$kit/logs/$stamp-sleep
@@ -2541,27 +2893,41 @@ printk_was=$(cat "$printk_ctl" 2>/dev/null | tr -s '\t ' '  ')
 suspend_was=$(cat "$console_suspend_ctl" 2>/dev/null)
 pm_test_delay=$(cat "$pm_test_delay_ctl" 2>/dev/null)
 num "$pm_test_delay" || pm_test_delay=5
+# pm_debug_messages: a run with sleeps sets it to 1 below, for the PM core's
+# lines in each cycle's kernel lines, and the restart at the end of the run
+# is what puts it back; dry does not sleep and leaves it as it is.
+debug_was=$(cat "$debug_messages_ctl" 2>/dev/null)
+debug_plan= debug_note=
+if [ "$dry" = 1 ]; then
+	debug_plan=' (dry leaves it as it is)'
+elif [ -n "$debug_was" ] && [ "$debug_was" != 1 ]; then
+	debug_plan=' (this run sets 1; the restart at its end puts it back)'
+fi
 {
 	if [ "$dry" = 1 ]; then
 		echo "$me $stamp: dry: every disk filesystem frozen and no sleep, then a ${hold}s hold and a restart (sysrq b); options: $options"
 	elif [ -n "$pm_test" ]; then
-		echo "$me $stamp: $cycles pm_test=$pm_test cycles (rtcwake -m mem -s $seconds; the suspend stops at $pm_test, waits ${pm_test_delay}s and comes back: no SoC sleep call) with every disk filesystem frozen (aborted attempts tried again: up to $aborts), then a ${hold}s hold and a restart (sysrq b); options: $options"
+		echo "$me $stamp: $cycles pm_test=$pm_test cycles (rtcwake -m $rtc_mode -s $seconds; the suspend stops at $pm_test, waits ${pm_test_delay}s and comes back: $no_sleep_call) with every disk filesystem frozen (aborted attempts tried again: up to $aborts), then a ${hold}s hold and a restart (sysrq b); options: $options"
+	elif [ "$sleep_mode" = s2idle ]; then
+		echo "$me $stamp: $cycles suspend-to-idle cycles of ${seconds}s (rtcwake -m freeze) with every disk filesystem frozen (aborted attempts and early wakes tried again: up to $aborts), then a ${hold}s hold and a restart (sysrq b); options: $options"
 	else
 		echo "$me $stamp: $cycles deep cycles of ${seconds}s with every disk filesystem frozen (aborted attempts tried again: up to $aborts), then a ${hold}s hold and a restart (sysrq b); options: $options"
 	fi
 	echo "kernel: $(uname -r) $(uname -v), build ID $kernel; the kit's: ${kit_id:-none}, revision $(cat "$kit/REVISION" 2>/dev/null || echo '7 or earlier')$([ "$kernel" = "$kit_id" ] || echo ' (not running: a baseline run)')"
 	echo "boot $(cat /proc/sys/kernel/random/boot_id), up $(cut -d' ' -f1 /proc/uptime)s"
 	echo "userdata: $dev on /dev/$disk (SCSI host $ufs_host); the read: the first $read_count x $read_bs, O_DIRECT"
-	echo "mem_sleep [$(cat /sys/power/mem_sleep)], suspend_stats success $(stat_of success) fail $(stat_of fail); freeze_filesystems $(cat /sys/power/freeze_filesystems 2>/dev/null || echo n/a), sync_on_suspend $(cat /sys/power/sync_on_suspend 2>/dev/null || echo n/a)"
+	echo "mem_sleep $(cat /sys/power/mem_sleep), suspend_stats success $(stat_of success) fail $(stat_of fail); freeze_filesystems $(cat /sys/power/freeze_filesystems 2>/dev/null || echo n/a), sync_on_suspend $(cat /sys/power/sync_on_suspend 2>/dev/null || echo n/a)"
 	echo "qcom_stats: aosd $(count_of aosd) cxsd $(count_of cxsd) ddr $(count_of ddr)$([ -r "$qstats/aosd" ] || echo ' (not readable: the depth cannot be judged)')"
+	[ "$sleep_mode" != s2idle ] ||
+		echo "mode=s2idle: rtcwake -m freeze (/sys/power/state: $(cat /sys/power/state 2>/dev/null)), mem_sleep not used; $(s2idle_summary)"
 	echo "interconnect floor: $floor; record: $(tr '\n' ' ' < "$icc_state" 2>/dev/null)"
 	echo "  last release log line: $(tail -n 1 "$icc_log" 2>/dev/null)"
 	[ ! -e "$icc_hold" ] || echo "  $icc_hold exists"
-	echo "INT_MAX nodes: $(grep -c 2147483647 /sys/kernel/debug/interconnect/interconnect_summary 2>/dev/null || echo n/a)"
+	echo "INT_MAX nodes: $(intmax_nodes)"
 	echo "Type-C: $(roles), USB devices $(usb_count); charger: $(charger)"
 	pci_list=$(pci_names)
 	echo "PCI: $(pci_count) devices${pci_list:+:$pci_list}; root ports:$(pci_root_ports | awk '{ printf " %s", $0 } END { if (!NR) printf " none" }')$([ "$pci_remove" = 0 ] || echo '; pci=remove: all of them go right before the freeze')"
-	echo "printk: kernel.printk ${printk_was:-n/a}, console_suspend ${suspend_was:-n/a}, ignore_loglevel $(cat "$ignore_loglevel_ctl" 2>/dev/null || echo n/a); pm_debug_messages $(cat "$debug_messages_ctl" 2>/dev/null || echo n/a) (the run sets 1), pm_print_times $(cat "$print_times_ctl" 2>/dev/null || echo n/a); pm_test [$(selected "$pm_test_ctl")], pm_test_delay ${pm_test_delay}s"
+	echo "printk: kernel.printk ${printk_was:-n/a}, console_suspend ${suspend_was:-n/a}, ignore_loglevel $(cat "$ignore_loglevel_ctl" 2>/dev/null || echo n/a); pm_debug_messages ${debug_was:-n/a}$debug_plan, pm_print_times $(cat "$print_times_ctl" 2>/dev/null || echo n/a); pm_test [$(selected "$pm_test_ctl")], pm_test_delay ${pm_test_delay}s"
 	echo "root: $rootsrc ext4, ext4 errors_count $rooterr, state $rootstate; to freeze, the root last:$(freeze_order "$rootsrc" | awk '!seen[$1]++ { printf " %s", $2 }')"
 	echo 'ext4, as the run found it (errors_count, error behaviour, the superblock'"'"'s default):'
 	printf '%s\n' "$targets" |
@@ -2589,7 +2955,7 @@ if [ "$floor" != released ]; then
 		fi
 		say "interconnect floor released ($(tail -n 1 "$icc_log" 2>/dev/null)); 60 s to settle"
 		sleep 60
-		say "INT_MAX nodes now: $(grep -c 2147483647 /sys/kernel/debug/interconnect/interconnect_summary 2>/dev/null || echo n/a)"
+		say "INT_MAX nodes now: $(intmax_nodes)"
 	else
 		say '=================================================================='
 		say "THE INTERCONNECT FLOOR IS ${floor}: this run cannot reach the depth of the 2026-11-21 failure"
@@ -2604,10 +2970,19 @@ armed=0
 [ "$armed" = 0 ] ||
 	say "the loop breaker is armed for this boot ($icc_pending): the boot after this run's restart holds the floor once"
 
-# The sleep settings; swap off the disk.
-printf deep > /sys/power/mem_sleep 2>/dev/null
-[ "$(selected /sys/power/mem_sleep)" = deep ] || stop 'cannot select deep in /sys/power/mem_sleep'
-[ ! -e /sys/power/pm_debug_messages ] || printf 1 > /sys/power/pm_debug_messages 2>/dev/null
+# The sleep settings; swap off the disk.  mode=s2idle does not use
+# mem_sleep (rtcwake -m freeze) and leaves it as it is.
+if [ "$sleep_mode" = deep ]; then
+	printf deep > /sys/power/mem_sleep 2>/dev/null
+	[ "$(selected /sys/power/mem_sleep)" = deep ] || stop 'cannot select deep in /sys/power/mem_sleep'
+fi
+if [ "$dry" = 0 ] && [ -n "$debug_was" ] && [ "$debug_was" != 1 ]; then
+	printf 1 > "$debug_messages_ctl" 2>/dev/null
+	if [ "$(cat "$debug_messages_ctl" 2>/dev/null)" = 1 ]; then
+		debug_note="pm_debug_messages stays 1 until the next boot (it was $debug_was)"
+		say "pm_debug_messages 1 for this run (it was $debug_was), so that each cycle's kernel lines have the PM core's: the restart that ends the run puts it back; a stop before any sleep leaves it at 1 until the next boot"
+	fi
+fi
 for s in $(disk_swaps); do
 	say "swapoff $s"
 	swapoff "$s" >> "$ramdir/log" 2>&1 || { cp "$ramdir/log" "$logs/log"; own; stop "swapoff $s failed"; }
@@ -2620,7 +2995,7 @@ sync
 
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for v in stamp ramdir part disk cycles seconds hold aborts dry rootsrc rootname floor armed kernel mount_cmd ufs_host \
-	pci_remove pm_test trace options printk_was suspend_was pm_test_delay; do
+	pci_remove pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note; do
 	eval "printf '%s=%s\n' $v \"\$(q \"\$$v\")\""
 done > "$ramdir/run.conf"
 say 'the run goes on from RAM in a session of its own: it ends with a restart even if this terminal goes away'
@@ -2631,7 +3006,14 @@ if [ "$pci_remove" = 1 ]; then
 	say "pci=remove: right before it freezes the disks the run removes the PCI root port(s)$pci_roots and everything below them, the Wi-Fi with them: Wi-Fi is gone from then until the restart, and an SSH session over Wi-Fi drops there while the run carries on; follow it over the USB cable (usb0), or read its result in pstore after the restart"
 fi
 if [ -n "$pm_test" ]; then
-	say "pm_test=$pm_test: each cycle's suspend stops at $pm_test ($(pm_test_what "$pm_test")), waits ${pm_test_delay}s and comes back; no SoC sleep call (PSCI SYSTEM_SUSPEND), so the cycles test the way down and back, not a depth; /sys/power/pm_test is set right before each rtcwake and back to none right after"
+	if [ "$sleep_mode" = s2idle ]; then
+		say "pm_test=$pm_test: each cycle's suspend-to-idle stops at $pm_test ($(pm_test_what "$pm_test")), waits ${pm_test_delay}s and comes back; no suspend-to-idle (no CPU enters its s2idle state), so the cycles test the way down and back, not a depth; /sys/power/pm_test is set right before each rtcwake and back to none right after"
+	else
+		say "pm_test=$pm_test: each cycle's suspend stops at $pm_test ($(pm_test_what "$pm_test")), waits ${pm_test_delay}s and comes back; no SoC sleep call (PSCI SYSTEM_SUSPEND), so the cycles test the way down and back, not a depth; /sys/power/pm_test is set right before each rtcwake and back to none right after"
+	fi
+fi
+if [ "$sleep_mode" = s2idle ] && [ "$dry" = 0 ]; then
+	say "mode=s2idle: each sleep is rtcwake -m freeze, suspend-to-idle: the CPUs stay online and idle in their s2idle state, the last one takes the CPU cluster's power domain down and enters PSCI CPU_SUSPEND; /sys/power/mem_sleep is not used and stays $(cat /sys/power/mem_sleep 2>/dev/null); a sleep a wakeup other than the RTC's alarm cut short is WOKEN EARLY and tried again, like an aborted attempt (aborts=$aborts)"
 fi
 if [ -n "$trace" ]; then
 	say "$trace_word: for each sleep the console loglevel is $trace_level (kernel.printk $printk_was otherwise), so the PM core's lines reach the consoles and ramoops; each console line costs 0.1 to 0.25 s here with interrupts off, so a sleep takes up to half a minute longer to return"

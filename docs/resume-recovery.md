@@ -422,8 +422,8 @@ kit's README, "The experiment options", has the details and the risks):
 
 ```sh
 sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
-     [pci=remove] [pm_test=LEVEL] [trace|trace=live] restart-ok
-sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok
+     [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle] restart-ok
+sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle] restart-ok
 ```
 
 - `pci=remove` removes every PCI root port, and the Wi-Fi below it, right
@@ -434,7 +434,16 @@ sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] re
 - `pm_test=LEVEL` (`freezer`, `devices`, `platform`, `processors`, `core`)
   stops each suspend at that level, waits 5 s and resumes, with no SoC
   sleep call (PSCI `SYSTEM_SUSPEND`): each cycle is PM-TEST, never a depth.
-  It is set only around each `rtcwake`.
+  It is set only around each `rtcwake`. At `devices` and `platform` the
+  CPU cluster's power domain cannot even power off through idle (its device,
+  the RPMh RSC, is prepared), so `qcom_stats` can only stay +0 there.
+- `mode=s2idle` sleeps each cycle with `rtcwake -m freeze`, suspend-to-idle,
+  instead of `rtcwake -m mem` (PSCI `SYSTEM_SUSPEND`): the CPUs stay online,
+  the last one takes the cluster down and enters PSCI `CPU_SUSPEND`.
+  `/sys/power/mem_sleep` plays no part. Every verdict carries `(s2idle)`; a
+  sleep that a wakeup other than the RTC's cut short is WOKEN EARLY and
+  tried again within `aborts=N`; `pm_test=` is then `freezer`, `devices` or
+  `platform` only.
 - `trace` raises the console loglevel to 8 for each sleep, so that the PM
   core's lines reach the ramoops console: live up to the console suspend,
   the rest at the resume. `trace=live` also keeps the consoles printing
@@ -729,6 +738,39 @@ not return on this port yet, and that is a different failure from the
 source and the `pci=remove`, `pm_test=` and `trace` options that came out of
 it are in the [porting log](porting-log.md) under the same date and in
 `~/ubuntu-gts9u/backups/deep-sleep-pcie-analysis-2026-11-22.md`.
+
+**With the root port removed again, 13:42 and 14:00** (revision 7, on the
+cable, `release-floor pci=remove trace`, one cycle each, the run removing
+the root port itself). `pm_test=core`
+(`squirtle-sleep-r7-pcirm-core-20261122.log`) passed as PM-TEST: the PCIe
+host went down (`qcom-pcie 1c00000.pcie: Timeout waiting for L2 entry!
+LTSSM: 0x11`, a warning) and came back (`qcom-pcie 1c00000.pcie: PCIe Gen.2
+x1 link up`, `PM: noirq resume of devices complete after 267.277 msecs`),
+CPUs 1 to 7 went offline, the PSCI syscore hook ran (`Calling
+psci_idle_syscore_suspend+0x0/0xb0`), the kernel busy-waited 5 s and
+resumed; all counters +0, as expected at `core`. `pm_test=platform`
+(`squirtle-sleep-r7-pcirm-platform-20261122.log`) passed too: `PM: noirq
+suspend of devices complete after 21.772 msecs`, the 5 s wait, the link up
+again, `PM: noirq resume of devices complete after 283.843 msecs`; `aosd`,
+`cxsd`, `ddr` and `apss` +0. That +0 was the only outcome `platform` allows
+here, so it says nothing about the deep state: the expectation that idle
+CPUs could reach it during the wait was wrong (the cluster's domain stays on
+while its device, the RSC, is prepared). The UFS read back as before in
+both, and each boot after came up. So the kernel's suspend path, the PCIe
+host's power-down and power-up included, comes back when nothing below it
+sleeps; what is left of 12:05 is the `SYSTEM_SUSPEND` call, the state behind
+it, and the resume from that state.
+
+**Docked, 14:18** (revision 7, on the powered dock in host role, the same
+options without `pm_test`; `squirtle-sleep-r7-pcirm-docked-20261122.log`).
+The real sleep did not come back here either: the records end at `progress:
+cycle 1/1: entering the sleep` and `printk: Suspending console(s)`, the
+tablet restarted by itself, and the next boot mounted the root clean. So the
+USB role makes no difference: with the PCIe host powered down, a real `deep`
+sleep does not return on this port, docked or not. Suspend-to-idle
+(`mode=s2idle`) reaches the cluster's deepest state by another firmware call
+and has not run yet; the [porting log](porting-log.md) has the reading of the
+source and the next run.
 
 #### Repairing the root from recovery
 

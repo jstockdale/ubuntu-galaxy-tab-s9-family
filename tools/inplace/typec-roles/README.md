@@ -292,6 +292,7 @@ Bluetooth are built in, so it can be run over SSH; then reboot.
 sudo sh ~/typec-roles/sleep-test.sh dry restart-ok                     # no sleep: the protection and the restart
 sudo sh ~/typec-roles/sleep-test.sh ro 3 30 restart-ok                 # floor as the boot left it
 sudo sh ~/typec-roles/sleep-test.sh ro 3 30 release-floor restart-ok   # release it first
+sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle restart-ok   # suspend-to-idle
 sh ~/typec-roles/sleep-test.sh status                                  # the result, no root
 ```
 
@@ -300,8 +301,8 @@ The whole form, with the experiment options (each off unless given; below,
 
 ```sh
 sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
-     [pci=remove] [pm_test=LEVEL] [trace|trace=live] restart-ok
-sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok
+     [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle] restart-ok
+sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle] restart-ok
 ```
 
 Each run freezes every disk filesystem and **ends with a restart of the
@@ -329,9 +330,12 @@ log, a new SSH login. Reading works: `sh ~/typec-roles/sleep-test.sh status`
 In order:
 
 1. It refuses, with nothing changed, unless it runs as root on an SM-X710,
-   `/sys/power/mem_sleep` offers `deep`, the RTC can wake the tablet,
-   userdata is a partition of a writable UFS LUN, `kernel.panic_on_warn`
-   and `kernel.hung_task_panic` are 0 (the first resume with a filesystem
+   `/sys/power/mem_sleep` offers `deep` (with `mode=s2idle` instead:
+   `/sys/power/state` offers `freeze` and a cpuidle state of cpu0 has an
+   s2idle entry; `mem_sleep` is neither needed nor touched), the RTC can
+   wake the tablet, userdata is a partition of a writable UFS LUN,
+   `kernel.panic_on_warn` and `kernel.hung_task_panic` are 0 (the first
+   resume with a filesystem
    frozen logs one kernel warning, and writers waiting on the frozen disk
    are reported as hung tasks after 60 s: either would otherwise panic the
    tablet in the middle of the run), the root filesystem is writable, ext4
@@ -410,8 +414,9 @@ In order:
    `EBUSY`: still frozen), checks the kernel log since the run began for a
    failure line and ext4 as above, and ends with `SLEEP-TEST RESULT: DRY: no
    sleep tried; ...` and the restart.
-6. Each cycle: `rtcwake -m mem -s SECONDS`; right after it each frozen
-   filesystem is frozen a second time, which must fail with `EBUSY` (still
+6. Each cycle: `rtcwake -m mem -s SECONDS` (`mode=s2idle`: `rtcwake -m
+   freeze -s SECONDS`); right after it each frozen filesystem is frozen a
+   second time, which must fail with `EBUSY` (still
    frozen); a second freeze that succeeds means something thawed it during
    the cycle, which fails the cycle as a failure of the protection (the
    filesystem stays frozen from then on). Then the kernel log since the
@@ -424,8 +429,9 @@ In order:
    started on a frozen ext4 (the kernel's `WARNING` in
    `ext4_journal_check_start`, `fs/ext4/ext4_jbd2.c`), a read that failed
    or differs, a sleep that did not happen (`rtcwake`, `suspend_stats`, no
-   `PM: suspend entry (deep)`). The run stops at the first failed cycle. A
-   cycle that passed is **PASS** when AOSS sleep, CX collapse and DDR low
+   `PM: suspend entry (deep)`, or `(s2idle)` with `mode=s2idle`). The run
+   stops at the first failed cycle. A cycle that passed is **PASS** when
+   AOSS sleep, CX collapse and DDR low
    power (`aosd`, `cxsd`, `ddr`) all counted up, **SHALLOW** when one did
    not (it did not test the depth of the 2026-11-21 failure),
    **DEPTH-UNKNOWN** without `qcom_stats`. A filesystem mounted between two
@@ -441,10 +447,11 @@ In order:
    as on 2026-11-22 when the touchscreen's double tap came in the noirq
    phase. It is not a FAIL only when all of these hold, and a FAIL
    otherwise: `rtcwake` failed; `suspend_stats` counted no success and one
-   failure; the attempt's kernel lines have `PM: suspend entry (deep)` and
-   `PM: suspend exit` and a line that shows the suspend given up on the way
-   down (`Wakeup pending. Abort CPU freeze`, `Wakeup pending, aborting
-   suspend`, `Triggering wakeup from IRQ N`, `Freezing ... aborted after`,
+   failure; the attempt's kernel lines have `PM: suspend entry (deep)` (or
+   `(s2idle)`) and `PM: suspend exit` and a line that shows the suspend
+   given up on the way down (`Wakeup pending. Abort CPU freeze`, `Wakeup
+   pending, aborting suspend`, `Triggering wakeup from IRQ N`, `Freezing ...
+   aborted after`,
    `Some devices failed to suspend, or early wake event detected`, `late` or
    `noirq suspend of devices failed`, `... suspend of devices aborted after`,
    or a device's `failed to suspend ...: error N`); less than 1 s of
@@ -590,10 +597,22 @@ kernel (the logs are in `~/ubuntu-gts9u/backups/`; details in
   desktop's tasks let the freezer through each time; the first resume of
   each run logged the expected `fs/super.c:1919` warning, writers waiting
   on the root were reported as hung tasks; each next boot was clean. The
-  2026-11-21 failure was not reproduced.
+  2026-11-21 failure was not reproduced;
+- undocked on the PC's USB cable: 12:05, the PCIe root port removed by
+  hand, `ro 3 30`: the tablet did not come back from its first sleep and
+  restarted by itself; 12:56, the same with the PCI devices kept: 3 of 3
+  SHALLOW; 13:42, `ro 1 30 release-floor pci=remove pm_test=core trace`:
+  PM-TEST core, the PCIe host went down and its link came back; 14:00, the
+  same with `pm_test=platform`: PM-TEST platform, all counters +0, which
+  is the only outcome that level allows (below, `pm_test=LEVEL`);
+- on the powered dock again, 14:18, `ro 1 30 release-floor pci=remove
+  trace`, a real sleep with the root port removed: the tablet did not come
+  back and restarted by itself, as at 12:05, so the USB role makes no
+  difference to that failure.
 
 Not run yet: revision 8, a cycle that reaches AOSS sleep, CX collapse or
-DDR low power, and an ext4 error with an errno under `errors=continue`.
+DDR low power, `mode=s2idle`, and an ext4 error with an errno under
+`errors=continue`.
 `fstrim.timer` (weekly) would, if it fired during a run, send discards to
 the read-only disk, which the block layer logs as a write and the run
 fails; it is not stopped for the run.
@@ -679,16 +698,30 @@ name the ones in force (`options: none` without them).
   back with no SoC sleep call, and the UFS read back as before; qcom_stats
   aosd +0 cxsd +0 ddr +0 (CPU idle during the wait, not a depth test);
   ...`), never PASS, SHALLOW or DEEP: no sleep is asked for, so no depth is
-  tested. cpuidle is paused only when the other CPUs go offline, so at
-  `freezer`, `devices` and `platform` the idle CPUs may still take the SoC
-  into a low-power state during the wait; the counts show it. A cycle
-  whose kernel lines lack `suspend debug: Waiting for N second(s).` (the
-  kernel's line at the level) fails. Refused with `dry`, when the kernel
-  does not offer the level, or when a level is selected already.
+  tested. cpuidle keeps running during the wait (it is paused only when
+  the other CPUs go offline), but from `devices` on it cannot take the CPU
+  cluster's power domain down: that domain's one device is the RPMh RSC
+  (`17a00000.rsc`), the suspend's prepare phase counted it, and genpd powers
+  no domain off while one of its devices is prepared. So at `devices` and
+  `platform` the CPUs reach their own power collapse at most, and `aosd`,
+  `cxsd`, `ddr` and `apss` can only stay +0 (as on 2026-11-22 at 14:00);
+  only at `freezer`, before anything is prepared, can idle take the cluster
+  down. Until that evening this README said the idle CPUs could take the
+  SoC down at `devices` and `platform`: that was wrong. A cycle whose
+  kernel lines lack `suspend debug: Waiting for N second(s).` (the kernel's
+  line at the level) fails. With `mode=s2idle` the levels are `freezer`,
+  `devices` and `platform` only: suspend-to-idle goes into its idle loop
+  right after the `platform` level, and the kernel refuses `processors`
+  and `core` with it; the run refuses them first. Refused with `dry`, when
+  the kernel does not offer the level, or when a level is selected
+  already.
 - **`trace`** (`ro`): for each sleep, the console loglevel (the first number
   of `kernel.printk`) goes to 8, and back right after `rtcwake` returns;
-  `pm_debug_messages` is 1, as every run sets it. The PM core's lines and
-  its phase lines (`PM: noirq suspend of devices complete after ...`) then
+  `pm_debug_messages` is 1, as every run with sleeps sets it (`dry` leaves
+  it as it is): the restart that ends the run is what puts it back, and a
+  stop before any sleep says that it stays 1 until the next boot. The PM
+  core's lines and its phase lines (`PM: noirq suspend of devices complete
+  after ...`) then
   reach the consoles, ramoops' among them. With `console_suspend` at its
   default the consoles are suspended from `printk: Suspending console(s)`
   until the resume: what reaches ramoops while it happens are the lines up
@@ -716,6 +749,65 @@ name the ones in force (`options: none` without them).
   that port stays clocked. Writing to ramoops and to `sec_log` is a copy
   into reserved memory, safe at any point. Use it after a `trace` run left
   `Suspending console(s)` as the last line.
+- **`mode=s2idle`** (`ro` and `dry`; `mode=deep`, the default, is accepted
+  too): each cycle is `rtcwake -m freeze -s SECONDS`, suspend-to-idle,
+  instead of `rtcwake -m mem`, which this kernel carries out as PSCI
+  `SYSTEM_SUSPEND`. `rtcwake` writes `freeze` to `/sys/power/state`;
+  `/sys/power/mem_sleep` plays no part and the run leaves it as it is. In
+  suspend-to-idle the CPUs stay online and idle in their state with an
+  s2idle entry (`state1`, `cpu-sleep-X-0`); the last one down takes the CPU
+  cluster's power domain down, which flushes the RPMh RSC's sleep set, and
+  enters PSCI `CPU_SUSPEND` with the cluster's deepest state; the RTC's
+  alarm ends it. It is the path the 2026-11-22 12:05 failure did not take
+  (`docs/porting-log.md`). Refused, with nothing changed, when
+  `/sys/power/state` offers no `freeze` or no cpuidle state of cpu0 has an
+  s2idle entry, and with `pm_test=processors` or `core`. `dry` checks the
+  same and sleeps not. Every cycle's verdict word, and every `RESULT`'s
+  about a sleep, carries ` (s2idle)` (`SLEEP-TEST cycle 1/3: PASS (s2idle):
+  ...`, `SLEEP-TEST RESULT: SHALLOW (s2idle): ...`; the freezer's is
+  `NO-SLEEP (freezer, s2idle)`; `STOPPED`, `FAIL before any sleep` and
+  `DRY` name it in their options alone), the options name `mode=s2idle`,
+  the progress line before each sleep says `rtcwake -m freeze`, and the
+  header says how many CPUs have which s2idle state and the cluster
+  domain's idle states. A
+  line from a run without `mode=s2idle` (every run before the evening of
+  2026-11-22) is from `deep`. Around each cycle the run also reads, and
+  prints as `cycle N/M: evidence: s2idle: ...` (a third evidence line per
+  cycle in pmsg): the s2idle entries of every CPU
+  (`cpuidle/state*/s2idle/usage`; more than one per CPU means CPUs woke and
+  went back to sleep inside it), the cluster domain's idle states
+  (`/sys/kernel/debug/pm_genpd/power-domain-cluster/idle_states`: `S1`
+  usage and s2idle +1 when the cluster went down, rejected +1 when the RSC
+  refused), the time asleep (the cycle's `Timekeeping suspended for N
+  seconds` lines added up, one for each time every CPU was frozen at once;
+  `cpuidle/state*/s2idle/time` leaves that time out and is not the sleep),
+  the wakeup IRQ by name, how long `rtcwake` took, and `suspend_stats`'
+  `last_hw_sleep` when the kernel has it (this one does not). The
+  verdicts:
+  - **PASS (s2idle)**, **SHALLOW (s2idle)**, **DEPTH-UNKNOWN (s2idle)**:
+    decided by `aosd`, `cxsd` and `ddr` as in a `deep` run, with the
+    s2idle evidence in the line. A cycle whose three counted is a PASS
+    whatever else: the SoC reached the deep states through
+    suspend-to-idle and came back.
+  - **WOKEN EARLY (s2idle)**: the kernel counted the suspend (`rtcwake`
+    0, a success counted), but a wakeup other than the RTC's alarm cut it
+    short: no CPU entered its s2idle state (a wakeup between the devices'
+    noirq phase and the idle loop ends the loop at once, and the suspend
+    still counts as a success), or less than half of SECONDS was spent
+    asleep; and the wakeup is on record (`/sys/power/pm_wakeup_irq`, or the
+    kernel's `PM: Triggering wakeup from IRQ N`, names an IRQ whose name has
+    no `rtc` in it, or a wakeup source was pending). Not a pass: the line
+    names the wakeup (the touchscreen with its hint), and the cycle is
+    tried again after 5 s like an ABORTED attempt, counted in the same
+    `aborts=N`; one more ends the run with `NO-SLEEP (s2idle)`, whose
+    RESULT counts `attempts aborted before the sleep or woken early`. A
+    short sleep that the RTC's alarm ended is no early wake: it is judged
+    as a sleep (SHALLOW, unless the deep states counted).
+  - **FAIL (s2idle)**: as in `deep`, and also a cycle in which no CPU
+    entered its s2idle state when no such wakeup explains it.
+  - **ABORTED (s2idle)**, **NO-SLEEP (freezer, s2idle)**, **PM-TEST LEVEL
+    (s2idle)**, **PCIE-DOWN (s2idle)**: as in `deep`; a PM-TEST cycle
+    never enters the idle loop (`no suspend-to-idle`).
 
 **The interconnect floor.** `ubuntu-gts9u-icc-late-release` releases it
 about 45 s into a boot. After a boot that released it and then ended

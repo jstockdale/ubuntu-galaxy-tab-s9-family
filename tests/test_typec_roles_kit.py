@@ -116,8 +116,8 @@ PREFIXES = (
     # sleep-test.sh's evidence.
     "/sys/kernel/debug/pm_genpd/", "/sys/kernel/debug/regulator/", "/sys/kernel/debug/wakeup_sources",
     "/sys/bus/pci/devices", "/sys/class/remoteproc/", "/sys/class/backlight/", "/sys/class/thermal/",
-    # sleep-test.sh's experiment options (trace, pm_test=).
-    "/sys/module/printk/parameters/", "/sys/module/suspend/parameters/",
+    # sleep-test.sh's experiment options (trace, pm_test=, mode=s2idle).
+    "/sys/module/printk/parameters/", "/sys/module/suspend/parameters/", "/sys/devices/system/cpu",
 )
 
 STUBS = {
@@ -2970,7 +2970,10 @@ mv "$T/frozen.new" "$T/frozen"''',
     # is writable: saved, its count rises).
     "rtcwake": RAM_CALL + r'''echo "$*" >> "$T/rtcwake.calls"
 case $* in *--version*) exit 0 ;; esac
-n=$(grep -c -- '-m mem' "$T/rtcwake.calls")
+n=$(grep -cE -- '-m (mem|freeze)' "$T/rtcwake.calls")
+# rtcwake -m freeze (mode=s2idle): suspend-to-idle, which mem_sleep plays no
+# part in (the stand-in notes what it held at each such sleep).
+case $* in *"-m freeze "*) frz=1 ;; *) frz= ;; esac
 fz=$(awk -v fz=" $(tr '\n' ' ' < "$T/frozen" 2>/dev/null) " 'index(fz, " " $2 " ") {print $1}' "$F/proc/1/mounts" | tr '\n' ' ')
 w=$(awk -v fz=" $fz " '$1 ~ /^\/dev\// && $3 !~ /^fuse/ && $4 !~ /^ro(,|$)/ && index(fz, " " $1 " ") == 0 {print $2}' "$F/proc/1/mounts")
 [ -z "$w" ] || echo "cycle $n slept with $w writable and not frozen" >> "$T/violations"
@@ -2978,8 +2981,9 @@ awk 'NR > 1 && $1 !~ /^\/dev\/zram/' "$F/proc/swaps" | grep -q . && echo "cycle 
 [ "$(cat "$F/sys/class/block/sda/ro")" = 1 ] || echo "cycle $n slept with sda writable at the block layer" >> "$T/violations"
 grep -q u "$F/proc/sysrq-trigger" && echo "cycle $n slept after a sysrq u" >> "$T/violations"
 # The kernel shows "s2idle [deep]" once "deep" is written; the stand-in, what was written.
-case $(cat "$F/sys/power/mem_sleep") in *'[deep]'*|deep) ;; *) echo "cycle $n slept with mem_sleep $(cat "$F/sys/power/mem_sleep")" >> "$T/violations" ;; esac
-case $* in "-u -d rtc0 -m mem -s "*) ;; *) echo "rtcwake $*" >> "$T/violations" ;; esac
+if [ -n "$frz" ]; then cat "$F/sys/power/mem_sleep" >> "$T/mem-sleep-at-freeze"
+else case $(cat "$F/sys/power/mem_sleep") in *'[deep]'*|deep) ;; *) echo "cycle $n slept with mem_sleep $(cat "$F/sys/power/mem_sleep")" >> "$T/violations" ;; esac; fi
+case $* in "-u -d rtc0 -m mem -s "*|"-u -d rtc0 -m freeze -s "*) ;; *) echo "rtcwake $*" >> "$T/violations" ;; esac
 # The experiment's knobs as this sleep finds them (pm_test, the console
 # loglevel, console_suspend), and the last line in pmsg, one line each.
 echo "pm_test=$(cat "$F/sys/power/pm_test") printk=$(tr '\t' ' ' < "$F/proc/sys/kernel/printk") console_suspend=$(cat "$F/sys/module/printk/parameters/console_suspend")" >> "$T/knobs-at-sleep"
@@ -2989,8 +2993,25 @@ echo "pm_test=$(cat "$F/sys/power/pm_test") printk=$(tr '\t' ' ' < "$F/proc/sys/
 case $(cat "$F/sys/power/pm_test") in freezer|devices|platform|processors|core) pt=1 ;; *) pt= ;; esac
 s=$T/cycle-$n
 if [ -e "$s/log" ]; then cat "$s/log" >> "$F/dev/kmsg"
+elif [ -n "$pt" ] && [ -n "$frz" ]; then printf '[  700.000000] PM: suspend entry (s2idle)\n[  700.200000] PM: suspend debug: Waiting for 5 second(s).\n[  705.300000] PM: suspend exit\n' >> "$F/dev/kmsg"
 elif [ -n "$pt" ]; then printf '[  700.000000] PM: suspend entry (deep)\n[  700.200000] suspend debug: Waiting for 5 second(s).\n[  705.300000] PM: suspend exit\n' >> "$F/dev/kmsg"
+elif [ -n "$frz" ]; then printf '[  700.000000] PM: suspend entry (s2idle)\n[  700.100000] PM: suspend-to-idle\n[  730.000000] Timekeeping suspended for 30.002 seconds\n[  730.000100] PM: Triggering wakeup from IRQ 21\n[  730.000200] PM: resume from suspend-to-idle\n[  730.100000] PM: suspend exit\n' >> "$F/dev/kmsg"
 else printf '[  700.000000] PM: suspend entry (deep)\n[  730.000000] Timekeeping suspended for 30.002 seconds\n[  730.100000] PM: suspend exit\n' >> "$F/dev/kmsg"; fi
+# Suspend-to-idle: each CPU's s2idle state entered once (cycle flag
+# no-s2idle: none), and the cluster's domain taken down to S1 (flags
+# no-cluster: not; cluster-rejected: refused).
+if [ -n "$frz" ] && [ -z "$pt" ] && [ ! -e "$s/no-s2idle" ]; then
+	for u in "$F"/sys/devices/system/cpu/cpu*/cpuidle/state*/s2idle; do
+		[ -d "$u" ] || continue
+		echo $(($(cat "$u/usage") + 1)) > "$u/usage"
+		echo $(($(cat "$u/time") + 1500)) > "$u/time"
+	done
+fi
+cl=$F/sys/kernel/debug/pm_genpd/power-domain-cluster/idle_states
+if [ -n "$frz" ] && [ -z "$pt" ] && [ -e "$cl" ] && [ ! -e "$s/no-cluster" ]; then
+	if [ -e "$s/cluster-rejected" ]; then c=4; else c=3; fi
+	awk -v c="$c" '$1 == "S1" { $c += 1; if (c == 3) $7 += 1 } { print }' "$cl" > "$T/cl.new" && mv "$T/cl.new" "$cl"
+fi
 if [ -e "$s/suspend-failed" ]; then k=fail; else k=success; fi
 echo $(($(cat "$F/sys/power/suspend_stats/$k") + 1)) > "$F/sys/power/suspend_stats/$k"
 for q in aosd cxsd ddr; do
@@ -3002,7 +3023,11 @@ done
 [ ! -e "$s/interrupts" ] || cp "$s/interrupts" "$F/proc/interrupts"
 [ ! -e "$s/wakeup_sources" ] || cp "$s/wakeup_sources" "$F/sys/kernel/debug/wakeup_sources"
 # pm_wakeup_irq: the cycle's, or the RTC's.
-if [ -e "$s/wakeup-irq" ]; then cat "$s/wakeup-irq" > "$F/sys/power/pm_wakeup_irq"; else echo 21 > "$F/sys/power/pm_wakeup_irq"; fi
+# (After a pm_test cycle nothing woke it: no data, which the stand-in
+# shows as an empty file.)
+if [ -e "$s/wakeup-irq" ]; then cat "$s/wakeup-irq" > "$F/sys/power/pm_wakeup_irq"
+elif [ -n "$pt" ]; then : > "$F/sys/power/pm_wakeup_irq"
+else echo 21 > "$F/sys/power/pm_wakeup_irq"; fi
 [ ! -e "$s/storage-dead" ] || touch "$T/storage-dead"
 [ ! -e "$s/other-data" ] || touch "$T/other-data"
 [ ! -e "$s/new-mount" ] || echo '/dev/sdh1 /media/stick2 ext4 rw,relatime 0 0' >> "$F/proc/1/mounts"
@@ -3335,6 +3360,17 @@ ICC_SUMMARY = (
     "  cpu0                                   3         1000         2000\n")
 
 
+# The name of each SM-X710 CPU's state with an s2idle entry (its PSCI
+# domain's domain-idle-states: cpu-sleep-0-0 on the little cores, 1-0 on
+# the big ones, 2-0 on the prime one).
+CPU_SLEEP = ["cpu-sleep-0-0"] * 3 + ["cpu-sleep-1-0"] * 4 + ["cpu-sleep-2-0"]
+# /sys/kernel/debug/pm_genpd/power-domain-cluster/idle_states as 7.2 prints
+# it (idle_states_show), with made-up values.
+CLUSTER_STATES = ("State  Time(ms)       Usage      Rejected   Above      Below      S2idle\n"
+                  "S0     1200           10         0          0          0          0\n"
+                  "S1     54000          5          0          0          0          0\n")
+
+
 def wakeup_sources(*rows):
     """/sys/kernel/debug/wakeup_sources with ROWS of (name, events, wakeups)."""
     lines = ["name\t\tactive_count\tevent_count\twakeup_count\texpire_count\tactive_since\ttotal_time\t"
@@ -3466,6 +3502,18 @@ class SleepTestTest(FakeTablet):
         (F / "usr/libexec/ubuntu-gts9u-icc-late-release").write_text("#!/bin/sh\n")
         (F / "usr/libexec/ubuntu-gts9u-icc-late-release").chmod(0o755)
         (F / "etc/hostname").write_text("squirtle\n")
+        # The CPUs' cpuidle states as squirtle has them: WFI, and the one
+        # with an s2idle entry, named by the CPU's cluster.
+        for cpu in range(8):
+            for state, name in (("state0", "WFI"), ("state1", CPU_SLEEP[cpu])):
+                d = F / f"sys/devices/system/cpu/cpu{cpu}/cpuidle" / state
+                d.mkdir(parents=True)
+                for attr, value in (("name", name), ("usage", "1000"), ("time", "5000000")):
+                    (d / attr).write_text(value + "\n")
+                if state == "state1":
+                    (d / "s2idle").mkdir()
+                    for attr in ("usage", "time"):
+                        (d / "s2idle" / attr).write_text("0\n")
         self.port = F / "sys/class/typec/port0"
         (self.port / "data_role").write_text("[host] device\n")
         (self.port / "power_role").write_text("source [sink]\n")
@@ -4940,7 +4988,8 @@ exit 0
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
-                self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok", result.stderr)
+                self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle] restart-ok",
+                              result.stderr)
 
     def assert_nothing_done(self):
         self.assertEqual(self.sysrq(), "")
@@ -5312,8 +5361,10 @@ exit 0
         after; each cycle PM-TEST, the run PM-TEST, never PASS, SHALLOW, DEEP
         or a depth."""
         (self.root / "dev/pmsg0").write_text("")
-        # In the second the idle CPUs took the SoC down during the wait
-        # (cpuidle runs until the CPUs go offline): counted, still no depth.
+        # In the second qcom_stats counted the SoC's states during the wait.
+        # On the SM-X710 that cannot happen at platform (the prepared RPMh RSC
+        # keeps the CPU cluster's domain on, docs/porting-log.md, 2026-11-22),
+        # but the counts are shown as read, and they are still no depth.
         d = self.tmp / "cycle-2/qcom_stats"
         d.mkdir(parents=True)
         for q, n in (("aosd", 8), ("cxsd", 6), ("ddr", 7)):
@@ -5548,9 +5599,527 @@ exit 0
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
-                self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok", result.stderr)
-                self.assertIn("[pci=remove] [pm_test=LEVEL] [trace|trace=live] restart-ok", result.stderr)
+                self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle] restart-ok",
+                              result.stderr)
+                self.assertIn("[pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle] restart-ok", result.stderr)
                 self.assert_nothing_done()
+
+    # mode=s2idle (2026-11-22 evening): each sleep is suspend-to-idle,
+    # rtcwake -m freeze, instead of PSCI SYSTEM_SUSPEND.
+
+    def s2idle_files(self):
+        """What an s2idle run's evidence reads beyond the default fake root:
+        the cluster domain's idle states (debugfs) and /proc/interrupts."""
+        d = self.root / "sys/kernel/debug/pm_genpd/power-domain-cluster"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "idle_states").write_text(CLUSTER_STATES)
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+
+    @staticmethod
+    def s2idle_log(asleep="30.002", irq=21):
+        """A suspend-to-idle's kernel lines with pm_debug_messages, worded as
+        7.2 prints them: "PM: suspend entry (s2idle)" (pm_suspend()), "PM:
+        suspend-to-idle" and "PM: resume from suspend-to-idle" (s2idle_loop(),
+        kernel/power/suspend.c), "Timekeeping suspended for N seconds"
+        (tk_debug_account_sleep_time(), kernel/time/timekeeping_debug.c: no
+        prefix) and "PM: Triggering wakeup from IRQ N"
+        (pm_system_irq_wakeup(), drivers/base/power/wakeup.c).  ASLEEP None:
+        no Timekeeping line; IRQ None: no wakeup line."""
+        lines = ["PM: suspend entry (s2idle)", "Filesystems sync: 0.000 seconds",
+                 "Freezing user space processes",
+                 "Freezing user space processes completed (elapsed 0.002 seconds)",
+                 "PM: suspend of devices complete after 84.636 msecs",
+                 "PM: late suspend of devices complete after 4.974 msecs",
+                 "PM: noirq suspend of devices complete after 21.772 msecs", "PM: suspend-to-idle"]
+        if asleep:
+            lines.append(f"Timekeeping suspended for {asleep} seconds")
+        if irq:
+            lines.append(f"PM: Triggering wakeup from IRQ {irq}")
+        lines += ["PM: resume from suspend-to-idle", "PM: noirq resume of devices complete after 283.843 msecs",
+                  "PM: resume of devices complete after 84.396 msecs", "Restarting tasks: Done", "PM: suspend exit"]
+        return "".join(f"[  7{n:02d}.000000] {line}\n" for n, line in enumerate(lines))
+
+    S2_PASS = ("asleep 30.0s (1 Timekeeping lines), s2idle entries +8 on 8 of 8 CPUs in state1 (cpu-sleep-0-0 "
+               "cpu-sleep-1-0 cpu-sleep-2-0), cluster S0 +0 (s2idle +0, rejected +0), S1 +1 (s2idle +1, rejected +0)")
+
+    def test_mode_s2idle_sleeps_with_rtcwake_freeze_and_names_its_mode_everywhere(self):
+        """mode=s2idle: rtcwake -m freeze for each sleep, /sys/power/mem_sleep
+        neither needed nor touched (here it offers no deep at all), the mode
+        in the header, the progress lines, every verdict and the RESULT, and a
+        third evidence line per cycle in pmsg: the CPUs' s2idle entries and
+        the cluster domain's states.  The suspend-to-idle's own kernel lines
+        are among the cycle's kernel lines."""
+        (self.root / "dev/pmsg0").write_text("")
+        (self.root / "sys/power/mem_sleep").write_text("[s2idle]\n")
+        self.s2idle_files()
+        for n in (1, 2):
+            self.cycle(n, log=self.s2idle_log())
+        result = self.run_test("ro", "2", "mode=s2idle", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("rtcwake.calls"), "--version\n" + "-u -d rtc0 -m freeze -s 30\n" * 2)
+        self.assertEqual((self.root / "sys/power/mem_sleep").read_text(), "[s2idle]\n")
+        self.assertEqual(self.read("mem-sleep-at-freeze"), "[s2idle]\n" * 2)
+        for i in (1, 2):
+            self.assertIn(f"SLEEP-TEST cycle {i}/2: PASS (s2idle): deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS "
+                          f"read back as before; {self.S2_PASS}; floor released", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PASS (s2idle): 2 of 2 cycles resumed with the UFS readable, 2 of them "
+                      "deep; floor released; kernel 68d243e908c0; options: mode=s2idle", self.out)
+        # Every verdict of the run says so; the restart's line is the run's.
+        pmsg = self.pmsg_lines(progress=True)
+        verdicts = [line for line in pmsg if line.startswith("SLEEP-TEST ") and "RESTART" not in line]
+        self.assertEqual(len(verdicts), 3, verdicts)
+        self.assertTrue(all("(s2idle)" in line for line in verdicts), verdicts)
+        self.assertEqual([line.split("; up ")[0] for line in pmsg if line.startswith("progress: ")], [
+            "progress: start: ro, 2 cycles of 30s, aborts=5, hold=0s; options: mode=s2idle; floor released; kernel "
+            "68d243e908c0",
+            "progress: protected: frozen: /media/stick /; /dev/sda read-only; from here the run ends with a restart",
+            "progress: cycle 1/2: entering the sleep, rtcwake -m freeze -s 30; no pm_test, no trace",
+            "progress: cycle 2/2: entering the sleep, rtcwake -m freeze -s 30; no pm_test, no trace"])
+        # Three evidence lines per cycle in pmsg, the third the s2idle one.
+        evidence = [line for line in pmsg if ": evidence: " in line]
+        self.assertEqual(len(evidence), 6, evidence)
+        self.assertEqual(evidence[2], "cycle 1/2: evidence: s2idle: s2idle entries +8 on 8 of 8 CPUs in state1 "
+                                      "(cpu-sleep-0-0 cpu-sleep-1-0 cpu-sleep-2-0); cluster S0 +0 (s2idle +0, rejected "
+                                      "+0), S1 +1 (s2idle +1, rejected +0); asleep 30.0s (1 Timekeeping lines); woken "
+                                      "by IRQ 21 (pm8xxx_rtc_alarm)")
+        log = (self.ramdir() / "log").read_text()
+        for said in ("cycle 1/2: suspend-to-idle for 30s (rtcwake -m freeze); data=host power=sink partner=present",
+                     "cycle 1/2: asleep 30.0s, woken by IRQ 21, rtcwake 0, suspend_stats success +1 fail +0, aosd +1 "
+                     "cxsd +1 ddr +1, data=host",
+                     "cycle 1/2: evidence: s2idle: s2idle entries +8 on 8 of 8 CPUs in state1 (cpu-sleep-0-0 "
+                     "cpu-sleep-1-0 cpu-sleep-2-0), 0.012s counted in them (not the time every CPU was frozen); "
+                     "cluster domain: S0 +0 (s2idle +0, rejected +0), S1 +1 (s2idle +1, rejected +0); asleep 30.0s "
+                     "(1 Timekeeping lines); woken by IRQ 21 (pm8xxx_rtc_alarm); rtcwake took 0.0s; suspend_stats "
+                     "last_hw_sleep not offered by this kernel",
+                     "mode=s2idle: each sleep is rtcwake -m freeze, suspend-to-idle"):
+            self.assertIn(said, log)
+        self.assertNotIn("deep sleep for", log)
+        # The suspend-to-idle's own lines reach the cycle's kernel lines.
+        kernel = [line.split("] ", 2)[-1] for line in log.splitlines() if "cycle 1/2: evidence: kernel: " in line]
+        for line in ("PM: suspend entry (s2idle)", "PM: suspend-to-idle", "Timekeeping suspended for 30.002 seconds",
+                     "PM: Triggering wakeup from IRQ 21", "PM: resume from suspend-to-idle", "PM: suspend exit"):
+            self.assertIn(line, kernel)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertEqual(before.splitlines()[0].split(": ", 1)[1],
+                         "2 suspend-to-idle cycles of 30s (rtcwake -m freeze) with every disk filesystem frozen "
+                         "(aborted attempts and early wakes tried again: up to 5), then a 0s hold and a restart "
+                         "(sysrq b); options: mode=s2idle")
+        self.assertIn("\nmem_sleep [s2idle], suspend_stats success 4 fail 0;", before)
+        self.assertIn(f"\nmode=s2idle: rtcwake -m freeze ({self.root}/sys/power/state: freeze mem), mem_sleep not used; the "
+                      "cpuidle states with an s2idle entry: state1(cpu-sleep-0-0) state1(cpu-sleep-1-0) "
+                      "state1(cpu-sleep-2-0) on 8 CPUs; power-domain-cluster: S0 usage 10 s2idle 0 rejected 0, S1 "
+                      "usage 5 s2idle 0 rejected 0\n", before)
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_mode_deep_is_the_default_and_its_lines_are_as_before(self):
+        """mode=deep is accepted and is what a run without mode= does: the same
+        result, pmsg and log, rtcwake -m mem with deep selected, and none of
+        mode=s2idle's words or evidence."""
+        seen = {}
+        for args in (("ro", "1"), ("ro", "1", "mode=deep")):
+            with self.subTest(args):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "dev/pmsg0").write_text("")
+                self.s2idle_files()
+                result = self.run_test(*args, "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                self.assertEqual(self.read("rtcwake.calls"), "--version\n-u -d rtc0 -m mem -s 30\n")
+                self.assertEqual((self.root / "sys/power/mem_sleep").read_text(), "deep")
+                stamp = self.ramdir().name
+                log = (self.ramdir() / "log").read_text()
+                for said in ("cycle 1/1: deep sleep for 30s (rtcwake -m mem); data=host",
+                             "cycle 1/1: asleep 30.0s, woken by IRQ 21, rtcwake 0, suspend_stats success +1 fail +0, "
+                             "aosd +1 cxsd +1 ddr +1, data=host power=sink partner=present, USB devices 0",
+                             "SLEEP-TEST cycle 1/1: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back "
+                             "as before; floor released",
+                             "SLEEP-TEST RESULT: PASS: 1 of 1 cycles resumed with the UFS readable, 1 of them deep; "
+                             "floor released; kernel 68d243e908c0; options: none"):
+                    self.assertIn(said, log)
+                pmsg = (self.root / "dev/pmsg0").read_text().replace(stamp, "STAMP")
+                self.assertIn("progress: cycle 1/1: entering the sleep, rtcwake -m mem -s 30; no pm_test, no trace;",
+                              pmsg)
+                self.assertNotIn("s2idle", pmsg)
+                self.assertNotIn("s2idle", (self.ramdir() / "result").read_text())
+                self.assertEqual(pmsg.count(": evidence: "), 2)
+                self.assertNotIn("evidence: s2idle", log)
+                (logs,) = (self.kit / "logs").glob("*-sleep")
+                self.assertEqual((logs / "before").read_text().splitlines()[0].split(": ", 1)[1],
+                                 "1 deep cycles of 30s with every disk filesystem frozen (aborted attempts tried "
+                                 "again: up to 5), then a 0s hold and a restart (sysrq b); options: none")
+                seen[args] = ((self.ramdir() / "result").read_text().replace(str(self.root), "ROOT"),
+                              re.sub(r"up [0-9.]+s", "up Ns", pmsg).replace(str(self.root), "ROOT"))
+        self.assertEqual(seen[("ro", "1")], seen[("ro", "1", "mode=deep")])
+
+    def test_mode_s2idle_is_refused_with_nothing_changed_where_it_cannot_run(self):
+        """Refused before anything is done: no freeze in /sys/power/state, or no
+        cpuidle state with an s2idle entry; dry checks the same.  And parsed
+        strictly: one mode=, deep or s2idle, and no pm_test level that
+        suspend-to-idle never reaches (the kernel refuses processors and core
+        with it)."""
+        cases = (
+            ("mode=s2idle: ROOT/sys/power/state offers no freeze (mem)",
+             lambda: (self.root / "sys/power/state").write_text("mem\n")),
+            ("mode=s2idle: no cpuidle state of cpu0 has an s2idle entry (ROOT/sys/devices/system/cpu/cpu0/cpuidle/"
+             "state*/s2idle): the CPUs would not enter suspend-to-idle's own state",
+             lambda: shutil.rmtree(self.root / "sys/devices/system/cpu/cpu0/cpuidle/state1/s2idle")),
+        )
+        for message, damage in cases:
+            for verb in ("ro", "dry"):
+                with self.subTest(message=message, verb=verb):
+                    FakeTablet.setUp(self)
+                    SleepTestTest.setUp(self)
+                    damage()
+                    result = self.run_test(verb, "mode=s2idle", "restart-ok")
+                    self.assertEqual(result.returncode, 1, self.out)
+                    self.assertIn("REFUSED: " + message.replace("ROOT/", f"{self.root}/"), self.out)
+                    self.assertIn("nothing was changed", self.out)
+                    self.assert_nothing_done()
+        for bad in ("mode=s3", "mode=", "mode=deep mode=s2idle", "mode=s2idle mode=s2idle", "mode=s2idle pm_test=core",
+                    "pm_test=processors mode=s2idle"):
+            with self.subTest(bad):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                result = self.run_test("ro", *bad.split(), "restart-ok")
+                self.assertEqual(result.returncode, 2, self.out)
+                self.assertIn("[trace|trace=live] [mode=s2idle] restart-ok", result.stderr)
+                self.assert_nothing_done()
+                if "pm_test=" in bad:
+                    level = bad.split("pm_test=")[1].split()[0]
+                    self.assertIn(f"pm_test={level} with mode=s2idle: suspend-to-idle never gets there", result.stderr)
+
+    def test_mode_s2idle_combines_with_the_other_options(self):
+        """mode=s2idle with pci=remove, pm_test=, trace=live, release-floor,
+        aborts= and hold=: each does what it does in a deep run, and the
+        options are named in one order."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.pci_tree()
+        self.s2idle_files()
+        self.floor_held()
+        result = self.run_test("ro", "1", "trace=live", "pm_test=devices", "mode=s2idle", "pci=remove", "aborts=2",
+                               "release-floor", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        options = "options: mode=s2idle pci=remove pm_test=devices trace=live"
+        self.assertEqual(self.read("rtcwake.calls"), "--version\n-u -d rtc0 -m freeze -s 30\n")
+        self.assertEqual(self.read("pci-remove.calls"), "0000:00:00.0 before\n")
+        self.assertEqual(self.read("knobs-at-sleep"), "pm_test=devices printk=8 4 1 7 console_suspend=N\n")
+        self.assertIn("SLEEP-TEST RESULT: PM-TEST devices (s2idle): 1 of 1 cycles went as far as pm_test=devices and "
+                      "came back with the UFS readable; no suspend-to-idle, so no depth was tested; floor released; "
+                      f"kernel 68d243e908c0; {options}", self.out)
+        progress = self.progress_lines()
+        self.assertTrue(progress[0].startswith("progress: start: ro, 1 cycles of 30s, aborts=2, hold=0s; "
+                                               f"{options}; floor released;"), progress)
+        self.assertTrue(progress[-1].startswith("progress: cycle 1/1: entering the sleep, rtcwake -m freeze -s 30; "
+                                                "pm_test devices, console loglevel 8, console_suspend N; up "), progress)
+        self.assertEqual((self.root / "sys/power/pm_test").read_text(), "none")
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_dry_with_mode_s2idle_leaves_mem_sleep_and_pm_debug_messages_alone(self):
+        result = self.run_test("dry", "mode=s2idle", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("rtcwake.calls"), "--version\n")
+        self.assertIn("SLEEP-TEST RESULT: DRY: no sleep tried;", self.out)
+        self.assertIn("floor released; kernel 68d243e908c0; options: mode=s2idle", self.out)
+        self.assertEqual((self.root / "sys/power/mem_sleep").read_text(), "s2idle [deep]\n")
+        self.assertEqual((self.root / "sys/power/pm_debug_messages").read_text(), "0\n")
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_an_s2idle_sleep_woken_early_is_tried_again_within_aborts(self):
+        """A sleep the kernel counted (rtcwake 0, success +1) but that the
+        touchscreen ended after 3 s, or before any CPU entered its s2idle
+        state: WOKEN EARLY, not a pass and not a FAIL; the cycle again, counted
+        against aborts=N; past it NO-SLEEP (s2idle).  Woken early by the RTC's
+        alarm is no early wake, and a cycle whose deep states counted is a PASS
+        however short."""
+        touch = "a wakeup from IRQ 199 (fts1ba90a, the touchscreen: do not touch the screen during the run)"
+        cl0 = "cluster S0 +0 (s2idle +0, rejected +0), S1 +0 (s2idle +0, rejected +0)"
+        cl1 = "cluster S0 +0 (s2idle +0, rejected +0), S1 +1 (s2idle +1, rejected +0)"
+        states = "s2idle entries +8 on 8 of 8 CPUs in state1 (cpu-sleep-0-0 cpu-sleep-1-0 cpu-sleep-2-0)"
+        shallow = ("no-aosd", "no-cxsd", "no-ddr")
+        cases = {
+            "after 3 s": (lambda: self.cycle(1, *shallow, log=self.s2idle_log("3.104", 199), irq=199),
+                          f"asleep 3.1s (1 Timekeeping lines), {states}, {cl1}"),
+            "before any CPU entered its state": (
+                lambda: self.cycle(1, *shallow, "no-s2idle", "no-cluster", log=self.s2idle_log(None, 199), irq=199),
+                f"never asleep (no Timekeeping line), s2idle entries +0 on 0 of 8 CPUs, {cl0}"),
+        }
+        for name, (setup, how) in cases.items():
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "dev/pmsg0").write_text("")
+                self.s2idle_files()
+                setup()
+                result = self.run_test("ro", "2", "mode=s2idle", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                early = (f"SLEEP-TEST cycle 1/2: WOKEN EARLY (s2idle): the suspend-to-idle was cut short ({how}; 30s "
+                         f"asked for) by {touch}; the UFS read back as before; counted as aborted attempt 1 "
+                         "(aborts=5): cycle 1/2 again in 5 s; floor released")
+                self.assertIn(early, self.out)
+                self.assertIn(early, self.pmsg_lines())
+                self.assertEqual(self.out.count("SLEEP-TEST cycle 1/2: PASS (s2idle): deep"), 1)
+                self.assertIn("SLEEP-TEST cycle 2/2: PASS (s2idle): deep", self.out)
+                self.assertIn("SLEEP-TEST RESULT: PASS (s2idle): 2 of 2 cycles resumed with the UFS readable, 2 of "
+                              "them deep; 1 attempt aborted before the sleep or woken early (woken early by IRQ 199 "
+                              "(fts1ba90a, the touchscreen) once) and tried again; floor released; kernel "
+                              "68d243e908c0; options: mode=s2idle", self.out)
+                self.assertNotIn("FAIL", self.out)
+                self.assertEqual(self.read("rtcwake.calls").count("-m freeze"), 3)
+                self.assertIn("progress: cycle 1/2: entering the sleep, rtcwake -m freeze -s 30, attempt 2;",
+                              "\n".join(self.progress_lines()))
+        with self.subTest("aborts=0"):
+            FakeTablet.setUp(self)
+            SleepTestTest.setUp(self)
+            self.s2idle_files()
+            self.cycle(1, *shallow, log=self.s2idle_log("3.104", 199), irq=199)
+            result = self.run_test("ro", "2", "mode=s2idle", "aborts=0", "restart-ok", "hold=0")
+            self.assertEqual(result.returncode, 1, self.out)
+            self.assertIn(f"by {touch}; the UFS read back as before; counted as aborted attempt 1, more than aborts=0: "
+                          "the run ends; floor released", self.out)
+            self.assertIn("SLEEP-TEST RESULT: NO-SLEEP (s2idle) at cycle 1/2: 1 attempt aborted before the sleep or "
+                          "woken early (woken early by IRQ 199 (fts1ba90a, the touchscreen) once), more than aborts=0; "
+                          "0 of 2 cycles passed before it; this run does not answer whether the storage comes back "
+                          "from a deep sleep; floor released; kernel 68d243e908c0; options: mode=s2idle", self.out)
+            self.assertIn("NEXT: no storage verdict: after the restart run the test again, without touching the "
+                          "screen; the ABORTED and WOKEN EARLY lines name what ended each attempt", self.out)
+            self.assertEqual(self.read("rtcwake.calls").count("-m freeze"), 1)
+            self.assertEqual(self.sysrq(), "b")
+        with self.subTest("the RTC's alarm after 2 s"):
+            FakeTablet.setUp(self)
+            SleepTestTest.setUp(self)
+            self.s2idle_files()
+            self.cycle(1, *shallow, log=self.s2idle_log("2.004", 21))
+            result = self.run_test("ro", "1", "mode=s2idle", "restart-ok", "hold=0")
+            self.assertEqual(result.returncode, 1, self.out)
+            self.assertIn("SLEEP-TEST cycle 1/1: SHALLOW (s2idle): resumed and the UFS read back as before, but not "
+                          "every sleep state was reached (aosd +0 cxsd +0 ddr +0; asleep 2.0s (1 Timekeeping lines), "
+                          f"{states}, {cl1}); floor released", self.out)
+            self.assertNotIn("WOKEN EARLY (s2idle):", self.out)
+        with self.subTest("deep states counted"):
+            FakeTablet.setUp(self)
+            SleepTestTest.setUp(self)
+            self.s2idle_files()
+            self.cycle(1, log=self.s2idle_log("3.104", 199), irq=199)
+            result = self.run_test("ro", "1", "mode=s2idle", "restart-ok", "hold=0")
+            self.assertEqual(result.returncode, 1, self.out)
+            self.assertIn("SLEEP-TEST cycle 1/1: PASS (s2idle): deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read "
+                          f"back as before; asleep 3.1s (1 Timekeeping lines), {states}, {cl1}; floor released",
+                          self.out)
+            self.assertNotIn("WOKEN EARLY (s2idle):", self.out)
+
+    def test_an_s2idle_sleep_in_which_no_cpu_entered_its_state_fails(self):
+        """The kernel counted a suspend, but no CPU entered its s2idle state and
+        no wakeup on record explains it: a FAIL, with the storage as it was."""
+        self.s2idle_files()
+        self.cycle(1, "no-aosd", "no-cxsd", "no-ddr", "no-s2idle", "no-cluster", log=self.s2idle_log(None, None),
+                   irq="")
+        result = self.run_test("ro", "2", "mode=s2idle", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("cycle 1/2: no \"Timekeeping suspended for\" line (timekeeping was not suspended), no wakeup IRQ "
+                      "recorded (pm_wakeup_irq has no data), rtcwake 0, suspend_stats success +1 fail +0", self.out)
+        self.assertIn("SLEEP-TEST cycle 1/2: FAIL (s2idle): no CPU entered its s2idle state (s2idle entries +0 on "
+                      "every CPU) (aosd +0 cxsd +0 ddr +0; floor released)", self.out)
+        self.assertIn("SLEEP-TEST RESULT: FAIL (s2idle) at cycle 1/2: no CPU entered its s2idle state (s2idle "
+                      "entries +0 on every CPU); 0 passed before it; floor released; kernel 68d243e908c0; options: "
+                      "mode=s2idle", self.out)
+        self.assertIn("restart: sysrq b; every disk filesystem frozen; the storage read back as before", self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m freeze"), 1)
+        self.assertNotIn("WOKEN EARLY (s2idle):", self.out)
+
+    def test_s2idle_shallow_with_the_cluster_refused_and_its_pm_test(self):
+        """A full-length suspend-to-idle whose cluster domain the RSC refused
+        (S1 rejected): SHALLOW (s2idle), with that in its line.  pm_test=platform
+        with mode=s2idle: rtcwake -m freeze, the suspend stops before the
+        idle loop, PM-TEST (s2idle), and the cycle line says truthfully that
+        nothing was suspended or woke it."""
+        self.s2idle_files()
+        self.cycle(1, "no-aosd", "no-cxsd", "no-ddr", "cluster-rejected", log=self.s2idle_log())
+        result = self.run_test("ro", "1", "mode=s2idle", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST cycle 1/1: SHALLOW (s2idle): resumed and the UFS read back as before, but not every "
+                      "sleep state was reached (aosd +0 cxsd +0 ddr +0; asleep 30.0s (1 Timekeeping lines), s2idle "
+                      "entries +8 on 8 of 8 CPUs in state1 (cpu-sleep-0-0 cpu-sleep-1-0 cpu-sleep-2-0), cluster S0 +0 "
+                      "(s2idle +0, rejected +0), S1 +0 (s2idle +0, rejected +1)); floor released", self.out)
+        self.assertIn("SLEEP-TEST RESULT: SHALLOW (s2idle): 1 of 1 cycles resumed with the UFS readable, 0 of them "
+                      "deep; floor released; kernel 68d243e908c0; options: mode=s2idle", self.out)
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.s2idle_files()
+        result = self.run_test("ro", "1", "mode=s2idle", "pm_test=platform", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("rtcwake.calls"), "--version\n-u -d rtc0 -m freeze -s 30\n")
+        self.assertEqual(self.read("knobs-at-sleep"), "pm_test=platform printk=5 4 1 7 console_suspend=Y\n")
+        self.assertEqual((self.root / "sys/power/pm_test").read_text(), "none")
+        self.assertIn("SLEEP-TEST cycle 1/1: PM-TEST platform (s2idle): the suspend went as far as pm_test=platform "
+                      "(the devices suspended through their noirq phase), waited there and came back with no "
+                      "suspend-to-idle, and the UFS read back as before; qcom_stats aosd +0 cxsd +0 ddr +0 (CPU idle "
+                      "during the wait, not a depth test); floor released", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PM-TEST platform (s2idle): 1 of 1 cycles went as far as pm_test=platform "
+                      "and came back with the UFS readable; no suspend-to-idle, so no depth was tested; floor "
+                      "released; kernel 68d243e908c0; options: mode=s2idle pm_test=platform", self.out)
+        self.assertIn("cycle 1/1: no \"Timekeeping suspended for\" line (timekeeping was not suspended), no wakeup IRQ "
+                      "recorded (pm_wakeup_irq has no data), rtcwake 0", self.out)
+        log = (self.ramdir() / "log").read_text()
+        self.assertIn("cycle 1/1: pm_test=platform cycle: rtcwake -m freeze -s 30, and the suspend stops at platform "
+                      "(the devices suspended through their noirq phase), waits 5s there and comes back, no "
+                      "suspend-to-idle; data=host", log)
+        self.assertIn("pm_test=platform: each cycle's suspend-to-idle stops at platform", log)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("1 pm_test=platform cycles (rtcwake -m freeze -s 30; the suspend stops at platform, waits 5s and "
+                      "comes back: no suspend-to-idle) with every disk filesystem frozen", (logs / "before").read_text())
+        verdicts = [line for line in self.out.splitlines() if "SLEEP-TEST " in line]
+        for word in ("PASS", "SHALLOW", "FAIL", "WOKEN EARLY"):
+            self.assertFalse([line for line in verdicts if word in line], word)
+
+    def test_an_aborted_s2idle_attempt_is_tried_again(self):
+        """A suspend-to-idle the kernel gave up in its noirq phase (the
+        touchscreen's wakeup, rtcwake 1, a failure counted): ABORTED (s2idle),
+        tried again, as in a deep run.  An attempt whose kernel lines are a
+        deep suspend's ("PM: suspend entry (deep)") is no aborted
+        suspend-to-idle: a FAIL."""
+        log = ("[13851.674165] PM: suspend entry (s2idle)\n"
+               "[13858.770514] PM: suspend of devices complete after 186.566 msecs\n"
+               "[13858.980061] PM: late suspend of devices complete after 209.497 msecs\n"
+               "[13858.996988] PM: Triggering wakeup from IRQ 199\n"
+               "[13859.007100] PM: noirq suspend of devices aborted after 10.100 msecs\n"
+               "[13859.007192] PM: noirq suspend of devices failed\n"
+               "[13859.031732] PM: late resume of devices complete after 24.259 msecs\n"
+               "[13861.416262] PM: suspend exit\n")
+        out = 'rtcwake: wakeup from "freeze" using rtc0 at Thu Mar  5 05:27:35 1970\nrtcwake: write error\n'
+        for name, attempt, aborted in (("s2idle", log, True),
+                                       ("deep lines", log.replace("(s2idle)", "(deep)"), False)):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.s2idle_files()
+                self.cycle(1, "suspend-failed", "no-aosd", "no-cxsd", "no-ddr", "no-s2idle", "no-cluster", rc=1,
+                           log=attempt, out=out, irq=199)
+                result = self.run_test("ro", "1", "mode=s2idle", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                if aborted:
+                    self.assertIn("SLEEP-TEST cycle 1/1: ABORTED (s2idle): the kernel gave up the suspend before the "
+                                  "tablet slept (rtcwake 1, suspend_stats success +0 fail +1): a wakeup from IRQ 199 "
+                                  "(fts1ba90a, the touchscreen: do not touch the screen during the run); the UFS read "
+                                  "back as before; aborted attempt 1 (aborts=5): cycle 1/1 again in 5 s; floor "
+                                  "released", self.out)
+                    self.assertIn("SLEEP-TEST RESULT: PASS (s2idle): 1 of 1 cycles resumed with the UFS readable, 1 "
+                                  "of them deep; 1 attempt aborted before the sleep (IRQ 199 (fts1ba90a, the "
+                                  "touchscreen) once) and tried again;", self.out)
+                    self.assertNotIn("FAIL", self.out)
+                else:
+                    self.assertIn("SLEEP-TEST cycle 1/1: FAIL (s2idle): rtcwake returned 1", self.out)
+                    self.assertIn("no 'PM: suspend entry (s2idle)'", self.out)
+                    self.assertNotIn("ABORTED", self.out)
+
+    # Three small defects the 2026-11-22 13:42 and 14:00 logs showed.
+
+    def test_the_int_max_count_is_one_line(self):
+        """grep -c prints 0 and fails when nothing matches: the count, then
+        "n/a" on a line of its own, came out under "INT_MAX nodes now: 0"."""
+        self.floor_held()
+        result = self.run_test("ro", "1", "release-floor", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        log = (self.ramdir() / "log").read_text()
+        self.assertRegex(log, r"INT_MAX nodes now: 0\n\[[0-9.]+\] ")
+        self.assertNotIn("\nn/a\n", log)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("\nINT_MAX nodes: 0\nType-C: ", (logs / "before").read_text())
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        (self.root / "sys/kernel/debug/interconnect/interconnect_summary").write_text(
+            "node tag avg peak\nebi 2147483647 2147483647\nqhm 2147483647 0\n")
+        self.run_test("ro", "1", "restart-ok", "hold=0")
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("\nINT_MAX nodes: 2\nType-C: ", (logs / "before").read_text())
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        (self.root / "sys/kernel/debug/interconnect/interconnect_summary").unlink()
+        self.run_test("ro", "1", "restart-ok", "hold=0")
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("\nINT_MAX nodes: n/a\nType-C: ", (logs / "before").read_text())
+
+    def test_mem_sleep_is_shown_as_the_kernel_shows_it(self):
+        """The file's content once ("s2idle [deep]"), not inside brackets of
+        its own ("[s2idle [deep]]")."""
+        self.run_test("ro", "1", "restart-ok", "hold=0")
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertIn("\nmem_sleep s2idle [deep], suspend_stats success 4 fail 0; freeze_filesystems n/a", before)
+        self.assertNotIn("[s2idle [deep]]", before)
+
+    def test_pm_debug_messages_is_set_for_sleeps_alone_and_the_restart_undoes_it(self):
+        """A run with sleeps sets pm_debug_messages to 1 and says that the
+        restart at its end puts it back, and a stop before any sleep says it
+        stays 1 until the next boot; dry does not sleep and leaves it."""
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertEqual((self.root / "sys/power/pm_debug_messages").read_text(), "1")
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("; pm_debug_messages 0 (this run sets 1; the restart at its end puts it back), pm_print_times 0;",
+                      (logs / "before").read_text())
+        self.assertIn("pm_debug_messages 1 for this run (it was 0), so that each cycle's kernel lines have the PM "
+                      "core's: the restart that ends the run puts it back; a stop before any sleep leaves it at 1 "
+                      "until the next boot", self.out)
+        self.assertEqual(self.sysrq(), "b")
+        with self.subTest("dry"):
+            FakeTablet.setUp(self)
+            SleepTestTest.setUp(self)
+            result = self.run_test("dry", "restart-ok", "hold=0")
+            self.assertEqual(result.returncode, 1, self.out)
+            self.assertEqual((self.root / "sys/power/pm_debug_messages").read_text(), "0\n")
+            (logs,) = (self.kit / "logs").glob("*-sleep")
+            self.assertIn("; pm_debug_messages 0 (dry leaves it as it is), pm_print_times 0;",
+                          (logs / "before").read_text())
+            self.assertNotIn("pm_debug_messages 1 for this run", self.out)
+        with self.subTest("a stop in RAM before any sleep"):
+            FakeTablet.setUp(self)
+            SleepTestTest.setUp(self)
+            (self.tmp / "freeze-fails").write_text("/\n")
+            result = self.run_test("ro", "1", "restart-ok", "hold=0")
+            self.assertEqual(result.returncode, 1, self.out)
+            self.assertIn("stopped: swap on the disk stays off until the next boot; pm_debug_messages stays 1 until "
+                          "the next boot (it was 0)", self.out)
+            self.assertEqual(self.sysrq(), "")
+        with self.subTest("a stop on the disk"):
+            FakeTablet.setUp(self)
+            SleepTestTest.setUp(self)
+            (self.tmp / "swapoff-fails").touch()
+            result = self.run_test("ro", "1", "restart-ok", "hold=0")
+            self.assertEqual(result.returncode, 1, self.out)
+            self.assertIn("STOPPED before freezing anything: swapoff /swapfile failed; nothing on the disk changed but "
+                          f"{self.kit}/logs/", self.out)
+            self.assertIn("; pm_debug_messages stays 1 until the next boot (it was 0)", self.out)
+
+    def test_a_cycle_with_no_wakeup_irq_on_record_says_so(self):
+        """pm_wakeup_irq has no data when no wakeup IRQ was recorded (a pm_test
+        cycle ends by itself; 2026-11-22 13:42 and 14:00 printed "woken by IRQ
+        ?"), and at platform timekeeping is never suspended ("asleep ?s"): the
+        cycle line says so.  The kernel's own "Triggering wakeup from IRQ N"
+        names the IRQ when the file says nothing."""
+        result = self.run_test("ro", "1", "pm_test=core", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("cycle 1/1: no \"Timekeeping suspended for\" line (timekeeping was not suspended), no wakeup IRQ "
+                      "recorded (pm_wakeup_irq has no data), rtcwake 0, suspend_stats success +1 fail +0", self.out)
+        self.assertNotIn("?s,", self.out)
+        self.assertNotIn("IRQ ?", self.out)
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.cycle(1, irq="", log="[  700.000000] PM: suspend entry (deep)\n"
+                                  "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+                                  "[  730.000100] PM: Triggering wakeup from IRQ 21\n"
+                                  "[  730.100000] PM: suspend exit\n")
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("cycle 1/1: asleep 30.0s, woken by IRQ 21, rtcwake 0", self.out)
     """The RAM root of sleep-test.sh, made by its own functions from this
     host's real tools (dash, grep, mawk, and Rust coreutils, which refuse to
     run under a loader started by hand), entered by its own in_ram_root in a
