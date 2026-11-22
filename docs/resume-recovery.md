@@ -417,6 +417,35 @@ Steps 1 and 2 ran on 2026-11-22: revision 7 resumed 13 of 13 deep sleeps,
 none of them deep enough to count in `qcom_stats` ("What ran on the
 tablet", below).
 
+The sleep test also has experiment options, each off unless given (the
+kit's README, "The experiment options", has the details and the risks):
+
+```sh
+sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
+     [pci=remove] [pm_test=LEVEL] [trace|trace=live] restart-ok
+sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok
+```
+
+- `pci=remove` removes every PCI root port, and the Wi-Fi below it, right
+  before the freeze, so that the PCIe host powers down in the suspend; the
+  Wi-Fi is gone until the restart. It is refused if that would not empty
+  the bus, and a cycle after which the PCIe host did not come back ends the
+  run (`PCIE-DOWN`): the next suspend would read its registers unclocked.
+- `pm_test=LEVEL` (`freezer`, `devices`, `platform`, `processors`, `core`)
+  stops each suspend at that level, waits 5 s and resumes, with no SoC
+  sleep call (PSCI `SYSTEM_SUSPEND`): each cycle is PM-TEST, never a depth.
+  It is set only around each `rtcwake`.
+- `trace` raises the console loglevel to 8 for each sleep, so that the PM
+  core's lines reach the ramoops console: live up to the console suspend,
+  the rest at the resume. `trace=live` also keeps the consoles printing
+  through the suspend (`console_suspend` N), at a cost in time with
+  interrupts off and with the debug UART kept powered.
+
+Every `RESULT` line names the options in force, and pmsg gets progress
+lines (`progress: ...`) up to the sleep a run enters, so that a run that
+never comes back still leaves its start, its options and that sleep in the
+next boot's pstore archive.
+
 Nobody touches the screen during a run: the touchscreen's double tap wakes
 the tablet, and in a suspend under way it makes the kernel give the suspend
 up (the script calls such an attempt ABORTED, tries the cycle again, and
@@ -686,6 +715,20 @@ shallow and what to run next is in
 `~/ubuntu-gts9u/backups/sleep-shallow-report-2026-11-22.md`; from then
 on the sleep test also prints read-only evidence around each cycle
 (`tools/inplace/typec-roles/README.md`, "The sleep test").
+
+**Undocked on the PC's cable, 12:05 and 12:56** (revision 7, USB in device
+role, the floor released by each run). With the Wi-Fi's PCIe root port
+removed from the bus first, the 12:05 run did not come back from its first
+`rtcwake -m mem`: the tablet restarted by itself about 71 s after the
+cycle's marker, with no panic record and nobody touching it, and the next
+boot mounted the root clean. The 12:56 control, the same with the PCI
+devices kept, resumed 3 of 3, all SHALLOW. So a sleep that can go deeper
+than the 16 that resumed (nothing of PCIe or USB left in the sleep set) does
+not return on this port yet, and that is a different failure from the
+2026-11-21 one, with no UFS line in it. The records, the reading of the
+source and the `pci=remove`, `pm_test=` and `trace` options that came out of
+it are in the [porting log](porting-log.md) under the same date and in
+`~/ubuntu-gts9u/backups/deep-sleep-pcie-analysis-2026-11-22.md`.
 
 #### Repairing the root from recovery
 

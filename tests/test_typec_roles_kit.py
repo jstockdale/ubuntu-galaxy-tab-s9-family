@@ -116,6 +116,8 @@ PREFIXES = (
     # sleep-test.sh's evidence.
     "/sys/kernel/debug/pm_genpd/", "/sys/kernel/debug/regulator/", "/sys/kernel/debug/wakeup_sources",
     "/sys/bus/pci/devices", "/sys/class/remoteproc/", "/sys/class/backlight/", "/sys/class/thermal/",
+    # sleep-test.sh's experiment options (trace, pm_test=).
+    "/sys/module/printk/parameters/", "/sys/module/suspend/parameters/",
 )
 
 STUBS = {
@@ -668,6 +670,12 @@ class FakeTablet(unittest.TestCase):
             # The freeze reaches the system's mounts through /proc/1/root:
             # the stubs take that path as it is.
             self.assertEqual(text.count("\nsysroot=/proc/1/root\n"), 1)
+            # A write to a PCI device's remove is the fake kernel's here
+            # (PCI_REMOVE_FAKE): the run's own function is replaced.
+            body = re.compile(r"^pci_remove\(\) \{ # NAME\n.*?^\}\n", re.M | re.S)
+            self.assertEqual(len(body.findall(text)), 1)
+            text = body.sub(lambda m: PCI_REMOVE_FAKE.replace("@ROOT@", str(self.root))
+                            .replace("@TMP@", str(self.tmp)), text)
         text = text.replace(pinned("install.sh", "hang_boot"), sha(self.hang_boot))
         text = text.replace(pinned("install.sh", "hang_vendor_boot"), sha(self.hang_vendor_boot))
         for real, standin in self.standins.items():
@@ -2874,6 +2882,28 @@ int main(int argc, char **argv)
 	return 127;
 }
 '''
+# The fake kernel's removal of a PCI device (remove_store ->
+# pci_stop_and_remove_bus_device_locked): the device's directory goes, and
+# every link in /sys/bus/pci/devices to it or below it.  @TMP@/pci-remove.calls
+# notes each call and whether the disk was frozen by then;
+# @TMP@/pci-remove-keeps names devices whose link stays (a removal that does
+# not empty the bus; the directories stay then too).  It runs in the run's
+# RAM part, with the RAM root's tools and the host's rm by its path, and
+# removes nothing outside the fake root's sys/devices.
+PCI_REMOVE_FAKE = r'''pci_remove() { # NAME (the fake kernel's)
+	echo "$1 $([ -e '@TMP@/disk-at-freeze' ] && echo after || echo before)" >> '@TMP@/pci-remove.calls'
+	fake_r=$(readlink -f "$pci_devs/$1") || return 0
+	fake_t=$(readlink -f '@ROOT@/sys/devices') || return 0
+	case $fake_r in "$fake_t"/?*) ;; *) return 0 ;; esac
+	for fake_l in "$pci_devs"/*; do
+		fake_q=$(readlink -f "$fake_l") || continue
+		case $fake_q/ in "$fake_r"/*) ;; *) continue ;; esac
+		! grep -qxF "${fake_l##*/}" '@TMP@/pci-remove-keeps' 2>/dev/null || continue
+		/usr/bin/rm -- "$fake_l"
+	done
+	[ -e '@TMP@/pci-remove-keeps' ] || /usr/bin/rm -r -- "$fake_r"
+}
+'''
 # Each RAM tool notes whether it ran before or after the first freeze, from
 # where, and with which PATH.
 RAM_CALL = 'echo "$([ -e "$T/disk-at-freeze" ] && echo after || echo before) $STUB_EXE $CALLER_PATH" >> "$T/ram-calls"\n'
@@ -2950,14 +2980,22 @@ grep -q u "$F/proc/sysrq-trigger" && echo "cycle $n slept after a sysrq u" >> "$
 # The kernel shows "s2idle [deep]" once "deep" is written; the stand-in, what was written.
 case $(cat "$F/sys/power/mem_sleep") in *'[deep]'*|deep) ;; *) echo "cycle $n slept with mem_sleep $(cat "$F/sys/power/mem_sleep")" >> "$T/violations" ;; esac
 case $* in "-u -d rtc0 -m mem -s "*) ;; *) echo "rtcwake $*" >> "$T/violations" ;; esac
+# The experiment's knobs as this sleep finds them (pm_test, the console
+# loglevel, console_suspend), and the last line in pmsg, one line each.
+echo "pm_test=$(cat "$F/sys/power/pm_test") printk=$(tr '\t' ' ' < "$F/proc/sys/kernel/printk") console_suspend=$(cat "$F/sys/module/printk/parameters/console_suspend")" >> "$T/knobs-at-sleep"
+{ tail -n 1 "$F/dev/pmsg0" 2>/dev/null || :; } >> "$T/pmsg-at-sleep"
+# A level written to pm_test (the stand-in keeps what was written): the
+# suspend stops there and nothing sleeps.
+case $(cat "$F/sys/power/pm_test") in freezer|devices|platform|processors|core) pt=1 ;; *) pt= ;; esac
 s=$T/cycle-$n
 if [ -e "$s/log" ]; then cat "$s/log" >> "$F/dev/kmsg"
+elif [ -n "$pt" ]; then printf '[  700.000000] PM: suspend entry (deep)\n[  700.200000] suspend debug: Waiting for 5 second(s).\n[  705.300000] PM: suspend exit\n' >> "$F/dev/kmsg"
 else printf '[  700.000000] PM: suspend entry (deep)\n[  730.000000] Timekeeping suspended for 30.002 seconds\n[  730.100000] PM: suspend exit\n' >> "$F/dev/kmsg"; fi
 if [ -e "$s/suspend-failed" ]; then k=fail; else k=success; fi
 echo $(($(cat "$F/sys/power/suspend_stats/$k") + 1)) > "$F/sys/power/suspend_stats/$k"
 for q in aosd cxsd ddr; do
-	[ -e "$s/no-$q" ] || [ ! -e "$F/sys/kernel/debug/qcom_stats/$q" ] ||
-		sed -i "s/^Count: \(.*\)/echo Count: \$((\1 + 1))/e" "$F/sys/kernel/debug/qcom_stats/$q"
+	[ -z "$pt" ] && [ ! -e "$s/no-$q" ] && [ -e "$F/sys/kernel/debug/qcom_stats/$q" ] || continue
+	sed -i "s/^Count: \(.*\)/echo Count: \$((\1 + 1))/e" "$F/sys/kernel/debug/qcom_stats/$q"
 done
 # What the sleep left in the files the evidence reads, if the cycle says.
 [ ! -d "$s/qcom_stats" ] || cp "$s/qcom_stats/"* "$F/sys/kernel/debug/qcom_stats/"
@@ -3386,6 +3424,14 @@ class SleepTestTest(FakeTablet):
         (F / "sys/power/state").write_text("freeze mem\n")
         (F / "sys/power/pm_test").write_text("[none] core processors platform devices freezer\n")
         (F / "sys/power/pm_debug_messages").write_text("0\n")
+        # The knobs of the experiment options, as squirtle had them on
+        # 2026-11-22 (kernel.printk as the kernel prints it, tabs between).
+        (F / "sys/power/pm_print_times").write_text("0\n")
+        (F / "proc/sys/kernel/printk").write_text("5\t4\t1\t7\n")
+        for d, name, value in (("printk", "console_suspend", "Y"), ("printk", "ignore_loglevel", "N"),
+                               ("suspend", "pm_test_delay", "5")):
+            (F / "sys/module" / d / "parameters").mkdir(parents=True, exist_ok=True)
+            (F / "sys/module" / d / "parameters" / name).write_text(value + "\n")
         (F / "sys/power/pm_wakeup_irq").write_text("21\n")
         (F / "sys/power/suspend_stats/success").write_text("4\n")
         (F / "sys/power/suspend_stats/fail").write_text("0\n")
@@ -3633,13 +3679,17 @@ class SleepTestTest(FakeTablet):
             fail = fail.replace(f"${name}", re.search(rf"^{name}='([^']*)'$", text, re.M).group(1))
         return re.compile(fail.replace("$disk", "sda").replace("\\\\", "\\"))
 
-    def pmsg_lines(self, evidence=True):
+    def pmsg_lines(self, evidence=True, progress=False):
         """What the run wrote to pmsg, without its prefix and stamp; without
-        the cycles' evidence lines if EVIDENCE is false."""
+        the cycles' evidence lines if EVIDENCE is false, and without the
+        progress lines ("progress: ...": the run's start, its protection, each
+        sleep's entry) unless PROGRESS is true."""
         prefix = f"gts9u sleep-test: {self.ramdir().name} "
         lines = (self.root / "dev/pmsg0").read_text().splitlines()
         self.assertTrue(all(line.startswith(prefix) for line in lines), lines)
-        return [line[len(prefix):] for line in lines if evidence or ": evidence: " not in line]
+        return [line[len(prefix):] for line in lines
+                if (evidence or ": evidence: " not in line)
+                and (progress or not line[len(prefix):].startswith("progress: "))]
 
     def test_each_cycle_s_diagnostic_lines_are_kept_with_its_verdict(self):
         """Revision 8's kernel logs a line at each calibration.  Each cycle
@@ -4890,7 +4940,7 @@ exit 0
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
-                self.assertIn("sleep-test.sh dry [release-floor] [hold=S] restart-ok", result.stderr)
+                self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok", result.stderr)
 
     def assert_nothing_done(self):
         self.assertEqual(self.sysrq(), "")
@@ -5087,8 +5137,420 @@ exit 0
         self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2", result.read_text())
         self.assertEqual(self.read("violations"), "")
 
+    # The experiment options (2026-11-22): pci=remove, pm_test=, trace.
 
-class RamRootTest(unittest.TestCase):
+    def pci_tree(self, devices=(("0000:00:00.0", "0x060400", ""), ("0000:01:00.0", "0x028000", "0000:00:00.0"))):
+        """PCI devices as sysfs shows them, by default the SM-X710's: the
+        root port 0000:00:00.0 on pcie0's host bridge (pci0000:00), the
+        Wi-Fi 0000:01:00.0 below it.  DEVICES: (name, class, the device it
+        sits below, or "" for the host bridge).  Each name is a link in
+        /sys/bus/pci/devices to its directory, which has its class and a
+        remove file (PCI_REMOVE_FAKE removes them)."""
+        bridge = self.root / "sys/devices/platform/soc@0/1c00000.pcie/pci0000:00"
+        bus = self.root / "sys/bus/pci/devices"
+        bus.mkdir(parents=True, exist_ok=True)
+        paths = {}
+        for name, cls, parent in devices:
+            d = (paths[parent] if parent else bridge) / name
+            d.mkdir(parents=True)
+            (d / "class").write_text(cls + "\n")
+            (d / "remove").write_text("")
+            (d / "power_state").write_text("D0\n")
+            paths[name] = d
+            (bus / name).symlink_to(os.path.relpath(d, bus))
+        return paths
+
+    def progress_lines(self):
+        return [line for line in self.pmsg_lines(progress=True) if line.startswith("progress: ")]
+
+    def test_pci_remove_takes_the_root_port_off_after_the_checks_and_before_the_freeze(self):
+        """The root port (and the Wi-Fi below it) goes in RAM, after every
+        check and errors=continue, right before the first freeze and the
+        first evidence: the bus is empty for the whole run, and the run says
+        so before it moves to RAM, in its log, its record and pmsg."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.pci_tree()
+        result = self.run_test("ro", "1", "pci=remove", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        # One removal, of the root port alone, before the first freeze.
+        self.assertEqual(self.read("pci-remove.calls"), "0000:00:00.0 before\n")
+        self.assertEqual(list((self.root / "sys/bus/pci/devices").iterdir()), [])
+        log = (self.ramdir() / "log").read_text()
+        order = ["pci=remove: right before it freezes the disks the run removes the PCI root port(s) 0000:00:00.0 "
+                 "and everything below them, the Wi-Fi with them: Wi-Fi is gone from then until the restart, and "
+                 "an SSH session over Wi-Fi drops there while the run carries on",
+                 "errors=continue: / (/dev/sda34)",
+                 "pci=remove: removing the PCI root port(s) 0000:00:00.0 and everything below them (2 PCI devices: "
+                 "0000:00:00.0 0000:01:00.0); Wi-Fi is gone from now until the restart, and an SSH session over "
+                 "Wi-Fi drops now: the run goes on",
+                 "pci=remove: removed 0000:00:00.0; PCI devices 2 -> 0; 10s for the system to settle before the "
+                 "freeze",
+                 "freezing every writable disk filesystem now", "frozen: /media/stick", "evidence: state:",
+                 "cycle 1/1: deep sleep"]
+        self.assertEqual([log.index(said) for said in order], sorted(log.index(said) for said in order))
+        self.assertRegex(self.out, r"cycle 1/1: evidence: before: [^\n]*; pci none; ")
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1 cycles resumed with the UFS readable, 1 of them deep; floor "
+                      "released; kernel 68d243e908c0; options: pci=remove", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertIn("then a 0s hold and a restart (sysrq b); options: pci=remove\n", before)
+        self.assertIn("PCI: 2 devices: 0000:00:00.0 0000:01:00.0; root ports: 0000:00:00.0; pci=remove: all of them "
+                      "go right before the freeze\n", before)
+        self.assertEqual(self.progress_lines()[:3], [
+            "progress: start: ro, 1 cycles of 30s, aborts=5, hold=0s; options: pci=remove; floor released; kernel "
+            "68d243e908c0; up 600.25s",
+            "progress: pci=remove: removed 0000:00:00.0; PCI devices 2 -> 0",
+            "progress: protected: frozen: /media/stick /; /dev/sda read-only; from here the run ends with a restart"])
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_dry_with_pci_remove_removes_it_before_the_freeze_and_sleeps_not(self):
+        self.pci_tree()
+        result = self.run_test("dry", "pci=remove", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("pci-remove.calls"), "0000:00:00.0 before\n")
+        self.assertEqual(self.read("rtcwake.calls"), "--version\n")
+        self.assertIn("SLEEP-TEST RESULT: DRY: no sleep tried;", self.out)
+        self.assertIn("floor released; kernel 68d243e908c0; options: pci=remove", self.out)
+
+    def test_pci_remove_is_refused_with_nothing_changed_when_it_would_not_empty_the_bus(self):
+        cases = {
+            "pci=remove: no PCI root port to remove (0 PCI devices)": (),
+            # An endpoint on the host bridge, no bridge.
+            "pci=remove: no PCI root port to remove (1 PCI devices: 0000:00:00.0)": (
+                ("0000:00:00.0", "0x028000", ""),),
+            # A device on the root bus beside the root port.
+            "pci=remove: 0000:00:01.0 not below a PCI root port (0000:00:00.0): removing the root ports would not "
+            "empty the bus": (("0000:00:00.0", "0x060400", ""), ("0000:01:00.0", "0x028000", "0000:00:00.0"),
+                              ("0000:00:01.0", "0x058000", "")),
+        }
+        for message, devices in cases.items():
+            with self.subTest(message):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                if devices:
+                    self.pci_tree(devices)
+                result = self.run_test("ro", "pci=remove", "restart-ok")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("REFUSED: " + message, self.out)
+                self.assertIn("nothing was changed", self.out)
+                self.assert_nothing_done()
+                self.assertEqual(self.read("pci-remove.calls"), "")
+                self.assertEqual(len(list((self.root / "sys/bus/pci/devices").glob("*"))), len(devices))
+
+    def test_a_removal_that_leaves_a_pci_device_stops_the_run_before_anything_is_frozen(self):
+        """The bus is not empty after the root port's removal: the run stops
+        before the freeze, errors= back, no restart, and says that what was
+        removed stays removed until a restart."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.pci_tree()
+        (self.tmp / "pci-remove-keeps").write_text("0000:01:00.0\n")
+        result = self.run_test("ro", "1", "pci=remove", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep: pci=remove: 1 of 2 PCI devices still there after "
+                      "removing 0000:00:00.0: 0000:01:00.0; every filesystem this run froze is thawed again, errors= "
+                      "is back as it was on: /media/stick /, and the tablet is not restarted; floor released; kernel "
+                      "68d243e908c0; options: pci=remove", self.out)
+        self.assertIn("NEXT: what was removed stays removed until the restart, the Wi-Fi with it (sudo reboot brings "
+                      "it back)", self.out)
+        self.assertEqual(self.read("pci-remove.calls"), "0000:00:00.0 before\n")
+        self.assertEqual(self.sysrq(), "")
+        self.assertEqual(self.read("fsfreeze.calls"), "--version\n")
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+        self.assertEqual(self.errors_mode(), {"/": [], "/media/stick": ["errors=remount-ro"]})
+        self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep: pci=remove:", "\n".join(self.pmsg_lines()))
+
+    def test_a_pcie_host_that_did_not_come_back_ends_a_pci_remove_run(self):
+        """With pci=remove, a cycle or an aborted attempt whose kernel lines
+        say the PCIe host did not come back ends the run: the host is powered
+        down but still marked suspended, and the next suspend would read its
+        registers unclocked.  Without pci=remove the same lines change
+        nothing (the host never powered down)."""
+        # The kernel's own lines: the link wait's, then the PM core's, which
+        # has "PM: " after the device (dev_fmt, drivers/base/power/main.c).
+        link = "qcom-pcie 1c00000.pcie: Link failed to come up. LTSSM: DW_PCIE_LTSSM_POLL_CONFIG"
+        core = "qcom-pcie 1c00000.pcie: PM: failed to resume async noirq: error -110"
+        down = f"[  731.000000] {link}\n[  731.000001] {core}\n"
+
+        def deep_log(lines):
+            return ("[  700.000000] PM: suspend entry (deep)\n"
+                    "[  730.000000] Timekeeping suspended for 30.002 seconds\n" + lines +
+                    "[  731.100000] PM: suspend exit\n")
+        for name, pci, setup, sleeps, first in (
+                ("a cycle", True, lambda: self.cycle(1, log=deep_log(down)), 1, link),
+                ("the PM core's line alone", True,
+                 lambda: self.cycle(1, log=deep_log(f"[  731.000001] {core}\n")), 1, core),
+                ("an aborted attempt", True, lambda: self.touch_abort(1, log=TOUCH_ABORT.replace(
+                    "[13861.416262] PM: suspend exit\n", down + "[13861.416262] PM: suspend exit\n")), 1, link),
+                ("without pci=remove", False, lambda: self.cycle(1, log=deep_log(down)), 3, None)):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "proc/interrupts").write_text(INTERRUPTS)
+                if pci:
+                    self.pci_tree()
+                setup()
+                result = self.run_test("ro", "3", *(("pci=remove",) if pci else ()), "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                self.assertEqual(self.read("rtcwake.calls").count("-m mem"), sleeps)
+                self.assertEqual(self.sysrq(), "b")
+                if pci:
+                    self.assertIn("SLEEP-TEST RESULT: PCIE-DOWN after cycle 1/3: the PCIe host did not come back "
+                                  f"({first}), and with "
+                                  "pci=remove a later suspend would read its registers with its clocks off, so the "
+                                  "run ends here;", self.out)
+                    self.assertIn("; options: pci=remove", self.out)
+                    self.assertNotIn("again in 5 s", self.out)
+                else:
+                    self.assertNotIn("PCIE-DOWN", self.out)
+                    self.assertIn("SLEEP-TEST RESULT: PASS: 3 of 3", self.out)
+
+    def test_pm_test_cycles_say_pm_test_and_never_a_depth(self):
+        """pm_test=platform: set right before each rtcwake, none again right
+        after; each cycle PM-TEST, the run PM-TEST, never PASS, SHALLOW, DEEP
+        or a depth."""
+        (self.root / "dev/pmsg0").write_text("")
+        # In the second the idle CPUs took the SoC down during the wait
+        # (cpuidle runs until the CPUs go offline): counted, still no depth.
+        d = self.tmp / "cycle-2/qcom_stats"
+        d.mkdir(parents=True)
+        for q, n in (("aosd", 8), ("cxsd", 6), ("ddr", 7)):
+            (d / q).write_text(qcom_stat(n, 1))
+        result = self.run_test("ro", "2", "pm_test=platform", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        for i, counts in ((1, "aosd +0 cxsd +0 ddr +0"), (2, "aosd +1 cxsd +1 ddr +1")):
+            self.assertIn(f"SLEEP-TEST cycle {i}/2: PM-TEST platform: the suspend went as far as pm_test=platform "
+                          "(the devices suspended through their noirq phase), waited there and came back with no "
+                          f"SoC sleep call, and the UFS read back as before; qcom_stats {counts} (CPU idle during "
+                          "the wait, not a depth test); floor released", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PM-TEST platform: 2 of 2 cycles went as far as pm_test=platform and came "
+                      "back with the UFS readable; no SoC sleep call, so no depth was tested; floor released; kernel "
+                      "68d243e908c0; options: pm_test=platform", self.out)
+        verdicts = [line for line in self.out.splitlines() if "SLEEP-TEST " in line]
+        self.assertEqual(len(verdicts), 4, verdicts)
+        for word in ("PASS", "SHALLOW", "DEEP", "deep", "DEPTH"):
+            self.assertFalse([line for line in verdicts if word in line], word)
+        # The level for each sleep, and none before, between and after.
+        self.assertEqual(self.read("knobs-at-sleep"), "pm_test=platform printk=5 4 1 7 console_suspend=Y\n" * 2)
+        self.assertEqual((self.root / "sys/power/pm_test").read_text(), "none")
+        self.assertEqual(self.read("rtcwake.calls").count("-u -d rtc0 -m mem -s 30"), 2)
+        self.assertEqual(self.sysrq(), "b")
+        log = (self.ramdir() / "log").read_text()
+        self.assertIn("cycle 1/2: pm_test=platform cycle: rtcwake -m mem -s 30, and the suspend stops at platform (the "
+                      "devices suspended through their noirq phase), waits 5s there and comes back, no SoC sleep call;", log)
+        self.assertIn("cycle 1/2: for this sleep: pm_test platform", log)
+        self.assertIn("pm_test=platform: each cycle's suspend stops at platform", log)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("2 pm_test=platform cycles (rtcwake -m mem -s 30; the suspend stops at platform, waits 5s and "
+                      "comes back: no SoC sleep call) with every disk filesystem frozen", (logs / "before").read_text())
+        self.assertIn("progress: cycle 1/2: entering the sleep, rtcwake -m mem -s 30; pm_test platform; up ",
+                      "\n".join(self.progress_lines()))
+
+    def test_each_pm_test_level_says_how_far_its_suspend_went(self):
+        for level, what in (("freezer", "the tasks frozen, no device suspended"),
+                            ("devices", "the devices' suspend phase, not their late and noirq ones"),
+                            ("platform", "the devices suspended through their noirq phase"),
+                            ("processors", "the devices suspended and the other CPUs offline"),
+                            ("core", "everything but the SoC sleep call (PSCI SYSTEM_SUSPEND), interrupts off")):
+            with self.subTest(level):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                result = self.run_test("ro", "1", f"pm_test={level}", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn(f"SLEEP-TEST cycle 1/1: PM-TEST {level}: the suspend went as far as pm_test={level} "
+                              f"({what}), waited there", self.out)
+                self.assertEqual(self.read("knobs-at-sleep"), f"pm_test={level} printk=5 4 1 7 console_suspend=Y\n")
+                self.assertEqual((self.root / "sys/power/pm_test").read_text(), "none")
+
+    def test_a_pm_test_cycle_that_did_not_stop_at_its_level_fails(self):
+        """The kernel's "suspend debug: Waiting for" line is the proof that
+        the suspend stopped at the level; without it the cycle FAILs."""
+        self.cycle(1, log="[  700.000000] PM: suspend entry (deep)\n"
+                          "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+                          "[  730.100000] PM: suspend exit\n")
+        result = self.run_test("ro", "1", "pm_test=devices", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST cycle 1/1: FAIL: no 'suspend debug: Waiting for' line: the suspend did not stop at "
+                      "pm_test=devices (aosd +0 cxsd +0 ddr +0; floor released)", self.out)
+        self.assertIn("SLEEP-TEST RESULT: FAIL at cycle 1/1: no 'suspend debug: Waiting for' line", self.out)
+        self.assertEqual((self.root / "sys/power/pm_test").read_text(), "none")
+
+    def test_an_aborted_pm_test_attempt_is_tried_again_with_its_level(self):
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        (self.root / "dev/pmsg0").write_text("")
+        self.touch_abort(1)
+        result = self.run_test("ro", "1", "pm_test=platform", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST cycle 1/1: ABORTED: the kernel gave up the suspend before the tablet slept", self.out)
+        self.assertIn("SLEEP-TEST cycle 1/1: PM-TEST platform:", self.out)
+        self.assertEqual(self.read("knobs-at-sleep"), "pm_test=platform printk=5 4 1 7 console_suspend=Y\n" * 2)
+        self.assertEqual((self.root / "sys/power/pm_test").read_text(), "none")
+        self.assertEqual([line.split("; up ")[0] for line in self.progress_lines() if "entering" in line], [
+            "progress: cycle 1/1: entering the sleep, rtcwake -m mem -s 30; pm_test platform",
+            "progress: cycle 1/1: entering the sleep, rtcwake -m mem -s 30, attempt 2; pm_test platform"])
+
+    def test_a_pm_test_level_that_does_not_take_sleeps_not(self):
+        """The level was offered at the checks and is refused right before
+        the sleep (here the fake kernel locks the file once the first read
+        has run): that cycle does not start, and the run ends as ABORTED,
+        with the restart."""
+        dd = self.tmp / "stubs/dd"
+        dd.write_text(dd.read_text().replace(RAM_CALL, RAM_CALL + 'chmod 0444 "$F/sys/power/pm_test"\n', 1))
+        result = self.run_test("ro", "1", "pm_test=platform", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST cycle 1/1: NOT STARTED: pm_test=platform did not take "
+                      f"({self.root}/sys/power/pm_test: [none] core processors platform devices freezer)", self.out)
+        self.assertIn("SLEEP-TEST RESULT: ABORTED at cycle 1/1, before its sleep (pm_test=platform did not take", self.out)
+        self.assertIn("; options: pm_test=platform", self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+        self.assertEqual(self.sysrq(), "b")
+
+    def test_the_knobs_are_never_left_set_by_a_run_that_stops_before_a_sleep(self):
+        """A stop before any sleep (here a freeze that fails) does not
+        restart the tablet: pm_test, the console loglevel and console_suspend
+        are as before the run, since they are set only around rtcwake."""
+        (self.tmp / "freeze-fails").write_text("/media/stick\n")
+        result = self.run_test("ro", "1", "pm_test=platform", "trace=live", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep:", self.out)
+        self.assertIn("options: pm_test=platform trace=live", self.out)
+        self.assertEqual(self.sysrq(), "")
+        self.assertEqual(self.read("knobs-at-sleep"), "")
+        self.assertEqual((self.root / "sys/power/pm_test").read_text(),
+                         "[none] core processors platform devices freezer\n")
+        self.assertEqual((self.root / "proc/sys/kernel/printk").read_text(), "5\t4\t1\t7\n")
+        self.assertEqual((self.root / "sys/module/printk/parameters/console_suspend").read_text(), "Y\n")
+
+    def test_trace_raises_the_console_loglevel_for_each_sleep_alone(self):
+        (self.root / "dev/pmsg0").write_text("")
+        result = self.run_test("ro", "2", "trace", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("knobs-at-sleep"),
+                         "pm_test=[none] core processors platform devices freezer printk=8 4 1 7 "
+                         "console_suspend=Y\n" * 2)
+        # Back after each sleep: the other three numbers as they were.
+        self.assertEqual((self.root / "proc/sys/kernel/printk").read_text(), "5 4 1 7\n")
+        self.assertEqual((self.root / "sys/module/printk/parameters/console_suspend").read_text(), "Y\n")
+        self.assertEqual((self.root / "sys/power/pm_debug_messages").read_text(), "1")
+        self.assertIn("cycle 1/2: for this sleep: console loglevel 8", (self.ramdir() / "log").read_text())
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles resumed with the UFS readable, 2 of them deep; floor "
+                      "released; kernel 68d243e908c0; options: trace", self.out)
+        self.assertIn("progress: cycle 2/2: entering the sleep, rtcwake -m mem -s 30; console loglevel 8; up ",
+                      "\n".join(self.progress_lines()))
+
+    def test_trace_live_also_keeps_the_consoles_on_for_each_sleep_alone(self):
+        result = self.run_test("ro", "2", "trace=live", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertEqual(self.read("knobs-at-sleep"),
+                         "pm_test=[none] core processors platform devices freezer printk=8 4 1 7 "
+                         "console_suspend=N\n" * 2)
+        self.assertEqual((self.root / "sys/module/printk/parameters/console_suspend").read_text(), "Y")
+        self.assertEqual((self.root / "proc/sys/kernel/printk").read_text(), "5 4 1 7\n")
+        self.assertIn("cycle 1/2: for this sleep: console loglevel 8, console_suspend N",
+                      (self.ramdir() / "log").read_text())
+        self.assertIn("trace=live: console_suspend N for each sleep (Y otherwise)", self.out)
+        self.assertIn("options: trace=live", self.out)
+
+    def test_all_three_options_are_named_in_the_header_pmsg_and_result(self):
+        (self.root / "dev/pmsg0").write_text("")
+        self.pci_tree()
+        result = self.run_test("ro", "1", "pci=remove", "pm_test=core", "trace=live", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        options = "options: pci=remove pm_test=core trace=live"
+        self.assertEqual(self.read("knobs-at-sleep"), "pm_test=core printk=8 4 1 7 console_suspend=N\n")
+        self.assertIn(f"SLEEP-TEST RESULT: PM-TEST core: 1 of 1 cycles went as far as pm_test=core and came back with "
+                      f"the UFS readable; no SoC sleep call, so no depth was tested; floor released; kernel 68d243e908c0; "
+                      f"{options}", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertEqual((logs / "before").read_text().splitlines()[0].split("; ")[-1], options)
+        self.assertIn(f"; {options}; ", self.progress_lines()[0])
+        self.assertTrue(self.progress_lines()[-1].startswith(
+            "progress: cycle 1/1: entering the sleep, rtcwake -m mem -s 30; pm_test core, console loglevel 8, "
+            "console_suspend N; up "), self.progress_lines())
+
+    def test_progress_lines_reach_pmsg_before_each_sleep(self):
+        """A run that never comes back from a sleep leaves in pmsg its start
+        with its options, the protection and the sleep it entered: each
+        sleep (each attempt) finds its own line the last one there."""
+        (self.root / "proc/interrupts").write_text(INTERRUPTS)
+        (self.root / "dev/pmsg0").write_text("")
+        self.touch_abort(1)
+        result = self.run_test("ro", "2", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        progress = self.progress_lines()
+        self.assertEqual(progress, [
+            "progress: start: ro, 2 cycles of 30s, aborts=5, hold=0s; options: none; floor released; kernel "
+            "68d243e908c0; up 600.25s",
+            "progress: protected: frozen: /media/stick /; /dev/sda read-only; from here the run ends with a restart",
+            "progress: cycle 1/2: entering the sleep, rtcwake -m mem -s 30; no pm_test, no trace; up 600.25s",
+            "progress: cycle 1/2: entering the sleep, rtcwake -m mem -s 30, attempt 2; no pm_test, no trace; up "
+            "600.25s",
+            "progress: cycle 2/2: entering the sleep, rtcwake -m mem -s 30; no pm_test, no trace; up 600.25s"])
+        # The first two lines in pmsg; each sleep's own the last when it began.
+        self.assertEqual(self.pmsg_lines(progress=True)[:2], progress[:2])
+        prefix = f"gts9u sleep-test: {self.ramdir().name} "
+        self.assertEqual([line[len(prefix):] for line in self.read("pmsg-at-sleep").splitlines()], progress[2:])
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles resumed with the UFS readable, 2 of them deep; 1 attempt "
+                      "aborted before the sleep (IRQ 199 (fts1ba90a, the touchscreen) once) and tried again; floor "
+                      "released; kernel 68d243e908c0; options: none", self.out)
+        # Each cut at 280 characters past "progress: "; the result file and
+        # the kernel log have none of them.
+        for line in (self.root / "dev/pmsg0").read_text().splitlines():
+            if line.startswith(prefix + "progress: "):
+                self.assertLessEqual(len(line), len(prefix + "progress: ") + 280, line)
+        self.assertIn("%.280s", re.search(r"^progress\(\) \{\n.*?^\}\n", self.script("sleep-test.sh"),
+                                          re.M | re.S).group(0))
+        self.assertNotIn("progress:", (self.ramdir() / "result").read_text())
+        self.assertNotIn("progress:", (self.root / "dev/kmsg").read_text())
+
+    def test_the_options_a_kernel_cannot_serve_are_refused_with_nothing_changed(self):
+        # (option, what the message says with ROOT for the fake root, the
+        # file under it, and what is done to that file).
+        cases = (
+            ("pm_test=freezer", "pm_test=freezer: this kernel does not offer that level (ROOT/sys/power/pm_test: "
+             "[none] core processors platform devices)", "sys/power/pm_test",
+             "[none] core processors platform devices\n"),
+            ("pm_test=platform", "pm_test=platform: no ROOT/sys/power/pm_test (a kernel without CONFIG_PM_DEBUG)",
+             "sys/power/pm_test", None),
+            ("trace", "trace: ROOT/sys/power/pm_print_times is 1: its two lines per device callback, thousands per "
+             "sleep, would go through the consoles at 0.1 to 0.25 s each with interrupts off",
+             "sys/power/pm_print_times", "1\n"),
+            ("trace=live", "trace=live: no ROOT/sys/power/pm_debug_messages (a kernel without "
+             "CONFIG_PM_SLEEP_DEBUG)", "sys/power/pm_debug_messages", None),
+            ("trace", "trace: cannot read the console loglevel in ROOT/proc/sys/kernel/printk",
+             "proc/sys/kernel/printk", "x\n"),
+            ("trace=live", "trace=live: cannot read ROOT/sys/module/printk/parameters/console_suspend",
+             "sys/module/printk/parameters/console_suspend", None),
+        )
+        for option, message, path, content in cases:
+            with self.subTest(message):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                if content is None:
+                    (self.root / path).unlink()
+                else:
+                    (self.root / path).write_text(content)
+                result = self.run_test("ro", "1", option, "restart-ok")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("REFUSED: " + message.replace("ROOT/", f"{self.root}/"), self.out)
+                self.assertIn("nothing was changed", self.out)
+                self.assert_nothing_done()
+
+    def test_the_options_are_parsed_strictly(self):
+        for bad in ("pm_test=deep", "pm_test=", "pm_test=core pm_test=core", "pm_test=core pm_test=platform",
+                    "trace trace", "trace trace=live", "trace=on", "pci=keep", "pci=", "dry pm_test=platform",
+                    "dry trace", "dry trace=live"):
+            with self.subTest(bad):
+                result = self.run_test(*bad.split(), "restart-ok")
+                self.assertEqual(result.returncode, 2, self.out)
+                self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] restart-ok", result.stderr)
+                self.assertIn("[pci=remove] [pm_test=LEVEL] [trace|trace=live] restart-ok", result.stderr)
+                self.assert_nothing_done()
     """The RAM root of sleep-test.sh, made by its own functions from this
     host's real tools (dash, grep, mawk, and Rust coreutils, which refuse to
     run under a loader started by hand), entered by its own in_ram_root in a
