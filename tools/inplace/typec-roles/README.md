@@ -86,11 +86,14 @@ The data role fault has not been seen on it.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
   the DTB, which did not change. `install.sh` checks that it still holds the
   hang-log kit's image.
-- **The module tree** comes from this build and is signed with its own key,
-  which is archived in the key registry. The patches add fields to
-  `tcpc_dev` and `tcpm_port`, and the kernel has no `MODVERSIONS`; a new key
-  is what marks a module of another build. **The kernel is locked down and
-  refuses a module signed with another build's key** (`Lockdown: ...
+- **The module tree** comes from this build and is signed with the key of
+  its build directory, which is archived in the key registry. The hang-log
+  kit has another key; revisions 2 to 7 of this kit were built in one
+  directory and share theirs. The patches add fields to `tcpc_dev` and
+  `tcpm_port`, and the kernel has no `MODVERSIONS`; a new key is what marks
+  a module of another build, and between two revisions with the same key
+  nothing does. **The kernel is locked down and refuses a module signed
+  with another build's key** (`Lockdown: ...
   unsigned module loading is restricted` in the kernel log). A kernel with
   the other build's module tree still has what is built in (storage, the
   display, USB with the gadget network, Wi-Fi, Bluetooth) but not what is
@@ -136,8 +139,10 @@ detail):
   behind a message of the partner's is answered once its swap has run, no
   longer before it is sent;
 - the USB power domains now stay in retention while the tablet sleeps. What
-  that costs in sleep and idle, and whether the USB host survives a real
-  sleep with it, has not been measured on this tablet.
+  that costs in sleep and idle has not been measured on this tablet. The
+  USB host came through one real sleep with it (2026-11-21, 30 s, on a
+  powered dock, devices not enumerated again); **the storage did not**, see
+  the checks below.
 
 ## Build (host)
 
@@ -342,5 +347,12 @@ again, up to three per attach; the verdict is still the roles.
 6. Suspend and resume with the dock attached, then with the charger: does
    the dock come back afterwards? Battery drain over a night of sleep,
    against the hang-log kernel, is the check for what retention costs.
+   **Not on the SM-X710 for now.** Its suspend is masked, and the one real
+   sleep on revision 7 (`sudo rtcwake -m mem -s 30`, 2026-11-21, on a
+   powered dock) ended with the dock's devices still there and the UFS PHY
+   not coming back (`phy initialization timed-out`): the root filesystem
+   went read-only and the tablet had to be restarted through sysrq. Until
+   that is fixed a sleep test costs a forced restart. After such a failure
+   `verify.sh` reports `root is not writable`.
 7. Bluetooth, Wi-Fi, audio and the rear camera at a known size: the kernel was
    rebuilt, and nothing else in it changed.

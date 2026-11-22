@@ -1005,6 +1005,22 @@ class InstallTest(FakeTablet):
                 self.assertEqual(self.tree()["updates/b.ko"], "hang updates/b.ko\n")
                 self.assertFalse((self.root / BACKUP).exists())
 
+    def test_a_root_that_ext4_gave_up_on_is_refused(self):
+        # ext4 keeps "rw" among the options and adds one of these.
+        for options in ("rw,noatime,emergency_ro", "rw,relatime,shutdown"):
+            with self.subTest(options):
+                FakeTablet.setUp(self)
+                (self.root / "mount-options").write_text(options + "\n")
+                before = self.state()
+                result = self.run_script("install.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("the root filesystem is not writable", result.stdout)
+                self.assertEqual(self.state(), before)
+                self.assertFalse((self.root / BACKUP).exists())
+        FakeTablet.setUp(self)
+        (self.root / "mount-options").write_text("rw,noatime,errors=remount-ro\n")
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+
     def test_vendor_boot_from_another_kit_is_refused(self):
         self.part("vendor_boot").write_bytes(os.urandom(SIZE))
         result = self.run_script("install.sh")
@@ -2512,6 +2528,25 @@ class VerifyTest(FakeTablet):
         self.assertEqual(result.returncode, 1)
         self.assertIn(f"FAIL build ID {HANG_BUILD_ID}", result.stdout)
         self.assertIn("FAIL sm5714_usbpd.sink_host_swap is missing", result.stdout)
+
+    def test_a_root_that_ext4_gave_up_on_is_not_writable(self):
+        # 2026-11-21: UFS did not come back from a sleep, ext4 aborted its
+        # journal, and the root stayed "rw,noatime,emergency_ro".
+        self.boot_kit()
+        for options, passes in (("rw,noatime", True), ("rw,noatime,emergency_ro", False),
+                                ("rw,relatime,shutdown", False), ("ro,relatime", False),
+                                ("rw,noatime,errors=remount-ro", True)):
+            with self.subTest(options):
+                (self.root / "mount-options").write_text(options + "\n")
+                result = self.run_script("verify.sh")
+                if passes:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("ok   root is rw", result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(f"FAIL root is not writable (mounted {options})", result.stdout)
+                    self.assertNotIn("ok   root is rw", result.stdout)
+                    self.assertNotIn("all checks passed", result.stdout)
 
 
 class ScriptsTest(unittest.TestCase):

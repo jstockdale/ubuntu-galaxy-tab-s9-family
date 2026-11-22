@@ -205,7 +205,12 @@ if [ "$upgrade" = 1 ]; then
 fi
 rm -f /run/gts9u-typec-roles.kit-modules /run/gts9u-typec-roles.installed-modules \
 	/run/gts9u-typec-roles.saved-modules
-findmnt -no OPTIONS / | tr ',' '\n' | grep -qx rw || die 'the root filesystem is not writable'
+# ext4 that gave up on a failing disk keeps "rw" among its options and adds
+# emergency_ro or shutdown.
+root_opts=$(findmnt -no OPTIONS /)
+echo "$root_opts" | tr ',' '\n' | grep -qx rw &&
+	! echo "$root_opts" | tr ',' '\n' | grep -qxE 'emergency_ro|shutdown' ||
+	die 'the root filesystem is not writable'
 cap=$(cat /sys/class/power_supply/*battery*/capacity 2>/dev/null | head -1)
 [ "${cap:-0}" -ge 30 ] || die "battery at ${cap:-unknown} %; charge to 30 % first"
 fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1 && die 'dpkg is busy; try again when it is done'
