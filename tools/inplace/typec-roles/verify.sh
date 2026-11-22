@@ -366,7 +366,12 @@ id=$(build_id)
 want=$(cat "$kit/BUILD_ID" 2>/dev/null)
 [ -n "$want" ] && [ "$id" = "$want" ] && ok "running the kit's kernel (build ID $(echo "$id" | cut -c1-12))" ||
 	bad "build ID $id, the kit's is ${want:-unknown}"
-findmnt -no OPTIONS / | tr ',' '\n' | grep -qx rw && ok 'root is rw' || bad 'root is not rw'
+# ext4 that gave up on a failing disk keeps "rw" among its options and adds
+# emergency_ro or shutdown: that root takes no write.
+root_opts=$(findmnt -no OPTIONS /)
+echo "$root_opts" | tr ',' '\n' | grep -qx rw &&
+	! echo "$root_opts" | tr ',' '\n' | grep -qxE 'emergency_ro|shutdown' &&
+	ok 'root is rw' || bad "root is not writable (mounted ${root_opts:-unknown})"
 
 k=$(journalctl -k -b --no-pager -q 2>/dev/null)
 # Four checks below read this boot's kernel log; without it none can pass.

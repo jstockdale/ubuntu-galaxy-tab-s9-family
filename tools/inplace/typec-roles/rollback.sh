@@ -1,7 +1,9 @@
 #!/bin/sh
 # Undo ~/typec-roles/install.sh: back to the hang-log kit's boot and module
-# tree (vendor_boot was never changed).  Run it before the hang-log kit's own
-# rollback.sh.
+# tree (vendor_boot was never changed).  Also after any number of upgrades
+# from one revision of the kit to the next, the last one finished or not:
+# what the first install saved is the way back, and an upgrade leaves it as
+# it was.  Run it before the hang-log kit's own rollback.sh.
 #   sudo sh ~/typec-roles/rollback.sh      then reboot
 set -eu
 export LC_ALL=C
@@ -55,8 +57,13 @@ trap '[ "$finished" = 1 ] || say "STOP: rollback ended early; $early"' EXIT
 # The kernel and its module tree first: the hang-log kernel refuses the kit's
 # modules.  The rest can be finished by a second run.
 restore_part boot "$backup/boot-hang-log.img" "$hang_boot"
+# What an install or upgrade that stopped can leave next to the tree: the new
+# tree unpacked, also by an install that stopped before it moved the hang-log
+# tree aside, and the earlier tree an upgrade set aside.  Neither is the way
+# back.
+rm -rf -- "/usr/lib/modules/.typec-roles-$release" "/usr/lib/modules/.typec-roles-old-$release"
 if [ -d "$backup/modules-$release" ]; then
-	rm -rf -- "/usr/lib/modules/.typec-roles-$release" "$modules"
+	rm -rf -- "$modules"
 	mv "$backup/modules-$release" "$modules" || die 'restoring the hang-log module tree failed'
 	# The tree comes back with its own modules.dep; this refreshes it.
 	depmod -a "$release" || die 'depmod failed'

@@ -4,12 +4,16 @@ against a fake root.
 install.sh and rollback.sh normally run as root on the SM-X710 and write the
 boot partition; verify.sh reads the Type-C port and the TCPM log.  Here every
 absolute path they touch is moved under a temporary directory, the partition
-size and the pinned hang-log image identities are replaced by those of small
-stand-in images, and id, uname, flock, findmnt, fuser, dpkg, depmod, blockdev,
-systemctl, journalctl, modinfo, dmesg, sleep and sync are stubbed, and for
-verify.sh cat as well: the TCPM log it reads is emptied by each read and holds
-1023 lines, as the kernel's does.  The sync stub records what a power failure
-right after each call would find.
+size and the pinned image identities (the hang-log kit's, and revision 7 of
+the kit's) are replaced by those of small stand-in images, and id, uname,
+flock, findmnt, fuser, dpkg, depmod, blockdev, systemctl, journalctl, modinfo,
+dmesg, sleep and sync are stubbed, and for verify.sh cat as well: the TCPM log
+it reads is emptied by each read and holds 1023 lines, as the kernel's does.
+findmnt reports a read-only root, fuser a busy dpkg and depmod a failure on
+request, and the sync stub records what a power failure right after each
+call would find, and fails on request.  For the tests of a run stopped
+anywhere, the commands that change the disk are wrapped so that a run can be
+killed, or see the command fail, before any one of them.
 make-kit.sh needs a kernel build and is only checked for syntax, for pinning
 the same identities as the tablet scripts, for what its comparison of two
 kernel source trees leaves out, for the strings it looks for in the image,
@@ -39,6 +43,41 @@ SIZE = 4 * 1024 * 1024
 BACKUP = "var/backups/ubuntu-gts9u-typec-roles"
 HANG_BUILD_ID = "68d243e908c0edfddc10429ede4bb235f205e44c"
 NEW_BUILD_ID = "0123456789abcdef0123456789abcdef01234567"
+NEWER_BUILD_ID = "89abcdef0123456789abcdef0123456789abcdef"
+NEWEST_BUILD_ID = "456789abcdef0123456789abcdef0123456789ab"
+# The revisions of the kit before it recorded what it wrote, as install.sh
+# knows them: the sha256 of boot.img and BUILD_ID from each packed kit
+# (~/ubuntu-gts9u/backups/typec-roles-kit*, 2026-11-20 and 21).  Revision 7
+# has been on the SM-X710 since 2026-11-21 22:39.
+EARLIER = (
+    ("45b5e2d884d937b01c784f6cc6ba581aa97734d3bd8a0a0cf385320bab9c68f5",
+     "65ce39dc68d2e85591e088300f6b0ccf81f5b243", "r1"),
+    ("3c483cf09959aec58213c0ad0d38466e78e5312a362183316e80f4ddc46780a9",
+     "7a614f2582c59b33e37632ef82a16ade7510aa6f", "r2"),
+    ("743c7f7cf859c3e155720e340b8ba39dcbeeb80d8bdf1b6be9c353867c3e1604",
+     "4ad9cb230f76092db3dbcc8291ae38367bfe2b4e", "r3"),
+    ("5794ceefd658b9f41d1adfbbaa4b45acb4e64c616f6e76acb2bce5805547e31f",
+     "6479859ed5e3c2c5d7cc43c085d2141e14b4fd2a", "r4,r5"),
+    ("e11e4e09668cd509b6b848ddcc32f0a7bf74cdfcb3da496caf8617f2e7b4e354",
+     "326b061707e9bd906d1e5eb4bc8ea158e19f42bb", "r6"),
+    ("613c0c12817c3286c4b927539245e41882c7729ec2b712e1eb1e77ae59d3a9d2",
+     "84c2748b5ee4b283b56a77579b0b0758f88117e1", "r7"),
+)
+R7_BOOT, R7_BUILD_ID, _ = EARLIER[-1]
+# What the tests' revision 7 runs: a stand-in for its kernel.
+R7_STANDIN_ID = "7" * 40
+# Revision 7's install.sh (93030d5, packed from 109c079), and the one of
+# revisions 5 and 6 (f00f2b3): their sha256 in the packed kits' SHA256SUMS,
+# and their git blobs.
+OLD_INSTALLS = (
+    ("r7", "0805fb25ba81b7f183d1c123f943404505e772e132869fa064a2b4c495b465e1",
+     "609bc42dde980ee4c819c51dbd89f6944b3d8295"),
+    ("r5 and r6", "f8315affbce49434f25bee951120ccf93d726b04f03707ba086583d24eee84cd",
+     "7dee403a7f1b67e1f5e91ec8c3c9af9d35c077c6"),
+)
+# The rollback.sh of revisions 5 to 7, the same way.
+OLD_ROLLBACK = ("116604b91498bc37a8f16043c83ecca9dd47a329c3c4bb67013090f2dcd62d4a",
+                "720de2324ffbfcec804b8693f1f9254de2be3a10")
 KEY_ID = "aa" * 20
 SIGNER = ":".join(["5A"] * 20)
 MODULES = ("modules.dep", "kernel/net/a.ko", "updates/b.ko")
@@ -58,10 +97,10 @@ STUBS = {
     "id": 'echo 0',
     "uname": 'case $1 in -r) echo %s ;; *) echo "#1 SMP PREEMPT test" ;; esac' % RELEASE,
     "flock": 'exit 0',
-    "findmnt": 'echo rw,relatime',
-    "fuser": 'exit 1',
+    "findmnt": 'cat "$FAKE_ROOT/mount-options" 2>/dev/null || echo rw,relatime',
+    "fuser": '[ -e "$FAKE_ROOT/dpkg-busy" ]',
     "dpkg": 'exit 0',
-    "depmod": 'exit 0',
+    "depmod": '[ ! -e "$FAKE_ROOT/depmod-fails" ]',
     "blockdev": 'exit 0',
     "systemctl": 'exit 3',
     "sleep": 'exec /usr/bin/sleep 0.01',
@@ -70,14 +109,38 @@ STUBS = {
     "modinfo": 'case $1 in -n) echo /fake/netconsole.ko ;; -F) cat "$FAKE_ROOT/signer" ;; esac',
     # What a power failure right after this call would find: is the hang-log
     # image saved, whose module tree is in place, what boot holds, is an
-    # install complete.  The call fails if a file named after its number asks.
+    # install complete, is an upgrade under way, and the boot image of the
+    # record's last line.  The call fails if a file named after its number
+    # asks.
     "sync": '''b=$FAKE_ROOT/%s
 echo "saved=$([ -s "$b/boot-hang-log.img" ] && echo yes || echo no)" \\
 	"tree=$(cut -d' ' -f1 "$FAKE_ROOT/usr/lib/modules/%s/modules.dep" 2>/dev/null)" \\
 	"boot=$(sha256sum < "$FAKE_ROOT/dev/disk/by-partlabel/boot" | cut -c1-64)" \\
-	"complete=$([ -e "$b/complete" ] && echo yes || echo no)" >> "$FAKE_ROOT/sync.calls"
+	"complete=$([ -e "$b/complete" ] && echo yes || echo no)" \\
+	"upgrading=$([ -e "$b/upgrading" ] && echo yes || echo no)" \\
+	"recorded=$(tail -n 1 "$b/revisions" 2>/dev/null | cut -d' ' -f1 | grep . || echo none)" \\
+	>> "$FAKE_ROOT/sync.calls"
 [ ! -e "$FAKE_ROOT/sync-fails-$(wc -l < "$FAKE_ROOT/sync.calls")" ]''' % (BACKUP, RELEASE),
 }
+# The commands with which install.sh and rollback.sh change the disk, and dd,
+# which also reads the partitions.  Wrapped, each call is a step: a run can be
+# stopped before any one of them, killed as a power cut would stop it, or with
+# that command failing.
+STEP_COMMANDS = ("mkdir", "chmod", "rm", "tar", "mv", "cp", "touch", "dd", "depmod", "sync",
+                 "blockdev")
+STEP_WRAPPER = '''#!/bin/sh
+n=0 stop=
+[ ! -e "$FAKE_ROOT/steps" ] || read -r n < "$FAKE_ROOT/steps"
+n=$((n + 1))
+echo "$n" > "$FAKE_ROOT/steps"
+echo "$n %(name)s $*" >> "$FAKE_ROOT/steps.log"
+[ ! -e "$FAKE_ROOT/stop" ] || read -r stop < "$FAKE_ROOT/stop"
+case $stop in
+"kill $n") kill -KILL "$STEPPED_SCRIPT"; exit 137 ;;
+"fail $n") exit 1 ;;
+esac
+exec %(real)s "$@"
+'''
 # The xHCI driver's other ways of saying that the controller is gone, and the
 # locked-down kernel refusing a module of another build.
 USB_HOST_ERRORS = (
@@ -424,6 +487,13 @@ def pinned(script, name):
     return re.search(rf"^{name}=([0-9a-f]+)$", (KIT_SRC / script).read_text(), re.M).group(1)
 
 
+def earlier_revisions():
+    """install.sh's table of the revisions that recorded nothing."""
+    text = (KIT_SRC / "install.sh").read_text()
+    block = re.search(r"^earlier='(.*?)'$", text, re.M | re.S).group(1)
+    return tuple(tuple(line.split()) for line in block.splitlines())
+
+
 def kernel_source():
     """The pinned kernel checkout, as tests/test_typec_dock_roles.py finds it."""
     base = os.environ.get("UBUNTU_WORKDIR", str(pathlib.Path.home() / "ubuntu-gts9u"))
@@ -477,6 +547,12 @@ class FakeTablet(unittest.TestCase):
         self.modules = self.root / "usr/lib/modules" / RELEASE
         for name in ("modules.dep", "kernel/net/a.ko", "updates/b.ko"):
             (self.modules / name).write_text(f"hang {name}\n")
+        # What revision 7 of the kit wrote to boot; no test tablet holds it
+        # unless a test says so.  The scripts see the stand-ins in place of
+        # the pinned identities.
+        self.r7_boot = os.urandom(SIZE)
+        self.standins = {R7_BOOT: sha(self.r7_boot), R7_BUILD_ID: R7_STANDIN_ID}
+        self.stepped = False
         # The kit, as make-kit.sh lays it out.
         self.new_boot = os.urandom(SIZE)
         self.kit.mkdir()
@@ -532,6 +608,12 @@ class FakeTablet(unittest.TestCase):
         text = text.replace(" iflag=direct", "")
         text = text.replace(pinned("install.sh", "hang_boot"), sha(self.hang_boot))
         text = text.replace(pinned("install.sh", "hang_vendor_boot"), sha(self.hang_vendor_boot))
+        for real, standin in self.standins.items():
+            text = text.replace(real, standin)
+        if self.stepped:
+            # The wrapped commands stop the script by its process ID.
+            text = text.replace("\nset -eu\n", "\nset -eu\nSTEPPED_SCRIPT=$$; export STEPPED_SCRIPT\n", 1)
+            self.assertIn("STEPPED_SCRIPT", text)
         # The script finds its kit by its own location.
         self.assertIn('kit=$(cd "$(dirname "$0")" && pwd)', text) if name != "rollback.sh" else None
         return text.replace('kit=$(cd "$(dirname "$0")" && pwd)', f"kit={self.kit}")
@@ -544,9 +626,131 @@ class FakeTablet(unittest.TestCase):
         return subprocess.run(["sh", str(path), *args], env=env, capture_output=True, text=True,
                               timeout=120, **popen)
 
-    def tree(self):
-        return {str(p.relative_to(self.modules)): p.read_text()
-                for p in self.modules.rglob("*") if p.is_file()}
+    def tree(self, path=None):
+        path = path or self.modules
+        return {str(p.relative_to(path)): p.read_text() for p in path.rglob("*") if p.is_file()}
+
+    def install_log(self):
+        return (self.root / "var/log/gts9u-typec-roles.log").read_text()
+
+    def state(self):
+        """What the scripts can change: the partitions, the module trees, the
+        backups and the saved boot set, by path: a file's content, a
+        directory's mode (the scripts set none of a file's).  A retired
+        backup's time stamp is left out."""
+        found = {}
+        for top in ("dev/disk/by-partlabel", "usr/lib/modules", "var/backups", "var/lib"):
+            for p in sorted((self.root / top).rglob("*")):
+                name = re.sub(r"\.(rolled-back|unfinished)-[0-9]{8}-[0-9]{6}", r".\1-TIME",
+                              str(p.relative_to(self.root)))
+                found[name] = sha(p.read_bytes()) if p.is_file() else oct(p.stat().st_mode & 0o7777)
+        return found
+
+    def saved_set(self, boot):
+        """A saved Ubuntu boot set (dual boot) whose boot.img is BOOT."""
+        saved = self.root / "var/lib/gts9u-boot-sets/ubuntu"
+        saved.mkdir(parents=True)
+        (saved / "boot.img").write_bytes(boot)
+        return saved
+
+    def step_commands(self):
+        """Wrap the commands that change the disk (STEP_COMMANDS): each call
+        is counted, and the call that "stop" names kills the script or fails."""
+        path = os.environ["PATH"]
+        for name in STEP_COMMANDS:
+            stub = self.bin / name
+            if stub.exists():
+                real = self.bin / f".real-{name}"
+                stub.rename(real)
+            else:
+                real = shutil.which(name, path=path)
+                self.assertIsNotNone(real, name)
+            stub.write_text(STEP_WRAPPER % {"name": name, "real": shlex.quote(str(real))})
+            stub.chmod(0o755)
+        self.stepped = True
+
+    def steps(self):
+        """The steps of the runs since the last call: (command, arguments)."""
+        log = self.root / "steps.log"
+        lines = log.read_text().splitlines() if log.exists() else []
+        log.unlink(missing_ok=True)
+        (self.root / "steps").unlink(missing_ok=True)
+        found = []
+        for line in lines:
+            _, command, *arguments = line.split(" ", 2)
+            found.append((command, arguments[0] if arguments else ""))
+        return found
+
+    def run_stopped(self, name, how, number):
+        """Run the script NAME stopped at its step NUMBER: killed before it
+        (how = "kill"), as a power cut or a kill would stop it, or with the
+        command of that step failing (how = "fail")."""
+        self.steps()
+        (self.root / "stop").write_text(f"{how} {number}\n")
+        try:
+            return self.run_script(name)
+        finally:
+            (self.root / "stop").unlink()
+            self.steps()
+
+    def install_r7(self, boot=None, build_id=R7_STANDIN_ID):
+        """Revision 7 of the kit as its own install.sh left the SM-X710 on
+        2026-11-21, and revisions 1 to 6 theirs: boot and the hang-log module
+        tree saved in the backup (root-only), and the saved set's image too
+        if there is a set; the kit's module tree in place, its image on boot,
+        the set's image replaced by it, and "complete".  No record.  Then its
+        kernel booted.  ScriptsTest checks this against revision 7's own
+        install.sh."""
+        boot = self.r7_boot if boot is None else boot
+        self.backup = self.root / BACKUP
+        self.backup.mkdir()
+        self.backup.chmod(0o700)
+        (self.backup / "boot-hang-log.img").write_bytes(self.part("boot").read_bytes())
+        self.modules.rename(self.backup / f"modules-{RELEASE}")
+        for name in MODULES:
+            (self.modules / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.modules / name).write_text(f"r7 {name}\n")
+        self.part("boot").write_bytes(boot)
+        saved = self.root / "var/lib/gts9u-boot-sets/ubuntu/boot.img"
+        if saved.exists():
+            (self.backup / "saved-set-boot.img").write_bytes(saved.read_bytes())
+            saved.write_bytes(boot)
+        (self.backup / "complete").touch()
+        self.running(build_id)
+
+    def r7_kit(self):
+        """The kit directory as revision 7's packed kit, with stand-ins for
+        its kernel and modules, and its own install.sh (OLD_INSTALLS)."""
+        (self.kit / "boot.img").write_bytes(self.r7_boot)
+        (self.kit / f"modules-{RELEASE}.tar").write_bytes(modules_tar("r7"))
+        (self.kit / "BUILD_ID").write_text(R7_STANDIN_ID + "\n")
+        self.seal()
+
+    def newer_kit(self, marker="newer", build_id=NEWER_BUILD_ID):
+        """The kit's next revision in the same place: another kernel and
+        another module tree, with the same list of modules."""
+        boot = os.urandom(SIZE)
+        (self.kit / "boot.img").write_bytes(boot)
+        (self.kit / f"modules-{RELEASE}.tar").write_bytes(modules_tar(marker))
+        (self.kit / "BUILD_ID").write_text(build_id + "\n")
+        self.seal()
+        return boot
+
+    def boot_kit_kernel(self, build_id):
+        """A boot of the kernel BUILD_ID with the kit's module key, the
+        hang-log kit's configuration and ramoops, and the switches as built."""
+        self.running(build_id)
+        params = self.root / "sys/module/sm5714_usbpd/parameters"
+        (params / "sink_host_swap").write_text("Y\n")
+        (params / "try_snk_extra_wait_ms").write_text("600\n")
+        (self.root / "journal").write_text(
+            f"kernel: Loaded X.509 cert 'Build time autogenerated kernel key: {KEY_ID}'\n"
+            "kernel: ramoops: using 0x200000@0x880900000, ecc: 96\n")
+        (self.root / "signer").write_text(SIGNER + "\n")
+        with gzip.open(self.root / "proc/config.gz", "wt") as config:
+            config.write("CONFIG_DETECT_HUNG_TASK=y\nCONFIG_SOFTLOCKUP_DETECTOR=y\n"
+                         "CONFIG_WQ_WATCHDOG=y\nCONFIG_NETCONSOLE=m\nCONFIG_PSTORE_RAM=y\n"
+                         "CONFIG_PSTORE_FTRACE=y\n")
 
 
 class InstallTest(FakeTablet):
@@ -569,7 +773,17 @@ class InstallTest(FakeTablet):
         self.assertEqual((backup / f"modules-{RELEASE}/updates/b.ko").read_text(), "hang updates/b.ko\n")
         self.assertTrue((backup / "complete").exists())
         self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
-        self.assertFalse((self.root / "usr/lib/modules" / f".typec-roles-{RELEASE}").exists())
+        self.assertEqual([p.name for p in (self.root / "usr/lib/modules").iterdir()], [RELEASE])
+        self.assertNotIn("STOP", self.install_log())
+
+    def test_install_records_what_it_writes(self):
+        """For the next revision's install.sh: the boot image and the kernel,
+        on the disk before boot is written (the sync test below)."""
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        backup = self.root / BACKUP
+        self.assertEqual((backup / "revisions").read_text(), f"{sha(self.new_boot)} {NEW_BUILD_ID}\n")
+        self.assertEqual(sorted(p.name for p in backup.iterdir()),
+                         ["boot-hang-log.img", "complete", f"modules-{RELEASE}", "revisions"])
 
     def test_rollback_restores_the_hang_log_kit_and_install_runs_again(self):
         self.assertEqual(self.run_script("install.sh").returncode, 0)
@@ -585,20 +799,17 @@ class InstallTest(FakeTablet):
         self.assertEqual(self.run_script("install.sh").returncode, 0)
         self.assertEqual(self.part("boot").read_bytes(), self.new_boot)
 
-    def test_second_install_is_refused(self):
+    def test_the_same_revision_again_changes_nothing_and_says_so(self):
         self.assertEqual(self.run_script("install.sh").returncode, 0)
+        before = self.state()
         result = self.run_script("install.sh")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("already installed", result.stdout)
+        self.assertIn(f"STOP: this revision of the Type-C roles kit is already installed "
+                      f"({self.root / BACKUP}); nothing was changed", result.stdout)
+        self.assertNotIn("ended early", result.stdout)
+        self.assertEqual(self.state(), before)
         self.assertEqual(self.part("boot").read_bytes(), self.new_boot)
         self.assertEqual(self.tree()["updates/b.ko"], "new updates/b.ko\n")
-
-    def saved_set(self, boot):
-        """A saved Ubuntu boot set (dual boot) whose boot.img is BOOT."""
-        saved = self.root / "var/lib/gts9u-boot-sets/ubuntu"
-        saved.mkdir(parents=True)
-        (saved / "boot.img").write_bytes(boot)
-        return saved
 
     def test_saved_boot_set_follows_install_and_rollback(self):
         # Not the hang-log kit's image: what goes back is what the set held.
@@ -672,10 +883,12 @@ class InstallTest(FakeTablet):
         result = self.run_script("install.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         hang, new = sha(self.hang_boot), sha(self.new_boot)
+        first = {"saved": "yes", "upgrading": "no"}
         self.assertEqual(self.syncs(), [
-            {"saved": "yes", "tree": "hang", "boot": hang, "complete": "no"},
-            {"saved": "yes", "tree": "new", "boot": hang, "complete": "no"},
-            {"saved": "yes", "tree": "new", "boot": new, "complete": "yes"},
+            {**first, "tree": "hang", "boot": hang, "complete": "no", "recorded": "none"},
+            # The record of what is written comes before the flash.
+            {**first, "tree": "new", "boot": hang, "complete": "no", "recorded": new},
+            {**first, "tree": "new", "boot": new, "complete": "yes", "recorded": new},
         ])
         # What the locked-down kernel means until the reboot and afterwards.
         self.assertIn("until the reboot the running kernel can load no module it has not loaded "
@@ -720,11 +933,11 @@ class InstallTest(FakeTablet):
         self.syncs()
         result = self.run_script("rollback.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        hang_log = {"tree": "hang", "boot": sha(self.hang_boot)}
+        hang_log = {"tree": "hang", "boot": sha(self.hang_boot), "upgrading": "no"}
         self.assertEqual(self.syncs(), [
             # The backup is still where a second run would look for it.
-            {**hang_log, "saved": "yes", "complete": "yes"},
-            {**hang_log, "saved": "no", "complete": "no"},
+            {**hang_log, "saved": "yes", "complete": "yes", "recorded": sha(self.new_boot)},
+            {**hang_log, "saved": "no", "complete": "no", "recorded": "none"},
         ])
 
     def test_a_rollback_that_stops_says_so_and_a_second_run_finishes_it(self):
@@ -773,18 +986,40 @@ class InstallTest(FakeTablet):
                 lambda: (self.root / "sys/class/power_supply/sm5714-battery/capacity").write_text("12\n"),
             "this is not an SM-X710":
                 lambda: (self.root / "proc/device-tree/compatible").write_bytes(b"samsung,gts9u\0"),
+            "the root filesystem is not writable":
+                lambda: (self.root / "mount-options").write_text("ro,relatime\n"),
+            "dpkg is busy": lambda: (self.root / "dpkg-busy").touch(),
+            "BUILD_ID in the kit is not a kernel build ID": lambda: (
+                (self.kit / "BUILD_ID").write_text(NEW_BUILD_ID.upper() + "\n"), self.seal()),
         }
         for message, damage in cases.items():
             with self.subTest(message):
                 FakeTablet.setUp(self)
                 damage()
-                boot_before = self.part("boot").read_bytes()
+                before = self.state()
                 result = self.run_script("install.sh")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(message, result.stdout)
-                self.assertEqual(self.part("boot").read_bytes(), boot_before)
+                self.assertNotIn("ended early", result.stdout)
+                self.assertEqual(self.state(), before)
                 self.assertEqual(self.tree()["updates/b.ko"], "hang updates/b.ko\n")
                 self.assertFalse((self.root / BACKUP).exists())
+
+    def test_a_root_that_ext4_gave_up_on_is_refused(self):
+        # ext4 keeps "rw" among the options and adds one of these.
+        for options in ("rw,noatime,emergency_ro", "rw,relatime,shutdown"):
+            with self.subTest(options):
+                FakeTablet.setUp(self)
+                (self.root / "mount-options").write_text(options + "\n")
+                before = self.state()
+                result = self.run_script("install.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("the root filesystem is not writable", result.stdout)
+                self.assertEqual(self.state(), before)
+                self.assertFalse((self.root / BACKUP).exists())
+        FakeTablet.setUp(self)
+        (self.root / "mount-options").write_text("rw,noatime,errors=remount-ro\n")
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
 
     def test_vendor_boot_from_another_kit_is_refused(self):
         self.part("vendor_boot").write_bytes(os.urandom(SIZE))
@@ -830,6 +1065,698 @@ class InstallTest(FakeTablet):
         self.assertEqual(self.tree()["updates/b.ko"], "new updates/b.ko\n")
 
 
+class UpgradeHelpers:
+    """A tablet with an earlier revision of the kit installed: revision 7 as
+    its own install.sh left it, which recorded nothing, or a revision that
+    recorded what it wrote.  The kit directory holds the next revision."""
+
+    def setUp(self):
+        super().setUp()
+        self.backup = self.root / BACKUP
+        # The revision the kit directory holds: its module marker, boot
+        # image and kernel.
+        self.expected = ("new", self.new_boot, NEW_BUILD_ID)
+
+    def install_recorded(self):
+        """A revision that records what it writes (this one, by a first
+        install), installed and booted; the kit directory then holds the
+        next revision."""
+        result = self.run_script("install.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.running(NEW_BUILD_ID)
+        self.newer_boot = self.newer_kit()
+        self.expected = ("newer", self.newer_boot, NEWER_BUILD_ID)
+
+    def assert_installed(self):
+        marker, boot, build_id = self.expected
+        self.assertEqual(self.part("boot").read_bytes(), boot)
+        self.assertEqual(self.part("vendor_boot").read_bytes(), self.hang_vendor_boot)
+        self.assertEqual(self.tree(), {n: f"{marker} {n}\n" for n in MODULES})
+        # The way back is what the first install saved, as it saved it.
+        self.assertEqual((self.backup / "boot-hang-log.img").read_bytes(), self.hang_boot)
+        self.assertEqual(self.tree(self.backup / f"modules-{RELEASE}"),
+                         {n: f"hang {n}\n" for n in MODULES})
+        self.assertEqual(self.backup.stat().st_mode & 0o777, 0o700)
+        self.assertEqual([p.name for p in (self.root / "usr/lib/modules").iterdir()], [RELEASE])
+        self.assertEqual((self.backup / "revisions").read_text().splitlines()[-1],
+                         f"{sha(boot)} {build_id}")
+        self.assertFalse((self.backup / "upgrading").exists())
+        self.assertTrue((self.backup / "complete").exists())
+
+    def assert_upgraded(self, result, found):
+        """RESULT is an upgrade that found FOUND on boot and finished."""
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"upgrade: boot holds {sha(found)[:12]}; the hang-log kit saved in "
+                      f"{self.backup} stays the way back", result.stdout)
+        self.assertIn("until the reboot the module tree in place is built for the new kernel, not "
+                      "for the running one", result.stdout)
+        self.assertNotIn("can load no module", result.stdout)
+        self.assertIn("Type-C roles kit installed; reboot now", result.stdout)
+        self.assert_installed()
+
+    def assert_on_the_hang_log_kit(self):
+        self.assertEqual(self.part("boot").read_bytes(), self.hang_boot)
+        self.assertEqual(self.part("vendor_boot").read_bytes(), self.hang_vendor_boot)
+        self.assertEqual(self.tree(), {n: f"hang {n}\n" for n in MODULES})
+        self.assertEqual([p.name for p in (self.root / "usr/lib/modules").iterdir()], [RELEASE])
+        self.assertFalse(self.backup.exists())
+
+    def assert_rolled_back(self):
+        result = self.run_script("rollback.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("back on the hang-log kit; reboot now", result.stdout)
+        self.assert_on_the_hang_log_kit()
+        self.assertTrue(list((self.root / "var/backups").glob("ubuntu-gts9u-typec-roles.rolled-back-*")))
+
+
+class UpgradeTest(UpgradeHelpers, FakeTablet):
+    """install.sh of a later revision of the kit on a tablet that has an
+    earlier one, and rollback.sh after it."""
+
+    def old_script(self, blob, digest):
+        """An earlier revision's script, from this checkout's git objects."""
+        found = subprocess.run(["git", "-C", str(REPO), "cat-file", "blob", blob],
+                               capture_output=True)
+        if found.returncode != 0:
+            self.skipTest(f"no git object {blob} (an earlier revision's script) here")
+        self.assertEqual(sha(found.stdout), digest)
+        return found.stdout
+
+    def test_revision_7_s_own_install_sh_leaves_what_these_tests_start_from(self):
+        """install_r7() builds what revision 7's install.sh left on the
+        tablet, and revision 5's and 6's: run here, each leaves the same
+        partitions, module trees, backup and saved boot set.  This revision's
+        first install leaves the same and its record."""
+        for name, digest, blob in OLD_INSTALLS:
+            for with_set in (False, True):
+                with self.subTest(name, saved_set=with_set):
+                    self.setUp()
+                    if with_set:
+                        self.saved_set(os.urandom(SIZE))
+                    before = self.tmp / "before"
+                    shutil.copytree(self.root, before)
+                    this_install = (self.kit / "install.sh").read_bytes()
+                    (self.kit / "install.sh").write_bytes(self.old_script(blob, digest))
+                    self.r7_kit()
+                    result = self.run_script("install.sh")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(f"boot written and read back ({sha(self.r7_boot)[:12]})",
+                                  result.stdout)
+                    by_its_install = self.state()
+                    shutil.rmtree(self.root)
+                    shutil.copytree(before, self.root)
+                    self.install_r7()
+                    self.assertEqual(self.state(), by_its_install)
+                    shutil.rmtree(self.root)
+                    shutil.copytree(before, self.root)
+                    (self.kit / "install.sh").write_bytes(this_install)
+                    self.seal()
+                    result = self.run_script("install.sh")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    record = self.backup / "revisions"
+                    self.assertEqual(record.read_text(), f"{sha(self.r7_boot)} {R7_STANDIN_ID}\n")
+                    record.unlink()
+                    self.assertEqual(self.state(), by_its_install)
+
+    def test_revision_7_s_own_rollback_sh_undoes_a_finished_upgrade(self):
+        """Run from the earlier kit's directory by mistake: it knows nothing of
+        upgrades, and a finished one leaves nothing it does not undo."""
+        found = os.urandom(SIZE)
+        saved = self.saved_set(found)
+        self.install_r7()
+        self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+        digest, blob = OLD_ROLLBACK
+        (self.kit / "rollback.sh").write_bytes(self.old_script(blob, digest))
+        self.assert_rolled_back()
+        self.assertEqual((saved / "boot.img").read_bytes(), found)
+
+    def test_revision_7_is_upgraded_in_place(self):
+        """The SM-X710 from 2026-11-21 22:39 on: one command, no rollback."""
+        self.install_r7()
+        self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+        self.assertEqual((self.backup / "revisions").read_text(),
+                         f"{sha(self.new_boot)} {NEW_BUILD_ID}\n")
+        self.assertEqual(sorted(p.name for p in self.backup.iterdir()),
+                         ["boot-hang-log.img", "complete", f"modules-{RELEASE}", "revisions"])
+        self.assertNotIn("STOP", self.install_log())
+        self.assert_rolled_back()
+
+    def test_every_revision_before_the_record_is_known_by_its_boot_image_and_kernel(self):
+        for boot, build_id, name in EARLIER:
+            with self.subTest(name):
+                self.setUp()
+                image, standin = os.urandom(SIZE), "a" * 40
+                self.standins.update({boot: sha(image), build_id: standin})
+                self.install_r7(boot=image, build_id=standin)
+                self.assert_upgraded(self.run_script("install.sh"), image)
+
+    def test_a_revision_that_recorded_what_it_wrote_is_upgraded(self):
+        self.install_recorded()
+        self.assert_upgraded(self.run_script("install.sh"), self.new_boot)
+        self.assertEqual((self.backup / "revisions").read_text(),
+                         f"{sha(self.new_boot)} {NEW_BUILD_ID}\n"
+                         f"{sha(self.newer_boot)} {NEWER_BUILD_ID}\n")
+        self.assert_rolled_back()
+
+    def test_after_any_number_of_upgrades_rollback_restores_the_hang_log_kit(self):
+        found = os.urandom(SIZE)
+        saved = self.saved_set(found)
+        self.install_r7()
+        self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+        self.running(NEW_BUILD_ID)
+        previous = self.new_boot
+        for marker, build_id in (("newer", NEWER_BUILD_ID), ("newest", NEWEST_BUILD_ID)):
+            boot = self.newer_kit(marker, build_id)
+            self.expected = (marker, boot, build_id)
+            self.assert_upgraded(self.run_script("install.sh"), previous)
+            self.assertEqual((saved / "boot.img").read_bytes(), boot)
+            self.assertEqual((self.backup / "saved-set-boot.img").read_bytes(), found)
+            self.running(build_id)
+            previous = boot
+        self.assertEqual(len((self.backup / "revisions").read_text().splitlines()), 3)
+        self.assert_rolled_back()
+        self.assertEqual((saved / "boot.img").read_bytes(), found)
+
+    def test_an_upgrade_runs_on_any_kernel_the_tablet_can_be_running(self):
+        """The hang-log kit's after a restore of boot from TWRP, or before the
+        reboot of a first install; an earlier revision's, before or after the
+        reboot of its install; this one's, after boot was written from TWRP."""
+        for name, build_id in (("the hang-log kit's", HANG_BUILD_ID), ("revision 7's", R7_STANDIN_ID),
+                               ("revision 1's", EARLIER[0][1]), ("this revision's", NEW_BUILD_ID)):
+            with self.subTest(name):
+                self.setUp()
+                self.install_r7(build_id=build_id)
+                self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+
+    def test_a_kernel_anywhere_in_the_record_may_run(self):
+        """Two upgrades without a reboot between them: the second one runs on
+        the kernel of the install before the first, which is not the record's
+        last line."""
+        self.install_recorded()
+        self.assert_upgraded(self.run_script("install.sh"), self.new_boot)
+        boot = self.newer_kit("newest", NEWEST_BUILD_ID)
+        self.expected = ("newest", boot, NEWEST_BUILD_ID)
+        self.assert_upgraded(self.run_script("install.sh"), self.newer_boot)
+
+    def test_an_upgrade_on_a_kernel_of_no_revision_is_refused(self):
+        self.install_r7(build_id="f" * 40)
+        before = self.state()
+        result = self.run_script("install.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"STOP: running kernel build ID {'f' * 40}, neither the hang-log kit's nor a "
+                      "revision of this kit's", result.stdout)
+        self.assertNotIn("ended early", result.stdout)
+        self.assertEqual(self.state(), before)
+
+    def test_the_same_revision_again_changes_nothing_and_says_so(self):
+        """Before the reboot of the upgrade and after it; over revision 7, and
+        over a revision with a record, whose last line is then this one."""
+        for over in ("revision 7", "a revision with a record"):
+            for rebooted in (False, True):
+                with self.subTest(over=over, rebooted=rebooted):
+                    self.setUp()
+                    if over == "revision 7":
+                        self.install_r7()
+                    else:
+                        self.install_recorded()
+                    running = (R7_STANDIN_ID, NEW_BUILD_ID)[over != "revision 7"]
+                    found = self.part("boot").read_bytes()
+                    self.assert_upgraded(self.run_script("install.sh"), found)
+                    self.running(self.expected[2] if rebooted else running)
+                    before = self.state()
+                    result = self.run_script("install.sh")
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("STOP: this revision of the Type-C roles kit is already installed "
+                                  f"({self.backup}); nothing was changed", result.stdout)
+                    self.assertNotIn("ended early", result.stdout)
+                    self.assertEqual(self.state(), before)
+
+    def test_a_kernel_without_a_build_id_is_no_revision_s(self):
+        """Also when the record has a line cut short, with no build ID."""
+        self.install_recorded()
+        with (self.backup / "revisions").open("a") as record:
+            record.write(sha(self.new_boot) + "\n")
+        (self.root / "sys/kernel/notes").write_bytes(b"")
+        before = self.state()
+        result = self.run_script("install.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("STOP: running kernel build ID unknown, neither the hang-log kit's nor a "
+                      "revision of this kit's", result.stdout)
+        self.assertEqual(self.state(), before)
+
+    def test_this_revision_on_boot_without_its_record_is_installed_again(self):
+        """boot written from TWRP, say: the module tree may be another's."""
+        for name, install in (("over revision 7", self.install_r7),
+                              ("over a revision with a record", self.install_recorded)):
+            with self.subTest(name):
+                self.setUp()
+                install()
+                found = self.expected[1]
+                self.part("boot").write_bytes(found)
+                result = self.run_script("install.sh")
+                self.assertNotIn("already installed", result.stdout)
+                self.assert_upgraded(result, found)
+
+    def test_the_hang_log_kit_on_boot_is_upgraded_too(self):
+        """After the way back from TWRP: boot holds the hang-log kit again and
+        its kernel runs; the module tree and the backup are still the kit's."""
+        self.install_r7()
+        self.part("boot").write_bytes(self.hang_boot)
+        self.running(HANG_BUILD_ID)
+        self.assert_upgraded(self.run_script("install.sh"), self.hang_boot)
+        self.assert_rolled_back()
+
+    def test_an_unknown_image_on_boot_is_refused_with_nothing_written(self):
+        for name, install in (
+                ("over revision 7", self.install_r7),
+                ("over a revision with a record", self.install_recorded),
+                ("a revision of no record and none of 1 to 7",
+                 lambda: self.install_r7(boot=os.urandom(SIZE)))):
+            with self.subTest(name):
+                self.setUp()
+                install()
+                if name != "a revision of no record and none of 1 to 7":
+                    self.part("boot").write_bytes(os.urandom(SIZE))
+                other = self.part("boot").read_bytes()
+                before = self.state()
+                result = self.run_script("install.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("STOP: the boot partition holds neither the hang-log kit nor a "
+                              f"revision of this kit ({sha(other)})", result.stdout)
+                self.assertNotIn("ended early", result.stdout)
+                self.assertEqual(self.state(), before)
+
+    def test_an_earlier_revision_goes_back_on_the_same_way(self):
+        self.install_recorded()
+        self.assert_upgraded(self.run_script("install.sh"), self.new_boot)
+        # The kit directory holds the first revision again.
+        (self.kit / "boot.img").write_bytes(self.new_boot)
+        (self.kit / f"modules-{RELEASE}.tar").write_bytes(modules_tar("new"))
+        (self.kit / "BUILD_ID").write_text(NEW_BUILD_ID + "\n")
+        self.seal()
+        self.expected = ("new", self.new_boot, NEW_BUILD_ID)
+        self.assert_upgraded(self.run_script("install.sh"), self.newer_boot)
+        self.assert_rolled_back()
+
+    def refusals(self):
+        """What an upgrade refuses, by name: the message, and the damage."""
+        saved = self.backup / "boot-hang-log.img"
+        saved_tree = self.backup / f"modules-{RELEASE}"
+        uname = '#!/bin/sh\ncase $1 in -r) echo 7.2.0-rc4 ;; *) echo "#1 SMP PREEMPT test" ;; esac\n'
+        return {
+            "saved hang-log image changed": (
+                f"the hang-log boot image saved in {self.backup} is missing or changed; nothing was "
+                "changed", lambda: saved.write_bytes(os.urandom(SIZE))),
+            "saved hang-log image missing": (
+                "is missing or changed; nothing was changed", saved.unlink),
+            "saved hang-log tree moved back by a rollback.sh that stopped": (
+                f"the hang-log module tree saved in {self.backup} is missing; nothing was changed "
+                "(if rollback.sh stopped, run it again)", lambda: shutil.rmtree(saved_tree)),
+            "saved hang-log tree without one of its modules": (
+                f"the hang-log module tree saved in {self.backup} does not have the hang-log kit's "
+                "list of modules", (saved_tree / "updates/b.ko").unlink),
+            "the hang-log kit rolled back from under the kit": (
+                "the hang-log kit is not installed",
+                (self.root / "var/backups/ubuntu-gts9u-hang-log/complete").unlink),
+            "another kernel release": (
+                f"running kernel release 7.2.0-rc4, expected {RELEASE}",
+                lambda: (self.bin / "uname").write_text(uname)),
+            "kit changed after it was packed": (
+                "the kit does not match its checksums; nothing was changed",
+                lambda: (self.kit / "BUILD_ID").write_text("0" * 40 + "\n")),
+            "kit whose BUILD_ID is no build ID": (
+                "BUILD_ID in the kit is not a kernel build ID",
+                lambda: ((self.kit / "BUILD_ID").write_text(NEW_BUILD_ID[:39] + "\n"), self.seal())),
+            "a module added by hand to the earlier kit's tree": (
+                "the installed module tree does not have the hang-log kit's list of modules",
+                lambda: (self.modules / "updates/by-hand.ko").write_text("r7 extra\n")),
+            "no module tree, and no upgrade under way": (
+                f"no module tree {self.modules}; run rollback.sh",
+                lambda: shutil.rmtree(self.modules)),
+            "vendor_boot of another build": (
+                "vendor_boot does not hold the hang-log kit",
+                lambda: self.part("vendor_boot").write_bytes(os.urandom(SIZE))),
+            "low battery": (
+                "battery at 12 %",
+                lambda: (self.root / "sys/class/power_supply/sm5714-battery/capacity").write_text("12\n")),
+            "read-only root": (
+                "the root filesystem is not writable",
+                lambda: (self.root / "mount-options").write_text("ro,relatime\n")),
+            "dpkg at work": ("dpkg is busy", (self.root / "dpkg-busy").touch),
+            "another tablet": (
+                "this is not an SM-X710",
+                lambda: (self.root / "proc/device-tree/compatible").write_bytes(b"samsung,gts9u\0")),
+        }
+
+    def test_upgrade_refusals_change_nothing(self):
+        for name in self.refusals():
+            with self.subTest(name):
+                self.setUp()
+                self.install_r7()
+                message, damage = self.refusals()[name]
+                damage()
+                before = self.state()
+                result = self.run_script("install.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+                self.assertNotIn("ended early", result.stdout)
+                self.assertEqual(self.state(), before)
+
+    def stop_in_the_module_swap(self):
+        """An upgrade from revision 7 that stops between the module swap and
+        the flash: depmod fails."""
+        self.install_r7()
+        (self.root / "depmod-fails").touch()
+        result = self.run_script("install.sh")
+        (self.root / "depmod-fails").unlink()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("STOP: depmod failed", result.stdout)
+        self.assertIn("STOP: the upgrade ended early; do NOT reboot before running install.sh "
+                      "again, or rollback.sh", result.stdout)
+        self.assertTrue((self.backup / "upgrading").exists())
+        self.assertEqual(self.part("boot").read_bytes(), self.r7_boot)
+        self.assertEqual(self.tree(), {n: f"new {n}\n" for n in MODULES})
+
+    def test_an_upgrade_that_stopped_is_finished_by_running_it_again(self):
+        self.stop_in_the_module_swap()
+        self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+        self.assert_rolled_back()
+
+    def test_rollback_undoes_an_upgrade_that_stopped(self):
+        self.stop_in_the_module_swap()
+        left = self.root / "usr/lib/modules" / f".typec-roles-old-{RELEASE}"
+        left.mkdir()
+        (left / "a.ko").write_text("r7 a.ko\n")
+        self.assert_rolled_back()
+
+    def test_an_upgrade_that_stopped_in_the_flash_is_finished_by_running_it_again(self):
+        """boot half-written is no image the script knows; it is written again
+        all the same, and so is one that was written whole, also once its
+        kernel has been booted, and by the revision after it."""
+        for name in ("half", "whole", "whole and booted", "whole and booted, then the next revision"):
+            with self.subTest(name):
+                self.setUp()
+                self.stop_in_the_module_swap()
+                found = self.new_boot
+                if name == "half":
+                    found = self.new_boot[:SIZE // 2] + self.r7_boot[SIZE // 2:]
+                self.part("boot").write_bytes(found)
+                if "booted" in name:
+                    self.running(NEW_BUILD_ID)
+                if "next" in name:
+                    self.expected = ("newer", self.newer_kit(), NEWER_BUILD_ID)
+                result = self.run_script("install.sh")
+                self.assertNotIn("already installed", result.stdout)
+                self.assert_upgraded(result, found)
+
+    def stop_between_the_two_moves(self):
+        """An upgrade from revision 7 killed between its two moves: the earlier
+        kit's tree moved aside, the new one not yet in its place."""
+        self.install_r7()
+        self.step_commands()
+        stage = self.root / "usr/lib/modules" / f".typec-roles-{RELEASE}"
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        number = self.steps().index(("mv", f"{stage} {self.modules}")) + 1
+        self.setUp()
+        self.install_r7()
+        self.step_commands()
+        self.assertEqual(self.run_stopped("install.sh", "kill", number).returncode, -9)
+        self.assertFalse(self.modules.exists())
+        self.assertEqual(self.tree(self.root / "usr/lib/modules" / f".typec-roles-old-{RELEASE}"),
+                         {n: f"r7 {n}\n" for n in MODULES})
+        self.assertTrue((self.backup / "upgrading").exists())
+
+    def test_an_upgrade_that_stopped_between_the_two_moves_is_finished_by_running_it_again(self):
+        self.stop_between_the_two_moves()
+        result = self.run_script("install.sh")
+        self.assertIn("an upgrade had stopped in the module swap: the earlier module tree is back "
+                      f"in {self.modules}", result.stdout)
+        self.assertNotIn("STOP", result.stdout)
+        self.assert_upgraded(result, self.r7_boot)
+        self.assert_rolled_back()
+
+    def test_an_upgrade_that_stopped_between_the_two_moves_is_undone_by_rollback(self):
+        self.stop_between_the_two_moves()
+        self.assert_rolled_back()
+
+    def test_a_missing_module_tree_with_nothing_to_put_back_is_left_to_rollback(self):
+        old = lambda: self.modules.parent / f".typec-roles-old-{RELEASE}"
+        cases = {
+            # Not this script's doing: it moves the tree only under its mark.
+            "set aside, and no upgrade under way": lambda: self.modules.rename(old()),
+            "set aside without its modules.dep": lambda: (
+                (self.backup / "upgrading").touch(), self.modules.rename(old()),
+                (old() / "modules.dep").unlink()),
+            "gone": lambda: ((self.backup / "upgrading").touch(), shutil.rmtree(self.modules)),
+        }
+        for name, damage in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                self.install_r7()
+                damage()
+                before = self.state()
+                result = self.run_script("install.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"STOP: no module tree {self.modules}; run rollback.sh", result.stdout)
+                self.assertNotIn("ended early", result.stdout)
+                self.assertEqual(self.state(), before)
+                self.assert_rolled_back()
+
+    def test_an_upgrade_records_what_it_writes_and_syncs_it_with_the_modules_before_the_flash(self):
+        self.install_r7()
+        self.syncs()
+        self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+        kept = {"saved": "yes", "tree": "new", "complete": "yes", "recorded": sha(self.new_boot)}
+        self.assertEqual(self.syncs(), [
+            {**kept, "boot": sha(self.r7_boot), "upgrading": "yes"},
+            {**kept, "boot": sha(self.new_boot), "upgrading": "no"},
+        ])
+
+    def test_an_upgrade_whose_sync_fails_before_the_flash_is_finished_by_running_it_again(self):
+        self.install_r7()
+        result = self.run_with_failing_sync("install.sh", 1)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("STOP: sync failed", result.stdout)
+        self.assertIn("STOP: the upgrade ended early; do NOT reboot before running install.sh "
+                      "again, or rollback.sh", result.stdout)
+        self.assertNotIn("writing boot", result.stdout)
+        self.assertEqual(self.part("boot").read_bytes(), self.r7_boot)
+        self.assertTrue((self.backup / "upgrading").exists())
+        self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+        self.assert_rolled_back()
+
+    def test_an_upgrade_s_last_sync_failing_is_reported_with_the_kit_in_place(self):
+        self.install_r7()
+        result = self.run_with_failing_sync("install.sh", 2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('STOP: the kit is in place, but sync failed: run "sudo sync" until it '
+                      "succeeds, then reboot", result.stdout)
+        self.assertNotIn("ended early", result.stdout)
+        self.assertNotIn("reboot now", result.stdout)
+        self.assert_installed()
+        self.assert_rolled_back()
+
+    def test_verify_checks_the_new_revision_after_an_upgrade(self):
+        """Every revision so far has the same module key: before the reboot
+        the earlier revision's kernel passes every check but the build ID."""
+        self.install_recorded()
+        self.assert_upgraded(self.run_script("install.sh"), self.new_boot)
+        self.boot_kit_kernel(NEW_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"FAIL build ID {NEW_BUILD_ID}, the kit's is {NEWER_BUILD_ID}", result.stdout)
+        self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+        self.boot_kit_kernel(NEWER_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"ok   running the kit's kernel (build ID {NEWER_BUILD_ID[:12]})", result.stdout)
+        self.assertIn("all checks passed", result.stdout)
+
+
+class StoppedRunTest(UpgradeHelpers, FakeTablet):
+    """A run stopped at each of its steps (STEP_COMMANDS): killed before it,
+    as a power cut or a kill stops it, or with that step's command failing.
+    From each state an upgrade leaves, install.sh run again finishes it and
+    rollback.sh undoes it; a first install that stopped is undone by
+    rollback.sh, as before; a rollback.sh that stopped is finished by running
+    it again."""
+
+    def snapshot(self, name):
+        copy = self.tmp / name
+        if copy.exists():
+            shutil.rmtree(copy)
+        shutil.copytree(self.root, copy)
+        return copy
+
+    def restore(self, copy):
+        shutil.rmtree(self.root)
+        shutil.copytree(copy, self.root)
+
+    def full_run(self, name):
+        """The steps of NAME run on this tablet without a stop, and the
+        tablet as it was before, to go back to."""
+        prepared = self.snapshot("prepared")
+        result = self.run_script(name)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        steps = self.steps()
+        self.assertTrue(steps)
+        self.finished = self.state()
+        self.restore(prepared)
+        return prepared, steps
+
+    def new_state(self, seen):
+        """Is the tablet in a state not met before in SEEN (which it joins)?
+        Two stops that leave the same disk lead to the same: the scripts
+        read nothing else that a stop changes."""
+        state = tuple(sorted(self.state().items()))
+        if state in seen:
+            return False
+        seen.add(state)
+        return True
+
+    def stop(self, name, how, number, steps):
+        """Run NAME stopped at step NUMBER; whether it changed anything."""
+        before = self.state()
+        result = self.run_stopped(name, how, number)
+        out = result.stdout + result.stderr
+        if how == "kill":
+            self.assertEqual(result.returncode, -9, out)
+        elif result.returncode == 0:
+            # A failure the script lets pass (blockdev's flush, or rollback.sh
+            # reading boot before it writes it anyway) changes nothing.
+            self.assertEqual(self.state(), self.finished, out)
+        changed = self.state() != before
+        if result.returncode not in (0, -9) and changed:
+            self.assertRegex(result.stdout, r"STOP: (install|the upgrade|rollback) ended early|"
+                             r"STOP: the (kit|hang-log kit) is (in|back in) place, but sync failed")
+        return changed
+
+    def test_an_upgrade_stopped_at_any_step_is_finished_by_install_and_undone_by_rollback(self):
+        """From revision 7, with a saved boot set made since its install: the
+        upgrade copies the hang-log kit's image for the set and updates it."""
+        self.install_r7()
+        boot_set = self.saved_set(self.r7_boot)
+        self.step_commands()
+        prepared, steps = self.full_run("install.sh")
+        self.assertEqual([step for step, _ in steps if step in ("mv", "touch", "depmod", "cp")],
+                         ["touch", "mv", "mv", "depmod", "cp", "mv", "cp", "mv", "touch"])
+        # The untouched tablet too: rollback.sh on revision 7 as it is.
+        seen = set()
+        for number, step in enumerate(steps, 1):
+            for how in ("kill", "fail"):
+                with self.subTest(step=number, command=" ".join(step), how=how):
+                    self.restore(prepared)
+                    self.stop("install.sh", how, number, steps)
+                    if not self.new_state(seen):
+                        continue
+                    stopped = self.snapshot("stopped")
+                    copy_made = (self.backup / "saved-set-boot.img").exists()
+                    self.assert_rolled_back()
+                    # rollback.sh restores the set from the copy; without one
+                    # it leaves the set as revision 7 left it, as before.
+                    self.assertEqual((boot_set / "boot.img").read_bytes(),
+                                     self.hang_boot if copy_made else self.r7_boot)
+                    self.restore(stopped)
+                    found = self.part("boot").read_bytes()
+                    result = self.run_script("install.sh")
+                    if "already installed" in result.stdout:
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assert_installed()
+                    else:
+                        self.assert_upgraded(result, found)
+                    self.assertEqual((boot_set / "boot.img").read_bytes(), self.new_boot)
+                    self.assertEqual((self.backup / "saved-set-boot.img").read_bytes(),
+                                     self.hang_boot)
+
+    def test_an_upgrade_stopped_twice_is_finished_by_a_third_run(self):
+        """Killed after the swap, with the earlier tree still set aside, then
+        killed again at each step of the run that was to finish it."""
+        self.install_r7()
+        self.step_commands()
+        old = self.modules.parent / f".typec-roles-old-{RELEASE}"
+        prepared, steps = self.full_run("install.sh")
+        number = steps.index(("rm", f"-rf -- {old}")) + 1
+        self.assertTrue(self.stop("install.sh", "kill", number, steps))
+        self.assertEqual(self.tree(old), {n: f"r7 {n}\n" for n in MODULES})
+        self.assertEqual(self.tree(), {n: f"new {n}\n" for n in MODULES})
+        once, again = self.full_run("install.sh")
+        seen = set()
+        for number, step in enumerate(again, 1):
+            with self.subTest(step=number, command=" ".join(step)):
+                self.restore(once)
+                self.stop("install.sh", "kill", number, again)
+                if not self.new_state(seen):
+                    continue
+                twice = self.snapshot("twice")
+                found = self.part("boot").read_bytes()
+                result = self.run_script("install.sh")
+                if "already installed" in result.stdout:
+                    self.assert_installed()
+                else:
+                    self.assert_upgraded(result, found)
+                self.restore(twice)
+                self.assert_rolled_back()
+
+    def test_a_first_install_stopped_at_any_step_is_undone_by_rollback(self):
+        """With a saved boot set from before the install."""
+        found = os.urandom(SIZE)
+        boot_set = self.saved_set(found)
+        self.step_commands()
+        untouched = self.state()
+        prepared, steps = self.full_run("install.sh")
+        seen = set()
+        for number, step in enumerate(steps, 1):
+            for how in ("kill", "fail"):
+                with self.subTest(step=number, command=" ".join(step), how=how):
+                    self.restore(prepared)
+                    self.stop("install.sh", how, number, steps)
+                    if not self.backup.exists():
+                        self.assertEqual(self.state(), untouched)
+                        continue
+                    if not self.new_state(seen):
+                        continue
+                    if not (self.backup / "complete").exists():
+                        # A second run does not finish it: rollback.sh first.
+                        before = self.state()
+                        refused = self.run_script("install.sh")
+                        self.assertIn("exists from an install that did not finish; run rollback.sh "
+                                      "first", refused.stdout)
+                        self.assertEqual(self.state(), before)
+                    result = self.run_script("rollback.sh")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    if "install.sh had stopped before it changed anything" in result.stdout:
+                        retired = "unfinished"
+                    else:
+                        self.assertIn("back on the hang-log kit; reboot now", result.stdout)
+                        retired = "rolled-back"
+                    self.assert_on_the_hang_log_kit()
+                    self.assertTrue(list((self.root / "var/backups").glob(
+                        f"ubuntu-gts9u-typec-roles.{retired}-*")))
+                    self.assertEqual((boot_set / "boot.img").read_bytes(), found)
+
+    def test_a_rollback_stopped_at_any_step_after_an_upgrade_is_finished_by_running_it_again(self):
+        self.install_r7()
+        boot_set = self.saved_set(self.r7_boot)
+        self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+        self.step_commands()
+        prepared, steps = self.full_run("rollback.sh")
+        seen = set()
+        for number, step in enumerate(steps, 1):
+            for how in ("kill", "fail"):
+                with self.subTest(step=number, command=" ".join(step), how=how):
+                    self.restore(prepared)
+                    self.stop("rollback.sh", how, number, steps)
+                    if not self.new_state(seen):
+                        continue
+                    if self.backup.exists():
+                        self.assert_rolled_back()
+                    else:
+                        # It had retired the backup: done but for its last sync.
+                        again = self.run_script("rollback.sh")
+                        self.assertIn("install.sh never ran (or was rolled back already)",
+                                      again.stdout)
+                        self.assert_on_the_hang_log_kit()
+                    self.assertEqual((boot_set / "boot.img").read_bytes(), self.hang_boot)
 class VerifyTest(FakeTablet):
     def setUp(self):
         super().setUp()
@@ -1452,18 +2379,7 @@ class VerifyTest(FakeTablet):
             self.assertEqual(sum(f"verify.sh {mode}" in line for line in usage), 1, mode)
 
     def boot_kit(self):
-        self.running(NEW_BUILD_ID)
-        params = self.root / "sys/module/sm5714_usbpd/parameters"
-        (params / "sink_host_swap").write_text("Y\n")
-        (params / "try_snk_extra_wait_ms").write_text("600\n")
-        (self.root / "journal").write_text(
-            f"kernel: Loaded X.509 cert 'Build time autogenerated kernel key: {KEY_ID}'\n"
-            "kernel: ramoops: using 0x200000@0x880900000, ecc: 96\n")
-        (self.root / "signer").write_text(SIGNER + "\n")
-        with gzip.open(self.root / "proc/config.gz", "wt") as config:
-            config.write("CONFIG_DETECT_HUNG_TASK=y\nCONFIG_SOFTLOCKUP_DETECTOR=y\n"
-                         "CONFIG_WQ_WATCHDOG=y\nCONFIG_NETCONSOLE=m\nCONFIG_PSTORE_RAM=y\n"
-                         "CONFIG_PSTORE_FTRACE=y\n")
+        self.boot_kit_kernel(NEW_BUILD_ID)
 
     def test_checks_pass_on_the_kit_kernel(self):
         self.boot_kit()
@@ -1613,6 +2529,25 @@ class VerifyTest(FakeTablet):
         self.assertIn(f"FAIL build ID {HANG_BUILD_ID}", result.stdout)
         self.assertIn("FAIL sm5714_usbpd.sink_host_swap is missing", result.stdout)
 
+    def test_a_root_that_ext4_gave_up_on_is_not_writable(self):
+        # 2026-11-21: UFS did not come back from a sleep, ext4 aborted its
+        # journal, and the root stayed "rw,noatime,emergency_ro".
+        self.boot_kit()
+        for options, passes in (("rw,noatime", True), ("rw,noatime,emergency_ro", False),
+                                ("rw,relatime,shutdown", False), ("ro,relatime", False),
+                                ("rw,noatime,errors=remount-ro", True)):
+            with self.subTest(options):
+                (self.root / "mount-options").write_text(options + "\n")
+                result = self.run_script("verify.sh")
+                if passes:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("ok   root is rw", result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(f"FAIL root is not writable (mounted {options})", result.stdout)
+                    self.assertNotIn("ok   root is rw", result.stdout)
+                    self.assertNotIn("all checks passed", result.stdout)
+
 
 class ScriptsTest(unittest.TestCase):
     def test_scripts_parse(self):
@@ -1628,6 +2563,36 @@ class ScriptsTest(unittest.TestCase):
                          pinned("make-kit.sh", "hang_vendor_boot"))
         self.assertEqual(pinned("install.sh", "hang_build_id"), HANG_BUILD_ID)
         self.assertEqual(pinned("make-kit.sh", "hang_build_id"), HANG_BUILD_ID)
+
+    def test_install_knows_the_revisions_before_the_record(self):
+        self.assertEqual(earlier_revisions(), EARLIER)
+        install = (KIT_SRC / "install.sh").read_text()
+        # One table, and the record that takes over from it.
+        self.assertEqual(install.count(R7_BOOT), 1)
+        self.assertIn('echo "$new_boot $new_id" >> "$backup/revisions"', install)
+
+    def test_the_revisions_without_a_record_are_the_packed_kits(self):
+        """Where the packed kits are (~/ubuntu-gts9u/backups on the build
+        host): each whose install.sh keeps no record is in install.sh's
+        table under its revision, with the boot.img and the BUILD_ID that
+        its SHA256SUMS vouches for."""
+        workdir = pathlib.Path(os.environ.get("UBUNTU_WORKDIR", str(pathlib.Path.home() / "ubuntu-gts9u")))
+        kits = sorted(p.parent for p in (workdir / "backups").glob("typec-roles-kit*/SHA256SUMS"))
+        if not kits:
+            self.skipTest(f"no packed kits in {workdir / 'backups'}")
+        table = {(boot, build_id): names.split(",") for boot, build_id, names in EARLIER}
+        for kit in kits:
+            with self.subTest(kit.name):
+                sums = {name: digest for digest, name in
+                        (line.split() for line in (kit / "SHA256SUMS").read_text().splitlines())}
+                install = (kit / "install.sh").read_bytes()
+                self.assertEqual(sha(install), sums["install.sh"])
+                if b'"$backup/revisions"' in install:
+                    continue
+                build_id = (kit / "BUILD_ID").read_bytes()
+                self.assertEqual(sha(build_id), sums["BUILD_ID"])
+                revision = re.fullmatch(r"typec-roles-kit(?:-(r\d+))?", kit.name).group(1) or "r1"
+                self.assertIn(revision, table[(sums["boot.img"], build_id.decode().strip())])
 
     def test_kit_ships_what_install_checks(self):
         text = (KIT_SRC / "make-kit.sh").read_text()
@@ -2047,11 +3012,29 @@ class ScriptsTest(unittest.TestCase):
                       "kit kernel, and a boot with the dock attached and devices on the bus.",
                       readme)
         # A docked boot tests the host controller only with devices on the
-        # bus, and an earlier revision is not upgraded in place.
+        # bus, and an earlier revision is upgraded in place.
         self.assertIn("A boot with nothing on the bus does not test the host controller.", readme)
-        self.assertIn("there is no upgrade from an earlier revision of this kit: run its "
-                      "`rollback.sh` and reboot, then this revision's `install.sh` and reboot "
-                      "again.", readme)
+        self.assertNotIn("there is no upgrade from an earlier revision", readme)
+        for said in ("**Over an earlier revision of this kit** `install.sh` runs as an upgrade: one "
+                     "command, then one reboot, and no `rollback.sh` first.",
+                     "`rollback.sh` returns to the hang-log kit, not to the earlier revision, after "
+                     "any number of upgrades.",
+                     "Anything else is refused with nothing written, and the message names the "
+                     "image or the build ID it found.",
+                     "If an upgrade stops half-way, run `install.sh` again, or `rollback.sh`, before "
+                     "any reboot; a second run of `install.sh` picks up wherever the first one "
+                     "stopped.",
+                     "`install.sh` of the revision that is installed already says so and changes "
+                     "nothing.",
+                     "A first install that stopped is not finished by a second run: `rollback.sh` "
+                     "undoes it, then `install.sh` runs again.",
+                     # Copied over the earlier kit, not into a directory inside it.
+                     "scp ~/ubuntu-gts9u/backups/typec-roles-kit/* <user>@<tablet>:typec-roles/",
+                     # The way back from TWRP stays.
+                     "dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-typec-roles/boot-hang-log.img \\ "
+                     "of=/dev/block/by-name/boot bs=4M"):
+            with self.subTest(said):
+                self.assertIn(said, readme)
         # Why the recorder reads the log every second, and what a plug-in or
         # a swap run without a verdict means.
         self.assertIn("so during a plug-in the script **reads the log every second** and adds "

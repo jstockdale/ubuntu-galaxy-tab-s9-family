@@ -86,11 +86,14 @@ The data role fault has not been seen on it.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
   the DTB, which did not change. `install.sh` checks that it still holds the
   hang-log kit's image.
-- **The module tree** comes from this build and is signed with its own key,
-  which is archived in the key registry. The patches add fields to
-  `tcpc_dev` and `tcpm_port`, and the kernel has no `MODVERSIONS`; a new key
-  is what marks a module of another build. **The kernel is locked down and
-  refuses a module signed with another build's key** (`Lockdown: ...
+- **The module tree** comes from this build and is signed with the key of
+  its build directory, which is archived in the key registry. The hang-log
+  kit has another key; revisions 2 to 7 of this kit were built in one
+  directory and share theirs. The patches add fields to `tcpc_dev` and
+  `tcpm_port`, and the kernel has no `MODVERSIONS`; a new key is what marks
+  a module of another build, and between two revisions with the same key
+  nothing does. **The kernel is locked down and refuses a module signed
+  with another build's key** (`Lockdown: ...
   unsigned module loading is restricted` in the kernel log). A kernel with
   the other build's module tree still has what is built in (storage, the
   display, USB with the gadget network, Wi-Fi, Bluetooth) but not what is
@@ -136,8 +139,10 @@ detail):
   behind a message of the partner's is answered once its swap has run, no
   longer before it is sent;
 - the USB power domains now stay in retention while the tablet sleeps. What
-  that costs in sleep and idle, and whether the USB host survives a real
-  sleep with it, has not been measured on this tablet.
+  that costs in sleep and idle has not been measured on this tablet. The
+  USB host came through one real sleep with it (2026-11-21, 30 s, on a
+  powered dock, devices not enumerated again); **the storage did not**, see
+  the checks below.
 
 ## Build (host)
 
@@ -176,7 +181,8 @@ object are what show it.
 ## Install, check, roll back (tablet)
 
 ```sh
-scp -r ~/ubuntu-gts9u/backups/typec-roles-kit <user>@<tablet>:typec-roles
+ssh <user>@<tablet> mkdir -p typec-roles
+scp ~/ubuntu-gts9u/backups/typec-roles-kit/* <user>@<tablet>:typec-roles/
 sudo sh ~/typec-roles/verify.sh dock 3     # optional: the baseline, before
 sudo sh ~/typec-roles/install.sh
 sudo reboot
@@ -191,12 +197,30 @@ sudo sh ~/typec-roles/rollback.sh          # back to the hang-log kit; reboot
 `/var/log/gts9u-typec-roles.log`. It syncs the disk after saving boot,
 before writing the new kernel and at the end, so that a power failure finds
 either the hang-log or the kit's kernel with its own modules. Reboot soon
-after it: until then the running kernel loads no further module. A second
-`install.sh` over an installed kit is refused, and there is no upgrade from
-an earlier revision of this kit: run its `rollback.sh` and reboot, then this
-revision's `install.sh` and reboot again. The hang-log kit's own `verify.sh`
-reports another build ID and module key while this kit is installed; its
-other checks still apply.
+after it: until then the running kernel loads no further module. A first
+install that stopped is not finished by a second run: `rollback.sh` undoes
+it, then `install.sh` runs again. The hang-log kit's own `verify.sh` reports
+another build ID and module key while this kit is installed; its other
+checks still apply.
+
+**Over an earlier revision of this kit** `install.sh` runs as an upgrade: one
+command, then one reboot, and no `rollback.sh` first. Copy the new kit over
+the old one in `~/typec-roles` as above (the `logs` of earlier runs stay),
+run `install.sh` and reboot. The hang-log kit that the first install saved
+stays the way back: the upgrade checks that it is whole, replaces the earlier
+kit's module tree and writes boot again, and vendor_boot keeps the hang-log
+kit's image. `rollback.sh` returns to the hang-log kit, not to the earlier
+revision, after any number of upgrades. Boot has to hold the hang-log kit
+(after a restore from TWRP) or a revision of this kit, and the running kernel
+has to be one of theirs: revisions 1 to 7 are known by their boot images and
+kernels, and every later install or upgrade adds a line to `revisions` in the
+backup before it writes boot. Anything else is refused with nothing written,
+and the message names the image or the build ID it found. Reboot soon after
+an upgrade too: until then the module tree in place is built for the new
+kernel, not for the running one. If an upgrade stops half-way, run
+`install.sh` again, or `rollback.sh`, before any reboot; a second run of
+`install.sh` picks up wherever the first one stopped. `install.sh` of the
+revision that is installed already says so and changes nothing.
 
 `rollback.sh` writes boot and the module tree back first and syncs. If it
 stops after that, it says that the hang-log kernel and its modules are back
@@ -323,5 +347,12 @@ again, up to three per attach; the verdict is still the roles.
 6. Suspend and resume with the dock attached, then with the charger: does
    the dock come back afterwards? Battery drain over a night of sleep,
    against the hang-log kernel, is the check for what retention costs.
+   **Not on the SM-X710 for now.** Its suspend is masked, and the one real
+   sleep on revision 7 (`sudo rtcwake -m mem -s 30`, 2026-11-21, on a
+   powered dock) ended with the dock's devices still there and the UFS PHY
+   not coming back (`phy initialization timed-out`): the root filesystem
+   went read-only and the tablet had to be restarted through sysrq. Until
+   that is fixed a sleep test costs a forced restart. After such a failure
+   `verify.sh` reports `root is not writable`.
 7. Bluetooth, Wi-Fi, audio and the rear camera at a known size: the kernel was
    rebuilt, and nothing else in it changed.

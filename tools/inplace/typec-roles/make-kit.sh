@@ -21,7 +21,9 @@
 #
 # Self-tests, each byte for byte:
 #   - boot: the hang-log kernel plus its DTB, by the kits' recipe, is the
-#     hang-log kit's boot.img, the image on the tablet;
+#     hang-log kit's boot.img, the image a first install finds on the tablet
+#     and saves (an upgrade finds an earlier revision there, and the saved
+#     image stays the way back);
 #   - the hang-log vendor_boot carries that same DTB.
 # Then the changes are checked to be only the intended ones: the DTB, the
 # configuration and the module list are the hang-log build's, the source
@@ -61,7 +63,8 @@ patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait
 # The files those patches change.
 patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c")
 
-# The tablet's current set: the hang-log kit.
+# The base on the tablet: the hang-log kit, which a first install saves and
+# rollback.sh puts back.
 hang_boot=d583546b5e5c33dbc48fbafc99b7eb039df33f64b0316e498d3f158f834ee968
 hang_vendor_boot=9165f42917a8ee4069b878fc0c0660391b39087fc6f3ea2b607f626821a7dbd4
 hang_image=3cb91f345b5e217290a737f254d7a278c426a0885305de008f308b27e7321216
