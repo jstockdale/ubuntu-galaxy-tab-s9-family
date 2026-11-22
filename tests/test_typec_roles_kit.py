@@ -268,6 +268,16 @@ SWAP_AGAIN_LOG = """\
 [  901.433405] state change DR_SWAP_SEND -> DR_SWAP_CHANGE_DR [rev3 DATA_ROLE_SWAP]
 [  901.433406] state change DR_SWAP_CHANGE_DR -> SNK_READY [rev3 DATA_ROLE_SWAP]
 """
+# One fix without the other: the swap goes out into the discovery and is cut
+# short, the write is told that nothing changed, and the next one is done.
+SWAP_CUT_AGAIN_LOG = SWAP_CUT_LOG + """\
+[ 3089.811175] Data role swap ended with the role unchanged
+[ 3089.840001] AMS DATA_ROLE_SWAP start
+[ 3089.840002] state change SNK_READY -> AMS_START [rev3 DATA_ROLE_SWAP]
+[ 3089.840003] state change AMS_START -> DR_SWAP_SEND [rev3 DATA_ROLE_SWAP]
+[ 3089.843405] state change DR_SWAP_SEND -> DR_SWAP_CHANGE_DR [rev3 DATA_ROLE_SWAP]
+[ 3089.843406] state change DR_SWAP_CHANGE_DR -> SNK_READY [rev3 DATA_ROLE_SWAP]
+"""
 
 
 def sha(data):
@@ -892,11 +902,14 @@ class VerifyTest(FakeTablet):
             (FLAP_LOG, None),             # no write was taken
             (SWAP_WAIT_LOG, "device"),    # success reported, nothing swapped
             (SWAP_AGAIN_LOG, "host"),     # told that nothing changed, then done
+            (SWAP_CUT_AGAIN_LOG, "host"),  # sent into the discovery, told so, then done
+            (SWAP_LOG + "[  300.900001] overflow\n", "host"),  # done, but the log lost lines
+            (TRY_SNK_LOST_LOG, "host"),   # the host from the attach: nothing to swap
         ])
-        result = self.run_script("verify.sh", "swap", "7")
+        result = self.run_script("verify.sh", "swap", "10")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual([r["verdict"] for r in self.results()],
-                         ["PASS", "FAIL", "FAIL", "PASS", "-", "FAIL", "PASS"])
+                         ["PASS", "FAIL", "FAIL", "PASS", "-", "FAIL", "PASS", "FAIL", "FAIL", "-"])
         self.assertEqual({len(r) for r in self.results()}, {20})
         rows = self.swap_rows()
         self.assertEqual([(r["asked"], r["refused_in_vdm"], r["sent"], r["role_unchanged"],
@@ -904,12 +917,14 @@ class VerifyTest(FakeTablet):
                          [("3", "2", "1", "0", "0"), ("1", "0", "1", "0", "1"),
                           ("1", "0", "1", "0", "0"), ("3", "2", "1", "0", "0"),
                           ("0", "0", "0", "0", "0"), ("1", "0", "1", "0", "0"),
-                          ("2", "0", "2", "1", "0")])
+                          ("2", "0", "2", "1", "0"), ("2", "0", "2", "1", "1"),
+                          ("3", "2", "1", "0", "0"), ("0", "0", "0", "0", "0")])
         accepted = "write 1 was accepted, the data role right after it: "
         self.assertEqual([r["write"] for r in rows],
                          [accepted + "host", accepted + "device", accepted + "host",
                           accepted + "device", "none of 25 writes was accepted",
-                          accepted + "device", accepted + "host"])
+                          accepted + "device", accepted + "host", accepted + "host",
+                          accepted + "host", accepted + "host"])
         out = result.stdout
         self.assertIn("trial 1: PASS, data host/host, power sink/sink (at 8 s/14 s)", out)
         self.assertIn("  data_role: 3 swaps asked for, 2 refused during a discovery, 1 sent, "
@@ -920,19 +935,31 @@ class VerifyTest(FakeTablet):
                       + accepted + "device\n", out)
         self.assertIn("  data_role: 2 swaps asked for, 0 refused during a discovery, 2 sent, "
                       "1 ended with the role unchanged, 0 cut short by a Soft Reset; ", out)
+        # A swap that was cut short fails the plug-in whatever the write was
+        # told and whatever the role is in the end, and so does a log that
+        # lost lines: what it lost may be just that.
+        self.assertIn("trial 8: FAIL, data host/host, power sink/sink (at 8 s/14 s)", out)
+        self.assertIn("  data_role: 2 swaps asked for, 0 refused during a discovery, 2 sent, "
+                      "1 ended with the role unchanged, 1 cut short by a Soft Reset; "
+                      + accepted + "host\n", out)
+        self.assertIn("trial 9: FAIL, data host/host, power sink/sink (at 8 s/14 s)", out)
+        self.assertEqual(self.results()[8]["overflow"], "1")
         self.assertIn("trial 5: data ?/?, power sink/sink", out)
-        # Trial 3 alone, trials 2 and 6 (in trial 4 the swap was done before
-        # the reset undid it), trial 5 alone.
+        self.assertIn("trial 10: data host/host, power sink/sink", out)
+        # Trial 3 alone; trials 2 and 6 (in trial 4 the swap was done before
+        # the reset undid it, and in trial 10 the tablet is the host with no
+        # swap in the log: a write that asks for the role it has is done);
+        # trials 5 and 10.
         self.assertEqual(out.count("the kernel asked for the host role itself: "
                                    "the switch was not off for this plug-in"), 1)
         self.assertEqual(out.count("a write reported a swap that did not happen"), 2)
         self.assertEqual(out.count("no swap was asked for: not a PD source with the tablet "
-                                   "as its USB device"), 1)
-        self.assertIn("3 of 7 plug-ins: a swap asked for through data_role, none sent into a "
+                                   "as its USB device"), 2)
+        self.assertIn("3 of 10 plug-ins: a swap asked for through data_role, none sent into a "
                       "discovery, none reported done with the role unchanged", out)
         self.assertNotIn("the refusal itself was not seen", out)
         # The kernel's own request is off for every trial and back afterwards.
-        self.assertEqual(seen, ["N\n"] * 7)
+        self.assertEqual(seen, ["N\n"] * 10)
         self.assertEqual(switch.read_text(), "Y\n")
         (kernel,) = (self.kit / "logs").glob("*/kernel")
         self.assertIn("sink_host_swap: N\n", kernel.read_text())
@@ -997,6 +1024,32 @@ class VerifyTest(FakeTablet):
         self.partner.mkdir()
         time.sleep(0.3)
         self.assertEqual(self.port.joinpath("data_role").read_text(), "host [device]\n")
+
+    def test_a_writer_that_is_not_done_when_its_plug_in_is_recorded_ends_there(self):
+        """A write to data_role can wait seconds for its swap.  A writer that
+        is still at it when the plug-in is recorded is stopped then: left
+        running, it would write into the next plug-in ahead of that one's
+        own writer."""
+        self.boot_kit()
+        self.plug_for_swap([(FLAP_LOG, None), (SWAP_EARLY_LOG, "host")])
+        # The first plug-in takes no write, and the writer's last writes are
+        # a second apart here: it is not done when the roles have been read.
+        (self.bin / "sleep").write_text("#!/bin/sh\ncase $1 in\n8|6) exec /usr/bin/sleep 0.3 ;;\n"
+                                        "0.005) exec /usr/bin/sleep 0.001 ;;\n"
+                                        "0.3) exec /usr/bin/sleep 1 ;;\nesac\n"
+                                        "exec /usr/bin/sleep 0.01\n")
+        result = self.run_script("verify.sh", "swap", "2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([r["verdict"] for r in self.results()], ["-", "PASS"])
+        self.assertEqual([r["write"] for r in self.swap_rows()],
+                         ["the writer was stopped before it was done",
+                          "write 1 was accepted, the data role right after it: host"])
+        self.assertIn("0 cut short by a Soft Reset; the writer was stopped before it was done\n",
+                      result.stdout)
+        # A writer says its word when it ends by itself; the first one never
+        # did, also not after its plug-in was recorded.
+        self.assertEqual([p.name for p in (self.kit / "logs").glob("*/trial-*.writes")],
+                         ["trial-2.writes"])
 
     def test_the_usage_names_every_mode_and_nothing_else(self):
         result = self.run_script("verify.sh", "docks")
@@ -1329,6 +1382,14 @@ class ScriptsTest(unittest.TestCase):
                       readme)
         self.assertIn("Wi-Fi, USB networking and Bluetooth are built in", readme)
         self.assertIn("Wi-Fi, USB networking and Bluetooth\n# are built in", install)
+        # The swap test is one of the steps after the install, and what a
+        # program that writes data_role gets from this kernel is said.
+        self.assertIn("sudo sh ~/typec-roles/verify.sh dock 10\n"
+                      "sudo sh ~/typec-roles/verify.sh swap 3\n",
+                      (KIT_SRC / "README.md").read_text())
+        self.assertIn("a program that writes the port's `data_role` itself now gets `EAGAIN` "
+                      "(`Resource temporarily unavailable`) while the kernel's discovery is "
+                      "running, and when the swap ended with the role unchanged", readme)
         for said in ("until the reboot the running kernel can load no module it has not loaded yet",
                      "while the kit is installed, do not upgrade ubuntu-gts9u-device: its "
                      "updates/qcom_spss_irq.ko is signed for another kernel"):

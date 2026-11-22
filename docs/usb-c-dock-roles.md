@@ -8,21 +8,28 @@ and the connector description (`power-role = "dual"`, `data-role = "dual"`,
 Everything measured here comes from the SM-X910 and two powered docks, an
 Anker hub (PD identity `291a:8383`) and a Satechi Thunderbolt 4 dock
 (`310e:0952`).  Where a statement rests on one dock or on a few samples, it
-says so.  A first revision of the two TCPM changes ran on that tablet on
-2026-11-21:
+says so.  Three test kernels ran on that tablet on 2026-11-21:
 
-- the data role change did what it should on all three attaches where it
-  came into play, with both docks;
-- the power role change worked on three attaches and failed on the fourth,
-  the Satechi plugged into the running tablet, which showed something the
-  first revision did not handle;
-- a boot with the dock attached lost its USB host for another reason, the
-  USB power domains in the boot's suspend cycle.
+- the first had the first revision of the two TCPM changes.  The data role
+  change did what it should on all three attaches where it came into play,
+  with both docks.  The power role change worked on three attaches and
+  failed on the fourth, the Satechi plugged into the running tablet, which
+  showed something that revision did not handle.  A boot with the dock
+  attached lost its USB host for another reason, the USB power domains in
+  the boot's suspend cycle;
+- the second had the second revision of the power role change and a change
+  to those power domains.  Two boots with the Satechi attached and four
+  plug-ins into the running tablet, two with each dock, all ended with the
+  tablet as power sink and USB host, and both boots kept the USB host
+  through the suspend cycle;
+- the third is what the tree carries now.  It adds two fixes for a data role
+  swap asked for from userspace and a driver that reads its two switches at
+  each attach.  One boot with the Satechi attached has run on it, with the
+  same outcome.  **The two fixes and the switches have not been tried on a
+  tablet yet.**
 
-What the tree carries now is the second revision of the power role change
-and, for the SM-X910, a change to those power domains.  **Both are compiled
-into test kernels and have not run on a tablet yet.**  Nothing of this has run
-on the SM-X710.
+The SM-X710 has the third kernel installed, without the power domain change.
+**No dock has been plugged into it yet.**
 
 ## What a powered dock should give
 
@@ -58,10 +65,13 @@ way round it:
   ran once, as host, through to DisplayPort alternate mode.
   The first of the two connections held for the ten minutes until the hub was
   disconnected.  With the patch below the same request has been accepted on
-  each of the three attaches that had the tablet as sink, twice by the
-  Satechi dock and once by the Anker hub, 4 to 9 ms after it went out.  Each
-  time the tablet stayed host and sink and charged from the 9 V contract
-  (1.66 A), with no `Data role mismatch` and no reset;
+  each of the nine attaches whose log was kept, six times by the Satechi
+  dock and three times by the Anker hub: the first request went out whole
+  each time (`PD TX complete, status: 0`) and the Accept came 4 to 9 ms
+  after it.  Each time the tablet stayed host and sink on the 9 V contract
+  (1.66 A), with no `Data role mismatch` and no reset.  A tenth attach, a
+  boot with the Satechi attached, ended in the same roles; its log was not
+  kept;
 - a DR_Swap sent later, while one of TCPM's own discovery messages was
   waiting for its reply, failed 30 times out of 30: the SM5714 reported the
   transmission discarded (29 times), the dock's discovery reply arrived where
@@ -97,6 +107,30 @@ dock that kept its own role across the reset (the earlier
 `adopt_retained_source_ufp` patch) is still kept.  With `sink_host_swap` off,
 a hard reset is handled as it was before this change.
 
+### A swap asked for from userspace
+
+The 30 failures above were writes to the port's `data_role`, and two things
+in TCPM made each of them worse than a request that is turned down.  Both
+are fixed for every TCPM port, without an opt-in:
+
+- `tcpm-no-dr-swap-during-vdm.patch`.  `tcpm_ams_start()` let a data role
+  swap start while one of TCPM's own VDM sequences was running, so the
+  DR_Swap went out over the discovery message that was waiting for its
+  reply.  It now turns the swap down for as long as that sequence runs: the
+  writer gets `EAGAIN` and the log says
+  `VDM in progress, DATA_ROLE_SWAP not started`.  The kernel's own request
+  is made before discovery starts and never meets this.
+- `tcpm-dr-set-checks-data-role.patch`.  `tcpm_dr_set()` told the writer
+  that the swap was done whenever the state machine came back without an
+  error of its own, also when the request had been discarded and the role
+  was the old one.  It now compares the data role with the one asked for,
+  and returns `EAGAIN` with `Data role swap ended with the role unchanged`
+  in the log when they differ.
+
+A program that writes `data_role` can get an error now where it was told
+"done" before; writing again is the answer to both.  Neither fix has been
+tried on a tablet yet.
+
 ## The power role: Try.SNK that never succeeded
 
 A dock that can also be powered from its host is a dual-role power port, and
@@ -105,11 +139,14 @@ TCPM does what `try-power-role = "sink"` asks for: it presents Rd and gives
 the dock `tDRPTry` (100 ms) to answer with Rp.  On this controller that wait
 is never met.  The SM5714 does not expose its CC comparators, only an
 attachment it has debounced itself, and that report is late: inside Try.SNK
-it came 124, 130, 130 and 147 ms after Rd went up (four attaches, both
-docks), and in two of them the dock's VBUS was already on 26 ms before it.
+it came 123 to 147 ms after Rd went up (eight attaches: seven with the
+Satechi, 123 to 130 ms, and one with the Anker hub, 147 ms), and in four of
+them the dock's VBUS was already on 26 to 29 ms before it.
 All 13 Try.SNK attempts recorded with the standard wait ended
 `SNK_TRY_WAIT -> SRC_TRYWAIT` with no Rp reported: the tablet became the
-power source and the dock never charged it.  PR_Swap is no way back either:
+power source and the dock never charged it.  The one attempt recorded on
+the SM-X710, the Satechi with the standard wait, ended the same way, with
+the dock's VBUS on 98 ms after Rd.  PR_Swap is no way back either:
 the Satechi answers Wait every time, and with the Anker hub the CC connection
 is lost while the roles change.
 
@@ -136,14 +173,24 @@ good.  The 433 and 453 ms between Rd and the report of the source that were
 measured earlier, with the port forced to sink, would be that whole sequence.
 This is read from the timing; nothing has watched the CC line itself.
 
-The revision in the tree makes the extra time one deadline, set when Rd goes
+The second revision makes the extra time one deadline, set when Rd goes
 up: `tDRPTry` plus the extra wait.  An Rp that goes away before the deadline
 sends the port back to `SNK_TRY_WAIT` for what is left of it, from either
 debounce state, and the Rp that comes back is taken as the first one would
 have been.  After the deadline, and with the extra wait at 0, every step is
-upstream's.  If the reading above is right, the Satechi's lasting Rp is
-reported about 450 ms after Rd, inside the 700 ms.  **This revision has not
-run on a tablet yet.**
+upstream's.
+
+It kept the sink role on all four attaches that went through Try.SNK with
+it and left a log, each with the Satechi: two boots with the dock attached
+and two plug-ins into the running tablet.  One of each took the path the
+first revision lost.  The Rp went away 47 ms after its report, with 528 and
+532 ms of the deadline left, and the lasting one was reported 407 and
+400 ms after Rd: the reading above, inside the 700 ms.  What tells the two
+paths apart in the log is the dock's VBUS.  In the four Satechi attaches
+whose first Rp stayed it was on 26 to 29 ms before the report; in the three
+whose Rp went away again, the first revision's among them, it was still
+off.  The Anker hub attached as a source from the start in its two plug-ins
+with this revision, so they did not come through Try.SNK at all.
 
 ## A boot with the dock attached: the USB host that died (SM-X910)
 
@@ -167,18 +214,30 @@ xHCI resumes as if its state had been kept.  It only showed now because the
 tablet is the USB host by the time the cycle runs.
 
 `gcc-sm8550-usb-gdscs-retention.patch` declares both domains as kept in
-retention, as upstream does for the same domains on sm8650.  It is in
-the SM-X910's test kernel; this branch, which the SM-X710's kernel kit is
-built from, does not carry it yet.
-**It has not run on a tablet yet**, and one question is open beyond
-the boot cycle, where the supply behind the domains stays up: whether the
-state also survives a real deep sleep.  Until that is shown, the sleep hook
-that takes the port out of host role around each sleep stays.
+retention, as upstream does for the same domains on sm8650.  The SM-X910's
+test kernels have had it since the second.  With it that tablet has been
+booted three times with the Satechi attached, and each time the USB host
+controller came through the suspend cycle with the dock's devices still on
+the bus afterwards.
+
+This branch, which the SM-X710's kernel kit is built from, does not carry
+the patch.  That tablet had never been the USB host when the boot's suspend
+cycle ran, so whether it needs the patch is not known; **a boot with the
+dock attached has not been tried there yet**, and the kit's `verify.sh`
+names a host controller that died when it finds one.
+
+One question is open beyond the boot cycle, where the supply behind the
+domains stays up: whether the state also survives a real deep sleep.  Until
+that is shown, the sleep hook that takes the port out of host role around
+each sleep stays.
 
 ## Switches
 
 Both behaviours are on by default on both boards and can be changed at run
-time; a change applies from the next attach.
+time; a change applies from the next attach.  The driver reads the two
+parameters for as long as nothing is attached, the last time when a partner
+shows, and keeps what it read until the port is empty again, so one
+connection is never handled half with the old value and half with the new.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -199,9 +258,13 @@ as it does upstream, which is what every other TCPM controller gets.
   is not PD and is not affected.
 - **More attaches end with the tablet as USB host**, so what is still wrong
   in host role applies to more of them.  On the SM-X910 the xHCI did not
-  survive suspend in host role (the section above), and the sleep hook takes
-  the port out of host role for each sleep; a dock's devices disconnect and
-  reconnect around it.
+  survive a suspend in host role before the power domain change (the section
+  above), and the sleep hook still takes the port out of host role for each
+  sleep; a dock's devices disconnect and reconnect around it.
+- **A program that writes the port's `data_role` can get `EAGAIN`**
+  (`Resource temporarily unavailable`): while the kernel's discovery is
+  running, and when the swap ended with the role unchanged.  It used to be
+  told that the swap was done.  Writing again is the answer to both.
 - **Try.SNK now works for every dual-role partner**, as the device tree always
   asked: with a power bank, a laptop or a phone the tablet ends up as the
   sink.  Before, the outcome depended on which side was seen first.
@@ -233,12 +296,14 @@ sudo sh -c 'cat /sys/kernel/debug/usb/tcpm-*/log'
 ```
 
 On the SM-X710 the [Type-C roles kit](../tools/inplace/typec-roles/README.md)
-carries the kernel, and its `verify.sh dock` runs these steps for each
-plug-in, keeps the log and gives a verdict.
+carries the kernel; its `verify.sh dock` runs these steps for each plug-in,
+keeps the log and gives a verdict, and its `verify.sh swap` does the same
+for a swap asked for from userspace.
 
-Expected: `[host]` and `[sink]`, `Charging` with a positive current, the
-dock's hub in `lsusb`.  In the log, after the contract (the bracketed
-suffix of each line left out):
+Expected: `[host]` and `[sink]`, `Charging` with a positive current (`Full`
+and no current near 100 %), the dock's hub in `lsusb`.
+
+In the log, after the contract (the bracketed suffix of each line left out):
 
 ```
 state change SNK_NEGOTIATE_CAPABILITIES -> SNK_TRANSITION_SINK
@@ -270,12 +335,12 @@ state change SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS -> SNK_ATTACHED
 The 600 can read a few milliseconds less: it is what is left of the deadline
 when the line is written.  Rd goes up 100 ms before the first of these lines,
 and the third is the SM5714's report of the source.  A dock whose Rp does not
-stay, the Satechi plugged into the running tablet, should now show the port
+stay, as the Satechi's did not in three attaches of seven, shows the port
 going back to waiting and taking the Rp that follows:
 
 ```
 state change SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS -> SNK_TRY_WAIT
-pending state change SNK_TRY_WAIT -> SRC_TRYWAIT @ 520 ms
+pending state change SNK_TRY_WAIT -> SRC_TRYWAIT @ 528 ms
 state change SNK_TRY_WAIT -> SNK_TRY_WAIT_DEBOUNCE
 state change SNK_TRY_WAIT_DEBOUNCE -> SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS
 state change SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS -> SNK_ATTACHED
@@ -288,10 +353,10 @@ the figure is whatever is left at that moment.  If the wait runs out instead
 the default has to follow that.  A dock whose own power supply is not plugged
 in never shows Rp, and the tablet powers it; that is as it should be.
 
-**The Satechi plugged into the running tablet is the case to watch.**  It
-is the one the first revision lost.  With `try_snk_extra_wait_ms=0` it
-attaches as it always did, with the tablet as power source: no charging, but
-a stable connection.
+**The Satechi is the case to watch**, plugged into the running tablet or
+attached at boot: its Rp that goes away again is what the first revision
+lost.  With `try_snk_extra_wait_ms=0` it attaches as it always did, with the
+tablet as power source: no charging, but a stable connection.
 
 Repeat at least ten times with each dock, including a boot with the dock
 attached and a plug after login, and check that the role is the one reported:
@@ -308,26 +373,30 @@ build host (gadget network up).
 - Why the dock sends a Soft_Reset after its own swap is not known.  That it
   comes even when the tablet has sent nothing as host (7 of 29) speaks
   against the tablet's first message in the new role as the trigger.
-- The second revision of the Try.SNK wait and the USB power domain change
-  have not run on a tablet; neither has anything on the SM-X710.  A real
-  sleep with a dock attached has not been tried with any of it.
+- The two fixes for a swap asked for from userspace and the switches at run
+  time have not been tried on a tablet, and no dock has been plugged into
+  the SM-X710 with any of this.  A real sleep with a dock attached has not
+  been tried on either tablet.
+- Whether the SM-X710 needs the USB power domain change.  A boot with the
+  dock attached will show it.
 - Whether the USB power domains keep their state through a real deep sleep
-  on the SM8550.  If they do, the sleep hook's role change can go, and a
-  dock's devices stay connected across a sleep.
-- How much of the 124 to 147 ms between Rd and the report of an Rp is the
-  dock's and how much the SM5714's own debounce (twice the dock's VBUS was
-  on 26 ms before the report).  If the controller's share can be shortened
-  far enough, the standard Try.SNK is met and the extra wait is only needed
-  for a dock that tries the sink role first itself.
-- `tcpm_dr_set()` reports success to userspace when a swap it sent was
-  discarded and the role did not change.
-- A DATA_ROLE_SWAP AMS can interrupt a VDM that is waiting for its reply;
-  that is what turns a late swap into a soft reset.
+  on the SM8550, and what keeping them in retention costs in sleep.  If the
+  state is kept, the sleep hook's role change can go, and a dock's devices
+  stay connected across a sleep.
+- How much of the 123 to 147 ms between Rd and the report of an Rp is the
+  dock's and how much the SM5714's own debounce (four times the dock's VBUS
+  was on 26 to 29 ms before the report).  If the controller's share can be
+  shortened far enough, the standard Try.SNK is met and the extra wait is
+  only needed for a dock that tries the sink role first itself.
+- `tcpm_pr_set()` and `tcpm_vconn_set()` are built the way `tcpm_dr_set()`
+  was and were left as they are: they report what the state machine ended
+  with, not the role.  Nothing here writes `power_role` or `vconn_source`,
+  and whether they can report a swap that did not happen was not looked at.
 - A request that the SM5714 reports as discarded (`PD TX complete, status: 1`
   right after the DR_Swap in the log) still waits 60 ms for an answer and
   counts as one of the three.  A dock that starts its own discovery right
-  after the contract could use all three up that way; the log of the first
-  tests will show whether one does.
+  after the contract could use all three up that way.  Neither dock here
+  does: none of the nine requests on record was discarded.
 - The earlier patch keeps every host role that did not come from a swap
   across a Hard Reset received as sink, not only one taken over from a dock
   that kept its role.  A tablet that attached as power source and became
@@ -344,6 +413,6 @@ build host (gadget network up).
   (14.94 W) and `op-sink-microwatt` is 15 W.  The contract is granted all
   the same; lowering `op-sink-microwatt` to 14940000 would clear the flag.
 - Booting with a dock attached has its own history (see the
-  [DisplayPort notes](gts9u-displayport.md)).  The one boot of that kind
-  with these changes ended as described above; DisplayPort through the dock
-  was not looked at in it.
+  [DisplayPort notes](gts9u-displayport.md)).  The boots of that kind with
+  these changes ended as described above; DisplayPort through the dock was
+  not looked at in them.

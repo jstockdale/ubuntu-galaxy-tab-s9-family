@@ -13,7 +13,7 @@ On the SM-X910 two docks did not get there:
   mismatch and one hard reset);
 - a dock seen as a sink first kept the tablet as power source, because
   Try.SNK gives up after 100 ms and the SM5714 reports a source later than
-  that: 123 to 147 ms after Rd in the seven attaches measured.
+  that: 123 to 147 ms after Rd in the eight attaches measured.
 
 **On the SM-X910 (2026-11-21)** a test kernel with both changes was tried
 with two docks. The data role change did what it should on all three
@@ -28,12 +28,15 @@ into the running tablet, all six with the tablet as USB host and power sink
 at the end, one of them through the case the first revision lost. This kit's
 kernel carries that second revision and, new, two fixes for a data role swap
 asked for from userspace (a write to the port's `data_role`) and a driver
-that reads its two switches at each attach; those three have not run on a
-tablet. **Nothing of this has run on the SM-X710.**
+that reads its two switches at each attach. The SM-X910 has booted once with
+a dock attached on a kernel with those three, with the same outcome; the two
+fixes and the switches have not been tried on a tablet. **On the SM-X710 the
+kit is installed, and no dock has been plugged into it yet.**
 
-The SM-X710 has the same controller, driver and connector description. The
-fault has not been reproduced on it; `verify.sh dock` before installing shows
-whether it does.
+The SM-X710 has the same controller, driver and connector description.
+Before the kit went on, `verify.sh dock` recorded the Satechi dock there
+once: it left the tablet as power source, as on the SM-X910. The data role
+fault has not been seen on it.
 
 The SM-X910's third change, the USB power domains kept in retention across
 suspend (a boot with the dock attached lost its USB host there), **is not in
