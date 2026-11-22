@@ -223,6 +223,20 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 	diff -rq -x .git -x '*.o' -x '*.ko' -x '.*.cmd' -x '*.mod' -x '*.mod.c' \
 		-x modules.order -x Module.symvers \
 		"$base_tree" "$tree" > "$tmp/trees.diff" || :
+	# patch(1) keeps the file it started from as FILE.orig when a hunk goes
+	# in at an offset, and scripts/build-mainline-kernel.sh does not tell it
+	# not to: on the SM-X710 the dwc3-qcom guard goes in four lines down.
+	# Such a backup is in the new tree alone.  It is passed over when it is
+	# what patch(1) kept there, the release tree's file, and shown like any
+	# other file when it is anything else.
+	backups=
+	for f in "${patched[@]}"; do
+		[ -f "$tree/$f.orig" ] && [ ! -e "$base_tree/$f.orig" ] &&
+			cmp -s "$tree/$f.orig" "$base_tree/$f" || continue
+		grep -vxF "Only in $tree/${f%/*}: ${f##*/}.orig" "$tmp/trees.diff" > "$tmp/trees.rest" || :
+		mv "$tmp/trees.rest" "$tmp/trees.diff"
+		backups="$backups ${f##*/}.orig"
+	done
 	sed -e "s|^Files $base_tree/\(.*\) and .* differ\$|\1|" "$tmp/trees.diff" | sort > "$tmp/trees.changed"
 	sort > "$tmp/trees.want" <<EOF
 $gcc.c
@@ -238,6 +252,10 @@ EOF
 	}
 	source_check="compared with $base_tree: five files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches"
 	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c differ from the release tree, by exactly this checkout'"'"'s changes'
+	if [ -n "$backups" ]; then
+		source_check="$source_check; passed over, a copy of the release tree's file that patch(1) kept:$backups"
+		echo "sources: passed over$backups, the release tree's file as patch(1) kept it"
+	fi
 else
 	echo 'sources: the seven patches and this checkout'"'"'s driver are in the build tree (BASE_SCRATCH not set: no tree comparison)'
 fi

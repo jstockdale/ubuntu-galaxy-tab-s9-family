@@ -2265,6 +2265,63 @@ class ScriptsTest(unittest.TestCase):
             "Only in %s: extra.c" % (new / "drivers"),
         ], result.stderr)
 
+    def test_tree_comparison_passes_over_a_backup_patch_kept_and_no_other(self):
+        """The build script's patch(1) keeps FILE.orig when a hunk goes in at
+        an offset, as the dwc3-qcom guard does on the SM-X710's tree.  That
+        backup is in the new tree alone and is the release tree's file, and
+        what was passed over is said on the console and in SOURCE.  Anything
+        else called .orig still has to show: one with other content, one of
+        a file the kit's patches do not change, one both trees have and one
+        that only the release tree has."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        block = re.search(r'^\tbackups=\n\tfor f in "\$\{patched\[@\]\}"; do\n.*?^\tdone\n',
+                          text, re.M | re.S)
+        self.assertIsNotNone(block)
+        said = re.search(r'^\tif \[ -n "\$backups" \]; then\n.*?^\tfi\n', text, re.M | re.S)
+        self.assertIsNotNone(said)
+        with tempfile.TemporaryDirectory() as tmp:
+            old, new = pathlib.Path(tmp, "old"), pathlib.Path(tmp, "new")
+            for tree, tag in ((old, "old"), (new, "new")):
+                for name in ("usb/glue.c", "clk/gcc.c", "usb/tcpm.c", "include/tcpm.h",
+                             "usb/other.c"):
+                    (tree / name).parent.mkdir(parents=True, exist_ok=True)
+                    (tree / name).write_text("%s of %s\n" % (name, tag))
+            (old / "usb/tcpm.c.orig").write_text("an older backup\n")
+            (new / "usb/tcpm.c.orig").write_text("usb/tcpm.c of old\n")
+            (new / "usb/glue.c.orig").write_text("usb/glue.c of old\n")
+            (new / "clk/gcc.c.orig").write_text("not the file of old\n")
+            (new / "usb/other.c.orig").write_text("usb/other.c of old\n")
+            (old / "include/tcpm.h.orig").write_text("include/tcpm.h of old\n")
+            script = ('set -euo pipefail; base_tree=$1 tree=$2 tmp=$3\n'
+                      'patched=(usb/glue.c clk/gcc.c usb/tcpm.c include/tcpm.h)\n'
+                      'diff -rq "$base_tree" "$tree" > "$tmp/trees.diff" || :\n'
+                      + block.group(0) +
+                      'cat "$tmp/trees.diff"; echo "backups:$backups"\n'
+                      'source_check=compared\n' + said.group(0) +
+                      'echo "source check: $source_check"\n')
+            result = subprocess.run(["bash", "-c", script, "backups", str(old), str(new), tmp],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(result.stdout.splitlines()), sorted([
+            "Files %s and %s differ" % (old / name, new / name)
+            for name in ("usb/glue.c", "clk/gcc.c", "usb/tcpm.c", "include/tcpm.h",
+                         "usb/other.c", "usb/tcpm.c.orig")
+        ] + [
+            "Only in %s: gcc.c.orig" % (new / "clk"),
+            "Only in %s: other.c.orig" % (new / "usb"),
+            "Only in %s: tcpm.h.orig" % (old / "include"),
+            "backups: glue.c.orig",
+            "sources: passed over glue.c.orig, the release tree's file as patch(1) kept it",
+            "source check: compared; passed over, a copy of the release tree's file "
+            "that patch(1) kept: glue.c.orig",
+        ]), result.stderr)
+        # Nothing passed over: nothing said, and the source check as it was.
+        quiet = subprocess.run(["bash", "-c", 'set -euo pipefail; backups= source_check=compared\n'
+                                + said.group(0) + 'echo "source check: $source_check"\n'],
+                               capture_output=True, text=True)
+        self.assertEqual((quiet.returncode, quiet.stdout), (0, "source check: compared\n"),
+                         quiet.stderr)
+
     def power_domain_gate(self, source):
         """Run make-kit.sh's check for the USB power domain patch on SOURCE."""
         text = (KIT_SRC / "make-kit.sh").read_text()
