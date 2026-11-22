@@ -176,7 +176,8 @@ object are what show it.
 ## Install, check, roll back (tablet)
 
 ```sh
-scp -r ~/ubuntu-gts9u/backups/typec-roles-kit <user>@<tablet>:typec-roles
+ssh <user>@<tablet> mkdir -p typec-roles
+scp ~/ubuntu-gts9u/backups/typec-roles-kit/* <user>@<tablet>:typec-roles/
 sudo sh ~/typec-roles/verify.sh dock 3     # optional: the baseline, before
 sudo sh ~/typec-roles/install.sh
 sudo reboot
@@ -191,12 +192,30 @@ sudo sh ~/typec-roles/rollback.sh          # back to the hang-log kit; reboot
 `/var/log/gts9u-typec-roles.log`. It syncs the disk after saving boot,
 before writing the new kernel and at the end, so that a power failure finds
 either the hang-log or the kit's kernel with its own modules. Reboot soon
-after it: until then the running kernel loads no further module. A second
-`install.sh` over an installed kit is refused, and there is no upgrade from
-an earlier revision of this kit: run its `rollback.sh` and reboot, then this
-revision's `install.sh` and reboot again. The hang-log kit's own `verify.sh`
-reports another build ID and module key while this kit is installed; its
-other checks still apply.
+after it: until then the running kernel loads no further module. A first
+install that stopped is not finished by a second run: `rollback.sh` undoes
+it, then `install.sh` runs again. The hang-log kit's own `verify.sh` reports
+another build ID and module key while this kit is installed; its other
+checks still apply.
+
+**Over an earlier revision of this kit** `install.sh` runs as an upgrade: one
+command, then one reboot, and no `rollback.sh` first. Copy the new kit over
+the old one in `~/typec-roles` as above (the `logs` of earlier runs stay),
+run `install.sh` and reboot. The hang-log kit that the first install saved
+stays the way back: the upgrade checks that it is whole, replaces the earlier
+kit's module tree and writes boot again, and vendor_boot keeps the hang-log
+kit's image. `rollback.sh` returns to the hang-log kit, not to the earlier
+revision, after any number of upgrades. Boot has to hold the hang-log kit
+(after a restore from TWRP) or a revision of this kit, and the running kernel
+has to be one of theirs: revisions 1 to 7 are known by their boot images and
+kernels, and every later install or upgrade adds a line to `revisions` in the
+backup before it writes boot. Anything else is refused with nothing written,
+and the message names the image or the build ID it found. Reboot soon after
+an upgrade too: until then the module tree in place is built for the new
+kernel, not for the running one. If an upgrade stops half-way, run
+`install.sh` again, or `rollback.sh`, before any reboot; a second run of
+`install.sh` picks up wherever the first one stopped. `install.sh` of the
+revision that is installed already says so and changes nothing.
 
 `rollback.sh` writes boot and the module tree back first and syncs. If it
 stops after that, it says that the hang-log kernel and its modules are back
