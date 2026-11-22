@@ -1,6 +1,7 @@
 #!/bin/sh
 # Checks after booting the Type-C roles kit, and a recorder for plug-in tests.
-#   sh ~/typec-roles/verify.sh                  kernel, key, switches, roles now
+#   sh ~/typec-roles/verify.sh                  kernel, key, switches, the root's
+#                                               ext4, roles now
 #   sudo sh ~/typec-roles/verify.sh dock [N]    N plug-ins of a powered dock
 #                                               (default 10), a verdict for each
 #   sudo sh ~/typec-roles/verify.sh record [N]  the same without a verdict: a
@@ -358,7 +359,7 @@ wait_partner() { # present|absent SECONDS; absent has to hold for 3 s, a
 case ${1:-} in
 dock|record|now|swap) plug_test "$@" ;;
 '') ;;
-*) sed -n '2,15s/^# //p' "$0" >&2; exit 2 ;;
+*) sed -n '2,16s/^# //p' "$0" >&2; exit 2 ;;
 esac
 
 echo "kernel: $(uname -v)"
@@ -374,6 +375,21 @@ root_opts=$(findmnt -no OPTIONS /)
 echo "$root_opts" | tr ',' '\n' | grep -qx rw &&
 	! echo "$root_opts" | tr ',' '\n' | grep -qxE 'emergency_ro|shutdown' &&
 	ok 'root is rw' || bad "root is not writable (mounted ${root_opts:-unknown})"
+# ext4's record of the root.  With an error recorded and deleted files held
+# open, a boot after a reset does not mount the root (this port's initramfs
+# has no fsck; docs/resume-recovery.md): any error is a FAIL.
+root_src=$(findmnt -no SOURCE /)
+root_name=$(readlink -f "$root_src" 2>/dev/null)
+root_name=${root_name:-$root_src}
+root_name=${root_name##*/}
+root_errors=$(cat "/sys/fs/ext4/$root_name/errors_count" 2>/dev/null)
+case $root_errors in
+0) ok "ext4 has recorded no error on the root ($root_name: errors_count 0)" ;;
+''|*[!0-9]*) note "cannot read /sys/fs/ext4/$root_name/errors_count: ext4's error count of the root was not checked" ;;
+*) bad "ext4 has recorded $root_errors errors on the root ($root_name, the last in" \
+	"$(cat "/sys/fs/ext4/$root_name/last_error_func" 2>/dev/null):$(cat "/sys/fs/ext4/$root_name/last_error_line" 2>/dev/null)):" \
+	'e2fsck -f it from recovery before the next reset (docs/resume-recovery.md, "Repairing the root from recovery")' ;;
+esac
 
 k=$(journalctl -k -b --no-pager -q 2>/dev/null)
 # Four checks below read this boot's kernel log; without it none can pass.
@@ -452,6 +468,66 @@ if [ -n "$k" ]; then
 	else
 		note 'the running kernel is not the kit'"'"'s: whether it resets the UFS PHY'"'"'s PCS before calibration cannot be seen from userspace'
 	fi
+fi
+
+# The root's mount this boot, from the kernel's own lines (fs/ext4/super.c,
+# fs/jbd2/journal.c).  An error that the mount found recorded, in the
+# superblock or in the journal's, or that ext4 recorded since, fails in any
+# boot.  A journal that had to be replayed ("recovery required on readonly
+# filesystem"), or that held transactions ext4 did not ask to replay ("JBD2:
+# Clearing recovery information on journal", which names no device), is
+# what a power loss or a forced restart leaves, and wrong only in the boot
+# right after sleep-test.sh's restart: that root was frozen, its journal
+# flushed and needs_recovery clear.  That boot is known by the run's
+# "SLEEP-TEST RESTART" line in the pmsg that this boot archived
+# (ubuntu-gts9u-pstore-archive: its INFO names the archiving boot).
+if [ -n "$k" ]; then
+	pst=/var/lib/ubuntu-gts9u/pstore
+	boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+	after_run=unknown
+	if [ ! -d "$pst" ]; then
+		unknown_why="there is no $pst"
+	elif [ ! -r "$pst" ] || [ ! -x "$pst" ]; then
+		unknown_why="$pst is not readable: group adm, or sudo"
+	else
+		after_run=no
+		for d in "$pst"/[0-9]*; do
+			[ -n "$boot" ] && grep -qs "by boot $boot" "$d/INFO" || continue
+			! grep -rqs 'gts9u sleep-test: [0-9-]* SLEEP-TEST RESTART: ' "$d" || after_run=yes
+		done
+	fi
+	rn=$root_name
+	case $rn in
+	''|*[!A-Za-z0-9_-]*) note "cannot name the root's device ($root_src): its ext4 lines this boot were not checked" ;;
+	*)
+		e=$(printf '%s\n' "$ku" | grep -E "EXT4-fs warning \\(device $rn\\): .*Filesystem error recorded from previous mount|EXT4-fs \\($rn\\): warning: mounting fs with errors|EXT4-fs error \\(device $rn\\)|Orphan file not empty on read-only fs")
+		if [ -n "$e" ]; then
+			bad "ext4 found or recorded an error on the root ($rn) this boot: e2fsck -f it from recovery" \
+				'before the next reset (docs/resume-recovery.md, "Repairing the root from recovery"):'
+			printf '%s\n' "$e" | tail -n 5
+		else
+			ok "the root ($rn) was mounted with no ext4 error found or recorded this boot"
+		fi
+		r=$(printf '%s\n' "$ku" | grep -E "EXT4-fs \\($rn\\): INFO: recovery required on readonly filesystem|JBD2: Clearing recovery information on journal")
+		case $after_run:${r:+found} in
+		yes:found)
+			bad "this is the boot after a sleep test's restart, and a journal was not empty at the mount: the" \
+				'root was not frozen at the restart, or something wrote to it while it was; check it with' \
+				'e2fsck -fn from recovery:'
+			printf '%s\n' "$r" | tail -n 3 ;;
+		yes:)
+			ok 'the boot after a sleep test'"'"'s restart: the root'"'"'s journal was empty at the mount (frozen to the restart)'
+			o=$(printf '%s\n' "$ku" | grep -E "EXT4-fs \\($rn\\): (orphan cleanup on readonly fs|recovery complete|mounted filesystem)" |
+				sed 's/.*EXT4-fs ([^)]*): //' | tr '\n' ';')
+			[ -z "$o" ] || note "the root's mount: ${o%;}" ;;
+		no:found)
+			note "the root's journal was replayed at this boot's mount ($(printf '%s\n' "$r" | head -n 1 | sed 's/.*\] //;s/^kernel: //')):" \
+				'what a power loss or a forced restart leaves' ;;
+		unknown:found)
+			note "the root's journal was replayed at this boot's mount: normal after a power loss, wrong right after a" \
+				"sleep test's restart, and whether this boot is one cannot be told ($unknown_why)" ;;
+		esac ;;
+	esac
 fi
 
 [ -d "$port" ] && ok "Type-C port registered: data $(role data_role), power $(role power_role)," \

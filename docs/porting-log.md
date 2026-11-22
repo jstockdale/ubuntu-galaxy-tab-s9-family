@@ -9029,3 +9029,185 @@ the run itself ends in a way the breaker counts as unclean.
   the host with fakes only.
 - The SM-X910's kit (`typec-roles-ultra`) needs its tree comparison changed
   for `phy-qcom-qmp-ufs.c` before it is rebuilt from this tree.
+
+### The first sleep-test baseline: an aborted sleep, then a root that did not mount (2026-11-22)
+
+**The run.** At 03:28:43 the owner started `sleep-test.sh ro 3 30
+restart-ok` on squirtle: kit revision 7's kernel (build ID
+`84c2748b5ee4…`, boot `788ce779`), docked and powered, the interconnect
+floor released, a baseline before revision 8. The run's files are in
+`~/ubuntu-gts9u/backups/squirtle-sleep-r7-baseline-20261122-0328/run/`.
+- Cycle 1 never slept. The touchscreen's double tap fired in the noirq
+  phase of the suspend: `PM: Triggering wakeup from IRQ 199`, then
+  `Wakeup pending. Abort CPU freeze`, and the kernel gave the suspend up.
+  IRQ 199 is `msmgpio 25 Level fts1ba90a`, the touch controller
+  (`samsung_fts1ba90a 9-0049: double tap to wake`).
+- `rtcwake` failed (`write error`: the write to `/sys/power/state` got
+  `EBUSY`), `suspend_stats` counted no success and one failure
+  (`last_failed_errno` -16), and qcom_stats counted nothing.
+- The read of userdata after it matched the first read, and the kernel
+  logged no UFS line. The storage was fine; this says nothing about the
+  2026-11-21 UFS fault.
+- The script called the cycle a FAIL and ended the run, which costs a
+  restart.
+
+**The root did not mount after it.** Before the first sleep the script had
+made every filesystem read-only with `sysrq u`, at 03:28:44. On ext4 that
+remount ends in `ext4_mark_recovery_complete()`, which records an error
+when the orphan file is not empty on a read-only filesystem, and on a
+running desktop it never is (deleted files held open). The error was saved
+to the superblock (first error 03:28:48, `ext4_mark_recovery_complete`
+line 6370). At every boot after the restart, ext4 skipped the orphan
+cleanup because of the recorded error, the same check failed the mount
+with `EFSCORRUPTED`, the initramfs (which has no fsck) panicked, and
+`panic=10` restarted the tablet: a boot loop. The superblock read from
+recovery said "clean with errors", error count 5. The owner repaired it
+from recovery with the Ubuntu `e2fsck` run from RAM. The evidence is in
+`~/ubuntu-gts9u/backups/squirtle-bootloop-20261122-0334/`.
+- **Repair outcome:** repaired 2026-11-22 about 03:45 PST from TWRP
+  (3.7.1_12) with Ubuntu's own `e2fsck` 1.47.0, copied to TWRP's RAM with
+  its libraries and run through its own loader (TWRP's `e2fsck` 1.45.4 is
+  too old for `orphan_file`): `-fn` (rc 4), `-fy` (rc 1), `-fn` again
+  (rc 0). Only orphan leftovers were fixed: 24 deleted inodes, the bitmaps
+  and counts they held, the orphan file's block; passes 2 to 4 were clean.
+  The tablet booted cleanly at 03:47, root read-write, `errors_count` 0.
+  The method is in
+  [resume-recovery.md](resume-recovery.md#repairing-the-root-from-recovery).
+- The 2026-11-21 remount did not leave this state only because the UFS
+  was dead by then and the error could not be written.
+- Why the boot did not repair it: the initramfs is generated on the build
+  host, where initramfs-tools' `fsck` hook cannot find the type of
+  `LABEL=...` for `/`, and `initramfs.conf` sets no `FSTYPE`, so no fsck is
+  copied in. Not changed yet; see
+  [resume-recovery.md](resume-recovery.md#protecting-the-storage-in-a-sleep-test).
+
+**The script change** (`tools/inplace/typec-roles/sleep-test.sh`; kit
+revision 8 keeps its kernel and its number, its scripts are repacked):
+- No `sysrq u`. Every writable disk filesystem is frozen (`fsfreeze -f`
+  through `/proc/1/root`, from the RAM root): one on a loop device first,
+  the root last. A freeze flushes the journal and records no error, and the
+  boot after a reset mounts the root as after a power loss. The UFS disk is
+  then made read-only at the block layer, as before. A freeze that fails is
+  undone and the run stops without a restart.
+- The run always ends with `sysrq b`, the filesystems still frozen. The
+  clean reboot through systemd is gone: it would stop services that wait
+  on the frozen disk.
+- ext4's error count of each frozen filesystem is read before the freezes,
+  after them and at the end. A root with a recorded error is refused. A
+  count that rose stops the run before any sleep. (As first written, a
+  count that rose by the end was to leave the tablet running with
+  `SLEEP-TEST ERROR-STATE`; the review below found that the count cannot
+  rise once the disk is read-only, and the error reaches the disk another
+  way. Corrected the same day, below.)
+- Only ext4 is frozen. exfat has no freeze, so an exfat filesystem mounted
+  writable (the SD card) has to be unmounted first.
+- `dry`: the protection, two reads 10 s apart and the restart, with no
+  sleep, ending in `SLEEP-TEST RESULT: DRY`. It is to be run first, to see
+  a clean boot after a protected run.
+- A suspend that the kernel gave up before the tablet slept is ABORTED, not
+  FAIL, when every one of these holds: `rtcwake` failed; `suspend_stats`
+  rose by no success and one failure; the attempt's kernel lines show the
+  suspend given up on the way down (a pending wakeup, a wakeup IRQ, a
+  device that refused); less than 1 s of suspended timekeeping; no UFS,
+  I/O, diagnostic-timeout or UFS-error line; and the read matches. Anything
+  else stays a FAIL. The line names the cause, here `IRQ 199 (fts1ba90a,
+  the touchscreen: do not touch the screen during the run)`. The cycle is
+  tried again after 5 s, up to `aborts=N` times in a run (default 5); one
+  more ends the run with `SLEEP-TEST RESULT: NO-SLEEP`, which leaves the
+  storage question open.
+- The run tells the owner not to touch the screen before it freezes
+  anything. Its own lines now go to its log only, and the part started
+  from the terminal shows them (`tail -f`), so a terminal that stops
+  reading cannot hold the run up.
+- The tests run all of it against fakes. Nothing of it has run on the
+  tablet.
+
+### The sleep test after its review: errors=continue, ext4 watched to the restart, NO-SLEEP (freezer) (2026-11-22)
+
+An adversarial review of the freeze rework (in
+`~/ubuntu-gts9u/tmp/typec-merge-scratch/sleep-abort/review/REPORT.md`)
+found `dry` safe as it was, and two major faults for runs with sleeps,
+both confirmed in the 7.2-rc3 source:
+- **The run could restart into the boot loop it was written to avoid.**
+  With the disk read-only at the block layer, `ext4_handle_error()` saves
+  no error and the error count cannot rise, so the script's only check
+  after the freeze was blind. But under `errors=remount-ro`, the root's
+  superblock default, ext4 still aborts its journal, and jbd2 writes the
+  error into the journal's superblock (`jbd2_journal_abort()` ->
+  `jbd2_journal_update_sb_errno()`); the block layer only warns about that
+  write. The next mount turns it into `EXT4_ERROR_FS`, skips the orphan
+  cleanup and fails on the orphan file, as at 03:28. The scenario is the
+  one the test exists for: a resume that half-loses the UFS and a failed
+  read on the root.
+- **A task-freezer failure would be reported as FAIL.** Writers waiting on
+  the frozen root are freezable, but a task queued behind one of them on a
+  memory map's lock is not; after 20 s the suspend fails ("Freezing user
+  space processes failed after"), which the script called a storage FAIL.
+
+The script now (`tools/inplace/typec-roles/sleep-test.sh`, committed with
+the rest of the rework; kit revision 8 keeps its kernel and its number):
+- remounts every ext4 filesystem it freezes with `errors=continue` as its
+  last step on the disk (`nsenter -t 1 -m -- mount -o
+  remount,errors=continue MOUNTPOINT`: the system's own mount in PID 1's
+  mount namespace), checks `/proc/1/mounts` for the result and stops,
+  putting back what it changed, if it did not take. With `errors=continue`
+  and the disk read-only an ext4 error aborts nothing and writes nothing.
+  The superblock's default is not touched; a stop before any sleep puts
+  each filesystem's behaviour back after the thaw and says so if that
+  failed; a restart needs nothing put back. A filesystem with
+  `errors=panic` is refused;
+- watches ext4 itself, not only its count: before the first freeze, once
+  the disk is read-only, at the end and right before `sysrq b`, the count
+  against the one read before the run, `emergency_ro`/`shutdown` in the
+  options, and ext4's and jbd2's lines in the kernel log since the run
+  began. Before any sleep that stops the run (thawed, `e2fsck` from
+  recovery next); after a sleep it says `SLEEP-TEST ERROR-STATE` with NEXT
+  lines that the root will probably not mount and how to reach TWRP, or
+  `SLEEP-TEST NOTE` for an error logged with nothing written, and restarts
+  in both cases (a tablet left up with its disk frozen cannot be used; a
+  restart keeps the lines in pstore). The test fake that raised the count
+  after the disk went read-only, which the kernel cannot do, is replaced
+  by ext4's and jbd2's own lines;
+- calls a freezer failure with the storage as before NO-SLEEP (freezer),
+  names the tasks from the kernel's dump, does not try it again, and
+  points to running from `multi-user.target`;
+- freezes each filesystem a second time after every sleep (and in `dry`):
+  it must fail with `EBUSY`; a freeze that succeeds there means something
+  thawed it, a FAIL of the protection;
+- refuses `panic_on_warn` or `hung_task_panic` other than 0: the first
+  resume with a filesystem frozen logs one expected warning
+  (`fs/super.c:1919`, the suspend's own thaw finding no freeze of its own
+  with `freeze_filesystems` 0), which no rule counts;
+- fails on a journal started on a frozen ext4 (`ext4_journal_check_start`'s
+  warning) and, before the first sleep, on any failure line since the run
+  began; counts the SCSI layer's `timing out`/`offline` lines and lines of
+  the UFS host's SCSI devices (`sd 0:0:0:0: ...`) as storage lines, which an
+  ABORTED attempt may not have; compares ext4's error counts with those read
+  before the run, not at the freeze; refuses escaped mount points before
+  anything is done; names devices through `readlink -f`; gives a hung
+  freeze its own NEXT line; writes `SLEEP-TEST RESTART` to pmsg just before
+  `sysrq b`.
+
+`verify.sh` now fails on any error ext4 recorded on the root
+(`errors_count`, "Filesystem error recorded from previous mount",
+"mounting fs with errors", "Orphan file not empty"), in any boot. In the
+boot right after a sleep test's restart (the run's `SLEEP-TEST RESTART`
+line in the pmsg that boot archived) it also fails on a root journal that
+was not empty at the mount ("recovery required on readonly filesystem",
+"JBD2: Clearing recovery information on journal"); in another boot those
+lines are a note, what a power loss leaves.
+
+The general fact, for this port as it is: with `orphan_file` and no fsck
+in the initramfs, an ext4 error recorded on a running root that has
+deleted-but-open files makes the next mount after a reset fail
+(`ext4_orphan_cleanup()` skips a filesystem with errors, and
+`ext4_mark_recovery_complete()` then fails on the orphan file). An fsck in
+the initramfs is an open item, not decided.
+
+Tests: `tests/test_typec_roles_kit.py` runs every new branch against fakes
+(157 tests in the module). Nothing of this has run on the tablet: as of
+2026-11-22 no sleep test has completed a deep sleep (the revision 7
+baseline never slept, and none has run on revision 8), the freeze has not
+run there at all, and the `errors=continue` behaviour is read from the
+source only. The first `dry` shows whether a second freeze fails with
+`EBUSY` and whether the remount takes.

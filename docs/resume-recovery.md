@@ -397,22 +397,228 @@ initialization timed-out`, the lines after it point to the next step:
 
 `tools/inplace/typec-roles/` revision 8 carries the reset and the
 diagnostic, and `sleep-test.sh`: deep sleeps with every disk filesystem
-read-only, run from a RAM root, so that a resume that loses the storage
-costs a restart and nothing else (its README has the details). The order:
-1. on revision 7, before the install, a baseline: does it fail every time,
+frozen, ext4 kept from recording an error (`errors=continue` with the disk
+read-only), run from a RAM root, so that a resume that loses the storage
+costs a restart and nothing else (its README has the details, and the next
+section why a freeze). The order:
+1. `sleep-test.sh dry`: the protection and the restart with no sleep, and
+   a clean boot after it (`verify.sh` knows the boot after a sleep test);
+2. on revision 7, before the install, a baseline: does it fail every time,
    or one time in N? With the floor released (`release-floor` in a boot
    after a forced restart);
-2. revision 8 installed: `verify.sh` (the diagnostic's entry lines, no UFS
+3. revision 8 installed: `verify.sh` (the diagnostic's entry lines, no UFS
    failure), then the sleep test docked and undocked, each with the floor
    released;
-3. only after those pass: sleeps with a writable root
+4. only after those pass: sleeps with a writable root
    (`scripts/diagnostics/suspend/gts9u-suspend-cycles.sh`), then the suspend
    policy.
 
+Nobody touches the screen during a run: the touchscreen's double tap wakes
+the tablet, and in a suspend under way it makes the kernel give the suspend
+up (the script calls such an attempt ABORTED, tries the cycle again, and
+after `aborts=N` of them ends with NO-SLEEP, not FAIL). A suspend whose
+task freezer gives up is NO-SLEEP (freezer) and is not tried again (below);
+the next run then goes from `multi-user.target`, without the desktop.
+
 After boot and after every sleep, `findmnt -no OPTIONS /` must show `rw`
-without `emergency_ro` and
+without `emergency_ro`,
 `journalctl -k -b | grep -iE 'phy initialization timed-out|ufshcd.*(error|fail)'`
-must print nothing.
+must print nothing, and `cat /sys/fs/ext4/sda34/errors_count` must say 0.
+
+### Protecting the storage in a sleep test
+
+The first form of `sleep-test.sh` made every disk filesystem read-only with
+`sysrq u` before the first sleep. On 2026-11-22 (03:28, the first baseline
+run on squirtle) that recorded an ext4 error on the live root, and every
+boot after it failed to mount the root. The mechanism, in the pinned kernel
+source (7.2-rc3):
+- `sysrq u` remounts every filesystem read-only
+  (`do_emergency_remount`). For ext4, `__ext4_remount()` then calls
+  `ext4_mark_recovery_complete()` (`fs/ext4/super.c`). That function, on a
+  read-only filesystem with `needs_recovery` or `orphan_present` set,
+  requires the orphan file to be empty and otherwise records
+  `ext4_error(sb, "Orphan file not empty on read-only fs.")` and returns
+  `-EFSCORRUPTED`. A running desktop always holds deleted files open, so
+  the orphan file is never empty: the error is recorded, and with the disk
+  still writable at the block layer, `ext4_handle_error()` saves it to the
+  superblock (the error flag, the count, the first error's function and
+  line: `ext4_mark_recovery_complete`, line 6370).
+- At the next mount, `ext4_orphan_cleanup()` (`fs/ext4/orphan.c`) skips the
+  cleanup on a filesystem with `EXT4_ERROR_FS` ("Skipping orphan recovery
+  on fs with errors"), so the orphan file stays full, and
+  `ext4_mark_recovery_complete()`, called from `__ext4_fill_super()` because
+  `orphan_present` is set, fails the same way: the mount fails with
+  `EFSCORRUPTED`. This port's initramfs has no fsck (see below), its
+  `panic` reboots after 10 s (`panic=10` on the command line), and the
+  tablet looped. The superblock read from recovery: "clean with errors",
+  error count 5, first error 03:28:48 in `ext4_mark_recovery_complete`
+  line 6370.
+- Repaired on 2026-11-22, about 03:45 PST, from TWRP (3.7.1_12) with
+  Ubuntu's own `e2fsck` 1.47.0, copied to TWRP's RAM with its libraries and
+  run through its own dynamic loader: TWRP's `e2fsck` 1.45.4 is too old
+  for the `orphan_file` feature. `e2fsck -fn` ended with 4 (errors left),
+  `e2fsck -fy` with 1 (repaired), a second `e2fsck -fn` with 0. It fixed
+  only what the orphans left behind: 24 deleted inodes with no deletion
+  time, the block and inode bitmaps and free counts they still held, and
+  the orphan file's block (passes 2 to 4 found nothing; it also applied
+  its usual extent-tree optimizations). The tablet booted cleanly at 03:47,
+  the root read-write, `errors_count` 0. The transcripts are in
+  `~/ubuntu-gts9u/backups/squirtle-bootloop-20261122-0334/`
+  (`fsck-n.log`, `fsck-y.log`).
+- On 2026-11-21 the same remount did not leave this state only because
+  the UFS was dead by then and the error could not be written.
+
+The general fact behind it, for this port as it is: with `orphan_file` and
+no fsck in the initramfs, **any ext4 error recorded on the running root
+while deleted files are held open makes the next mount after a reset
+fail**. The error sets `EXT4_ERROR_FS` in the superblock (or in the
+journal's superblock, which the next mount turns into it:
+`ext4_clear_journal_err()`, "Filesystem error recorded from previous
+mount"); after a reset `orphan_present` is still set; the mount skips the
+orphan cleanup because of the error and then fails in
+`ext4_mark_recovery_complete()` on the orphan file that is not empty. A
+clean shutdown avoids it only when the programs' files are closed and the
+orphan file is empty by the time the root is unmounted. An fsck in the
+initramfs would repair such a root at boot; whether to add one
+(`fsck.ext4 -p` may not repair these states without a manual run, which is
+not checked) is an open item, not decided.
+
+The script now freezes the filesystems instead (`fsfreeze -f`, FIFREEZE):
+- `freeze_super()` (`fs/super.c`) blocks new writers, syncs the filesystem,
+  then calls `ext4_freeze()`, which flushes the journal
+  (`jbd2_journal_flush`), clears `needs_recovery`, clears `orphan_present`
+  only if the orphan file is empty, and writes the superblock. Nothing in
+  that path records an error.
+- After a reset with the root frozen, the next mount has no journal to
+  replay, runs `ext4_orphan_cleanup()` (no error recorded; on a read-only
+  mount it lifts `SB_RDONLY` for the cleanup, as after any power loss),
+  which empties the orphan file, and then `ext4_mark_recovery_complete()`
+  clears `orphan_present`. That is the path of an ordinary power loss, less
+  the journal replay. A mount that has to replay a journal ("INFO: recovery
+  required on readonly filesystem") or that finds one ext4 did not ask to
+  replay ("JBD2: Clearing recovery information on journal") in the boot
+  right after a run means the freeze did not hold to the restart;
+  `verify.sh` fails then (it knows that boot by the run's `SLEEP-TEST
+  RESTART` line in the pmsg the boot archived).
+- Writers to a frozen filesystem wait in `__sb_start_write()`
+  (`include/linux/fs/super.h`) through `percpu_down_read_freezable(...,
+  true)`, which sleeps `TASK_UNINTERRUPTIBLE | TASK_FREEZABLE`
+  (`kernel/locking/percpu-rwsem.c`), and the suspend's task freezer takes a
+  task in `TASK_FREEZABLE` (`__set_task_frozen()`, `kernel/freezer.c`): the
+  writers themselves do not stop a suspend. A task queued behind one of
+  them can: a write fault on a shared mapping of a file on the root
+  (sqlite's `-shm`, the journal's files) waits in `ext4_page_mkwrite()` ->
+  `sb_start_pagefault()` while it holds the VMA's lock, and another thread
+  of that process that forks, unmaps or changes the mapping waits for that
+  lock killable or uninterruptible, not freezable (`mm/mmap.c`,
+  `mm/mmap_lock.c`). `__set_task_frozen()` refuses it, and after 20 s the
+  freezer gives up ("Freezing user space processes failed after ...",
+  `kernel/power/process.c`), naming the task. The script calls that
+  NO-SLEEP (freezer); whether it happens on this desktop is not known. The
+  suspend's own filesystem sync finds nothing to write. The hung-task
+  detector reports such writers after 60 s awake (`kernel/hung_task.c`);
+  `hung_task_panic` is 0 by the kernel's default
+  (`CONFIG_BOOTPARAM_HUNG_TASK_PANIC=0`, as the hang-log kit's build keeps
+  it; its `verify.sh` checks the sysctl), so that is a warning, and the
+  script refuses to start otherwise.
+- The kernel's own freeze on suspend (`filesystems_freeze()`) freezes only
+  filesystems marked for it unless `/sys/power/freeze_filesystems` is 1;
+  at 1 it takes an extra hold on a filesystem that userspace froze and
+  drops only that hold at resume (`freeze_super()`/`thaw_super()` holders,
+  `fs/super.c`). At 0, squirtle's setting, the resume runs
+  `filesystems_thaw()` all the same: it finds no freeze of its own on the
+  frozen filesystem, leaves the userspace freeze in place and warns once
+  per boot, `WARN_ON_ONCE(sb->s_writers.freeze_kcount == 0)` at
+  `fs/super.c:1919` (`may_unfreeze()`, inlined in `thaw_super_locked()`),
+  which taints the kernel `W`. The same happens after a suspend that was
+  given up, the freezer's too. It is expected, and the script refuses to
+  start with `panic_on_warn` set. After every sleep the script freezes each
+  filesystem a second time, which must fail with `EBUSY` (`freeze_super()`
+  -> `may_freeze()`): the check that nothing thawed it.
+- `exfat` has no freeze (`exfat_sops` has no `freeze_fs`): the script
+  refuses while an exfat filesystem is mounted writable.
+- `blockdev --setro` on the whole disk makes `bdev_read_only()` true for
+  its partitions (`get_disk_ro()`, `include/linux/blkdev.h`). From then on
+  `ext4_handle_error()` skips `save_error_info()` and its superblock write,
+  so the error count cannot rise. It does not skip the journal abort: under
+  `errors=remount-ro` (this root's superblock default) or for a forced
+  read-only, `jbd2_journal_abort()` writes the error number into the
+  journal's superblock (`jbd2_journal_update_sb_errno()`,
+  `fs/jbd2/journal.c`), and the block layer lets that write through after
+  logging the first write to a read-only disk (`bio_check_ro()`,
+  `block/blk-core.c`). The next mount then reads it, marks the filesystem
+  in error ("Filesystem error recorded from previous mount") and fails as
+  above.
+- Hence `errors=continue`: as the last step before the run moves to RAM,
+  every ext4 filesystem it freezes is remounted with it (`nsenter -t 1 -m
+  -- mount -o remount,errors=continue MOUNTPOINT`, the system's own mount
+  in PID 1's mount namespace: a remount of a mount in another namespace is
+  refused, `do_remount()`), and `/proc/1/mounts` has to show it. With
+  `errors=continue` and the disk read-only, `ext4_handle_error()` neither
+  aborts the journal nor saves anything nor goes `emergency_ro`. A forced
+  read-only still does (`ext4_abort()`: on a frozen filesystem only after
+  jbd2 aborted the journal on its own, an abort that writes the error by
+  itself), and the script looks for that (below). `errors=` is a
+  mount option, changed by a remount of the read-write filesystem
+  (`ext4_parse_param()`, the last `errors=` given wins); the superblock's
+  `s_errors`, which the next boot mounts with, is not touched (the kernel
+  shows `errors=` only when it differs from it: `_ext4_show_options()`). A
+  stop before any sleep puts each one back after the thaw (a frozen
+  filesystem refuses a remount, `reconfigure_super()`: `EBUSY`). This is
+  read from the source only: nothing of it has run on the tablet.
+- Swap to a swap file goes to its blocks past the filesystem
+  (`mm/page_io.c`), so a freeze does not stop it: the script turns swap on
+  the disk off first.
+
+What the script does with ext4's state: it refuses to start on a root with
+a recorded error; before the first freeze, once the disk is read-only, at
+the end and right before the restart it compares each frozen filesystem's
+`errors_count` with the one it read before the run, looks at its options
+(`emergency_ro`, `shutdown`), and at the kernel log since the run began
+(`EXT4-fs error (device NAME)`, `Aborting journal on device NAME-`,
+`EXT4-fs (NAME): Remounting filesystem read-only`). Before any sleep any
+of it stops the run, thawed and not restarted, with `e2fsck -f` from
+recovery as the next step. After a sleep it says `SLEEP-TEST ERROR-STATE`
+(a journal aborted, an error saved) with NEXT lines that the root will
+probably not mount at the next boot ("probably": `JBD2: I/O error when
+updating journal superblock` means that write failed), or `SLEEP-TEST
+NOTE` (an error logged on the read-only disk under `errors=continue`,
+nothing written), and restarts in either case.
+
+#### Repairing the root from recovery
+
+What the 2026-11-22 repair did, for a root that does not mount. TWRP's own
+`e2fsck` (1.45.4 in TWRP 3.7.1_12) does not know `orphan_file`; Ubuntu's
+does. The build host's rootfs carries the same binary that was used
+(`rootfs-gts9uwifi/usr/sbin/e2fsck`, identical to the copy in the backup
+directory above); it needs `libext2fs.so.2`, `libcom_err.so.2`,
+`libblkid.so.1`, `libuuid.so.1`, `libe2p.so.2`, `libc.so.6` and the loader
+`ld-linux-aarch64.so.1`, all in `usr/lib/aarch64-linux-gnu/`. Copy the
+eight files to one directory in TWRP's RAM (`adb push` to `/tmp/e2fsck/`),
+check as in "Offline repair" above that userdata is not mounted, and run
+it through its own loader:
+
+```sh
+E=/tmp/e2fsck; P=/dev/block/by-name/userdata
+$E/ld-linux-aarch64.so.1 --library-path $E $E/e2fsck -fn "$P"   # look: 4 = errors left
+$E/ld-linux-aarch64.so.1 --library-path $E $E/e2fsck -fy "$P"   # repair: 1 = repaired
+$E/ld-linux-aarch64.so.1 --library-path $E $E/e2fsck -fn "$P"   # must end with 0
+```
+
+These command lines show the method; the owner's own were not recorded
+here. TWRP's `/tmp` is gone after a reboot.
+
+Why the boot did not repair the root: the initramfs that boots on this port
+is built on the build host (`scripts/make-initramfs.sh` runs
+`update-initramfs` in the rootfs chroot). initramfs-tools' `fsck` hook puts
+`fsck` and `fsck.ext4` in only for the types it finds for `/` in fstab, and
+for `/` it looks the type up from the device (`LABEL=...`, through
+`blkid`), which does not exist on the build host; `initramfs.conf`
+(`scripts/build-ubuntu-rootfs.sh`) sets no `FSTYPE`. So the initramfs has
+no fsck (the two built images, `rootfs/boot/initrd.img-7.2.0-rc3-dirty` and
+`rootfs-gts9uwifi/boot/initrd.img-7.2.0-rc3-dirty`, list none), and its
+`checkfs` says "fsck not present, so skipping root file system" before
+the mount. Not changed here; open, as said above.
 
 X710 suspend has so far passed one real deep and one real s2idle cycle
 (2026-11-06, baseline kernel, rpmhpd unsynced and the interconnect floor
