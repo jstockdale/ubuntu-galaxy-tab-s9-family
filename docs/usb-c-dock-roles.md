@@ -5,10 +5,11 @@ the SM5714 Type-C controller, its TCPM driver (`kernel/drivers/sm5714_usbpd.c`)
 and the connector description (`power-role = "dual"`, `data-role = "dual"`,
 `try-power-role = "sink"`).
 
-Everything measured here comes from the SM-X910 and two powered docks, an
-Anker hub (PD identity `291a:8383`) and a Satechi Thunderbolt 4 dock
-(`310e:0952`).  Where a statement rests on one dock or on a few samples, it
-says so.  Three test kernels ran on that tablet on 2026-11-21:
+Most of what was measured here comes from the SM-X910 and two powered docks,
+an Anker hub (PD identity `291a:8383`) and a Satechi Thunderbolt 4 dock
+(`310e:0952`); what the SM-X710 showed is told where it belongs.  Where a
+statement rests on one dock or on a few samples, it says so.  Three test
+kernels ran on the SM-X910 on 2026-11-21:
 
 - the first had the first revision of the two TCPM changes.  The data role
   change did what it should on all three attaches where it came into play,
@@ -26,13 +27,19 @@ says so.  Three test kernels ran on that tablet on 2026-11-21:
   and a driver that reads its two switches at each attach.  One boot with
   the Satechi attached has run on it, with the same outcome.
 
-The tree now carries a third fix of that kind as well.  Test kernels with
-it were built for both tablets on 2026-11-21 and are installed on neither.
-**None of the three fixes and neither switch has been tried on a tablet
-yet.**
+The tree now carries a third fix of that kind as well, a NULL check in the
+USB controller's glue (`dwc3-qcom`) for both tablets, and the power domain
+change in the SM-X710's kernel kit too.  No kernel with the third fix or the
+NULL check has run on a tablet, and the power domain change has run on the
+SM-X910 only.  **None of the three fixes and neither switch has been tried
+on a tablet yet.**
 
-The SM-X710 has the third kernel installed, without the power domain change.
-**No dock has been plugged into it yet.**
+The SM-X710 has the third kernel's TCPM changes installed, without the power
+domain change.  On 2026-11-21 it was recorded with both docks on the kernel
+before the kit, and booted with the Anker hub attached on the kit's kernel.
+In that boot the kernel's own request for the host role was accepted the one
+time it was made, and after the boot's suspend cycle in host role the next
+USB host controller failed to start (see "A boot with the dock attached").
 
 ## What a powered dock should give
 
@@ -74,7 +81,9 @@ way round it:
   after it.  Each time the tablet stayed host and sink on the 9 V contract
   (1.66 A), with no `Data role mismatch` and no reset.  A tenth attach, a
   boot with the Satechi attached, ended in the same roles; its log was not
-  kept;
+  kept.  On the SM-X710 the request was made once, by the kit's kernel in
+  the docked boot below, and the Anker hub with its charger accepted it
+  3.5 ms after it went out;
 - a DR_Swap sent later, while one of TCPM's own discovery messages was
   waiting for its reply, failed 30 times out of 30: the SM5714 reported the
   transmission discarded (29 times), the dock's discovery reply arrived where
@@ -145,20 +154,31 @@ Source_Capabilities or a swap of the partner's own, takes the port through
 its ready state first, and the ready state completed every pending swap with
 status 0.  The writer had its answer while its swap had not been sent; for a
 data role swap the role check above made that answer `EAGAIN`, also when the
-swap went out afterwards and was accepted.  `SRC_READY` and `SNK_READY` now
-leave a pending swap alone while a state is still queued
-(`Swap is still queued, left pending` in the log): the states the swap goes
-through complete it, or the ready state after them.  Where the partner's
-message has put its own state in the swap's place, the ready state after
-that one completes the swap; for a data role swap the role check then says
-what became of it.  And when the message that got in first was the partner's
-own DR_Swap, the port accepted it and then sent the queued DR_Swap as well,
-which put the data role back.  A queued `DR_SWAP_SEND` is now dropped where
-the partner's swap changes the role
-(`Partner swapped first, queued DR_SWAP_SEND dropped`): the role it was
-queued for is the one the port has then.  Both parts are for every TCPM port,
-the first for all three role attributes, the second for the data
-role.  Neither case has been seen on a tablet.
+swap went out afterwards and was accepted.
+
+`SRC_READY` and `SNK_READY` now leave a pending swap alone while a swap is
+still queued (`Swap is still queued, left pending` in the log).  That is the
+write's own swap, about to be sent, or a swap request of the partner's that
+took its place, about to be accepted.  The states the swap goes through
+complete it, or the ready state after them; after the partner's swap the
+role check sees the role that swap left.  Where the partner's message has
+put another state in the swap's place, the ready state completes the swap
+as before, and for a data role swap the role check says what became of it.
+A VCONN swap that turns the port's VCONN on ends in
+`VCONN_SWAP_SEND_SOFT_RESET`, which completed the pending swap as well; it
+now leaves a swap that is still queued alone too.
+
+When the message that got in first was the partner's own swap of the same
+kind, the port accepted it and then sent the queued swap as well, which put
+the role back.  A queued `DR_SWAP_SEND` is now dropped where the partner's
+DR_Swap changes the data role
+(`Partner swapped first, queued DR_SWAP_SEND dropped`), and a queued
+`PR_SWAP_SEND` or `VCONN_SWAP_SEND` where the port accepts the partner's
+PR_Swap or VCONN_Swap (`Partner swapped first, queued PR_SWAP_SEND dropped`,
+`Partner swapped first, queued VCONN_SWAP_SEND dropped`).  The role the
+queued swap was for is the one the port has then.  All of it is for every
+TCPM port and all three role attributes.  None of it has been seen on a
+tablet.
 
 None of the three fixes has been tried on a tablet yet.
 
@@ -175,9 +195,11 @@ Satechi, 123 to 130 ms, and one with the Anker hub, 147 ms), and in four of
 them the dock's VBUS was already on 26 to 29 ms before it.
 All 13 Try.SNK attempts recorded with the standard wait ended
 `SNK_TRY_WAIT -> SRC_TRYWAIT` with no Rp reported: the tablet became the
-power source and the dock never charged it.  The one attempt recorded on
-the SM-X710, the Satechi with the standard wait, ended the same way, with
-the dock's VBUS on 98 ms after Rd.  PR_Swap is no way back either:
+power source and the dock never charged it.  The one attempt with a powered
+dock recorded on the SM-X710, the Satechi with the standard wait on the
+kernel before the kit, ended the same way, with the dock's VBUS on 98 ms
+after Rd: the tablet stayed power source and host, with the dock's devices
+on the bus and the battery discharging.  PR_Swap is no way back either:
 the Satechi answers Wait every time, and with the Anker hub the CC connection
 is lost while the roles change.
 
@@ -223,7 +245,7 @@ whose Rp went away again, the first revision's among them, it was still
 off.  The Anker hub attached as a source from the start in its two plug-ins
 with this revision, so they did not come through Try.SNK at all.
 
-## A boot with the dock attached: the USB host that died (SM-X910)
+## A boot with the dock attached: the USB host that died
 
 With the first revision, the SM-X910 booted with the Satechi attached came up
 as sink and host, and the dock's devices enumerated.  At 24 s the boot ran
@@ -245,22 +267,47 @@ xHCI resumes as if its state had been kept.  It only showed now because the
 tablet is the USB host by the time the cycle runs.
 
 `gcc-sm8550-usb-gdscs-retention.patch` declares both domains as kept in
-retention, as upstream does for the same domains on sm8650.  The SM-X910's
-test kernels have had it since the second.  With it that tablet has been
-booted three times with the Satechi attached, and each time the USB host
-controller came through the suspend cycle with the dock's devices still on
-the bus afterwards.
+retention, as upstream does for the same domains on sm8650.  The kernel
+build applies it for both tablets, and the SM-X910's test kernels have had
+it since the second.  With it the SM-X910 has been booted three times with
+the Satechi attached, and each time the USB host controller came through
+the suspend cycle with the dock's devices still on the bus afterwards.
 
-This branch, which the SM-X710's kernel kit is built from, does not carry
-the patch.  That tablet had never been the USB host when the boot's suspend
-cycle ran, so whether it needs the patch is not known; **a boot with the
-dock attached has not been tried there yet**, and the kit's `verify.sh`
-names a host controller that died when it finds one.
+The SM-X710 needs it as well.  On 2026-11-21 it was booted on its kit's
+kernel, which does not have the patch, with the Anker hub attached and the
+hub's charger unplugged.  It came up as power source and USB host at 14.7 s
+and ran the boot's suspend cycle from 22.7 to 26.8 s, with nothing on the
+bus: that hub enumerates no device while the tablet powers it (see "Still
+open").  At 718 s the hub's charger was plugged in.  The port attached
+again, the kernel's own request made it host on a 9 V contract as sink, and
+the probe of the new xHCI failed (`Host halt failed, -110`,
+`can't setup: -110`), so no device came up.  In the boot before, whose
+suspend cycle ran with the port in device role, the same hub attached at
+6846 s and the xHCI started without error.  That is one observation, with
+the SM-X910's signature.  The SM-X710's kernel kit now carries the patch,
+and that kernel has not run on the tablet.  The test that confirms it is
+the same boot with the patch and with devices on the bus: the hub's charger
+in its PD port, or a self-powered dock.  A boot whose bus stays empty does
+not put the host controller to the test.  Both kits' `verify.sh` fail when
+they find a host controller that died.
+
+The failed probe had a second effect.  It leaves the xHCI device without
+driver data, and 6.6 s later the controller runtime-suspended: the
+`dwc3-qcom` glue read the port speeds through that missing data, a NULL
+pointer dereference in `dwc3_qcom_suspend()`.  At the next reboot a service
+that writes the controller's runtime power setting hung behind it, and the
+shutdown stalled for 7.5 minutes.
+`dwc3-qcom-check-hcd-before-reading-port-speed.patch`, for both tablets,
+treats a port without that data as empty, so the suspend completes.  It
+does not bring the host controller back: that is the power domain change's
+part, and the xHCI device stays without a driver until the next role
+change.  It has not run on a tablet.
 
 One question is open beyond the boot cycle, where the supply behind the
 domains stays up: whether the state also survives a real deep sleep.  Until
-that is shown, the sleep hook that takes the port out of host role around
-each sleep stays.
+that is shown, the SM-X910's sleep hook, which takes the port out of host
+role around each sleep, stays.  The SM-X710 has no such hook installed, so a
+sleep in host role there is that test.
 
 ## Switches
 
@@ -294,10 +341,11 @@ as it does upstream, which is what every other TCPM controller gets.
   `sink_host_swap=N` gives the old behaviour.  An A-to-C cable to a computer
   is not PD and is not affected.
 - **More attaches end with the tablet as USB host**, so what is still wrong
-  in host role applies to more of them.  On the SM-X910 the xHCI did not
-  survive a suspend in host role before the power domain change (the section
-  above), and the sleep hook still takes the port out of host role for each
-  sleep; a dock's devices disconnect and reconnect around it.
+  in host role applies to more of them.  On the SM-X910, and once on the
+  SM-X710, the xHCI did not come through a suspend in host role without the
+  power domain change (the section above).  On the SM-X910 the sleep hook
+  still takes the port out of host role for each sleep; a dock's devices
+  disconnect and reconnect around it.
 - **A program that writes the port's `data_role` can get `EAGAIN`**
   (`Resource temporarily unavailable`): while a VDM exchange is under way,
   from the moment TCPM queues a VDM (discovery's, for one) until that
@@ -402,25 +450,35 @@ tablet as power source: no charging, but a stable connection.
 Repeat at least ten times with each dock, including a boot with the dock
 attached and a plug after login, and check that the role is the one reported:
 the data role, not the fact that a DR_Swap went out.  After a boot with the
-dock attached, also check that the kernel log has no `xhci-hcd` line with
-`HC died` and that the dock's devices are still there after the first half
-minute.  Then the things that must not change: a plain PD charger (charges,
-no swap unless it offers one), an unpowered hub and a USB stick (enumerate,
-about 0.6 s later than before), and on the SM-X710 the A-to-C cable to the
-build host (gadget network up).
+dock attached and devices behind it, also check that the kernel log has no
+`xhci-hcd` line with `HC died` or `Host halt failed` and that the dock's
+devices are still there after the first half minute.  Then the things that
+must not change: a plain PD charger (charges, no swap unless it offers one),
+an unpowered hub and a USB stick (enumerate, about 0.6 s later than before),
+and on the SM-X710 the A-to-C cable to the build host (gadget network up).
+The Anker hub cannot serve as the unpowered hub: without its charger it
+enumerates nothing (see "Still open").
 
 ## Still open
 
 - Why the dock sends a Soft_Reset after its own swap is not known.  That it
   comes even when the tablet has sent nothing as host (7 of 29) speaks
   against the tablet's first message in the new role as the trigger.
-- The three fixes for a swap asked for from userspace and the switches at
-  run time have not been tried on a tablet, and the third fix is in no
-  kernel that has run.  No dock has been plugged into the SM-X710 with any
-  of this.  A real sleep with a dock attached has not been tried on either
-  tablet.
-- Whether the SM-X710 needs the USB power domain change.  A boot with the
-  dock attached will show it.
+- The three fixes for a swap asked for from userspace, the switches at run
+  time and the `dwc3-qcom` NULL check have not been tried on a tablet, and
+  the third fix and the NULL check are in no kernel that has run.  Not done
+  on the SM-X710: `dock` and `swap` runs on a kit kernel, the Satechi on a
+  kit kernel, and a boot with the dock attached and devices on the bus.  A
+  real sleep with a dock attached has not been tried on either tablet.
+- Whether the power domain change brings the SM-X710's USB host controller
+  through a boot with a dock attached: its kernel with the patch has not run
+  on the tablet.  Idle and suspend power with retention on the SM-X710 are
+  not measured.
+- The Anker hub enumerates no USB device while the tablet powers it: on the
+  SM-X710 on the kernel before the kit and on the kit's, and on the SM-X910
+  on a kit kernel, each time with a 5 V 900 mA contract and its DisplayPort
+  alternate mode entered.  Why is not known.  With its charger it enumerated
+  13 devices on the SM-X910.
 - Whether the USB power domains keep their state through a real deep sleep
   on the SM8550, and what keeping them in retention costs in sleep.  If the
   state is kept, the sleep hook's role change can go, and a dock's devices
@@ -433,11 +491,21 @@ build host (gadget network up).
 - Writes to `power_role` and `vconn_source` (`tcpm_pr_set()`,
   `tcpm_vconn_set()`) have neither of the first two fixes: their swap can
   still be started while a VDM exchange is under way, and after the wait
-  they report what the state machine ended with, not whether the role
-  changed.  Of the three fixes only the third covers them, so that a swap
-  of theirs that is still queued is not reported done.  Nothing here writes
-  `power_role` or `vconn_source`, and whether they can report a swap that
-  did not happen was not looked at.
+  they can return 0 with the role unchanged, as there is no role check like
+  `tcpm_dr_set()`'s.  That shows when a swap of another kind from the
+  partner took the queued swap's place.  Of the three fixes only the third
+  covers them.  Nothing here writes `power_role` or `vconn_source`.
+- The VDM guard looks at the VDM state machine when the write starts the
+  swap.  A PD 3.x source then waits tSinkTx (16 ms) before it sends, and a
+  VDM exchange that starts in that time is not looked at again.  A swap
+  that a ready state takes from `upcoming_state` goes out without passing
+  `tcpm_ams_start()` again, so none of its checks run for it.
+- A Soft Reset or a Hard Reset does not complete a pending swap with an
+  error: the write waits for the ready state after it.  A port without
+  `request_dfp_as_sink` keeps a queued swap through a Hard Reset it
+  receives.  That is the one premise of the three drops that a Hard Reset
+  can break: it resets the data role and VCONN, so the partner's swap after
+  it need not give the role the queued swap was for.
 - A request that the SM5714 reports as discarded (`PD TX complete, status: 1`
   right after the DR_Swap in the log) still waits 60 ms for an answer and
   counts as one of the three.  A dock that starts its own discovery right

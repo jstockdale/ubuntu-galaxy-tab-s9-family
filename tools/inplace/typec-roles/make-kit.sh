@@ -1,10 +1,11 @@
 #!/bin/bash
 # Pack the Type-C roles kit on the build host.  It goes on top of the
 # hang-log kit: the hang-log kernel rebuilt with this branch's five TCPM
-# patches and the sm5714_usbpd policy that turns them on
-# (docs/usb-c-dock-roles.md), in boot, plus the build's module tree, signed
-# with its own key.  The configuration and the DTB do not change, so
-# vendor_boot stays the hang-log kit's.
+# patches, the sm5714_usbpd policy that turns them on, the retention of the
+# USB power domains across suspend and the NULL check of the hcd in the
+# dwc3-qcom glue (docs/usb-c-dock-roles.md), in boot, plus the build's module
+# tree, signed with its own key.  The configuration and the DTB do not
+# change, so vendor_boot stays the hang-log kit's.
 #
 #   bash tools/inplace/typec-roles/make-kit.sh BUILD_SCRATCH KERNEL_OUT_DIR \
 #       HANG_KERNEL_OUT_DIR HANG_KIT_DIR KIT_DIR
@@ -15,7 +16,8 @@
 # (~/ubuntu-gts9u/out/kernel-gts9wifi-hang), HANG_KIT_DIR that kit
 # (~/ubuntu-gts9u/backups/hang-log-kit-r2).  HANG_SCRATCH, when set, is the
 # hang-log build's scratch; its kernel source tree is then the reference the
-# new one is compared with, file by file.
+# new one is compared with, file by file, and its compiled clock controller
+# the reference for the power domain table.
 #
 # Self-tests, each byte for byte:
 #   - boot: the hang-log kernel plus its DTB, by the kits' recipe, is the
@@ -23,10 +25,12 @@
 #   - the hang-log vendor_boot carries that same DTB.
 # Then the changes are checked to be only the intended ones: the DTB, the
 # configuration and the module list are the hang-log build's, the source
-# trees differ in the three Type-C files alone and those are what this
-# checkout's patches and driver give, the new image has the new code and the
-# old one does not and was built after the last change to those files, and
-# the new boot image differs only in its kernel.  Nothing is flashed.
+# trees differ in the three Type-C files, the clock controller and the
+# dwc3-qcom glue alone and those are what this checkout's patches and driver
+# give, the new image has the new code and the old one does not and was
+# built after the last change to those files, the compiled power domain
+# table differs in the two power-state masks alone, and the new boot image
+# differs only in its kernel.  Nothing is flashed.
 set -euo pipefail
 export LC_ALL=C
 
@@ -48,9 +52,14 @@ avbtool=$tools/avbtool.py
 size=100663296
 dts=sm8550-samsung-gts9wifi
 tcpm_dir=drivers/usb/typec/tcpm
+gcc=drivers/clk/qcom/gcc-sm8550
+dwc3=drivers/usb/dwc3/dwc3-qcom
 patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
 	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch
-	tcpm-keep-queued-swap-pending.patch)
+	tcpm-keep-queued-swap-pending.patch gcc-sm8550-usb-gdscs-retention.patch
+	dwc3-qcom-check-hcd-before-reading-port-speed.patch)
+# The files those patches change.
+patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c")
 
 # The tablet's current set: the hang-log kit.
 hang_boot=d583546b5e5c33dbc48fbafc99b7eb039df33f64b0316e498d3f158f834ee968
@@ -65,31 +74,33 @@ hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
 # whose name is in the image's type information; that one tells the wait
 # with a deadline from the plain longer timeout before it.  Then what the
 # revisions after it add: the log lines of the three fixes for a swap asked
-# for from userspace (the third has two), and policy_open, a member of the
-# driver's structure, which only a driver that reads its parameters at each
-# attach has.
+# for from userspace (the third has three; its PR_Swap line is in no earlier
+# revision of that patch), and policy_open, a member of the driver's
+# structure, which only a driver that reads its parameters at each attach
+# has.
 new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
 	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
 	'Swap is still queued, left pending' 'Partner swapped first, queued DR_SWAP_SEND dropped'
+	'Partner swapped first, queued PR_SWAP_SEND dropped'
 	policy_open)
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
-objects=("$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
+objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
 	"$tcpm_dir/sm5714_usbpd.o:$tcpm_dir/sm5714_usbpd.c"
-	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h")
+	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h" "$dwc3.o:$dwc3.c")
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 die() { echo "$*" >&2; exit 1; }
 for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$hang/Image.gz" "$hang/$dts.dtb" "$hang/config" "$hangkit/boot.img" \
-	"$hangkit/vendor_boot.img" "$tree/$tcpm_dir/tcpm.c" "$tree/include/linux/usb/tcpm.h" \
+	"$hangkit/vendor_boot.img" "${patched[@]/#/$tree/}" \
 	"$build/.config" "$build/certs/signing_key.x509" "$build/vmlinux" \
-	"$build/$tcpm_dir/tcpm.o" "$build/$tcpm_dir/sm5714_usbpd.o" \
+	"$build/$gcc.o" "$build/$tcpm_dir/tcpm.o" "$build/$tcpm_dir/sm5714_usbpd.o" "$build/$dwc3.o" \
 	"$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
 	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}"; do
 	[ -f "$f" ] || die "missing: $f"
 done
-for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git; do
+for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy; do
 	command -v "$t" >/dev/null || die "missing tool: $t"
 done
 [ "$(sha "$hang/Image.gz")" = "$hang_image" ] || die "$hang is not the hang-log kit's kernel build"
@@ -151,9 +162,9 @@ cmp -s "$out/config" "$hang/config" || {
 	die 'the configuration embedded in Image.gz is not out/config'
 echo "DTB (${hang_dtb:0:12}) and configuration (${hang_config:0:12}): the hang-log build's, byte for byte"
 
-# 3. The sources.  The driver is this checkout's; the two TCPM files are the
-# hang-log tree's with this checkout's five patches on top; nothing else in
-# the kernel tree differs.
+# 3. The sources.  The driver is this checkout's; the two TCPM files, the
+# clock controller and the dwc3-qcom glue are the hang-log tree's with this
+# checkout's seven patches on top; nothing else in the kernel tree differs.
 cmp -s "$tree/$tcpm_dir/sm5714_usbpd.c" "$repo/kernel/drivers/sm5714_usbpd.c" ||
 	die "the build tree's sm5714_usbpd.c is not this checkout's"
 grep -q 'request_dfp_as_sink' "$tree/include/linux/usb/tcpm.h" &&
@@ -163,20 +174,49 @@ grep -q 'request_dfp_as_sink' "$tree/include/linux/usb/tcpm.h" &&
 	grep -q 'VDM in progress, DATA_ROLE_SWAP not started' "$tree/$tcpm_dir/tcpm.c" &&
 	grep -q 'Data role swap ended with the role unchanged' "$tree/$tcpm_dir/tcpm.c" &&
 	grep -q 'Swap is still queued, left pending' "$tree/$tcpm_dir/tcpm.c" &&
-	grep -q 'Partner swapped first, queued DR_SWAP_SEND dropped' "$tree/$tcpm_dir/tcpm.c" ||
+	grep -q 'Partner swapped first, queued DR_SWAP_SEND dropped' "$tree/$tcpm_dir/tcpm.c" &&
+	grep -q 'Partner swapped first, queued PR_SWAP_SEND dropped' "$tree/$tcpm_dir/tcpm.c" ||
 	die 'the build tree does not carry the five TCPM patches'
+# The power state the source gives one power domain.  Counting the
+# PWRSTS_RET_ON lines of the file does not do: the four PCIe domains carry
+# it upstream.
+gdsc_pwrsts() { # FILE NAME
+	awk -v head="static struct gdsc $2 = {" '
+		$0 == head { inside = 1; next }
+		inside && /^};/ { exit }
+		inside && $1 == ".pwrsts" { print $3 }
+	' "$1"
+}
+for d in usb30_prim_gdsc usb3_phy_gdsc; do
+	[ "$(gdsc_pwrsts "$tree/$gcc.c" "$d")" = 'PWRSTS_RET_ON,' ] ||
+		die "the build tree does not carry the USB power domain patch ($d)"
+done
+grep -q 'Retention across system suspend, as on sm8650' "$tree/$gcc.c" ||
+	die 'the build tree does not carry the USB power domain patch'
+# The guard adds no string to the image; its comment is the marker.
+grep -q 'no hcd and no root hub' "$tree/$dwc3.c" ||
+	die 'the build tree does not carry the dwc3-qcom guard'
 source_check='marker lines only (HANG_SCRATCH not set)'
 if [ -n "${HANG_SCRATCH:-}" ]; then
 	hang_tree=$HANG_SCRATCH/linux-src-gts9wifi
-	[ -f "$hang_tree/$tcpm_dir/tcpm.c" ] || die "no kernel source tree in $HANG_SCRATCH"
-	mkdir -p "$tmp/src/$tcpm_dir" "$tmp/src/include/linux/usb"
-	cp "$hang_tree/$tcpm_dir/tcpm.c" "$tmp/src/$tcpm_dir/"
-	cp "$hang_tree/include/linux/usb/tcpm.h" "$tmp/src/include/linux/usb/"
+	for f in "${patched[@]}"; do
+		[ -f "$hang_tree/$f" ] || die "no kernel source tree in $HANG_SCRATCH"
+		mkdir -p "$tmp/src/${f%/*}"
+		cp "$hang_tree/$f" "$tmp/src/$f"
+	done
+	# The hang-log build applied this branch's opps patch to dwc3-qcom.c
+	# already, and nothing of what this kit adds: the guard goes on top of
+	# that, so the comparison below sees the guard alone.
+	grep -q 'dwc3_qcom_set_pstate' "$hang_tree/$dwc3.c" ||
+		die "the hang-log tree's dwc3-qcom.c does not carry dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch"
+	! grep -q 'no hcd and no root hub' "$hang_tree/$dwc3.c" &&
+		! grep -q 'Retention across system suspend, as on sm8650' "$hang_tree/$gcc.c" ||
+		die 'the hang-log tree carries the dwc3-qcom guard or the USB power domain patch already'
 	for p in "${patches[@]}"; do
 		patch -s -d "$tmp/src" -p1 --no-backup-if-mismatch < "$repo/kernel/patches/$p" ||
 			die "$p does not apply to the hang-log tree"
 	done
-	for f in "$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h; do
+	for f in "${patched[@]}"; do
 		cmp -s "$tmp/src/$f" "$tree/$f" ||
 			die "$f is not the hang-log tree's with this checkout's patches applied"
 	done
@@ -188,19 +228,21 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 		"$hang_tree" "$tree" > "$tmp/trees.diff" || :
 	sed -e "s|^Files $hang_tree/\(.*\) and .* differ\$|\1|" "$tmp/trees.diff" | sort > "$tmp/trees.changed"
 	sort > "$tmp/trees.want" <<EOF
+$gcc.c
+$dwc3.c
 $tcpm_dir/sm5714_usbpd.c
 $tcpm_dir/tcpm.c
 include/linux/usb/tcpm.h
 EOF
 	cmp -s "$tmp/trees.changed" "$tmp/trees.want" || {
-		echo 'the kernel source trees differ in more than the three Type-C files:' >&2
+		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c and dwc3-qcom.c:' >&2
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $hang_tree: three files differ, tcpm.c and tcpm.h by this checkout's five patches"
-	echo 'sources: only sm5714_usbpd.c, tcpm.c and tcpm.h differ from the hang-log tree, by exactly this checkout'"'"'s changes'
+	source_check="compared with $hang_tree: five files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches"
+	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c differ from the hang-log tree, by exactly this checkout'"'"'s changes'
 else
-	echo 'sources: the five TCPM patches and this checkout'"'"'s driver are in the build tree (HANG_SCRATCH not set: no tree comparison)'
+	echo 'sources: the seven patches and this checkout'"'"'s driver are in the build tree (HANG_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.
@@ -223,6 +265,25 @@ done
 [ "$build/arch/arm64/boot/Image.gz" -nt "$build/vmlinux" ] || die 'Image.gz is older than vmlinux'
 cmp -s "$build/arch/arm64/boot/Image.gz" "$out/Image.gz" || die "$out/Image.gz is not the build directory's"
 echo 'build: the changed objects are newer than their sources, vmlinux newer than them, and Image.gz is the build directory'"'"'s'
+# The power domain change is two numbers in a table and leaves no string.
+# The table was compiled from the patched source and linked into this image
+# (the check above), and against the hang-log build's it differs in exactly
+# those two: 5 (PWRSTS_OFF_ON) became 6 (PWRSTS_RET_ON).
+gdsc_check='the object is newer than the patched source and older than vmlinux (HANG_SCRATCH not set)'
+if [ -n "${HANG_SCRATCH:-}" ]; then
+	[ -f "$HANG_SCRATCH/linux-gts9wifi/$gcc.o" ] || die "no $gcc.o in $HANG_SCRATCH"
+	llvm-objcopy -O binary --only-section=.data "$HANG_SCRATCH/linux-gts9wifi/$gcc.o" "$tmp/gcc.hang.data"
+	llvm-objcopy -O binary --only-section=.data "$build/$gcc.o" "$tmp/gcc.new.data"
+	[ -s "$tmp/gcc.new.data" ] || die "no .data in $gcc.o"
+	cmp -l "$tmp/gcc.hang.data" "$tmp/gcc.new.data" > "$tmp/gcc.data.diff" || :
+	[ "$(awk '{print $2, $3}' "$tmp/gcc.data.diff" | tr '\n' ';')" = '5 6;5 6;' ] || {
+		echo "the compiled $gcc table does not differ from the hang-log build's in two power-state masks alone:" >&2
+		cat "$tmp/gcc.data.diff" >&2
+		exit 1
+	}
+	gdsc_check="the compiled table differs from the hang-log build's in two bytes, 5 to 6"
+fi
+echo "power domains: $gdsc_check"
 
 # 5. The kernel's GNU build ID note: the vDSOs' come first, the kernel's last.
 build_id() {
@@ -298,6 +359,7 @@ printf '%s\n' "$serial" > "$kit/SIGNER"
 		echo "kernel/patches/$p $(sha "$repo/kernel/patches/$p")"
 	done
 	echo "source check: $source_check"
+	echo "power domain table: $gdsc_check"
 } > "$kit/SOURCE"
 install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/README.md" "$kit/"
 files=(boot.img "modules-$release.tar" BUILD_ID KEY_ID SIGNER SOURCE

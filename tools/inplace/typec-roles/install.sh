@@ -1,9 +1,11 @@
 #!/bin/sh
 # Type-C roles kit, on top of the hang-log kit: the hang-log kernel rebuilt
-# with the two TCPM changes for powered USB-C docks (the tablet asks for the
-# USB host role itself before discovery, and Try.SNK waits long enough for
-# the SM5714 to report a source), in boot, and its module tree.  The DTB and
-# the configuration are the hang-log kit's, so vendor_boot is checked but not
+# with the TCPM changes for powered USB-C docks (the tablet asks for the USB
+# host role itself before discovery, Try.SNK waits long enough for the SM5714
+# to report a source, and three fixes for a swap asked for from userspace),
+# with the USB power domains kept in retention across suspend and with a NULL
+# check in the dwc3-qcom glue, in boot, and its module tree.  The DTB and the
+# configuration are the hang-log kit's, so vendor_boot is checked but not
 # written.
 #
 #   sudo sh ~/typec-roles/install.sh      then reboot

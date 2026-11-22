@@ -1,0 +1,55 @@
+Subject: [PATCH] usb: dwc3: qcom: check the hcd before reading a port's speed
+
+dwc3_qcom_read_usb2_speed() takes the hcd from the drvdata of dwc->xhci
+and reads hcd->self.root_hub.  dwc->xhci is the xhci-hcd platform device
+that dwc3 creates in host role.  It stays registered when the xhci-plat
+probe fails, and its drvdata is NULL then.  dwc3_qcom_suspend() reads
+the port speeds in host role whenever wakeup is set, and a runtime
+suspend always sets it.
+
+Seen on an SM-X710 on 2026-11-21.  After a boot with a hub attached, a
+later attach in host role registered a new xHCI, and its probe failed
+("xhci-hcd xhci-hcd.2.auto: Host halt failed, -110", then "can't setup:
+-110" and "probe with driver xhci-hcd failed with error -110").  6.6 s
+later the controller runtime-suspended (user space allows runtime PM
+for it), and the glue oopsed on the pm workqueue: a NULL
+pointer dereference at virtual address 0x58, pc
+dwc3_qcom_suspend+0x118/0x264, called from
+dwc3_qcom_runtime_suspend+0x44/0x60.  The faulting load is
+hcd->self.root_hub, at offset 0x58 in that build, from the NULL drvdata.
+
+The pm worker died with the controller's runtime PM status at
+"suspending".  At the next reboot the stop job of
+ubuntu-gts9u-usb-runtime-pm.service, a shell writing the controller's
+power/control, blocked behind that status and could not be killed:
+shutdown stalled for 7.5 minutes in user space.
+
+A system suspend reads the speeds as well when the glue may wake the
+system, which the gts9 family overlay sets up (wakeup-source on
+usb@a600000), unless the controller is runtime-suspended already.
+
+Return USB_SPEED_UNKNOWN when there is no hcd.  The glue then arms its
+wakeup interrupts as for an empty port, and the suspend completes.
+
+This does not fix the failed probe.  That is the controller context lost
+while the USB GDSCs were off, which gcc-sm8550-usb-gdscs-retention.patch
+addresses.  The xhci-hcd device stays without a driver until the next
+role change replaces it.  dwc3-qcom-legacy.c has the same code; the
+SM8550 boards use the flattened binding, and it is left alone.
+
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -240,6 +240,13 @@ static enum usb_device_speed dwc3_qcom_r
+ 	 */
+ 	hcd = platform_get_drvdata(dwc->xhci);
+ 
++	/*
++	 * With no xHCI driver bound to dwc->xhci, as after a failed probe,
++	 * there is no hcd and no root hub to read the speed from.
++	 */
++	if (!hcd)
++		return USB_SPEED_UNKNOWN;
++
+ #ifdef CONFIG_USB
+ 	udev = usb_hub_find_child(hcd->self.root_hub, port_index + 1);
+ #else

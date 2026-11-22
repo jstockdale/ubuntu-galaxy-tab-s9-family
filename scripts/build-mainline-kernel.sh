@@ -257,6 +257,13 @@ apply_unless 'ufshcd_opp_drop_votes' \
 apply_unless 'dwc3_qcom_set_pstate' \
 	drivers/usb/dwc3/dwc3-qcom.c \
 	dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch
+# A failed xhci-plat probe leaves dwc->xhci without drvdata, and the glue's
+# suspend in host role then reads the port speeds through a NULL hcd (an
+# oops on the SM-X710, 2026-11-21).  The guard lets the suspend complete;
+# it does not bring the xHCI back.
+apply_unless 'no hcd and no root hub' \
+	drivers/usb/dwc3/dwc3-qcom.c \
+	dwc3-qcom-check-hcd-before-reading-port-speed.patch
 bash "$repo/scripts/stage-gpu-recovery-experiment.sh" "$kernel_tree"
 apply_unless 'Late-created SM-X910 DSP endpoints' \
 	drivers/mailbox/qcom-ipcc.c ipcc-reserve-gts9u-runtime-channels.patch
@@ -295,6 +302,18 @@ apply_unless 'default y if ARCH_QCOM' \
 	drivers/pci/pwrctrl/Kconfig build-wcn-pcie-providers-in.patch
 apply_unless 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' \
 	drivers/phy/qualcomm/phy-qcom-qmp-pcie.c unpark-pcie0-pipe-mux.patch
+# The USB GDSCs power off in every system suspend, the boot-time panel cycle
+# included, while xhci resumes as if they had kept its context, so in host
+# role the xHCI does not come back from it: what a boot with a dock attached
+# ends in, seen on the SM-X910 (HC died) and once on the SM-X710 (its next
+# probe failed with -110).  Keep them in retention, as upstream does on
+# sm8650.  Three boots of the SM-X910 with a dock attached came through that
+# cycle with it; the SM-X710 has not run with it yet, and a real sleep in host
+# role has not been tried (docs/usb-c-dock-roles.md, "A boot with the dock
+# attached").  dwc3-qcom-wakeup-before-core-probe.patch, its follow-up, is not
+# applied here yet.
+apply_unless 'Retention across system suspend, as on sm8650' \
+	drivers/clk/qcom/gcc-sm8550.c gcc-sm8550-usb-gdscs-retention.patch
 apply_unless 'Match the SM-X910 Samsung kernel at standard mode' \
 	drivers/i2c/busses/i2c-qcom-geni.c \
 	match-samsung-geni-i2c-100khz-timing.patch
@@ -417,10 +436,12 @@ apply_unless 'Data role swap ended with the role unchanged' \
 # swap is still queued when a message of the partner's makes the port change
 # state first.  The ready state after that message completed the write before
 # the swap was sent, which the role check above then answers with -EAGAIN for
-# a swap accepted a moment later: the write now waits until the swap has run.
-# And when that message is the partner's own DR_Swap, the queued DR_Swap went
-# out after it and put the data role back: it is dropped.  Read from the
-# code; neither has been seen on a tablet.
+# a swap accepted a moment later: the write now waits until the swap has run,
+# also when a swap request of the partner's took its place, and so does the
+# state that ends a VCONN swap turning VCONN on.  And when that message is the
+# partner's own swap of the same kind, the queued swap went out after it and
+# put the role back: it is dropped.  Read from the code; none of it has been
+# seen on a tablet.
 apply_unless 'Swap is still queued, left pending' \
 	drivers/usb/typec/tcpm/tcpm.c tcpm-keep-queued-swap-pending.patch
 # A dock's DisplayPort alternate mode is discovered while the tablet is still

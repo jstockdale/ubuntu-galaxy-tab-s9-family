@@ -43,6 +43,8 @@ KEY_ID = "aa" * 20
 SIGNER = ":".join(["5A"] * 20)
 MODULES = ("modules.dep", "kernel/net/a.ko", "updates/b.ko")
 TCPM_DIR = "drivers/usb/typec/tcpm"
+GCC = "drivers/clk/qcom/gcc-sm8550"
+DWC3 = "drivers/usb/dwc3/dwc3-qcom"
 
 PREFIXES = (
     "/dev/disk/by-partlabel/", "/usr/lib/modules/", "/var/backups", "/var/log/", "/run/",
@@ -174,6 +176,16 @@ TRY_SNK_RP_LOST_LOG = """\
 [   52.560001] state change SNK_TRY_WAIT -> SNK_TRY_WAIT_DEBOUNCE [rev1 NONE_AMS]
 [   52.575001] state change SNK_TRY_WAIT_DEBOUNCE -> SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS [delayed 15 ms]
 [   52.575005] state change SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS -> SNK_ATTACHED [rev1 NONE_AMS]
+"""
+# The SM-X710's own, 2026-11-21: after a boot whose suspend cycle ran in host
+# role, the xHCI of a later attach in host role did not come up.
+USB_HOST_PROBE_FAILED = """\
+kernel: PM: suspend entry (deep)
+kernel: PM: suspend exit
+kernel: xhci-hcd xhci-hcd.2.auto: xHCI Host Controller
+kernel: xhci-hcd xhci-hcd.2.auto: Host halt failed, -110
+kernel: xhci-hcd xhci-hcd.2.auto: can't setup: -110
+kernel: xhci-hcd xhci-hcd.2.auto: probe with driver xhci-hcd failed with error -110
 """
 # The SM-X910's boot suspend cycle with a dock attached (2026-11-21).
 USB_HOST_DIED = """\
@@ -346,6 +358,27 @@ SWAP_SENT_FROM_READY_LOG = """\
 [  750.545402] AMS NONE_AMS finished
 [  750.545403] state change DR_SWAP_CHANGE_DR -> SRC_READY [rev3 NONE_AMS]
 """
+# The tablet as PD 3 source and USB host, nothing for the writer to do: its
+# own VCONN swap, queued for the cable's discovery, and a power role swap
+# that a program writing power_role queued, each met by the partner's swap
+# of the same kind in the tSinkTx wait.  Both queued swaps are dropped.
+SWAP_PARTNER_FIRST_OTHER_KINDS_LOG = """\
+[  760.000001] state change SRC_ATTACH_WAIT -> SRC_ATTACHED [delayed 200 ms]
+[  760.300001] state change SRC_TRANSITION_SUPPLY -> SRC_READY [rev3 POWER_NEGOTIATION]
+[  760.400001] AMS VCONN_SWAP start
+[  760.400002] pending state change SRC_READY -> AMS_START @ 16 ms [rev3 VCONN_SWAP]
+[  760.405001] PD RX, header: 0x48b [1]
+[  760.405002] state change SRC_READY -> VCONN_SWAP_ACCEPT [rev3 VCONN_SWAP]
+[  760.405003] Partner swapped first, queued VCONN_SWAP_SEND dropped
+[  760.406501] AMS VCONN_SWAP finished
+[  760.406502] state change VCONN_SWAP_ACCEPT -> VCONN_SWAP_START [rev3 NONE_AMS]
+[  760.600001] AMS POWER_ROLE_SWAP start
+[  760.600002] pending state change SRC_READY -> AMS_START @ 16 ms [rev3 POWER_ROLE_SWAP]
+[  760.605001] PD RX, header: 0x68a [1]
+[  760.605002] state change SRC_READY -> PR_SWAP_ACCEPT [rev3 POWER_ROLE_SWAP]
+[  760.605003] Partner swapped first, queued PR_SWAP_SEND dropped
+[  760.606501] state change PR_SWAP_ACCEPT -> PR_SWAP_START [rev3 POWER_ROLE_SWAP]
+"""
 
 
 def dock_messages(start, count):
@@ -389,6 +422,13 @@ def added_lines(patch):
 
 def pinned(script, name):
     return re.search(rf"^{name}=([0-9a-f]+)$", (KIT_SRC / script).read_text(), re.M).group(1)
+
+
+def kernel_source():
+    """The pinned kernel checkout, as tests/test_typec_dock_roles.py finds it."""
+    base = os.environ.get("UBUNTU_WORKDIR", str(pathlib.Path.home() / "ubuntu-gts9u"))
+    source = pathlib.Path(os.environ.get("KERNEL_SRC", base + "/linux-mainline"))
+    return source if (source / ".git").exists() and shutil.which("patch") else None
 
 
 def modules_tar(marker, extra=()):
@@ -1177,20 +1217,22 @@ class VerifyTest(FakeTablet):
     def test_swap_counts_what_the_third_fix_logs(self):
         """A write that the partner's own DR_Swap answered, and one whose
         swap went out from a ready state: both are done, neither was sent
-        from AMS_START, and the third fix's two lines are counted."""
+        from AMS_START, and the third fix's lines are counted, the drops of
+        a queued PR_Swap or VCONN_Swap with those of a DR_Swap."""
         self.boot_kit()
         self.plug_for_swap([(SWAP_PARTNER_FIRST_LOG, "host"),
                             (SWAP_PARTNER_FIRST_AS_SOURCE_LOG, "host"),
-                            (SWAP_SENT_FROM_READY_LOG, "host")])
-        result = self.run_script("verify.sh", "swap", "3")
+                            (SWAP_SENT_FROM_READY_LOG, "host"),
+                            (SWAP_PARTNER_FIRST_OTHER_KINDS_LOG, "host")])
+        result = self.run_script("verify.sh", "swap", "4")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([r["verdict"] for r in self.results()], ["PASS"] * 3)
+        self.assertEqual([r["verdict"] for r in self.results()], ["PASS"] * 3 + ["-"])
         # No swap of the tablet's took the role in the first two.
-        self.assertEqual([r["dr_swaps"] for r in self.results()], ["0", "0", "1"])
+        self.assertEqual([r["dr_swaps"] for r in self.results()], ["0", "0", "1", "0"])
         self.assertEqual([(r["asked"], r["refused_in_vdm"], r["sent"], r["role_unchanged"],
                            r["cut_short"]) for r in self.swap_rows()],
                          [("1", "0", "0", "0", "0"), ("1", "0", "0", "0", "0"),
-                          ("1", "0", "1", "0", "0")])
+                          ("1", "0", "1", "0", "0"), ("0", "0", "0", "0", "0")])
         out = result.stdout
         pending = "  still queued when the port was ready again, left pending: 1"
         dropped = "  dropped because the partner swapped first: 1"
@@ -1207,7 +1249,10 @@ class VerifyTest(FakeTablet):
                          ["  data_role: 1 swaps asked for, 0 refused during a VDM exchange, 1 sent, "
                           "0 ended with the role unchanged, 0 cut short by a Soft Reset; " + accepted,
                           pending])
-        self.assertIn("3 of 3 plug-ins: a swap asked for through data_role", out)
+        # The drops of the other two kinds count the same.
+        self.assertEqual(self.trial_lines(out, 4)[2], "  dropped because the partner swapped first: 2")
+        self.assertEqual(out.count("dropped because the partner swapped first"), 2)
+        self.assertIn("3 of 4 plug-ins: a swap asked for through data_role", out)
 
     def test_the_log_is_read_every_second_during_a_plug_in(self):
         """A dock that re-attaches in a loop fills the log in seconds.  What
@@ -1432,27 +1477,30 @@ class VerifyTest(FakeTablet):
         self.assertIn("ok   netconsole module present and signed with the kit's key", result.stdout)
         self.assertIn("ok   no module was refused, and no symbol failures this boot", result.stdout)
         self.assertIn("all checks passed", result.stdout)
-        self.assertNotIn("USB host controller", result.stdout)
+        # A controller that has not been through a suspend has shown nothing.
+        self.assertIn("note the USB host controller did not die, but no suspend cycle has run yet "
+                      "this boot: run this again later", result.stdout)
+        self.assertNotIn("ok   the USB host controller", result.stdout)
+        # Nothing is attached, so there is no bus to count devices on.
+        self.assertNotIn("on the bus", result.stdout)
 
     def journal_add(self, text):
         with (self.root / "journal").open("a") as journal:
             journal.write(text)
 
     def test_checks_know_the_controller_s_other_ways_of_dying(self):
-        """Reported like the death in the boot's suspend cycle, and like it
-        not a failure of this kit."""
         for line in USB_HOST_ERRORS:
             with self.subTest(line):
                 self.boot_kit()
                 self.journal_add(f"kernel: PM: suspend entry (deep)\n{line}\n"
                                  "kernel: PM: suspend exit\n")
                 result = self.run_script("verify.sh")
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("note the USB host controller died this boot (not something this "
-                              f"kit changes):\n{line}\n", result.stdout)
-                self.assertNotIn("FAIL", result.stdout)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"FAIL the USB host controller died this boot:\n{line}\n",
+                              result.stdout)
+                self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+                self.assertNotIn("the USB host controller did not die", result.stdout)
                 self.assertNotIn("came back from a suspend", result.stdout)
-                self.assertIn("all checks passed", result.stdout)
 
     def test_a_controller_that_was_set_up_again_after_a_suspend_is_noted_and_is_not_a_death(self):
         self.boot_kit()
@@ -1463,6 +1511,8 @@ class VerifyTest(FakeTablet):
         self.assertIn("note the USB host controller came back from a suspend without its state and "
                       "was set up again (times this boot: 1)", result.stdout)
         self.assertNotIn("the USB host controller died", result.stdout)
+        self.assertIn("ok   the USB host controller did not die this boot (suspend cycles so far: 1)",
+                      result.stdout)
         self.assertNotIn("FAIL", result.stdout)
 
     def test_checks_fail_when_the_kernel_refused_a_module(self):
@@ -1501,19 +1551,57 @@ class VerifyTest(FakeTablet):
                               result.stdout)
                 self.assertIn("ok   sm5714_usbpd.sink_host_swap = Y", result.stdout)
 
-    def test_a_dead_usb_host_controller_is_reported_and_not_a_failure(self):
-        """The kit does not carry the SM-X910's USB power domain change."""
+    def test_checks_fail_when_the_usb_host_controller_died(self):
+        """The kit carries the USB power domain change: a controller that did
+        not come back fails the check, as the SM-X910's and this tablet's
+        did without it."""
+        for name, journal, lines in (
+                ("the SM-X910's", USB_HOST_DIED,
+                 ("xHCI host not responding to stop endpoint command", "HC died; cleaning up",
+                  "Host halt failed, -110")),
+                ("the SM-X710's", USB_HOST_PROBE_FAILED, ("Host halt failed, -110",))):
+            with self.subTest(name):
+                self.boot_kit()
+                self.journal_add(journal)
+                self.roles("host", "sink")
+                self.partner.mkdir(exist_ok=True)
+                (self.root / "sys/bus/usb/devices/1-1/idVendor").unlink(missing_ok=True)
+                result = self.run_script("verify.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("FAIL the USB host controller died this boot:", result.stdout)
+                for line in lines:
+                    self.assertIn(line, result.stdout)
+                self.assertIn("note USB host with no device on the bus", result.stdout)
+                self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+                self.assertIn("some checks FAILED", result.stdout)
+
+    def test_checks_count_the_suspend_cycles_and_the_devices_behind_a_dock(self):
+        """A boot with the dock attached, as it should end: the boot's suspend
+        cycle ran, the controller is alive and the hub is on the bus."""
         self.boot_kit()
-        self.journal_add(USB_HOST_DIED)
+        self.journal_add("kernel: PM: suspend entry (deep)\nkernel: PM: suspend exit\n")
+        self.roles("host", "sink")
+        self.partner.mkdir()
         result = self.run_script("verify.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("FAIL", result.stdout)
-        self.assertIn("note the USB host controller died this boot (not something this kit changes):",
+        self.assertIn("ok   the USB host controller did not die this boot (suspend cycles so far: 1)",
                       result.stdout)
-        for line in ("xHCI host not responding to stop endpoint command", "HC died; cleaning up",
-                     "Host halt failed, -110"):
-            self.assertIn(line, result.stdout)
-        self.assertIn("all checks passed", result.stdout)
+        self.assertIn("ok   USB host, devices on the bus: 1", result.stdout)
+        self.assertIn("ok   Type-C port registered: data host, power sink, partner present",
+                      result.stdout)
+
+    def test_a_usb_host_without_devices_is_noted_and_does_not_fail(self):
+        """A charger that took the swap has nothing behind it, and the Anker
+        hub without its charger enumerates nothing."""
+        self.boot_kit()
+        self.roles("host", "sink")
+        self.partner.mkdir()
+        (self.root / "sys/bus/usb/devices/1-1/idVendor").unlink()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("note USB host with no device on the bus (nothing behind the dock, "
+                      "or its hub did not come up)", result.stdout)
+        self.assertNotIn("FAIL", result.stdout)
 
     def test_checks_fail_on_the_hang_log_kernel(self):
         self.boot_kit()
@@ -1581,10 +1669,11 @@ class ScriptsTest(unittest.TestCase):
     def test_the_image_check_looks_for_what_only_this_revision_has(self):
         """The first three strings are also in an image built with the plain
         longer timeout before it, and the deadline of the Try.SNK wait is in
-        the second revision of that patch alone.  The last five came after
+        the second revision of that patch alone.  The last six came after
         it: the log lines of the three fixes for a swap asked for from
-        userspace, of which the third has two, and the driver's mark for
-        reading its parameters at each attach."""
+        userspace, of which the third has three (the PR_Swap one is in no
+        earlier revision of that patch), and the driver's mark for reading
+        its parameters at each attach."""
         text = (KIT_SRC / "make-kit.sh").read_text()
         strings = shlex.split(re.search(r"^new_strings=\((.*?)\)$", text, re.M | re.S).group(1))
         self.assertEqual(strings, ["Requesting DFP before discovery", "sink_host_swap",
@@ -1593,6 +1682,7 @@ class ScriptsTest(unittest.TestCase):
                                    "Data role swap ended with the role unchanged",
                                    "Swap is still queued, left pending",
                                    "Partner swapped first, queued DR_SWAP_SEND dropped",
+                                   "Partner swapped first, queued PR_SWAP_SEND dropped",
                                    "policy_open"])
         tcpm_c = f"{TCPM_DIR}/tcpm.c"
         wait = added_lines("tcpm-try-snk-extra-wait.patch")
@@ -1605,19 +1695,24 @@ class ScriptsTest(unittest.TestCase):
                   for name in ("tcpm-request-dfp-as-sink-before-discovery.patch",
                                "tcpm-no-dr-swap-during-vdm.patch",
                                "tcpm-dr-set-checks-data-role.patch",
-                               "tcpm-keep-queued-swap-pending.patch")]
+                               "tcpm-keep-queued-swap-pending.patch",
+                               "gcc-sm8550-usb-gdscs-retention.patch",
+                               "dwc3-qcom-check-hcd-before-reading-port-speed.patch")]
         others.append(driver)
         for name in ("try_snk_wait_until", "tcpm_try_snk_wait_left"):
             with self.subTest(name):
                 self.assertFalse([other[:40] for other in others if name in other])
         # The build tree is checked for the same revision of the patch.
         self.assertIn("grep -q 'tcpm_try_snk_wait_left' \"$tree/$tcpm_dir/tcpm.c\"", text)
-        # Each of the four log lines is its own patch's, there once, and the
-        # build tree is checked for it.
+        # Each of the five log lines is its own patch's, there once, and the
+        # build tree is checked for it: a tree with an earlier revision of the
+        # third fix has its first two lines.  The VCONN_Swap one is not
+        # checked; it came with the PR_Swap one.
         for name, line in (("tcpm-no-dr-swap-during-vdm.patch", strings[4]),
                            ("tcpm-dr-set-checks-data-role.patch", strings[5]),
                            ("tcpm-keep-queued-swap-pending.patch", strings[6]),
-                           ("tcpm-keep-queued-swap-pending.patch", strings[7])):
+                           ("tcpm-keep-queued-swap-pending.patch", strings[7]),
+                           ("tcpm-keep-queued-swap-pending.patch", strings[8])):
             with self.subTest(line):
                 calls = [added.strip() for added in added_lines(name)[tcpm_c] if line in added]
                 self.assertEqual(calls, [f'tcpm_log(port, "{line}");'])
@@ -1637,7 +1732,9 @@ class ScriptsTest(unittest.TestCase):
                                  "tcpm-try-snk-extra-wait.patch",
                                  "tcpm-no-dr-swap-during-vdm.patch",
                                  "tcpm-dr-set-checks-data-role.patch",
-                                 "tcpm-keep-queued-swap-pending.patch"])
+                                 "tcpm-keep-queued-swap-pending.patch",
+                                 "gcc-sm8550-usb-gdscs-retention.patch",
+                                 "dwc3-qcom-check-hcd-before-reading-port-speed.patch"])
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text().replace("\\\n", " ")
         for name in names:
             with self.subTest(name):
@@ -1645,11 +1742,140 @@ class ScriptsTest(unittest.TestCase):
                 self.assertEqual(len(re.findall(
                     rf"^apply_unless '[^']+'\s+\S+\s+{re.escape(name)}\s*$", build, re.M)), 1)
         # Each file a patch changes is one the kit compares with the hang-log build's.
+        patched = re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1)
         changed = set()
         for name in names:
             changed.update(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / name).read_text(),
                                       re.M))
-        self.assertEqual(changed, {f"{TCPM_DIR}/tcpm.c", "include/linux/usb/tcpm.h"})
+        self.assertEqual(changed, {f"{TCPM_DIR}/tcpm.c", "include/linux/usb/tcpm.h", f"{GCC}.c",
+                                   f"{DWC3}.c"})
+        self.assertEqual(patched, '"$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c"')
+        self.assertIn("\ntcpm_dir=drivers/usb/typec/tcpm\n", text)
+        self.assertIn("\ngcc=drivers/clk/qcom/gcc-sm8550\n", text)
+        self.assertIn("\ndwc3=drivers/usb/dwc3/dwc3-qcom\n", text)
+
+    def test_every_changed_source_is_required_dated_and_compared(self):
+        """The kit's changes to the kernel tree are the patched files and the
+        driver.  Each source is required, its object is dated against it,
+        and with HANG_SCRATCH each is what may differ from the hang-log tree.
+        The dwc3-qcom guard adds no string to the image: the marker in the
+        build tree's source and the date of its object are its proof."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        names = {"tcpm_dir": TCPM_DIR, "gcc": GCC, "dwc3": DWC3}
+
+        def expand(word):
+            return re.sub(r"\$\{?(\w+)\}?", lambda match: names[match.group(1)], word)
+
+        patched = [expand(word) for word in shlex.split(
+            re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1))]
+        driver = f"{TCPM_DIR}/sm5714_usbpd.c"
+        want = re.search(r'^\tsort > "\$tmp/trees\.want" <<EOF\n(.*?)^EOF$', text, re.M | re.S)
+        self.assertEqual(sorted(expand(word) for word in want.group(1).split()),
+                         sorted(patched + [driver]))
+        objects = [expand(pair) for pair in shlex.split(
+            re.search(r"^objects=\((.*?)\)$", text, re.M | re.S).group(1))]
+        required = text[text.index('for f in "$mkbootimg"'):]
+        required = required[:required.index("; do\n")]
+        self.assertIn('"${patched[@]/#/$tree/}"', required)
+        for source in patched + [driver]:
+            if source.endswith(".c"):
+                with self.subTest(source):
+                    self.assertIn(f"{source[:-2]}.o:{source}", objects)
+                    variable = next(f"${name}" for name, value in names.items()
+                                    if source.startswith(value))
+                    obj = source[:-2].replace(names[variable[1:]], variable) + ".o"
+                    self.assertIn(f'"$build/{obj}"', required)
+        self.assertIn("grep -q 'no hcd and no root hub' \"$tree/$dwc3.c\" ||\n"
+                      "\tdie 'the build tree does not carry the dwc3-qcom guard'", text)
+        self.assertNotIn("llvm-objdump", text)
+
+    def test_the_hang_log_tree_is_a_reference_for_the_guard_and_the_power_domains(self):
+        """The hang-log build has this branch's opps patch in dwc3-qcom.c and
+        neither of the two patches this kit adds there and in gcc-sm8550.c,
+        and its compiled clock controller is the reference for the power
+        domain table, as the release build's is for the SM-X910 kit."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        self.assertIn("grep -q 'dwc3_qcom_set_pstate' \"$hang_tree/$dwc3.c\" ||\n\t\tdie ", text)
+        self.assertIn("! grep -q 'no hcd and no root hub' \"$hang_tree/$dwc3.c\" &&\n"
+                      "\t\t! grep -q 'Retention across system suspend, as on sm8650' "
+                      "\"$hang_tree/$gcc.c\" ||\n\t\tdie ", text)
+        build = (REPO / "scripts/build-mainline-kernel.sh").read_text()
+        self.assertIn("apply_unless 'dwc3_qcom_set_pstate' \\\n\tdrivers/usb/dwc3/dwc3-qcom.c \\\n"
+                      "\tdwc3-qcom-drop-required-opps-vote-in-system-suspend.patch\n", build)
+        self.assertIn('llvm-objcopy -O binary --only-section=.data "$HANG_SCRATCH/linux-gts9wifi/$gcc.o"',
+                      text)
+        self.assertIn("""tr '\\n' ';')" = '5 6;5 6;' ]""", text)
+        self.assertIn('\techo "power domain table: $gdsc_check"\n', text)
+        tools = re.search(r"^for t in (.*); do$", text, re.M).group(1).split()
+        self.assertIn("llvm-objcopy", tools)
+        self.assertNotIn("llvm-objdump", tools)
+
+
+    def power_domain_gate(self, source):
+        """Run make-kit.sh's check for the USB power domain patch on SOURCE."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        gate = re.search(r"^gdsc_pwrsts\(\) \{.*?^grep -q 'Retention across system suspend[^\n]*\n"
+                         r"\tdie 'the build tree does not carry the USB power domain patch'\n",
+                         text, re.M | re.S)
+        self.assertIsNotNone(gate)
+        with tempfile.TemporaryDirectory() as tmp:
+            pathlib.Path(tmp, "gcc-sm8550.c").write_text(source)
+            return subprocess.run(
+                ["bash", "-c", 'set -euo pipefail; export LC_ALL=C\n'
+                 'die() { echo "$*" >&2; exit 1; }\ntree=$1 gcc=gcc-sm8550\n' + gate.group(0),
+                 "gate", tmp], capture_output=True, text=True)
+
+    def test_the_power_domain_check_reads_the_two_usb_domains(self):
+        """Upstream already has PWRSTS_RET_ON on the four PCIe domains, so the
+        patched file has six of them: counting the lines would refuse the
+        patched tree.  The same check as the SM-X910 kit's."""
+        def block(name, pwrsts):
+            return ('static struct gdsc %s = {\n\t.gdscr = 0x39004,\n\t.pd = {\n'
+                    '\t\t.name = "%s",\n\t},\n\t.pwrsts = %s,\n'
+                    '\t.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,\n};\n\n' % (name, name, pwrsts))
+
+        def source(usb30, usb3_phy, marker):
+            return ("".join(block(name, "PWRSTS_RET_ON") for name in
+                            ("pcie_0_gdsc", "pcie_0_phy_gdsc", "pcie_1_gdsc", "pcie_1_phy_gdsc"))
+                    + block("ufs_phy_gdsc", "PWRSTS_OFF_ON")
+                    + ("/* Retention across system suspend, as on sm8650: see "
+                       "gcc-sm8550-usb-gdscs-retention.patch */\n" if marker else "")
+                    + block("usb30_prim_gdsc", usb30) + block("usb3_phy_gdsc", usb3_phy)
+                    # What follows a domain's block is not read as its state.
+                    + block("usb3_phy_gdsc_2", "PWRSTS_RET_ON"))
+
+        off, ret = "PWRSTS_OFF_ON", "PWRSTS_RET_ON"
+        patched = self.power_domain_gate(source(ret, ret, True))
+        self.assertEqual((patched.returncode, patched.stdout, patched.stderr), (0, "", ""))
+        refused = "the build tree does not carry the USB power domain patch"
+        for name, text, message in (
+                ("upstream", source(off, off, False), refused + " (usb30_prim_gdsc)"),
+                ("the controller's only", source(ret, off, True), refused + " (usb3_phy_gdsc)"),
+                ("the PHY's only", source(off, ret, True), refused + " (usb30_prim_gdsc)"),
+                ("no marker", source(ret, ret, False), refused),
+                ("no such domain", "", refused + " (usb30_prim_gdsc)")):
+            with self.subTest(name):
+                result = self.power_domain_gate(text)
+                self.assertEqual((result.returncode, result.stderr), (1, message + "\n"))
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_power_domain_check_passes_on_the_patched_kernel_file_only(self):
+        path = "drivers/clk/qcom/gcc-sm8550.c"
+        upstream = subprocess.run(["git", "-C", str(kernel_source()), "show", "HEAD:" + path],
+                                  check=True, capture_output=True, text=True).stdout
+        # The reason the check cannot count lines.
+        self.assertGreater(upstream.count("PWRSTS_RET_ON"), 0)
+        self.assertEqual(self.power_domain_gate(upstream).returncode, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = pathlib.Path(tmp, path)
+            target.parent.mkdir(parents=True)
+            target.write_text(upstream)
+            with open(REPO / "kernel/patches/gcc-sm8550-usb-gdscs-retention.patch", "rb") as stream:
+                applied = subprocess.run(["patch", "-d", tmp, "-p1", "--no-backup-if-mismatch"],
+                                         stdin=stream, check=True, capture_output=True, text=True)
+            self.assertNotRegex(applied.stdout, r"fuzz|offset")
+            result = self.power_domain_gate(target.read_text())
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
 
     def staleness_gate(self, ages=(), out_image=b"image"):
         """Run make-kit.sh's check that the image was made from the sources as
@@ -1665,6 +1891,8 @@ class ScriptsTest(unittest.TestCase):
         # The sources, the objects compiled from them, vmlinux, the image.
         files = {f"tree/{TCPM_DIR}/tcpm.c": 100, f"tree/{TCPM_DIR}/sm5714_usbpd.c": 100,
                  "tree/include/linux/usb/tcpm.h": 100, f"build/{TCPM_DIR}/tcpm.o": 200,
+                 f"tree/{GCC}.c": 100, f"build/{GCC}.o": 200,
+                 f"tree/{DWC3}.c": 100, f"build/{DWC3}.o": 200,
                  f"build/{TCPM_DIR}/sm5714_usbpd.o": 200, "build/vmlinux": 300,
                  "build/arch/arm64/boot/Image.gz": 400, "out/Image.gz": 400}
         files.update(ages)
@@ -1678,7 +1906,7 @@ class ScriptsTest(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-c", 'set -euo pipefail; export LC_ALL=C\n'
                  'die() { echo "$*" >&2; exit 1; }\ntree=$1/tree build=$1/build out=$1/out\n'
-                 f'tcpm_dir={TCPM_DIR}\n' + objects.group(0) + "\n" + gate.group(0),
+                 f'tcpm_dir={TCPM_DIR}\ngcc={GCC}\ndwc3={DWC3}\n' + objects.group(0) + "\n" + gate.group(0),
                  "gate", tmp], capture_output=True, text=True)
             return result.returncode, result.stdout, result.stderr.replace(tmp, "TMP")
 
@@ -1694,6 +1922,9 @@ class ScriptsTest(unittest.TestCase):
             "tcpm.c changed since": ({f"tree/{tcpm}.c": 250}, stale % (tcpm, tcpm + ".c")),
             "tcpm.h changed since": ({f"tree/{header}": 250}, stale % (tcpm, header)),
             "the driver changed since": ({f"tree/{driver}.c": 250}, stale % (driver, driver + ".c")),
+            "gcc-sm8550.c changed since": ({f"tree/{GCC}.c": 250}, stale % (GCC, GCC + ".c")),
+            "dwc3-qcom.c changed since": ({f"tree/{DWC3}.c": 250}, stale % (DWC3, DWC3 + ".c")),
+            "no dwc3-qcom object": ({f"build/{DWC3}.o": None}, stale % (DWC3, DWC3 + ".c")),
             # The driver includes the header too.
             "the driver's object alone is old": (
                 {f"build/{driver}.o": 50, f"tree/{driver}.c": 40}, stale % (driver, header)),
@@ -1747,15 +1978,30 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         kit = re.search(r"^patches=\((.*?)\)$", text, re.M | re.S).group(1).split()
         self.assertEqual(sorted(re.findall(r"`kernel/patches/([^`]+)`", readme)), sorted(kit))
-        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (5, 5))
-        self.assertIn("`kernel/patches/tcpm-keep-queued-swap-pending.patch`: five TCPM patches.",
-                      readme)
+        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (7, 5))
+        self.assertIn("seven patches, five of them to TCPM.", readme)
         # What has run, and what has not.
-        self.assertIn("The third fix is in no kernel that has run: this revision's was built on "
-                      "2026-11-21 and is not installed. None of the three fixes and neither "
-                      "switch has been tried on a tablet. **On the SM-X710 the previous revision "
-                      "of the kit, without the third fix, is installed, and no dock has been "
-                      "plugged into it yet.**", readme)
+        self.assertIn("New in this revision are the third fix, the SM-X910's power domain change "
+                      "and a NULL check in the dwc3-qcom glue. The third fix and the NULL check "
+                      "are in no kernel that has run on a tablet, and the power domain change has "
+                      "run on the SM-X910 only. None of the three fixes and neither switch has "
+                      "been tried on a tablet. **On the SM-X710 the previous revision of the kit "
+                      "is installed, without the third fix and the power domain change.**", readme)
+        for stale in ("was built on", "no dock has been plugged into it", "is not in this kit",
+                      "this kit changes nothing there"):
+            self.assertNotIn(stale, readme)
+        # What the SM-X710 showed, and what is still to be done there.
+        self.assertIn("That is the SM-X910's fault, seen once here: the reason this revision "
+                      "carries the power domain change.", readme)
+        self.assertIn("not done yet: `verify.sh dock` and `swap` on a kit kernel, the Satechi on a "
+                      "kit kernel, and a boot with the dock attached and devices on the bus.",
+                      readme)
+        # A docked boot tests the host controller only with devices on the
+        # bus, and an earlier revision is not upgraded in place.
+        self.assertIn("A boot with nothing on the bus does not test the host controller.", readme)
+        self.assertIn("there is no upgrade from an earlier revision of this kit: run its "
+                      "`rollback.sh` and reboot, then this revision's `install.sh` and reboot "
+                      "again.", readme)
         # Why the recorder reads the log every second, and what a plug-in or
         # a swap run without a verdict means.
         self.assertIn("so during a plug-in the script **reads the log every second** and adds "

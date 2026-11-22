@@ -4,44 +4,87 @@ tcpm_dr_set(), tcpm_pr_set() and tcpm_vconn_set() put their swap in
 upcoming_state, start the AMS and wait for the swap to be completed.  A
 message of the partner's that is handled before AMS_START has run and
 that makes the port change state (new Source_Capabilities, a swap of the
-partner's own) leaves the swap in upcoming_state.  The ready state that
-follows completes the pending swap with status 0 first and only then
-moves on to upcoming_state, where the swap is sent.
+partner's own) can leave the swap in upcoming_state.  The ready state
+that follows completes the pending swap with status 0 first and only
+then moves on to upcoming_state, where the swap is sent.
 
 The writer has its answer before the swap is on the wire.  With the role
 check in tcpm_dr_set() that answer is -EAGAIN, for a swap the partner
 accepts a moment later.
 
-Have the two ready states leave a pending swap alone while a state is
-queued.  The swap is then completed by the states it goes through (a
-refusal, the timeout) or by the ready state after them.  If the queued
-state is another one, which has taken the swap's place, the ready state
-after that one completes the swap as before and the role check says what
-became of it.
+Have the two ready states leave a pending swap alone while the swap
+itself is still queued: a DR_SWAP_SEND, PR_SWAP_SEND or VCONN_SWAP_SEND
+in upcoming_state.  The swap is then completed by the states it goes
+through (a refusal, the timeout) or by the ready state after them.
 
-When the message that got in first is the partner's DR_Swap, the port
-accepts it and then sends the queued DR_Swap as well, which puts the
-data role back: a write of "host" changes nothing, and a port with
-tcpc->request_dfp_as_sink that asked for the host role ends up as
-device with the matter settled.  Drop a queued DR_SWAP_SEND where the
-partner's swap changes the role.  The role it was queued for is the one
-the port gets there.
+A swap request of the partner's that is handled while the port is still
+on its way to AMS_START takes the queued swap's place: DR_SWAP_ACCEPT,
+PR_SWAP_ACCEPT or VCONN_SWAP_ACCEPT in upcoming_state.  Leave the
+pending swap alone behind that as well.  The writer then gets its answer
+after the partner's swap, and the role check in tcpm_dr_set() sees the
+role that swap left.  Completed before it, the check would run while the
+port sends its Accept and see the old role.
 
-Neither has been seen on a tablet; both are read from the code.  The
+Any other state queued there has taken the swap's place for good, and
+the ready state completes the swap as before; for a data role the role
+check says what became of it.
+
+A VCONN swap that turns the port's VCONN on ends in
+VCONN_SWAP_SEND_SOFT_RESET, the partner's as well as the port's own, and
+that state completes the pending swap with its status either way.  Have
+it leave a swap that is still queued alone as well.
+
+When the message that got in first is the partner's own swap of the same
+kind, the port accepts it and then sends the queued swap too, which puts
+the role back: the write changes nothing, and a port with
+tcpc->request_dfp_as_sink that asked for the host role ends up as device
+with the matter settled.  Drop a queued DR_SWAP_SEND where the partner's
+DR_Swap changes the data role, and a queued PR_SWAP_SEND or
+VCONN_SWAP_SEND where the port accepts the partner's PR_Swap or
+VCONN_Swap.  The role the queued swap was for is the one the partner's
+swap gives the port.  That holds for the VCONN_Swap queued before SOP'
+discovery as well, which asks for the VCONN source role.
+
+This is read from the code; none of it has been seen to happen.  The
 window is the time between tcpm_ams_start() and AMS_START: tSinkTx for a
 PD 3.x source, and for a sink a message that was received already and
 waits for the port lock.
 ---
- drivers/usb/typec/tcpm/tcpm.c | 28 ++++++++++++++++++++++++++--
- 1 file changed, 26 insertions(+), 2 deletions(-)
+ drivers/usb/typec/tcpm/tcpm.c | 77 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 74 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
 --- a/drivers/usb/typec/tcpm/tcpm.c
 +++ b/drivers/usb/typec/tcpm/tcpm.c
-@@ -5231,6 +5231,22 @@ static void tcpm_swap_complete(struct tc
+@@ -5231,6 +5231,47 @@ static void tcpm_swap_complete(struct tc
  	}
  }
  
++/*
++ * Whether a write to one of the port's roles still waits for a swap that is
++ * queued in upcoming_state: its own swap, about to be sent, or a swap request
++ * of the partner's that took its place there, about to be accepted.  The
++ * write is answered after that swap.  Any other state queued there means
++ * that no swap is going to happen.
++ */
++static bool tcpm_swap_is_queued(struct tcpm_port *port)
++{
++	if (!port->swap_pending)
++		return false;
++
++	switch (port->upcoming_state) {
++	case DR_SWAP_SEND:
++	case PR_SWAP_SEND:
++	case VCONN_SWAP_SEND:
++	case DR_SWAP_ACCEPT:
++	case PR_SWAP_ACCEPT:
++	case VCONN_SWAP_ACCEPT:
++		return true;
++	default:
++		return false;
++	}
++}
++
 +/*
 + * A ready state completes the swap that a write to one of the port's roles
 + * waits for.  Not while that swap still sits in upcoming_state, behind a
@@ -50,7 +93,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
 + */
 +static void tcpm_swap_complete_ready(struct tcpm_port *port)
 +{
-+	if (port->swap_pending && port->upcoming_state != INVALID_STATE) {
++	if (tcpm_swap_is_queued(port)) {
 +		tcpm_log(port, "Swap is still queued, left pending");
 +		return;
 +	}
@@ -61,7 +104,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  static enum typec_pwr_opmode tcpm_get_pwr_opmode(enum typec_cc_status cc)
  {
  	switch (cc) {
-@@ -5546,7 +5562,7 @@ static void run_state_machine(struct tcp
+@@ -5546,7 +5587,7 @@ static void run_state_machine(struct tcp
  #endif
  		port->try_src_count = 0;
  
@@ -70,7 +113,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		tcpm_typec_connect(port);
  
  		if (port->ams != NONE_AMS)
-@@ -5935,7 +5951,7 @@ static void run_state_machine(struct tcp
+@@ -5935,7 +5976,7 @@ static void run_state_machine(struct tcp
  
  		if (!port->pd_capable && port->slow_charger_loop)
  			tcpm_set_current_limit(port, tcpm_get_current_limit(port), 5000);
@@ -79,7 +122,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		tcpm_typec_connect(port);
  		if (port->pd_capable && port->source_caps[0] & PDO_FIXED_DUAL_ROLE)
  			mod_enable_frs_delayed_work(port, 0);
-@@ -6233,6 +6249,14 @@ static void run_state_machine(struct tcp
+@@ -6233,6 +6274,14 @@ static void run_state_machine(struct tcp
  		/* Whoever asked for it, a completed swap settles the data role */
  		port->sink_dfp_done = true;
  		port->data_role_swapped = true;
@@ -94,3 +137,48 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		tcpm_unregister_altmodes(port);
  		if (port->data_role == TYPEC_HOST)
  			tcpm_set_roles(port, true, TYPEC_STATE_USB, port->pwr_role,
+@@ -6275,6 +6324,15 @@ static void run_state_machine(struct tcp
+ 
+ 	/* PR_Swap states */
+ 	case PR_SWAP_ACCEPT:
++		/*
++		 * A power role swap of the port's own that was still queued
++		 * when the partner's came in asked for the role this one gives
++		 * it.
++		 */
++		if (port->upcoming_state == PR_SWAP_SEND) {
++			tcpm_log(port, "Partner swapped first, queued PR_SWAP_SEND dropped");
++			port->upcoming_state = INVALID_STATE;
++		}
+ 		tcpm_pd_send_control(port, PD_CTRL_ACCEPT, TCPC_TX_SOP);
+ 		tcpm_set_state(port, PR_SWAP_START, 0);
+ 		break;
+@@ -6371,6 +6429,14 @@ static void run_state_machine(struct tcp
+ 		break;
+ 
+ 	case VCONN_SWAP_ACCEPT:
++		/*
++		 * A VCONN swap of the port's own that was still queued when
++		 * the partner's came in asked for the role this one gives it.
++		 */
++		if (port->upcoming_state == VCONN_SWAP_SEND) {
++			tcpm_log(port, "Partner swapped first, queued VCONN_SWAP_SEND dropped");
++			port->upcoming_state = INVALID_STATE;
++		}
+ 		tcpm_pd_send_control(port, PD_CTRL_ACCEPT, TCPC_TX_SOP);
+ 		tcpm_ams_finish(port);
+ 		tcpm_set_state(port, VCONN_SWAP_START, 0);
+@@ -6414,7 +6480,12 @@ static void run_state_machine(struct tcp
+ 		tcpm_set_state(port, ready_state(port), 0);
+ 		break;
+ 	case VCONN_SWAP_SEND_SOFT_RESET:
+-		tcpm_swap_complete(port, port->swap_status);
++		/*
++		 * The partner's VCONN swap ends here too: a swap of the port's
++		 * own that is still queued behind it has not been sent yet.
++		 */
++		if (!tcpm_swap_is_queued(port))
++			tcpm_swap_complete(port, port->swap_status);
+ 		if (tcpm_can_communicate_sop_prime(port)) {
+ 			port->tx_sop_type = TCPC_TX_SOP_PRIME;
+ 			port->upcoming_state = SOFT_RESET_SEND;

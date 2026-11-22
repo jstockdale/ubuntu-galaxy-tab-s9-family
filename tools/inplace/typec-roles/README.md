@@ -6,14 +6,18 @@ the kernel changes for powered USB-C docks described in
 can be tested on a tablet. Everything the hang-log kit set stays: the same
 configuration, the same DTB, the same ramoops region and sysctl drop-in.
 
-**Why.** A powered dock should leave the tablet as power sink and USB host.
-On the SM-X910 two docks did not get there:
+**Why.** A powered dock should leave the tablet as power sink and USB host,
+also when the tablet boots with the dock attached. On the SM-X910 two docks
+did not get there:
 - the dock's own data role swap ended in `Data role mismatch` and an endless
   re-attach (every attach of one hub; the other dock has two on record, one
   mismatch and one hard reset);
 - a dock seen as a sink first kept the tablet as power source, because
   Try.SNK gives up after 100 ms and the SM5714 reports a source later than
-  that: 123 to 147 ms after Rd in the eight attaches measured.
+  that: 123 to 147 ms after Rd in the eight attaches measured;
+- a boot with the dock attached lost its USB host controller in the suspend
+  cycle the boot runs for the panel (`HC died`). On the SM-X710 the next
+  xHCI failed to start after such a boot, once (below).
 
 **On the SM-X910 (2026-11-21)** a test kernel with both changes was tried
 with two docks. The data role change did what it should on all three
@@ -26,37 +30,59 @@ for the whole wait, which goes back to waiting when an Rp goes away again,
 ran there the same day: two boots with a dock attached and four plug-ins
 into the running tablet, all six with the tablet as USB host and power sink
 at the end, one of them through the case the first revision lost. This kit's
-kernel carries that second revision and, new, three fixes for a data role
-swap asked for from userspace (a write to the port's `data_role`) and a
-driver that reads its two switches at each attach. The SM-X910 has booted
-once with a dock attached on a kernel with the first two fixes and the
-driver, with the same outcome. The third fix is in no kernel that has run:
-this revision's was built on 2026-11-21 and is not installed. None of the
-three fixes and neither switch has been tried on a tablet. **On the SM-X710
-the previous revision of the kit, without the third fix, is installed, and
-no dock has been plugged into it yet.**
+kernel carries that second revision, three fixes for a data role swap asked
+for from userspace (a write to the port's `data_role`) and a driver that
+reads its two switches at each attach. The SM-X910 has booted once with a
+dock attached on a kernel with the first two fixes and the driver, with the
+same outcome. New in this revision are the third fix, the SM-X910's power
+domain change and a NULL check in the dwc3-qcom glue. The third fix and the
+NULL check are in no kernel that has run on a tablet, and the power domain
+change has run on the SM-X910 only. None of the three fixes and neither
+switch has been tried on a tablet. **On the SM-X710 the previous revision
+of the kit is installed, without the third fix and the power domain
+change.**
 
-The SM-X710 has the same controller, driver and connector description.
-Before the kit went on, `verify.sh dock` recorded the Satechi dock there
-once: it left the tablet as power source, as on the SM-X910. The data role
-fault has not been seen on it.
+The SM-X710 has the same controller, driver and connector description. What
+it showed on 2026-11-21:
+- on the kernel before the kit, `verify.sh dock` recorded the Satechi dock
+  once: it left the tablet as power source and USB host, with its devices on
+  the bus, as on the SM-X910. The Anker hub without its charger left it the
+  same way with nothing on the bus: that hub enumerates no device while the
+  tablet powers it, on either tablet;
+- on the previous revision's kernel, booted with the Anker hub attached
+  without its charger, the tablet was power source and USB host when the
+  boot's suspend cycle ran. When the hub's charger went in, at 718 s, the
+  port attached again, the kernel's own request for the host role was
+  accepted, and the tablet ended as host and sink on 9 V; but the new USB
+  host controller failed to start (`Host halt failed, -110`), so no device
+  came up. In the boot before, whose suspend cycle ran in device role, the
+  same hub attached without that error. That is the SM-X910's fault, seen
+  once here: the reason this revision carries the power domain change.
+  6.6 s after the failed start the dwc3-qcom glue oopsed, and the next
+  reboot stalled for 7.5 minutes: the NULL check is for that;
+- not done yet: `verify.sh dock` and `swap` on a kit kernel, the Satechi on
+  a kit kernel, and a boot with the dock attached and devices on the bus.
 
-The SM-X910's third change, the USB power domains kept in retention across
-suspend (a boot with the dock attached lost its USB host there), **is not in
-this kit**. `verify.sh` reports a USB host controller that died, as a note.
+The data role fault has not been seen on it.
 
 **What changes:**
 - **Kernel:** the hang-log kernel rebuilt with
   `kernel/patches/tcpm-request-dfp-as-sink-before-discovery.patch`,
   `kernel/patches/tcpm-try-snk-extra-wait.patch`, the `sm5714_usbpd.c` that
-  turns both on, and the three fixes for a swap asked for from userspace,
+  turns both on, the three fixes for a swap asked for from userspace,
   `kernel/patches/tcpm-no-dr-swap-during-vdm.patch`,
   `kernel/patches/tcpm-dr-set-checks-data-role.patch` and
-  `kernel/patches/tcpm-keep-queued-swap-pending.patch`: five TCPM patches.
-  In the kernel source tree three files differ from the hang-log build:
-  `tcpm.c`, `tcpm.h` and the driver. `make-kit.sh` checks
-  that, and that the configuration and the DTB are byte for byte the
-  hang-log build's.
+  `kernel/patches/tcpm-keep-queued-swap-pending.patch`,
+  `kernel/patches/gcc-sm8550-usb-gdscs-retention.patch`, which keeps the
+  two USB power domains in retention across suspend instead of switching
+  them off, and
+  `kernel/patches/dwc3-qcom-check-hcd-before-reading-port-speed.patch`,
+  which lets the USB controller's glue suspend when an xHCI failed to
+  start: seven patches, five of them to TCPM. In the kernel source tree
+  five files differ from the hang-log build: `tcpm.c`, `tcpm.h`, the
+  driver, `gcc-sm8550.c` and `dwc3-qcom.c` (the hang-log build's has the
+  dwc3-qcom CX vote patch already). `make-kit.sh` checks that, and that the
+  configuration and the DTB are byte for byte the hang-log build's.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
   the DTB, which did not change. `install.sh` checks that it still holds the
   hang-log kit's image.
@@ -91,6 +117,9 @@ this kit**. `verify.sh` reports a USB host controller that died, as a note.
   echo 0 | sudo tee /sys/module/sm5714_usbpd/parameters/try_snk_extra_wait_ms
   ```
 
+  The power domain change and the NULL check have no switch; `rollback.sh`
+  is the way back.
+
 **What it can change for other things you plug in** (the write-up has the
 detail):
 - a PD source that offers data role swap and accepts it, a laptop over a
@@ -105,7 +134,10 @@ detail):
   it used to be told that the swap was done. Writing again is the answer to
   both. A write to `data_role`, `power_role` or `vconn_source` that waits
   behind a message of the partner's is answered once its swap has run, no
-  longer before it is sent.
+  longer before it is sent;
+- the USB power domains now stay in retention while the tablet sleeps. What
+  that costs in sleep and idle, and whether the USB host survives a real
+  sleep with it, has not been measured on this tablet.
 
 ## Build (host)
 
@@ -132,9 +164,13 @@ The build archives its module key in the registry
 not there. Run `make-kit.sh` from the checkout that was built: it compares
 the build tree with that checkout's driver and patches. With `HANG_SCRATCH`
 it also compares the whole kernel source tree with the hang-log build's
-(the objects that the module builds leave in the tree aside). Either way
-it checks that the image is the build directory's and was built after the
-last change to `tcpm.c`, `tcpm.h` and the driver.
+(the objects that the module builds leave in the tree aside), and the
+compiled power domain table with the hang-log build's: the two power-state
+values and nothing else. Either way it checks that the image is the build
+directory's and was built after the last change to `tcpm.c`, `tcpm.h`, the
+driver, `gcc-sm8550.c` and `dwc3-qcom.c`. The NULL check leaves no string in
+the image: the marker in the build tree's `dwc3-qcom.c` and the date of its
+object are what show it.
 `SOURCE` in the kit records the checkout and which of the two checks ran.
 
 ## Install, check, roll back (tablet)
@@ -156,9 +192,11 @@ sudo sh ~/typec-roles/rollback.sh          # back to the hang-log kit; reboot
 before writing the new kernel and at the end, so that a power failure finds
 either the hang-log or the kit's kernel with its own modules. Reboot soon
 after it: until then the running kernel loads no further module. A second
-`install.sh` over an installed kit is refused; roll back first. The hang-log
-kit's own `verify.sh` reports another build ID and module key while this kit
-is installed; its other checks still apply.
+`install.sh` over an installed kit is refused, and there is no upgrade from
+an earlier revision of this kit: run its `rollback.sh` and reboot, then this
+revision's `install.sh` and reboot again. The hang-log kit's own `verify.sh`
+reports another build ID and module key while this kit is installed; its
+other checks still apply.
 
 `rollback.sh` writes boot and the module tree back first and syncs. If it
 stops after that, it says that the hang-log kernel and its modules are back
@@ -214,9 +252,10 @@ kernel's request off, the dock's own swap can still end them as it used to.
 `N refused during a VDM exchange` in a plug-in's line counts the writes the
 first fix turned away (`VDM in progress, DATA_ROLE_SWAP not started` in the
 TCPM log); a run in which no write met a VDM exchange says so and asks for
-another plug-in. The third fix's two lines are counted under the plug-in when
-they show (`left pending`, `dropped because the partner swapped first`); they
-do not decide, and the run cannot bring about the race they come from. A
+another plug-in. The third fix's lines are counted under the plug-in when
+they show (`left pending`, and `dropped because the partner swapped first`
+for a queued swap of any kind); they do not decide, and the run cannot bring
+about the race they come from. A
 plug-in without a verdict says why: no swap asked for, every write refused
 before TCPM started one, or a log that lost lines. A run in which no plug-in
 got a verdict fails. Start the run with nothing plugged in: the first plug-in
@@ -229,12 +268,17 @@ stays off until the next boot, or until
 
 Without an argument `verify.sh` checks the boot: the kit's kernel and module
 key, the two switches, and what the hang-log kit set. A module the kernel
-refused fails it, and so does a kernel log that cannot be read. A USB host
-controller that died (`HC died`, `not responding to stop endpoint command`,
-`Host halt failed`, `Host System Error`, `Controller not ready at resume`)
-is a note, since this kit changes nothing there, and so is one that came
-back from a suspend without its state and was set up again (`xHC error in
-resume`).
+refused fails it, and so does a kernel log that cannot be read. It also reads
+the boot's kernel log for a USB host controller that died (`HC died`, `not
+responding to stop endpoint command`, `Host halt failed`, `Host System
+Error`, `Controller not ready at resume`), and fails if it did. After a boot
+with the dock attached that is the check for the power domain change. It
+needs a suspend cycle to have run: before the boot's own cycle, about half a
+minute in, it prints a note and no verdict. And it needs devices on the bus:
+with nothing behind the dock a controller that lost its state can go unseen
+until the next attach, as on 2026-11-21. A controller that came back from a
+suspend without its state and was set up again (`xHC error in resume`) is a
+note: USB works, the devices were enumerated again.
 
 What a passing dock looks like in `trial-N.tcpm.log` is in the write-up:
 `SNK_READY -> AMS_START`, `Requesting DFP before discovery`, `AMS_START ->
@@ -264,13 +308,20 @@ again, up to three per attach; the verdict is still the roles.
    `cat /sys/module/sm5714_usbpd/parameters/sink_host_swap` says `Y` again,
    and one `sudo sh ~/typec-roles/verify.sh dock 1` passes with `host role
    requested 1`: the kernel asks by itself again from the next attach.
-4. A boot with the dock attached, then `sh ~/typec-roles/verify.sh` (does it
-   note a USB host controller that died?) and
-   `sudo sh ~/typec-roles/verify.sh now`.
+4. **A boot with the dock attached and devices behind it**: the Anker hub
+   with its charger in its PD port and something plugged into the hub, or
+   the Satechi with its power supply. Then `sh ~/typec-roles/verify.sh` and
+   `sudo sh ~/typec-roles/verify.sh now`. The devices behind the dock work,
+   the battery charges, and `verify.sh` says `the USB host controller did
+   not die this boot` with at least one suspend cycle counted. A boot with
+   nothing on the bus does not test the host controller.
 5. `sudo sh ~/typec-roles/verify.sh record` once each with: a plain PD
    charger (charges; a swap only if the charger offers one), an unpowered hub
-   and a USB stick (enumerate), the A-to-C cable to the build host (`usb0`
-   comes up, the gadget network works).
-6. Suspend and resume with the dock attached, then with the charger.
+   (not the Anker hub: without its charger it enumerates nothing) and a USB
+   stick (enumerate), the A-to-C cable to the build host (`usb0` comes up,
+   the gadget network works).
+6. Suspend and resume with the dock attached, then with the charger: does
+   the dock come back afterwards? Battery drain over a night of sleep,
+   against the hang-log kernel, is the check for what retention costs.
 7. Bluetooth, Wi-Fi, audio and the rear camera at a known size: the kernel was
    rebuilt, and nothing else in it changed.

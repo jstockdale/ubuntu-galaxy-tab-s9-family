@@ -267,7 +267,8 @@ plug_test() { # dock|record|now|swap [COUNT]
 			unchanged=$(count 'Data role swap ended with the role unchanged' "$out.tcpm.log")
 			cut=$(count '\] state change DR_SWAP_SEND -> [A-Z_]*SOFT_RESET' "$out.tcpm.log")
 			queued=$(count 'Swap is still queued, left pending' "$out.tcpm.log")
-			dropped=$(count 'Partner swapped first, queued DR_SWAP_SEND dropped' "$out.tcpm.log")
+			# A queued DR_SWAP_SEND, PR_SWAP_SEND or VCONN_SWAP_SEND.
+			dropped=$(count 'Partner swapped first, queued [A-Z_]+ dropped' "$out.tcpm.log")
 			overflow=$(echo "$c" | cut -f10)
 			wrote=$(cat "$writes" 2> /dev/null)
 			refused_total=$((refused_total + refused))
@@ -418,17 +419,31 @@ fi
 
 [ -d "$port" ] && ok "Type-C port registered: data $(role data_role), power $(role power_role)," \
 	"partner $([ -e "$partner" ] && echo present || echo none)" || bad "no $port"
-# On the SM-X910 a boot with the dock attached lost its USB host controller in
-# the boot's suspend cycle.  This kit changes nothing there, so it is reported
-# and not a failure.
+# A boot with the dock attached has the port as USB host when the boot's
+# suspend cycle runs; the host controller has to come back from it.  Without
+# the power domain change it did not, on the SM-X910 and once here.
 dead='xhci-hcd .*(HC died|not responding to stop endpoint command|Host halt failed|Host System Error|Controller not ready at resume)'
-n=$(printf '%s\n' "$k" | grep -cE "$dead")
-[ "$n" = 0 ] || { note 'the USB host controller died this boot (not something this kit changes):'
-	printf '%s\n' "$k" | grep -E "$dead" | tail -5; }
-# Not a death: the controller came back without its state and was set up
-# again, and the devices behind it were enumerated again.
-n=$(printf '%s\n' "$k" | grep -c 'xhci-hcd .*xHC error in resume')
-[ "$n" = 0 ] || note "the USB host controller came back from a suspend without its state and was set up again (times this boot: $n)"
+if [ -n "$k" ]; then
+	cycles=$(printf '%s\n' "$k" | grep -c 'PM: suspend exit')
+	n=$(printf '%s\n' "$k" | grep -cE "$dead")
+	if [ "$n" != 0 ]; then
+		bad 'the USB host controller died this boot:'
+		printf '%s\n' "$k" | grep -E "$dead" | tail -5
+	elif [ "$cycles" = 0 ]; then
+		note 'the USB host controller did not die, but no suspend cycle has run yet this boot: run this again later'
+	else
+		ok "the USB host controller did not die this boot (suspend cycles so far: $cycles)"
+	fi
+	# Not a death: the controller came back without its state and was set up
+	# again, and the devices behind it were enumerated again.
+	n=$(printf '%s\n' "$k" | grep -c 'xhci-hcd .*xHC error in resume')
+	[ "$n" = 0 ] || note "the USB host controller came back from a suspend without its state and was set up again (times this boot: $n)"
+fi
+if [ "$(role data_role)" = host ] && [ -e "$partner" ]; then
+	n=$(usb_devices | wc -l)
+	[ "$n" -gt 0 ] && ok "USB host, devices on the bus: $n" ||
+		note 'USB host with no device on the bus (nothing behind the dock, or its hub did not come up)'
+fi
 systemctl is-active --quiet typec-sink-host 2>/dev/null &&
 	note 'typec-sink-host is running; stop it before any plug-in test (sudo systemctl stop typec-sink-host)'
 note "plug-in tests: sudo sh $kit/verify.sh dock 10"
