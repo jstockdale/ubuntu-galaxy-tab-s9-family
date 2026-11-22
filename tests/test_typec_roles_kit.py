@@ -2555,6 +2555,29 @@ class VerifyTest(FakeTablet):
                       "before calibration cannot be seen from userspace", result.stdout)
         self.assertNotIn("UFS PHY calibration line", result.stdout)
 
+    def test_the_sleep_test_s_own_kernel_log_lines_are_not_counted(self):
+        """sleep-test.sh writes its verdicts to the kernel log, and a failed
+        cycle's verdict quotes the first failure line.  verify.sh, run in
+        the same boot (during the run's hold), counts the kernel's lines
+        only; a copy of a diagnostic line, which the run does not write
+        there, would not count either."""
+        own = "kernel: gts9u sleep-test: 20261122-031500 "
+        self.boot_kit()
+        self.journal_add(own + "cycle 1/1: diagnostic: " + UFS_CAL_ENTRY[len("kernel: "):] + "\n" +
+                         own + "SLEEP-TEST cycle 1/1: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   UFS PHY: 1 calibrations this boot", result.stdout)
+        self.journal_add("kernel: PM: suspend entry (deep)\n" + "\n".join(UFS_TIMEOUT) + "\n" +
+                         own + "SLEEP-TEST cycle 1/1: FAIL: 4 failure lines in the kernel log, the first: "
+                         + UFS_TIMEOUT[1][len("kernel: "):] + "\n" +
+                         own + "SLEEP-TEST RESULT: FAIL at cycle 1/1: 4 failure lines in the kernel log, "
+                         "the first: " + UFS_TIMEOUT[1][len("kernel: "):] + "\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL the UFS PHY or host failed to come up this boot (4 lines; ", result.stdout)
+        self.assertNotIn("gts9u sleep-test", result.stdout)
+
     def test_checks_know_the_controller_s_other_ways_of_dying(self):
         for line in USB_HOST_ERRORS:
             with self.subTest(line):
@@ -3067,6 +3090,130 @@ class SleepTestTest(FakeTablet):
         self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", pmsg)
         self.assertEqual(self.read("rtcwake.calls").count("-u -d rtc0 -m mem -s 15"), 1)
 
+    def diag_re(self):
+        """sleep-test.sh's pattern for the diagnostic's lines."""
+        return re.compile(re.search(r"^ufs_diag='([^']*)'$", self.script("sleep-test.sh"), re.M).group(1))
+
+    def pmsg_lines(self):
+        """What the run wrote to pmsg, without its prefix and stamp."""
+        prefix = f"gts9u sleep-test: {self.ramdir().name} "
+        lines = (self.root / "dev/pmsg0").read_text().splitlines()
+        self.assertTrue(all(line.startswith(prefix) for line in lines), lines)
+        return [line[len(prefix):] for line in lines]
+
+    def test_each_cycle_s_diagnostic_lines_are_kept_with_its_verdict(self):
+        """Revision 8's kernel logs a line at each calibration.  Each cycle
+        shows its own lines and no earlier cycle's again, and keeps them in
+        the result file and in pmsg, before its verdict.  The kernel log gets
+        no copy: nothing the run writes there can be matched again as a
+        diagnostic or failure line, by a later cycle or by verify.sh."""
+        (self.root / "dev/pmsg0").write_text("")
+        entry = {n: f"qcom-qmp-ufs-phy 1d80000.phy: calibration entry: SW_RESET 0 START 0x1 PWRDN 0x1 "
+                    f"READY 0x{n} C_READY 0x1 CMN 0x3" for n in (1, 2)}
+        for n, line in entry.items():
+            self.cycle(n, log=f"[  {n}00.000001] PM: suspend entry (deep)\n[  {n}00.000002] {line}\n"
+                              f"[  {n}00.000003] Timekeeping suspended for 30.002 seconds\n"
+                              f"[  {n}00.000004] PM: suspend exit\n")
+        result = self.run_test("ro", "2", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles", self.out)
+        for n, line in entry.items():
+            self.assertEqual(re.findall(rf"cycle {n}/2: diagnostic: (.*)", self.out), [line])
+        kept = [f"cycle 1/2: diagnostic: {entry[1]}",
+                "SLEEP-TEST cycle 1/2: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back as "
+                "before; floor released",
+                f"cycle 2/2: diagnostic: {entry[2]}",
+                "SLEEP-TEST cycle 2/2: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back as "
+                "before; floor released"]
+        self.assertEqual(self.pmsg_lines()[:4], kept)
+        self.assertEqual((self.ramdir() / "result").read_text().splitlines()[:4], kept)
+        kmsg = (self.root / "dev/kmsg").read_text()
+        self.assertNotIn("diagnostic:", kmsg)
+        for line in entry.values():
+            self.assertEqual(kmsg.count(line), 1)
+        # Nothing the run itself wrote to the kernel log is a diagnostic or
+        # a failure line by its own patterns.
+        fail = re.search(r'^fail_re\(\) \{\n\techo "(.*)"\n\}', self.script("sleep-test.sh"), re.M).group(1)
+        ufs_fail = re.search(r"^ufs_fail='([^']*)'$", self.script("sleep-test.sh"), re.M).group(1)
+        fail = re.compile(fail.replace("$ufs_fail", ufs_fail).replace("$disk", "sda").replace("\\\\", "\\"))
+        for line in ("[  1.0] I/O error, dev sda, sector 8 op 0x0:(READ)",
+                     "[  1.0] EXT4-fs error (device sda34): ext4_journal_check_start:86",
+                     "[  1.0] " + UFS_TIMEOUT[1][len("kernel: "):]):
+            self.assertIsNotNone(fail.search(line), line)
+        own = [line for line in kmsg.splitlines() if "gts9u sleep-test: " in line]
+        self.assertTrue(own)
+        for line in own:
+            self.assertIsNone(self.diag_re().search(line), line)
+            self.assertIsNone(fail.search(line), line)
+
+    def failed_resume(self, sets):
+        """A resume whose calibration timed out SETS times, as on 2026-11-21,
+        with revision 8's diagnostic lines: the UFS_TIMEOUT set (two failure
+        lines and four diagnostic ones each), each set's state lines told
+        apart by their CMN value; then two failure lines for the host and an
+        I/O error."""
+        lines = ["PM: suspend entry (deep)"]
+        for s in range(1, sets + 1):
+            lines += [line[len("kernel: "):].replace("CMN 0x3", f"CMN {s:#x}") for line in UFS_TIMEOUT[:6]]
+        lines += [line[len("kernel: "):] for line in UFS_TIMEOUT[6:]]
+        lines += ["PM: suspend exit", "I/O error, dev sda, sector 29026560 op 0x0:(READ) flags 0x80700"]
+        return "".join(f"[  800.{n:06d}] {line}\n" for n, line in enumerate(lines, 1))
+
+    def test_a_failed_cycle_s_diagnostic_lines_survive_the_restart_in_pmsg(self):
+        """One failed calibration: its four diagnostic lines go to pmsg and
+        the result file before the cycle's verdict, all of them."""
+        (self.root / "dev/pmsg0").write_text("")
+        log = self.failed_resume(1)
+        self.cycle(1, "storage-dead", log=log)
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        diag = [line.split("] ", 1)[1] for line in log.splitlines() if self.diag_re().search(line)]
+        self.assertEqual(len(diag), 4)
+        self.assertEqual([line[len("kernel: "):] for line in UFS_TIMEOUT if self.diag_re().search(line)],
+                         [line.replace("CMN 0x1", "CMN 0x3") for line in diag])
+        pmsg = self.pmsg_lines()
+        want = [f"cycle 1/1: diagnostic: {line}" for line in diag]
+        self.assertEqual(pmsg[:4], want)
+        self.assertTrue(pmsg[4].startswith("SLEEP-TEST cycle 1/1: FAIL: "), pmsg)
+        self.assertTrue(pmsg[5].startswith("SLEEP-TEST RESULT: FAIL at cycle 1/1: "), pmsg)
+        self.assertIn("NEXT: the storage did not come back", "\n".join(pmsg[6:]))
+        self.assertNotIn("left out", "\n".join(pmsg))
+        self.assertEqual((self.ramdir() / "result").read_text().splitlines()[:4], want)
+        self.assertNotIn("diagnostic:", (self.root / "dev/kmsg").read_text())
+        self.assertEqual((self.root / "proc/sysrq-trigger").read_text(), "ub")
+
+    def test_a_failed_resume_s_retries_are_capped_in_pmsg(self):
+        """Fifteen failed calibrations: sixty diagnostic lines, all on the
+        terminal and in the run's log; pmsg and the result file keep the
+        first 12 and the last 4 and say how many were left out, so that the
+        ring keeps the verdicts."""
+        (self.root / "dev/pmsg0").write_text("")
+        log = self.failed_resume(15)
+        self.cycle(1, "storage-dead", log=log)
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        diag = [f"cycle 1/1: diagnostic: {line.split('] ', 1)[1]}" for line in log.splitlines()
+                if self.diag_re().search(line)]
+        self.assertEqual(len(diag), 60)
+        # The terminal and the run's log: every line, in order.
+        self.assertEqual(re.findall(r"cycle 1/1: diagnostic: .*", self.out), diag)
+        self.assertEqual(re.findall(r"cycle 1/1: diagnostic: .*", (self.ramdir() / "log").read_text()), diag)
+        note = (f"cycle 1/1: diagnostic: 44 of 60 lines left out here (kept: the first 12 and the last "
+                f"4); the terminal and {self.ramdir()}/log had them all")
+        want = diag[:12] + [note] + diag[-4:]
+        pmsg = self.pmsg_lines()
+        self.assertEqual(pmsg[:17], want)
+        self.assertTrue(pmsg[17].startswith("SLEEP-TEST cycle 1/1: FAIL: 33 failure lines"), pmsg[17])
+        self.assertTrue(pmsg[18].startswith("SLEEP-TEST RESULT: FAIL at cycle 1/1: "), pmsg[18])
+        self.assertEqual((self.ramdir() / "result").read_text().splitlines()[:17], want)
+        self.assertLess(len((self.root / "dev/pmsg0").read_bytes()), 8 * 1024)
+        # Every pmsg line is cut at 300 characters, past the prefix.
+        self.assertIn("%.300s", re.search(r"^keep\(\) \{\n.*?^\}\n", self.script("sleep-test.sh"),
+                                          re.M | re.S).group(0))
+
     def test_a_held_floor_is_said_loudly_and_labels_every_verdict(self):
         self.floor_held()
         for n in (1, 2):
@@ -3320,7 +3467,19 @@ class SleepTestTest(FakeTablet):
         result = self.run_script("sleep-test.sh", "status")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("no sleep test in", result.stdout)
-        self.assertIn(f"grep -ah 'gts9u sleep-test' -r {self.root}/var/lib/ubuntu-gts9u/pstore", result.stdout)
+        # The command it gives reads the newest archive's pmsg, in order.
+        (command,) = [line.strip() for line in result.stdout.splitlines() if "grep -rah" in line]
+        archive = self.root / "var/lib/ubuntu-gts9u/pstore"
+        for seq, stamp in (("000009", "20261122-020000"), ("000010", "20261122-031500")):
+            d = archive / f"{seq}-20261122T110000Z-boot-788ce779"
+            d.mkdir(parents=True)
+            (d / "pmsg-ramoops-0").write_text(
+                f"gts9u sleep-test: {stamp} cycle 1/1: diagnostic: x\n"
+                f"gts9u sleep-test: {stamp} SLEEP-TEST RESULT: FAIL at cycle 1/1: y\n")
+            (d / "console-ramoops-0").write_text("[  1.0] Booting Linux\n")
+        shown = subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(shown, "gts9u sleep-test: 20261122-031500 cycle 1/1: diagnostic: x\n"
+                                "gts9u sleep-test: 20261122-031500 SLEEP-TEST RESULT: FAIL at cycle 1/1: y\n")
         (self.bin / "id").write_text("#!/bin/sh\necho 0\n")
         self.run_test("restart-ok", "1", "hold=0")
         (self.bin / "id").write_text("#!/bin/sh\necho 1000\n")
@@ -4090,7 +4249,9 @@ class ScriptsTest(unittest.TestCase):
                      "A run with the floor held says `floor held` in every verdict",
                      "So the boot after a run in a boot that released the floor holds it once, and the "
                      "next run needs `release-floor`",
-                     "sudo grep -ah 'gts9u sleep-test' -r /var/lib/ubuntu-gts9u/pstore /sys/fs/pstore",
+                     "The verdict and diagnostic lines are in pmsg",
+                     """`grep -rah 'gts9u sleep-test' "$(ls -d /var/lib/ubuntu-gts9u/pstore/[0-9]* | """
+                     """tail -n 1)"`""",
                      "APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 \\"):
             with self.subTest(said):
                 self.assertIn(said, readme if "\\" not in said else (KIT_SRC / "README.md").read_text())

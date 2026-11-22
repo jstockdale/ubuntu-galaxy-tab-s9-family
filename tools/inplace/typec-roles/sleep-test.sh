@@ -51,6 +51,10 @@
 #   - one verdict line per cycle (SLEEP-TEST cycle ...), one for the run
 #     (SLEEP-TEST RESULT: ...) and the next steps (NEXT: ...), also in the
 #     kernel log and in /dev/pmsg0, which pstore keeps for the next boot;
+#     each cycle's diagnostic lines (cycle N/M: diagnostic: ...) go to the
+#     result file and to /dev/pmsg0 as well, at most the first 12 and the
+#     last 4 of a cycle there, so that a failed one is still readable after
+#     the restart;
 #   - then, after hold=S, the restart.  While the storage reads back as
 #     before, a clean reboot: SIGINT to systemd, which starts
 #     ctrl-alt-del.target, reboot.target on this system (checked before).
@@ -109,6 +113,19 @@ settle=10
 ram_tools='rtcwake dmesg dd sha256sum sleep grep awk sync blockdev'
 ufs_fail='phy initialization timed-out|Failed to calibrate PHY|Enabling the controller failed|Host init failed|ufshcd_wl_resume failed|Trying to write to read-only block-device'
 ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET'
+# How many of a cycle's diagnostic lines go to the result file and to pmsg:
+# the first diag_head and the last diag_tail, and one line for the ones
+# between.  A resume whose calibration fails retries it 15 times, up to four
+# lines each (the entry, the state after the timeout, the late poll's
+# outcome, the state 1 s on); the terminal and the run's log in /run get
+# every line, and those go with the restart.  pmsg is 128 KiB of ramoops
+# (the hang-log kit's DTB), about 73 KiB of it data with ECC 96, and it is
+# a ring: what goes there must leave room for the verdicts.  A cycle puts at
+# most 17 diagnostic lines there, each cut at 300 characters; a passing one
+# has only its entry lines, one or two.  Ten cycles, the last one failed,
+# come to well under 20 KiB with their verdicts.
+diag_head=12
+diag_tail=4
 
 usage() {
 	sed -n '2,12s/^# //p' "$0" >&2
@@ -119,9 +136,9 @@ usage() {
 if [ "${1:-}" = status ]; then
 	if [ ! -e "$base/latest" ]; then
 		echo "no sleep test in $base this boot."
-		echo 'A run that ended in a restart left its verdict lines in the kernel log and in pmsg,'
-		echo 'which pstore keeps for the next boot:'
-		echo "  sudo grep -ah 'gts9u sleep-test' -r /var/lib/ubuntu-gts9u/pstore /sys/fs/pstore | tail -n 60"
+		echo 'A run that ended in a restart left its verdict and diagnostic lines in pmsg, which'
+		echo 'pstore keeps for the next boot; the newest archive of it (group adm, or use sudo):'
+		echo "  grep -rah 'gts9u sleep-test' \"\$(ls -d /var/lib/ubuntu-gts9u/pstore/[0-9]* | tail -n 1)\""
 		exit 0
 	fi
 	echo "run: $base/latest -> $(readlink "$base/latest")"
@@ -266,12 +283,22 @@ since() { # MARKER FILE
 }
 
 # A line for the record and for the next boot: the result file, the kernel
-# log (pstore's console keeps it across a restart) and pmsg.
+# log and pmsg.  The kernel log's copy is at the default level, 4, which
+# pstore's console keeps only with a console loglevel above 4; pmsg is what
+# survives the restart in any case.
 verdict() {
 	say "$*"
 	printf '%s\n' "$*" >> "$ramdir/result" 2>/dev/null
 	printf 'gts9u sleep-test: %s %.900s\n' "$stamp" "$*" >> /dev/kmsg 2>/dev/null
 	[ ! -e /dev/pmsg0 ] || printf 'gts9u sleep-test: %s %s\n' "$stamp" "$*" >> /dev/pmsg0 2>/dev/null
+}
+
+# A diagnostic line for the record: the result file and pmsg.  Not the
+# kernel log, which has the driver's line already: a copy there would be one
+# more line for a later cycle's excerpt or for verify.sh to count.
+keep() {
+	printf '%s\n' "$*" >> "$ramdir/result" 2>/dev/null
+	[ ! -e /dev/pmsg0 ] || printf 'gts9u sleep-test: %s %.300s\n' "$stamp" "$*" >> /dev/pmsg0 2>/dev/null
 }
 
 # The failure lines of a kernel log excerpt: the UFS ones, the block layer's
@@ -483,7 +510,18 @@ run_from_ram() { # CONFIG
 		done
 		dline=${dline# }
 		grep -E "$ufs_diag" "$k" > "$ramdir/diag-$i"
-		while IFS= read -r dl; do say "$cyc: diagnostic: ${dl#\[*\] }"; done < "$ramdir/diag-$i"
+		dn=$(grep -c '' "$ramdir/diag-$i")
+		dj=0
+		while IFS= read -r dl; do
+			dj=$((dj + 1))
+			dl="$cyc: diagnostic: ${dl#\[*\] }"
+			say "$dl"
+			if [ "$dj" -le "$diag_head" ] || [ "$dj" -gt $((dn - diag_tail)) ]; then
+				keep "$dl"
+			elif [ "$dj" = $((diag_head + 1)) ]; then
+				keep "$cyc: diagnostic: $((dn - diag_head - diag_tail)) of $dn lines left out here (kept: the first $diag_head and the last $diag_tail); the terminal and $ramdir/log had them all"
+			fi
+		done < "$ramdir/diag-$i"
 		say "$cyc: asleep ${asleep:-?}s, woken by IRQ ${wake:-?}, rtcwake $rtc_rc, suspend_stats success $(delta "$ok0" "$ok1") fail $(delta "$fail0" "$fail1"), $dline, $(roles), USB devices $(usb_count)"
 		if [ -n "$reasons" ]; then
 			verdict "SLEEP-TEST $cyc: FAIL: $reasons ($dline; floor $floor)"

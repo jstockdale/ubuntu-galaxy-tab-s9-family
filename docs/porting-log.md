@@ -8991,15 +8991,38 @@ restart-ok`):
   qcom_stats), DEPTH-UNKNOWN or FAIL, with the floor's state on every line;
 - logs to `/run/gts9u-sleep-test/`, the kernel log and `/dev/pmsg0`, then
   restarts: a clean reboot while the storage reads back, sysrq `b`
-  otherwise.
+  otherwise;
+- puts each cycle's diagnostic lines in pmsg and the result file too, before
+  the cycle's verdict (the first 12 and the last 4 of a cycle and a count of
+  the rest), not in the kernel log, so a failed cycle's lines survive the
+  restart; `verify.sh` counts only the kernel's own lines.
 
 It also runs on revision 7, for a baseline. A boot after a forced restart
 holds the floor (the loop breaker), so a run there needs `release-floor`;
 the run itself ends in a way the breaker counts as unclean.
 
+**Built (2026-11-22, 02:36 to 02:44).** Kit revision 8 is in
+`~/ubuntu-gts9u/backups/typec-roles-kit-r8`:
+- built from commit 094930e, clean, incrementally in `build-typec` with
+  `APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1`, in 5 min 40 s. The module key is
+  `51029e652d6e…`, that of revisions 2 to 7; the build's registry row
+  (Image.gz `a6717595…`) is mirrored locally and to Drive;
+- kernel build ID `2cbed67367d8…`, `boot.img` `9e920f61…`, modules tar
+  `701be642…`;
+- `make-kit.sh` passed every check, with `HANG_SCRATCH`: six source files
+  differ from the hang-log tree, by the seven patches, the stage script and
+  the diagnostic; the configuration and the DTB are the hang-log build's,
+  and revision 7's; 63 modules, the hang-log list, all signed with the build
+  key; boot differs from the hang-log kit's, and from revision 7's, in the
+  kernel alone;
+- in the new `vmlinux`, `qmp_ufs_phy_calibrate()` calls no
+  `of_machine_compatible_match()`. When the PHY's configuration is
+  `sm8550_ufsphy_cfg` it logs the entry line (`qmp_ufs_dbg_state()`,
+  KERN_DEBUG, `calibration entry`), calls `reset_control_assert()` and sets
+  bit 0 of PCS + 0x8 (SW_RESET) before the tables; any other PHY gets
+  neither. The diagnostic's strings are in the image.
+
 **Not done:**
-- Revision 8 is not built yet. The build, the kit and its checks come after
-  the commit.
 - Nothing of this has run on the tablet: not the reset, not the diagnostic,
   not the sleep test. Its sysrq `u`, the block-layer read-only flag, the
   clean reboot through `ctrl-alt-del.target` and the RAM root are tested on

@@ -433,14 +433,18 @@ fi
 ufs_fail='phy initialization timed-out|Failed to calibrate PHY|Enabling the controller failed|Host init failed|ufshcd_wl_resume failed'
 ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET'
 if [ -n "$k" ]; then
-	cal=$(printf '%s\n' "$k" | grep -c 'calibration entry: SW_RESET')
-	n=$(printf '%s\n' "$k" | grep -cE "$ufs_fail")
+	# The kernel's own lines only: sleep-test.sh writes its verdicts to the
+	# kernel log as well, and a failed cycle's verdict quotes the first
+	# failure line.
+	ku=$(printf '%s\n' "$k" | grep -v 'gts9u sleep-test: ')
+	cal=$(printf '%s\n' "$ku" | grep -c 'calibration entry: SW_RESET')
+	n=$(printf '%s\n' "$ku" | grep -cE "$ufs_fail")
 	if [ "$n" != 0 ]; then
 		bad "the UFS PHY or host failed to come up this boot ($n lines; the diagnostic's lines follow theirs):"
-		printf '%s\n' "$k" | grep -E "$ufs_fail|$ufs_diag" | tail -12
+		printf '%s\n' "$ku" | grep -E "$ufs_fail|$ufs_diag" | tail -12
 	elif [ "$cal" != 0 ]; then
 		ok "UFS PHY: $cal calibrations this boot, each logged by the diagnostic of the kit's kernel, none failed"
-		note "last calibration: $(printf '%s\n' "$k" | grep 'calibration entry: SW_RESET' | tail -n 1 |
+		note "last calibration: $(printf '%s\n' "$ku" | grep 'calibration entry: SW_RESET' | tail -n 1 |
 			sed 's/.*calibration entry: //')"
 	elif [ -n "$want" ] && [ "$id" = "$want" ]; then
 		bad "no UFS PHY calibration line this boot: the kit's kernel logs one at every calibration" \

@@ -331,7 +331,15 @@ it nothing is done. In order:
    `SLEEP-TEST RESULT:` line, and `NEXT:` lines with the next step. They go
    to the terminal, to `/run/gts9u-sleep-test/<time>/result` (readable
    without root, `latest` points to the newest), to the kernel log and to
-   `/dev/pmsg0`, which pstore keeps across the restart.
+   `/dev/pmsg0`, which pstore keeps across the restart. Each cycle's
+   diagnostic lines (`cycle N/M: diagnostic:`, revision 8's kernel) go to
+   the result file and to `/dev/pmsg0` too, just before the cycle's
+   verdict: all of them up to 16, otherwise the first 12, a line saying how
+   many were left out, and the last 4 (a failed resume retries its
+   calibration 15 times, up to four lines each, and pmsg is a small ring).
+   The terminal and the run's log in `/run` have every line until the
+   restart. The diagnostic lines do not go to the kernel log, which has the
+   driver's own.
 7. After `hold=S` (300 s unless given), the restart. While the storage reads
    back as before, a clean reboot: SIGINT to systemd, which starts
    `ctrl-alt-del.target` (it checks first that this is `reboot.target`). It
@@ -361,11 +369,17 @@ unit, the documented way to release it now (before anything goes
 read-only). `release-floor` is refused while `icc-hold` exists; remove that
 file yourself if you mean to.
 
-**The result after the restart.** `/run` is gone then. The verdict lines
-are in pstore:
-`sudo grep -ah 'gts9u sleep-test' -r /var/lib/ubuntu-gts9u/pstore /sys/fs/pstore | tail -n 60`
+**The result after the restart.** `/run` is gone then. The verdict and
+diagnostic lines are in pmsg, which the boot after the restart archives
+under `/var/lib/ubuntu-gts9u/pstore`, one directory per boot, the newest
+last (readable by group adm; otherwise prefix `sudo`):
+`grep -rah 'gts9u sleep-test' "$(ls -d /var/lib/ubuntu-gts9u/pstore/[0-9]* | tail -n 1)"`
 (`sleep-test.sh status` prints that command when there is no run in
-`/run`). If SSH drops during the sleep and comes back before the restart,
+`/run`). From the build host:
+`ssh -o HostKeyAlias=10.42.0.2 jstockdale@192.168.1.234 'grep -rah "gts9u sleep-test" "$(ls -d /var/lib/ubuntu-gts9u/pstore/[0-9]* | tail -n 1)"'`.
+After a later restart the run's lines are in an older directory: the
+stamp in each line tells the runs apart. If SSH drops during the sleep and
+comes back before the restart,
 `sh ~/typec-roles/sleep-test.sh status` or, if the storage is gone and no
 program starts,
 `while IFS= read -r l; do echo "$l"; done < /run/gts9u-sleep-test/latest/result`
