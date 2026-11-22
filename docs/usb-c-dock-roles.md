@@ -22,11 +22,14 @@ says so.  Three test kernels ran on that tablet on 2026-11-21:
   plug-ins into the running tablet, two with each dock, all ended with the
   tablet as power sink and USB host, and both boots kept the USB host
   through the suspend cycle;
-- the third is what the tree carries now.  It adds two fixes for a data role
-  swap asked for from userspace and a driver that reads its two switches at
-  each attach.  One boot with the Satechi attached has run on it, with the
-  same outcome.  **The two fixes and the switches have not been tried on a
-  tablet yet.**
+- the third added two fixes for a data role swap asked for from userspace
+  and a driver that reads its two switches at each attach.  One boot with
+  the Satechi attached has run on it, with the same outcome.
+
+The tree now carries a third fix of that kind as well.  Test kernels with
+it were built for both tablets on 2026-11-21 and are installed on neither.
+**None of the three fixes and neither switch has been tried on a tablet
+yet.**
 
 The SM-X710 has the third kernel installed, without the power domain change.
 **No dock has been plugged into it yet.**
@@ -116,10 +119,13 @@ are fixed for every TCPM port, without an opt-in:
 - `tcpm-no-dr-swap-during-vdm.patch`.  `tcpm_ams_start()` let a data role
   swap start while one of TCPM's own VDM sequences was running, so the
   DR_Swap went out over the discovery message that was waiting for its
-  reply.  It now turns the swap down for as long as that sequence runs: the
-  writer gets `EAGAIN` and the log says
-  `VDM in progress, DATA_ROLE_SWAP not started`.  The kernel's own request
-  is made before discovery starts and never meets this.
+  reply.  It now turns the swap down for as long as the VDM state machine
+  runs (`vdm_sm_running`: from the moment TCPM queues a VDM, a request of
+  its own such as discovery's or an answer to the partner's, or receives
+  one of the partner's, until that exchange is over): the writer gets
+  `EAGAIN` and the log says `VDM in progress, DATA_ROLE_SWAP not started`.
+  The kernel's own request is made before discovery starts and never meets
+  this.
 - `tcpm-dr-set-checks-data-role.patch`.  `tcpm_dr_set()` told the writer
   that the swap was done whenever the state machine came back without an
   error of its own, also when the request had been discarded and the role
@@ -128,8 +134,33 @@ are fixed for every TCPM port, without an opt-in:
   in the log when they differ.
 
 A program that writes `data_role` can get an error now where it was told
-"done" before; writing again is the answer to both.  Neither fix has been
-tried on a tablet yet.
+"done" before; writing again is the answer to both.
+
+A third fix, `tcpm-keep-queued-swap-pending.patch`, comes from reading the
+code after those two; no trace showed the fault.  A write to `data_role`,
+`power_role` or `vconn_source` puts its swap in `upcoming_state`, where
+`AMS_START` takes it from, and waits for the swap to be completed.  A message
+of the partner's that TCPM handles before that, such as new
+Source_Capabilities or a swap of the partner's own, takes the port through
+its ready state first, and the ready state completed every pending swap with
+status 0.  The writer had its answer while its swap had not been sent; for a
+data role swap the role check above made that answer `EAGAIN`, also when the
+swap went out afterwards and was accepted.  `SRC_READY` and `SNK_READY` now
+leave a pending swap alone while a state is still queued
+(`Swap is still queued, left pending` in the log): the states the swap goes
+through complete it, or the ready state after them.  Where the partner's
+message has put its own state in the swap's place, the ready state after
+that one completes the swap; for a data role swap the role check then says
+what became of it.  And when the message that got in first was the partner's
+own DR_Swap, the port accepted it and then sent the queued DR_Swap as well,
+which put the data role back.  A queued `DR_SWAP_SEND` is now dropped where
+the partner's swap changes the role
+(`Partner swapped first, queued DR_SWAP_SEND dropped`): the role it was
+queued for is the one the port has then.  Both parts are for every TCPM port,
+the first for all three role attributes, the second for the data
+role.  Neither case has been seen on a tablet.
+
+None of the three fixes has been tried on a tablet yet.
 
 ## The power role: Try.SNK that never succeeded
 
@@ -235,9 +266,15 @@ each sleep stays.
 
 Both behaviours are on by default on both boards and can be changed at run
 time; a change applies from the next attach.  The driver reads the two
-parameters for as long as nothing is attached, the last time when a partner
-shows, and keeps what it read until the port is empty again, so one
-connection is never handled half with the old value and half with the new.
+parameters for as long as the port is looking for a partner, the last time
+when one shows, and keeps what it read until the port looks for one again,
+so one attach is never handled half with the old value and half with the
+new.  An attach is not the same as a plug-in.  An error recovery, the one
+after a data role mismatch for instance, drops the connection and sends
+the port looking again with the dock still plugged in, and the attach that
+follows takes the values as they are then.  A Soft Reset keeps the attach
+and the values with it, and so does a Hard Reset that the port comes
+through attached.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -262,9 +299,13 @@ as it does upstream, which is what every other TCPM controller gets.
   above), and the sleep hook still takes the port out of host role for each
   sleep; a dock's devices disconnect and reconnect around it.
 - **A program that writes the port's `data_role` can get `EAGAIN`**
-  (`Resource temporarily unavailable`): while the kernel's discovery is
-  running, and when the swap ended with the role unchanged.  It used to be
-  told that the swap was done.  Writing again is the answer to both.
+  (`Resource temporarily unavailable`): while a VDM exchange is under way,
+  from the moment TCPM queues a VDM (discovery's, for one) until that
+  exchange is over, and when the swap ended with the role unchanged.  It
+  used to be told that the swap was done.  Writing again is the answer to
+  both.  A write to `data_role`, `power_role` or `vconn_source` that waits
+  behind a message of the partner's is answered later than before: once its
+  swap has run, not at the ready state in between.
 - **Try.SNK now works for every dual-role partner**, as the device tree always
   asked: with a power bank, a laptop or a phone the tablet ends up as the
   sink.  Before, the outcome depended on which side was seen first.
@@ -373,10 +414,11 @@ build host (gadget network up).
 - Why the dock sends a Soft_Reset after its own swap is not known.  That it
   comes even when the tablet has sent nothing as host (7 of 29) speaks
   against the tablet's first message in the new role as the trigger.
-- The two fixes for a swap asked for from userspace and the switches at run
-  time have not been tried on a tablet, and no dock has been plugged into
-  the SM-X710 with any of this.  A real sleep with a dock attached has not
-  been tried on either tablet.
+- The three fixes for a swap asked for from userspace and the switches at
+  run time have not been tried on a tablet, and the third fix is in no
+  kernel that has run.  No dock has been plugged into the SM-X710 with any
+  of this.  A real sleep with a dock attached has not been tried on either
+  tablet.
 - Whether the SM-X710 needs the USB power domain change.  A boot with the
   dock attached will show it.
 - Whether the USB power domains keep their state through a real deep sleep
@@ -388,10 +430,14 @@ build host (gadget network up).
   was on 26 to 29 ms before the report).  If the controller's share can be
   shortened far enough, the standard Try.SNK is met and the extra wait is
   only needed for a dock that tries the sink role first itself.
-- `tcpm_pr_set()` and `tcpm_vconn_set()` are built the way `tcpm_dr_set()`
-  was and were left as they are: they report what the state machine ended
-  with, not the role.  Nothing here writes `power_role` or `vconn_source`,
-  and whether they can report a swap that did not happen was not looked at.
+- Writes to `power_role` and `vconn_source` (`tcpm_pr_set()`,
+  `tcpm_vconn_set()`) have neither of the first two fixes: their swap can
+  still be started while a VDM exchange is under way, and after the wait
+  they report what the state machine ended with, not whether the role
+  changed.  Of the three fixes only the third covers them, so that a swap
+  of theirs that is still queued is not reported done.  Nothing here writes
+  `power_role` or `vconn_source`, and whether they can report a swap that
+  did not happen was not looked at.
 - A request that the SM5714 reports as discarded (`PD TX complete, status: 1`
   right after the DR_Swap in the log) still waits 60 ms for an answer and
   counts as one of the three.  A dock that starts its own discovery right
