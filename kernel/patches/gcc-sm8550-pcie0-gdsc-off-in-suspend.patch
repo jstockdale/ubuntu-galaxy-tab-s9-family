@@ -1,0 +1,54 @@
+Subject: [TEST builds only] clk: qcom: gcc-sm8550: let pcie_0_gdsc collapse in system suspend
+
+Test builds only.  scripts/build-mainline-kernel.sh applies this only with
+APPLY_SM8550_PCIE0_GDSC_OFF=1, after gcc-sm8550-usb-gdscs-retention.patch,
+refuses it without APPLY_SM8550_SLEEP_FIXES=1, and refuses a build without
+the variable in a source tree that carries it.  No board check: both
+tablets' builds get it when the variable is set.
+
+pcie_0_gdsc goes from PWRSTS_RET_ON to PWRSTS_OFF_ON.  gdsc_disable() then
+drops the application processor's vote for it (it is VOTABLE, and probe
+clears GDSC_SLEEP_ENA_VOTE) when genpd powers it off at the end of a
+suspend's noirq phase, instead of leaving it on in hardware until CX
+collapses.  Nothing else changes: pcie_0_phy_gdsc, the PCIe1 domains and
+the USB domains keep their states, and the line count of the file is the
+same, so the patches after this one apply at the same lines.
+
+Why.  On the SM-X710 (gts9wifi) a sleep with the PCIe host powered down
+(its root port removed, so that dw_pcie_suspend_noirq() takes its power-off
+branch) and the interconnect floor released did not return with this GDSC
+in retention: 0 of 8 (six on Type-C kit revision 7's kernel, one on
+revision 9's, one on revision 10's), the SoC dropping PS_HOLD 43 to 44 s
+after the RTC alarm; the same sleep with the floor held came back.  With the
+GDSC collapsed it returned 7 of 7 (four on revision 9, three on revision 10,
+through the run-time switch of gcc-sm8550-gdsc-debug-switches.patch), and
+with revision 10's PIPE clock revert the PCIe host came back as well.  Two
+SM8550 community kernels with the same symptom made the same change
+(ROCKNIX PR 3636, retroforge patch 0143).
+
+Why upstream has PWRSTS_RET_ON (967e011013ed, "clk: qcom: gcc-sm8550: Do
+not turn off PCIe GDSCs during gdsc_disable()", v6.14): a PCIe controller
+that keeps its link through a system suspend (qcom_pcie_suspend_noirq()
+with the link kept, the PCI devices still bound) loses its registers when
+its GDSC collapses, and its resume breaks.  That is the case on this port in
+every suspend in which the Wi-Fi stays: the root port cannot go to D3, so
+dw_pcie_suspend_noirq() keeps the link, and genpd still powers the GDSC off.
+The boot's pm_test=platform panel cycle is such a suspend.  This patch does
+nothing about it; it is for testing the sleep with the PCIe host powered
+down.
+
+It needs the PIPE clock revert (clk-qcom-regmap-phy-mux-revert-rework.patch,
+APPLY_SM8550_SLEEP_FIXES=1): without it the GDSC did not report power-up at
+the resume ("pcie_0_gdsc status stuck at 'off'", revision 9).
+
+--- a/drivers/clk/qcom/gcc-sm8550.c
++++ b/drivers/clk/qcom/gcc-sm8550.c
+@@ -3003,7 +3003,7 @@
+ 	.pd = {
+ 		.name = "pcie_0_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_RET_ON,
++	.pwrsts = PWRSTS_OFF_ON, /* gcc-sm8550-pcie0-gdsc-off-in-suspend.patch */
+ 	.flags = VOTABLE | POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+

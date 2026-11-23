@@ -40,6 +40,9 @@ apply_deep_sleep_debug=${APPLY_DEEP_SLEEP_DEBUG_SWITCHES:-0}
 # Test builds until they have run on hardware: the SM8550 sleep fixes below,
 # three upstream commits, with unpark-pcie0-pipe-mux.patch left out.
 apply_sm8550_sleep_fixes=${APPLY_SM8550_SLEEP_FIXES:-0}
+# Test builds only: pcie_0_gdsc collapsed in system suspend, see
+# gcc-sm8550-pcie0-gdsc-off-in-suspend.patch below.
+apply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}
 
 validate_bool() {
 	case "$2" in
@@ -62,6 +65,15 @@ validate_bool APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC "$apply_qmp_ufs_diagnostic"
 # place looks like.  Refused here, before the tree is touched.
 if [ "$apply_qmp_ufs_diagnostic" = 1 ] && [ "${UFS_PCS_RESET_EXPERIMENTAL:-1}" != 1 ]; then
 	echo 'APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 needs the PCS reset (UFS_PCS_RESET_EXPERIMENTAL=1)' >&2
+	exit 1
+fi
+validate_bool APPLY_SM8550_PCIE0_GDSC_OFF "$apply_pcie0_gdsc_off"
+# A collapsed pcie_0_gdsc did not report power-up again at the resume while
+# the PCIe PIPE clock mux stayed on the clock of a PHY that was off (kit
+# revision 9): the GDSC change needs the mux revert of the sleep fixes.
+# Refused here, before the tree is touched.
+if [ "$apply_pcie0_gdsc_off" = 1 ] && [ "$apply_sm8550_sleep_fixes" != 1 ]; then
+	echo 'APPLY_SM8550_PCIE0_GDSC_OFF=1 needs APPLY_SM8550_SLEEP_FIXES=1: without the PIPE clock revert pcie_0_gdsc does not power up again at the resume' >&2
 	exit 1
 fi
 
@@ -398,12 +410,46 @@ fi
 # applied here yet.
 apply_unless 'Retention across system suspend, as on sm8650' \
 	drivers/clk/qcom/gcc-sm8550.c gcc-sm8550-usb-gdscs-retention.patch
+# gcc-sm8550-pcie0-gdsc-off-in-suspend.patch is deliberately NOT applied by
+# default.  It gives pcie_0_gdsc PWRSTS_OFF_ON, so that genpd collapses it in
+# every system suspend.  On the SM-X710 a sleep with the PCIe host powered
+# down (its root port removed) and the interconnect floor released returned
+# only with that GDSC collapsed (kit revisions 9 and 10: 7 of 7 with it, 0
+# of 8 without).  Upstream keeps it in retention (967e011013ed) because a
+# host that keeps its link through the suspend loses its controller when the
+# GDSC collapses, and on this port every suspend that keeps the Wi-Fi, the
+# boot's panel cycle included, keeps the link.  So test builds only: set
+# APPLY_SM8550_PCIE0_GDSC_OFF=1 (the SM-X710's Type-C roles kit, revision
+# 11), which needs APPLY_SM8550_SLEEP_FIXES=1 (checked at the top).  No board
+# gate.  Strictly, on top of the USB GDSC patch just above and under the
+# debug switches below; the patch keeps the file's line count, so the debug
+# switches go in at the same lines with it and without it.  A tree that
+# carries it is refused for a build without the variable, so that a release
+# built in a reused test tree cannot ship it.  It is known by the line it
+# changes.
+pcie0_gdsc_patch=gcc-sm8550-pcie0-gdsc-off-in-suspend.patch
+pcie0_gdsc_line="PWRSTS_OFF_ON, /* $pcie0_gdsc_patch */"
+if [ "$apply_pcie0_gdsc_off" = 1 ]; then
+	if grep -qF -- "$pcie0_gdsc_line" "$kernel_tree/drivers/clk/qcom/gcc-sm8550.c"; then
+		# Reject a partly applied copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$pcie0_gdsc_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$pcie0_gdsc_patch"
+	fi
+elif grep -qF -- "$pcie0_gdsc_line" "$kernel_tree/drivers/clk/qcom/gcc-sm8550.c"; then
+	echo "$pcie0_gdsc_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_SM8550_PCIE0_GDSC_OFF=1." >&2
+	exit 1
+fi
 # gcc-sm8550-gdsc-debug-switches.patch and rpmhpd-debug-retention-floor.patch
 # are deliberately NOT applied by default, like the UFS PHY diagnostic above.
-# They add run-time switches, all off at every boot and set by root through
-# /sys/module, for telling apart the causes of the SM-X710's deep-sleep wake
-# hang: the PCIe and USB GDSCs collapsed instead of left on, and a RETENTION
-# floor for the CX and MX votes.  They are for test builds: set
+# They add run-time switches, set by root through /sys/module, for telling
+# apart the causes of the SM-X710's deep-sleep wake hang: the PCIe and USB
+# GDSCs collapsed instead of left on, and a RETENTION floor for the CX and MX
+# votes.  Every boot starts with each as the build's table has it: off, but
+# the pcie0 one on with APPLY_SM8550_PCIE0_GDSC_OFF=1, where it can put
+# pcie_0_gdsc back in retention.  They are for test builds: set
 # APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (the SM-X710's Type-C roles kit, revision
 # 9).  The GDSC one goes on top of the USB GDSC patch just above, each
 # strictly; a tree that carries either is refused for a default build, so

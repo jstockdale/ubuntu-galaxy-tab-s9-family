@@ -105,6 +105,21 @@ R9_SCRIPTS = {
 }
 # What the tests' revision 9 runs: a stand-in for its kernel.
 R9_STANDIN_ID = "9" * 40
+# Revision 10's scripts (packed from ab2c536 into typec-roles-kit-r10 and
+# installed on squirtle on 2026-11-23 at 11:37 by its own install.sh, over
+# revision 9): sha256 in its SHA256SUMS, git blob.
+R10_SCRIPTS = {
+    "install.sh": ("703e4de048fb48edda2b3f539e7cf1dcfde4c581353a5b94cedf3985d1e7b6d8",
+                   "0b3ed7906e0f43197098b0181c2bcdda0f3f9f57"),
+    "rollback.sh": ("95c1a6151f170d0a9cd69c3026f7422498b97e2b6d28ad08ed0be312e93d77fc",
+                    "b579697abe4295919e365e3f35e9112c4661af0a"),
+    "verify.sh": ("44e17a78da2a4e048dba1e885ae924d7d8ffd95755b335a424d31063b115fd3d",
+                  "f90e1be312cb68709ff77892a437d1a438d4e250"),
+    "sleep-test.sh": ("99e02b4d2015e3bca340ce459f241e59bd12a784bb90733d6424fc5af28a204b",
+                      "35016ef9c8cee9d51870656a8790915f8a0b7748"),
+}
+# What the tests' revision 10 runs: a stand-in for its kernel.
+R10_STANDIN_ID = "10" * 20
 # How sleep-test.sh names the debug switches on a kernel without them, at
 # the end of every cycle's verdict and RESULT line (the fake tablet's kernel
 # has none unless a test gives them).
@@ -134,6 +149,10 @@ TYPEC_PATCHES = ["tcpm-request-dfp-as-sink-before-discovery.patch", "tcpm-try-sn
 UFS_PATCHES = ["qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch",
                "qmp-ufs-pcs-state-diagnostic.patch", "qmp-ufs-pwrdn-readback-diagnostic.patch"]
 DEBUG_PATCHES = ["gcc-sm8550-gdsc-debug-switches.patch", "rpmhpd-debug-retention-floor.patch"]
+# Revision 11's pcie_0_gdsc, behind APPLY_SM8550_PCIE0_GDSC_OFF, and the line
+# it gives that domain, by which the build script and make-kit.sh know it.
+GDSC_PATCHES = ["gcc-sm8550-pcie0-gdsc-off-in-suspend.patch"]
+PCIE0_LINE = "\t.pwrsts = PWRSTS_OFF_ON, /* gcc-sm8550-pcie0-gdsc-off-in-suspend.patch */\n"
 # Revision 10's three upstream commits, each with the file it changes (and
 # ufs-qcom.h with ufs-qcom.c), its upstream hash, and the line the build
 # script knows it by; and the patch it leaves out.
@@ -152,12 +171,15 @@ SWITCHES = (("pcie0", "gcc_sm8550/parameters/debug_pcie0_off"),
             ("pcie0phy", "gcc_sm8550/parameters/debug_pcie0_phy_off"),
             ("usb", "gcc_sm8550/parameters/debug_usb_off"),
             ("cxmx", "rpmhpd/parameters/debug_ret_floor"))
+# Revision 11's read-only fifth, and what it says on that kernel.
+BOOT_STATE = "gcc_sm8550/parameters/debug_boot_state"
+R11_BOOT = "pcie0 Y, pcie0phy N, usb N"
 
 
 def kit_patches(text):
-    """make-kit.sh's four lists of patches, as it names them."""
+    """make-kit.sh's five lists of patches, as it names them."""
     return [re.search(rf"^{name}=\((.*?)\)$", text, re.M | re.S).group(1).split()
-            for name in ("typec_patches", "debug_patches", "fix_patches", "ufs_patches")]
+            for name in ("typec_patches", "gdsc_patches", "debug_patches", "fix_patches", "ufs_patches")]
 
 PREFIXES = (
     "/dev/disk/by-partlabel/", "/usr/lib/modules/", "/var/backups", "/var/log/", "/run/",
@@ -178,8 +200,13 @@ PREFIXES = (
     "/sys/module/printk/parameters/", "/sys/module/suspend/parameters/", "/sys/devices/system/cpu",
     # Revision 9's debug switches (verify.sh, sleep-test.sh's gdsc= and cxmx=).
     "/sys/module/gcc_sm8550/parameters", "/sys/module/rpmhpd/parameters",
-    # Revision 10's clock counts (verify.sh under sudo, sleep-test.sh's evidence).
-    "/sys/kernel/debug/clk/",
+    # Revision 10's clock counts (verify.sh under sudo, sleep-test.sh's
+    # evidence), read from each clock's own files since revision 11.
+    "/sys/kernel/debug/clk",
+    # Revision 11's rpmh option: the tracepoint, the trace, the command DB.
+    "/sys/kernel/tracing", "/sys/kernel/debug/cmd-db",
+    # Revision 11's evidence of the audio DSP's clients and the command line.
+    "/proc/asound/", "/proc/[0-9]", "/proc/cmdline",
 )
 
 STUBS = {
@@ -677,7 +704,7 @@ class FakeTablet(unittest.TestCase):
         (self.kit / "BUILD_ID").write_text(NEW_BUILD_ID + "\n")
         (self.kit / "KEY_ID").write_text(KEY_ID + "\n")
         (self.kit / "SIGNER").write_text(SIGNER + "\n")
-        (self.kit / "REVISION").write_text("10\n")
+        (self.kit / "REVISION").write_text("11\n")
         for name in ("install.sh", "rollback.sh", "verify.sh", "sleep-test.sh", "README.md"):
             (self.kit / name).write_bytes((KIT_SRC / name).read_bytes())
         self.seal()
@@ -855,10 +882,12 @@ class FakeTablet(unittest.TestCase):
         (self.backup / "complete").touch()
         self.running(build_id)
 
-    def debug_switches(self, **values):
+    def debug_switches(self, boot=None, **values):
         """Revision 9's debug switches as the kernel shows them, N unless
         VALUES says otherwise (by word: pcie0="Y"); a value of None leaves
-        that switch out."""
+        that switch out.  BOOT is revision 11's debug_boot_state (R11_BOOT
+        on its kernel), and None leaves it out, as the kernels of revisions
+        9 and 10 have it."""
         for word, path in SWITCHES:
             value = values.get(word, "N")
             f = self.root / "sys/module" / path
@@ -867,6 +896,17 @@ class FakeTablet(unittest.TestCase):
                 continue
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(value + "\n")
+        f = self.root / "sys/module" / BOOT_STATE
+        if boot is None:
+            f.unlink(missing_ok=True)
+        else:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(boot + "\n")
+
+    def r11_switches(self, **values):
+        """The debug switches as revision 11's kernel boots with them:
+        pcie0 Y (pcie_0_gdsc OFF_ON), the others N, and debug_boot_state."""
+        self.debug_switches(boot=R11_BOOT, **{"pcie0": "Y", **values})
 
     def r7_kit(self):
         """The kit directory as revision 7's packed kit, with stand-ins for
@@ -889,14 +929,14 @@ class FakeTablet(unittest.TestCase):
     def boot_kit_kernel(self, build_id):
         """A boot of the kernel BUILD_ID with the kit's module key, the
         hang-log kit's configuration and ramoops, and the switches as built:
-        the driver's two, and revision 9's debug switches, off; the PCIe
-        link up, and revision 10's power-up write line before the
-        calibration entry."""
+        the driver's two, and the debug switches as revision 11's kernel
+        boots with them (pcie0 on, the others off); the PCIe link up, and
+        revision 10's power-up write line before the calibration entry."""
         self.running(build_id)
         params = self.root / "sys/module/sm5714_usbpd/parameters"
         (params / "sink_host_swap").write_text("Y\n")
         (params / "try_snk_extra_wait_ms").write_text("600\n")
-        self.debug_switches()
+        self.r11_switches()
         (self.root / "journal").write_text(
             f"kernel: Loaded X.509 cert 'Build time autogenerated kernel key: {KEY_ID}'\n"
             "kernel: ramoops: using 0x200000@0x880900000, ecc: 96\n"
@@ -1423,7 +1463,7 @@ class UpgradeTest(UpgradeHelpers, FakeTablet):
         (self.kit / "boot.img").write_bytes(self.new_boot)
         (self.kit / f"modules-{RELEASE}.tar").write_bytes(modules_tar("new"))
         (self.kit / "BUILD_ID").write_text(NEW_BUILD_ID + "\n")
-        (self.kit / "REVISION").write_text("10\n")
+        (self.kit / "REVISION").write_text("11\n")
         for name, data in scripts.items():
             (self.kit / name).write_bytes(data)
         self.seal()
@@ -1477,6 +1517,66 @@ class UpgradeTest(UpgradeHelpers, FakeTablet):
                 self.assertIn("STOP: this revision of the Type-C roles kit is already installed "
                               f"({self.backup}); nothing was changed", result.stdout)
                 self.assertEqual(self.state(), before)
+        self.assert_rolled_back()
+
+    def own_r10_kit(self):
+        """The kit directory as revision 10's packed kit, with stand-ins for
+        its kernel and modules and its own scripts (R10_SCRIPTS), as the
+        owner copied it to squirtle on 2026-11-23.  Returns its boot image."""
+        boot = os.urandom(SIZE)
+        (self.kit / "boot.img").write_bytes(boot)
+        (self.kit / f"modules-{RELEASE}.tar").write_bytes(modules_tar("r10"))
+        (self.kit / "BUILD_ID").write_text(R10_STANDIN_ID + "\n")
+        (self.kit / "REVISION").write_text("10\n")
+        for name, (digest, blob) in R10_SCRIPTS.items():
+            (self.kit / name).write_bytes(self.old_script(blob, digest))
+        self.seal()
+        return boot
+
+    def test_squirtle_after_2026_11_23_with_revision_10_is_upgraded_to_this_revision_in_place(self):
+        """What squirtle has after 2026-11-23 11:37: revision 7 installed by
+        its own install.sh, revision 9 over it by its own, revision 10 over
+        that by its own (each recording what it writes) and booted, sleep
+        tests' logs in the kit directory.  This revision's files copied over
+        revision 10's: one install and no rollback, the record has all
+        three, a second install changes nothing, and rollback.sh still goes
+        back to the hang-log kit."""
+        scripts = {name: (self.kit / name).read_bytes() for name in ("install.sh", "rollback.sh", "verify.sh",
+                                                                    "sleep-test.sh", "README.md")}
+        self.install_r7()
+        r9_boot = self.own_r9_kit()
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.running(R9_STANDIN_ID)
+        r10_boot = self.own_r10_kit()
+        result = self.run_script("install.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"upgrade: boot holds {sha(r9_boot)[:12]}", result.stdout)
+        self.assertEqual(self.part("boot").read_bytes(), r10_boot)
+        self.running(R10_STANDIN_ID)
+        record = f"{sha(r9_boot)} {R9_STANDIN_ID}\n{sha(r10_boot)} {R10_STANDIN_ID}\n"
+        self.assertEqual((self.backup / "revisions").read_text(), record)
+        logs = self.kit / "logs/20261123-122339-sleep"
+        logs.mkdir(parents=True)
+        (logs / "before").write_text("sleep-test 20261123-122339: 1 suspend-to-idle cycles of 30s\n")
+        self.this_kit(scripts)
+        self.assert_upgraded(self.run_script("install.sh"), r10_boot)
+        self.assertEqual((self.backup / "revisions").read_text(), record + f"{sha(self.new_boot)} {NEW_BUILD_ID}\n")
+        self.assertTrue((logs / "before").exists())
+        for rebooted in (False, True):
+            with self.subTest(rebooted=rebooted):
+                self.running(NEW_BUILD_ID if rebooted else R10_STANDIN_ID)
+                before = self.state()
+                result = self.run_script("install.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("STOP: this revision of the Type-C roles kit is already installed "
+                              f"({self.backup}); nothing was changed", result.stdout)
+                self.assertEqual(self.state(), before)
+        # The way back to revision 10 from TWRP (the README): its image on
+        # boot again, its kernel booted; install.sh of this revision then
+        # runs as an upgrade over it, as over any revision the record has.
+        self.part("boot").write_bytes(r10_boot)
+        self.running(R10_STANDIN_ID)
+        self.assert_upgraded(self.run_script("install.sh"), r10_boot)
         self.assert_rolled_back()
 
     def test_squirtle_on_2026_11_22_evening_is_upgraded_to_this_revision_in_place(self):
@@ -1912,7 +2012,7 @@ class UpgradeTest(UpgradeHelpers, FakeTablet):
         self.boot_kit_kernel(NEWER_BUILD_ID)
         result = self.run_script("verify.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"ok   running the kit's kernel (build ID {NEWER_BUILD_ID[:12]}, revision 10)",
+        self.assertIn(f"ok   running the kit's kernel (build ID {NEWER_BUILD_ID[:12]}, revision 11)",
                       result.stdout)
         self.assertIn("all checks passed", result.stdout)
 
@@ -2748,6 +2848,66 @@ class VerifyTest(FakeTablet):
         with (self.root / "journal").open("a") as journal:
             journal.write(text)
 
+    def wifi_function(self):
+        """The Wi-Fi's PCI function as sysfs shows it, ath11k bound."""
+        d = self.root / "sys/devices/platform/soc@0/1c00000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0"
+        d.mkdir(parents=True)
+        (d / "current_link_speed").write_text("5.0 GT/s PCIe\n")
+        driver = self.root / "sys/bus/pci/drivers/ath11k_pci"
+        driver.mkdir(parents=True)
+        (d / "driver").symlink_to(os.path.relpath(driver, d))
+        bus = self.root / "sys/bus/pci/devices"
+        bus.mkdir(parents=True, exist_ok=True)
+        (bus / "0000:01:00.0").symlink_to(os.path.relpath(d, bus))
+
+    def test_the_wifi_is_checked_after_the_boot_s_first_suspend(self):
+        """Revision 11 collapses pcie_0_gdsc under the kept link in the boot's
+        panel cycle: after the boot's first suspend a PCI core, ath11k or MHI
+        line that says the Wi-Fi did not come back fails, on any kernel; with
+        none and the function bound it passes; before any suspend, or
+        without the function, it is a note."""
+        cycle = "kernel: PM: suspend entry (deep)\nkernel: PM: suspend debug: Waiting for 0 second(s).\n"
+        fw = ("kernel: ath11k_pci 0000:01:00.0: fw_version 0x11021302 fw_build_timestamp 2026-02-04 08:10\n"
+              "kernel: PM: suspend exit\n")
+        self.boot_kit()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("note no suspend has run yet this boot (the panel cycle runs about 22 s in): the Wi-Fi after it "
+                      "was not checked; run this again later\n", result.stdout)
+        self.wifi_function()
+        self.journal_add(cycle + fw)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   Wi-Fi after this boot's first suspend: 0000:01:00.0, link 5.0 GT/s PCIe, no PCI, ath11k or "
+                      "MHI failure line\n", result.stdout)
+        self.assertNotIn("no ath11k firmware line", result.stdout)
+        lost = ("kernel: pci 0000:01:00.0: Unable to change power state from D3hot to D0, device inaccessible",
+                "kernel: ath11k_pci 0000:01:00.0: failed to power up hif during resume: -110",
+                "kernel: mhi mhi0: Device failed to enter MHI Ready",
+                "kernel: pcieport 0000:00:00.0: AER: Uncorrectable (Fatal) error message received from 0000:01:00.0")
+        for line in lost:
+            with self.subTest(line):
+                self.boot_kit()
+                self.journal_add(cycle + line + "\nkernel: PM: suspend exit\n")
+                result = self.run_script("verify.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("FAIL the Wi-Fi did not come back from this boot's first suspend (the panel cycle, unless "
+                              f"a sleep test ran before it) (1 lines):\n{line}\n", result.stdout)
+                self.assertIn('note revision 11 collapses pcie_0_gdsc under the kept link in that suspend: README, '
+                              '"Revision 11: the runs", says what to do\n', result.stdout)
+                self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+        # Such a line before the first suspend is not about it; and the
+        # function taken off the bus (pci=remove) is a note.
+        (self.root / "sys/bus/pci/devices/0000:01:00.0").unlink()
+        self.boot_kit()
+        (self.root / "journal").write_text(lost[1] + "\n" + (self.root / "journal").read_text() + cycle + fw)
+        result = self.run_script("verify.sh")
+        self.assertNotIn("the Wi-Fi did not come back", result.stdout)
+        # No function on the bus, no failure line: a note.
+        self.assertIn("note no Wi-Fi function on the PCI bus with ath11k_pci bound, and no line that says it did not "
+                      "come back from this boot's first suspend (a sleep test's pci=remove leaves the bus so until a "
+                      "restart)\n", result.stdout)
+
     def test_checks_see_the_ufs_phy_through_the_diagnostic_s_lines(self):
         """Revision 8: the PCS reset logs nothing; on the kit's kernel the
         diagnostic logs each calibration of the UFS PHY.  A calibration that
@@ -2816,36 +2976,52 @@ class VerifyTest(FakeTablet):
         self.assertIn("FAIL the UFS PHY or host failed to come up this boot (4 lines; ", result.stdout)
         self.assertNotIn("gts9u sleep-test", result.stdout)
 
-    def test_checks_see_the_debug_switches_off_on_the_kit_s_kernel(self):
-        """Revision 9: on the kit's kernel each of the four debug switches is
-        there and reads N; one that is on, or missing, fails.  On another
-        kernel they are a note: listed if it has them, said to be absent if
-        not."""
-        names = ("gcc_sm8550.debug_pcie0_off", "gcc_sm8550.debug_pcie0_phy_off", "gcc_sm8550.debug_usb_off",
-                 "rpmhpd.debug_ret_floor")
+    def test_checks_see_the_debug_switches_as_the_kit_s_kernel_boots_them(self):
+        """Revisions 9 to 11: on the kit's kernel each of the four debug
+        switches is there and reads as revision 11's kernel boots it, pcie0
+        Y (pcie_0_gdsc OFF_ON) and the others N, and debug_boot_state says
+        so; a switch that reads otherwise, or one missing, fails.  On
+        another kernel they are a note: listed if it has them, said to be
+        absent if not."""
+        names = ("gcc_sm8550.debug_pcie0_phy_off", "gcc_sm8550.debug_usb_off", "rpmhpd.debug_ret_floor")
         self.boot_kit()
         result = self.run_script("verify.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   debug switches at boot (gcc_sm8550.debug_boot_state): pcie0 Y, pcie0phy N, usb N: "
+                      "pcie_0_gdsc collapses in system suspend (OFF_ON), revision 11's default\n", result.stdout)
+        self.assertIn("ok   debug switch gcc_sm8550.debug_pcie0_off = Y (on: pcie_0_gdsc OFF_ON, the kit's default "
+                      "since revision 11)\n", result.stdout)
         for name in names:
             self.assertIn(f"ok   debug switch {name} = N (off)\n", result.stdout)
         for values, line in (
                 ({"usb": "Y"}, "FAIL debug switch gcc_sm8550.debug_usb_off is Y, expected N (off): the kit's kernel "
                                "starts every boot with it off, and only a sleep test sets it, until its restart\n"),
-                ({"cxmx": None}, "FAIL debug switch rpmhpd.debug_ret_floor is missing, expected N (off)")):
+                ({"cxmx": None}, "FAIL debug switch rpmhpd.debug_ret_floor is missing, expected N (off)"),
+                # gdsc-ret=pcie0 by hand, or a kernel without the new default.
+                ({"pcie0": "N"}, "FAIL debug switch gcc_sm8550.debug_pcie0_off is N, expected Y: the kit's kernel "
+                                 "starts every boot with pcie_0_gdsc OFF_ON, and only a sleep test (gdsc-ret=pcie0) "
+                                 "changes it, until its restart\n"),
+                ({"boot": None}, "FAIL gcc_sm8550.debug_boot_state is missing, expected 'pcie0 Y, pcie0phy N, usb "
+                                 "N': the kit's kernel boots with pcie_0_gdsc OFF_ON and the other GDSCs in "
+                                 "retention\n"),
+                ({"boot": "pcie0 N, pcie0phy N, usb N"}, "FAIL gcc_sm8550.debug_boot_state is pcie0 N, pcie0phy N, "
+                                                         "usb N, expected 'pcie0 Y, pcie0phy N, usb N'")):
             with self.subTest(line):
                 self.boot_kit()
-                self.debug_switches(**values)
+                self.r11_switches(**values) if "boot" not in values else self.debug_switches(
+                    pcie0="Y", **values)
                 result = self.run_script("verify.sh")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(line, result.stdout)
                 self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
-        # Another kernel: revision 8's, with none of them, or one with them.
+        # Another kernel: revision 8's, with none of them, or one with them
+        # (revision 10's, all N), or revision 11's.
         self.boot_kit()
         self.running(HANG_BUILD_ID)
         self.debug_switches(pcie0=None, pcie0phy=None, usb=None, cxmx=None)
         result = self.run_script("verify.sh")
         self.assertIn("note the running kernel is not the kit's and offers no debug switches (the kernels of "
-                      "revisions 9 and 10 have them)\n", result.stdout)
+                      "revisions 9 to 11 have them)\n", result.stdout)
         self.assertNotIn("debug switch gcc_sm8550", result.stdout)
         self.debug_switches(usb="Y")
         result = self.run_script("verify.sh")
@@ -2854,6 +3030,11 @@ class VerifyTest(FakeTablet):
                       "rpmhpd.debug_ret_floor=N\n", result.stdout)
         self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
         self.assertIn(f"FAIL build ID {HANG_BUILD_ID}, the kit's is {NEW_BUILD_ID}", result.stdout)
+        self.r11_switches()
+        result = self.run_script("verify.sh")
+        self.assertIn("note debug switches of the running kernel, which is not the kit's: "
+                      "gcc_sm8550.debug_pcie0_off=Y gcc_sm8550.debug_pcie0_phy_off=N gcc_sm8550.debug_usb_off=N "
+                      "rpmhpd.debug_ret_floor=N (at boot: pcie0 Y, pcie0phy N, usb N)\n", result.stdout)
 
     def test_checks_see_revision_10_s_pcie_gpu_and_power_up_lines(self):
         """Revision 10: the Wi-Fi's PCIe link has to come up at boot without
@@ -2907,16 +3088,16 @@ class VerifyTest(FakeTablet):
 
     def test_the_ufs_host_s_clock_counts_are_checked_under_sudo(self):
         """Revision 10's lane clock fix: under sudo (debugfs is root's) the
-        UFS host's five clocks, as clk_summary has them; on the kit's kernel
-        a count above 3 is the leak and fails, on another kernel the counts
-        are a note.  Without the file, a note says it needs root."""
+        UFS host's five clocks, from each clock's own counters (revision 11;
+        revision 10 read clk_summary); on the kit's kernel a count above 3 is
+        the leak and fails, on another kernel the counts are a note.
+        Without the files, a note says it needs root."""
         self.boot_kit()
         result = self.run_script("verify.sh")
         self.assertIn(f"note the UFS host clocks' enable counts need root: sudo sh {self.kit}/verify.sh\n",
                       result.stdout)
         clk = self.root / "sys/kernel/debug/clk"
-        clk.mkdir(parents=True)
-        (clk / "clk_summary").write_text(clk_summary(**CLK_LEAK))
+        write_clocks(clk, **CLK_LEAK)
         leak = ("tcsr_ufs_pad_clkref_en 522/522, gcc_ufs_phy_ahb_clk 523/523, gcc_ufs_phy_axi_clk 522/522, "
                 "gcc_ufs_phy_unipro_core_clk 522/522, gcc_ufs_phy_ice_core_clk 523/523")
         result = self.run_script("verify.sh")
@@ -2926,16 +3107,15 @@ class VerifyTest(FakeTablet):
         self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
         # As the fix leaves them while the UFS works: ufshcd's one, and the
         # inline crypto engine's own on its core and AHB clocks.
-        (clk / "clk_summary").write_text(clk_summary(
-            bi_tcxo=(9, 9), tcsr_ufs_pad_clkref_en=(1, 1), gcc_ufs_phy_ahb_clk=(3, 3), gcc_ufs_phy_axi_clk=(1, 1),
-            gcc_ufs_phy_unipro_core_clk=(1, 1), gcc_ufs_phy_ice_core_clk=(3, 3)))
+        write_clocks(clk, bi_tcxo=(9, 9), tcsr_ufs_pad_clkref_en=(1, 1), gcc_ufs_phy_ahb_clk=(3, 3),
+                     gcc_ufs_phy_axi_clk=(1, 1), gcc_ufs_phy_unipro_core_clk=(1, 1), gcc_ufs_phy_ice_core_clk=(3, 3))
         result = self.run_script("verify.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("ok   UFS host clocks (enable/prepare): tcsr_ufs_pad_clkref_en 1/1, gcc_ufs_phy_ahb_clk 3/3, "
                       "gcc_ufs_phy_axi_clk 1/1, gcc_ufs_phy_unipro_core_clk 1/1, gcc_ufs_phy_ice_core_clk 3/3\n",
                       result.stdout)
         # Another kernel: the counts, and no verdict on them.
-        (clk / "clk_summary").write_text(clk_summary(**CLK_LEAK))
+        write_clocks(clk, **CLK_LEAK)
         self.running(HANG_BUILD_ID)
         result = self.run_script("verify.sh")
         self.assertIn(f"note UFS host clocks of the running kernel, which is not the kit's (enable/prepare): {leak}\n",
@@ -3374,7 +3554,13 @@ done
 [ ! -d "$s/qcom_stats" ] || cp "$s/qcom_stats/"* "$F/sys/kernel/debug/qcom_stats/"
 [ ! -e "$s/interrupts" ] || cp "$s/interrupts" "$F/proc/interrupts"
 [ ! -e "$s/wakeup_sources" ] || cp "$s/wakeup_sources" "$F/sys/kernel/debug/wakeup_sources"
-[ ! -e "$s/clk_summary" ] || cp "$s/clk_summary" "$F/sys/kernel/debug/clk/clk_summary"
+[ ! -d "$s/clk" ] || cp -R "$s/clk/." "$F/sys/kernel/debug/clk/"
+[ ! -d "$s/genpd" ] || cp -R "$s/genpd/." "$F/sys/kernel/debug/pm_genpd/"
+# Revision 11's rpmh: the tracepoint's switch and the trace's size as this
+# sleep finds them, then what the cycle says rpmh-rsc wrote.
+ev=$F/sys/kernel/tracing/events/rpmh/rpmh_send_msg/enable
+[ ! -e "$ev" ] || echo "enable $(cat "$ev") trace $(wc -c < "$F/sys/kernel/tracing/trace")" >> "$T/rpmh-at-sleep"
+[ ! -e "$s/trace" ] || cat "$s/trace" >> "$F/sys/kernel/tracing/trace"
 # pm_wakeup_irq: the cycle's, or the RTC's.
 # (After a pm_test cycle nothing woke it: no data, which the stand-in
 # shows as an empty file.)
@@ -3749,32 +3935,29 @@ def qcom_stat(count, seconds):
             f"Accumulated Duration: {int(seconds * 19200000)}\n")
 
 
-def clk_summary(**counts):
-    """/sys/kernel/debug/clk/clk_summary as 7.2 prints it: two heading
-    lines and a rule, then one line per clock, indented by its depth in the
-    tree, its consumer at the end, a second consumer on a line of its own.
-    COUNTS gives a clock's enable and prepare count, (enable, prepare); the
-    other clocks of the list read 0/0, and the AO peer of XO and a clock
-    that is no UFS host's are there to be left out."""
-    rows = [("bi_tcxo", 1, "88e8000.phy                     ref"),
-            ("tcsr_ufs_pad_clkref_en", 2, "ufshc@1d84000                   no_connection_id"),
-            ("bi_tcxo_ao", 1, "deviceless                      no_connection_id"),
-            ("gcc_ufs_phy_ahb_clk", 1, "ufshc@1d84000                   no_connection_id"),
-            ("gcc_ufs_phy_axi_clk", 4, "ufshc@1d84000                   no_connection_id"),
-            ("gcc_ufs_phy_unipro_core_clk", 4, "ufshc@1d84000                   no_connection_id"),
-            ("gcc_ufs_phy_ice_core_clk", 4, "ufshc@1d84000                   no_connection_id"),
-            ("gcc_usb30_prim_master_clk", 4, "a600000.usb                     core")]
-    text = ("                                 enable  prepare  protect                                duty  "
-            "hardware                            connection\n"
-            "   clock                          count    count    count        rate   accuracy phase  cycle    "
-            "enable   consumer                         id\n" + "-" * 140 + "\n")
-    for name, depth, consumer in rows:
+# The clocks the fake debugfs has, each with its parent's name (None: no
+# clk_parent file, a clock without a parent): XO and its AO peer, the UFS
+# host's five, a PLL under XO for them, and a clock that is no UFS host's.
+CLK_PARENTS = {"xo_board": None, "bi_tcxo": "xo_board", "bi_tcxo_ao": "xo_board",
+               "tcsr_ufs_pad_clkref_en": "bi_tcxo", "gcc_gpll0": "bi_tcxo",
+               "gcc_ufs_phy_ahb_clk": None, "gcc_ufs_phy_axi_clk": "gcc_gpll0",
+               "gcc_ufs_phy_unipro_core_clk": "gcc_gpll0", "gcc_ufs_phy_ice_core_clk": "gcc_gpll0",
+               "gcc_usb30_prim_master_clk": "gcc_gpll0"}
+
+
+def write_clocks(directory, **counts):
+    """/sys/kernel/debug/clk as 7.2 makes it (clk_debug_create_one): a
+    directory per clock with its enable and prepare counts, and its parent's
+    name for a clock that has one.  COUNTS gives a clock's (enable, prepare);
+    the others read 0 and 0."""
+    for name, parent in CLK_PARENTS.items():
+        d = directory / name
+        d.mkdir(parents=True, exist_ok=True)
         enable, prepare = counts.get(name, (0, 0))
-        text += (f"{' ' * depth}{name:<32} {enable:<7} {prepare:<7} 0        38400000    0          0     "
-                 f"50000      Y   {consumer}\n")
-        if name == "gcc_ufs_phy_ice_core_clk":
-            text += " " * 100 + "1d88000.crypto                  core\n"
-    return text
+        (d / "clk_enable_count").write_text(f"{enable}\n")
+        (d / "clk_prepare_count").write_text(f"{prepare}\n")
+        if parent:
+            (d / "clk_parent").write_text(parent + "\n")
 
 
 # squirtle's counts on 2026-11-23 (backups/squirtle-clk-ufs-20261123.txt,
@@ -3790,6 +3973,19 @@ def ddr_stats(seconds_at_547):
             "DDR LPM Stat Name:0xd0\tcount:2\tDuration (ticks):100\n"
             f"DDR Freq 547Mhz:\tCP IDX:0\tcount:5\tDuration (ticks):{int(seconds_at_547 * 19200000)}\n"
             "DDR Freq 2092Mhz:\tCP IDX:5\tcount:9\tDuration (ticks):384000000\n")
+
+
+def rpmh_line(ts, state, addr, data):
+    """A line of the trace for one command rpmh-rsc wrote (rpmh_send_msg,
+    drivers/soc/qcom/trace-rpmh.h)."""
+    return (f"          <idle>-0       [000] d..2. {ts:12.6f}: rpmh_send_msg: apps_rsc: tcs(m): 2 [{state}] "
+            f"cmd(n): 0 msgid: 0x10108 addr: {addr} data: {data} complete: 0\n")
+
+
+# The command DB as its debugfs file dumps it (made-up addresses).
+CMD_DB = ("Command DB DUMP\nSlave ARC (v1.0)\n-------------------------\n0x30000: cx.lvl [00 01]\n0x30010: mx.lvl\n"
+          "0x30030: xo.lvl\nSlave BCM (v1.0)\n-------------------------\n0x50000: MC0\n0x50004: SH0\n"
+          "Slave VRM (v1.0)\n-------------------------\n0x40100: ldob1\n")
 
 
 class SleepTestTest(FakeTablet):
@@ -4166,11 +4362,11 @@ class SleepTestTest(FakeTablet):
                 "SLEEP-TEST cycle 2/2: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back as "
                 f"before; floor released; {NO_SWITCHES}"]
         self.assertEqual(self.pmsg_lines(evidence=False)[:6], kept)
-        # In pmsg each cycle's three evidence lines come between its
+        # In pmsg each cycle's five evidence lines come between its
         # diagnostic lines and its verdict; the result file has none.
         pmsg = self.pmsg_lines()
-        self.assertEqual([line.split(": evidence: ")[0] for line in pmsg[:12]],
-                         kept[:2] + ["cycle 1/2"] * 3 + kept[2:5] + ["cycle 2/2"] * 3 + kept[5:])
+        self.assertEqual([line.split(": evidence: ")[0] for line in pmsg[:16]],
+                         kept[:2] + ["cycle 1/2"] * 5 + kept[2:5] + ["cycle 2/2"] * 5 + kept[5:])
         self.assertEqual((self.ramdir() / "result").read_text().splitlines()[:6], kept)
         self.assertNotIn("evidence:", (self.ramdir() / "result").read_text())
         kmsg = (self.root / "dev/kmsg").read_text()
@@ -4290,8 +4486,7 @@ class SleepTestTest(FakeTablet):
         (F / "sys/kernel/debug/interconnect/interconnect_summary").write_text(ICC_SUMMARY)
         (F / "sys/kernel/debug/wakeup_sources").write_text(
             wakeup_sources(("alarmtimer.0.auto", 1, 0), ("a600000.usb", 0, 0)))
-        (F / "sys/kernel/debug/clk").mkdir(parents=True)
-        (F / "sys/kernel/debug/clk/clk_summary").write_text(clk_summary(**CLK_LEAK))
+        write_clocks(F / "sys/kernel/debug/clk", **CLK_LEAK)
         (F / "proc/interrupts").write_text(INTERRUPTS)
         files = {
             "sys/bus/platform/devices/1d84000.ufshc/power/runtime_status": "suspended",
@@ -4333,8 +4528,7 @@ class SleepTestTest(FakeTablet):
             wakeup_sources(("alarmtimer.0.auto", 1 + n, n), ("a600000.usb", 0, 0)))
         # The UFS host resumed with the sleep: one more enable of each of its
         # clocks, as the lane clock leak has it.
-        (self.tmp / f"cycle-{n}" / "clk_summary").write_text(clk_summary(**{
-            name: (e + n, p + n) for name, (e, p) in CLK_LEAK.items()}))
+        write_clocks(self.tmp / f"cycle-{n}" / "clk", **{name: (e + n, p + n) for name, (e, p) in CLK_LEAK.items()})
         log = (f"[  {n}00.000001] PM: suspend entry (deep)\n"
                f"[  {n}00.000002] CPU features: SANITY CHECK: Unexpected variation in SYS_ID_AA64MMFR1_EL1. "
                "Boot CPU: 0x00000011212122, CPU3: 0x00000010212122\n"
@@ -4424,9 +4618,9 @@ class SleepTestTest(FakeTablet):
                  "cycle 1/2: asleep", "cycle 1/2: evidence: qcom_stats", "SLEEP-TEST cycle 1/2: SHALLOW",
                  "cycle 2/2: evidence: before:", "cycle 2/2: deep sleep", "cycle 2/2: evidence: qcom_stats"]
         self.assertEqual([log.index(said) for said in order], sorted(log.index(said) for said in order))
-        # pmsg: three lines per cycle, each cut at 300 characters.
+        # pmsg: five lines per cycle, each cut at 300 characters.
         pmsg = [line for line in self.pmsg_lines() if ": evidence: " in line]
-        self.assertEqual(len(pmsg), 6, pmsg)
+        self.assertEqual(len(pmsg), 10, pmsg)
         self.assertEqual(pmsg[0], "cycle 1/2: evidence: qcom_stats: aosd +0, cxsd +0, ddr +0; subsystems adsp +0, "
                                   "apss +1 30.0s; ddr modes 0xd4 +0, 0xd0 +0; ddr time at 547MHz 30.0s")
         self.assertTrue(pmsg[1].startswith("cycle 1/2: evidence: pcie link kept; PCIe came back (no host failure "
@@ -4436,10 +4630,10 @@ class SleepTestTest(FakeTablet):
         self.assertEqual(pmsg[2], "cycle 1/2: evidence: clocks before: xo 6/6, pad_clkref 522/522, axi 522/522, "
                                   "ahb 523/523, unipro_core 522/522, ice_core 523/523; after: xo 7/7, pad_clkref "
                                   "523/523, axi 523/523, ahb 524/524, unipro_core 523/523, ice_core 524/524")
-        self.assertTrue(pmsg[4].startswith("cycle 2/2: evidence: pcie link down and up again; PCIe came back (no "
-                                           "host failure line); irq 21 pm8xxx_rtc_alarm +1; wakeup "), pmsg[4])
-        self.assertTrue(pmsg[5].startswith("cycle 2/2: evidence: clocks before: xo 7/7, pad_clkref 523/523, "),
-                        pmsg[5])
+        self.assertTrue(pmsg[6].startswith("cycle 2/2: evidence: pcie link down and up again; PCIe came back (no "
+                                           "host failure line); irq 21 pm8xxx_rtc_alarm +1; wakeup "), pmsg[6])
+        self.assertTrue(pmsg[7].startswith("cycle 2/2: evidence: clocks before: xo 7/7, pad_clkref 523/523, "),
+                        pmsg[7])
         prefix = f"gts9u sleep-test: {self.ramdir().name} "
         for line in (self.root / "dev/pmsg0").read_text().splitlines():
             self.assertLessEqual(len(line), len(prefix) + 300, line)
@@ -4455,7 +4649,8 @@ class SleepTestTest(FakeTablet):
         (F / "sys/kernel/debug/qcom_stats/ddr_stats").mkdir()
         (F / "sys/kernel/debug/pm_genpd/pm_genpd_summary").mkdir(parents=True)
         (F / "sys/kernel/debug/wakeup_sources").mkdir()
-        (F / "sys/kernel/debug/clk/clk_summary").mkdir(parents=True)
+        (F / "sys/kernel/debug").mkdir(parents=True, exist_ok=True)
+        (F / "sys/kernel/debug/clk").write_text("")
         (F / "sys/bus/pci/devices/0000:01:00.0").mkdir(parents=True)
         result = self.run_test("ro", "2", "restart-ok", "hold=0")
         self.assertEqual(result.returncode, 1, self.out)
@@ -4469,12 +4664,13 @@ class SleepTestTest(FakeTablet):
             self.assertIn(f"cycle {i}/2: evidence: before: ufs -; usb - wakeup -; pci 0000:01:00.0 -; "
                           "remoteproc none; backlight none; warmest -\n", self.out)
         self.assertIn("evidence: pci 0000:01:00.0: -, link -, d3cold_allowed -, wakeup -, runtime -", self.out)
-        # A clk_summary that cannot be read as a file: said so, and the run
-        # as without it.
+        # No clock directory that can be read: said so, and the run as
+        # without it.
         for i in (1, 2):
             for when in ("before", "after"):
-                self.assertIn(f"cycle {i}/2: evidence: {when}: clocks (enable/prepare): clk_summary not readable\n",
+                self.assertIn(f"cycle {i}/2: evidence: {when}: clocks (enable/prepare): clock counts not readable\n",
                               self.out)
+                self.assertIn(f"cycle {i}/2: evidence: {when}: XO held by: clock counts not readable\n", self.out)
         log = (self.ramdir() / "log").read_text()
         for word in ("cannot open", "No such file", "Is a directory", "awk:", "read error"):
             self.assertNotIn(word, log)
@@ -4490,8 +4686,8 @@ class SleepTestTest(FakeTablet):
         self.assertEqual(result.returncode, 1, self.out)
         self.assertIn("SLEEP-TEST RESULT: SHALLOW: 10 of 10 cycles resumed with the UFS readable, 0 of them "
                       "deep", self.out)
-        self.assertEqual(len([line for line in self.pmsg_lines() if ": evidence: " in line]), 30)
-        self.assertLess(len((self.root / "dev/pmsg0").read_bytes()), 16 * 1024)
+        self.assertEqual(len([line for line in self.pmsg_lines() if ": evidence: " in line]), 50)
+        self.assertLess(len((self.root / "dev/pmsg0").read_bytes()), 24 * 1024)
 
     def test_the_evidence_reads_and_writes_only_its_own_files(self):
         """The evidence functions write nothing but their output files in
@@ -5423,7 +5619,7 @@ exit 0
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
                 self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]\n"
-                              "       [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok", result.stderr)
+                              "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok", result.stderr)
 
     def assert_nothing_done(self):
         self.assertEqual(self.sysrq(), "")
@@ -6088,18 +6284,27 @@ exit 0
 
     def test_the_options_are_parsed_strictly(self):
         for bad in ("pm_test=deep", "pm_test=", "pm_test=core pm_test=core", "pm_test=core pm_test=platform",
-                    "trace trace", "trace trace=live", "trace=on", "pci=keep", "pci=", "dry pm_test=platform",
+                    "trace trace", "trace trace=live", "trace=on", "pci=", "pci=add", "dry pm_test=platform",
                     "dry trace", "dry trace=live",
+                    # Revision 11's pci=keep: one pci= at most, and no sleep in dry.
+                    "pci=remove pci=keep", "pci=keep pci=keep", "dry pci=keep",
                     # Revision 9's debug switches: one list of known words, once each.
                     "gdsc=", "gdsc=pcie1", "gdsc=pcie0,", "gdsc=,usb", "gdsc=pcie0,,usb", "gdsc=pcie0,pcie0",
-                    "gdsc=PCIE0", "gdsc=pcie0 gdsc=usb", "cxmx=", "cxmx=on", "cxmx=ret cxmx=ret"):
+                    "gdsc=PCIE0", "gdsc=pcie0 gdsc=usb", "cxmx=", "cxmx=on", "cxmx=ret cxmx=ret",
+                    # Revision 11's gdsc-ret=pcie0: that word alone, once, and
+                    # not with gdsc=pcie0.
+                    "gdsc-ret=", "gdsc-ret=usb", "gdsc-ret=pcie0phy", "gdsc-ret=pcie0 gdsc-ret=pcie0",
+                    "gdsc=pcie0 gdsc-ret=pcie0", "gdsc=usb,pcie0 gdsc-ret=pcie0",
+                    # Revision 11's rpmh: once, and no sleep in dry.
+                    "rpmh rpmh", "dry rpmh", "rpmh=1"):
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
                 self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]\n"
-                              "       [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok", result.stderr)
-                self.assertIn("[pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]\n"
-                              "       [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok", result.stderr)
+                              "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok", result.stderr)
+                self.assertIn("[pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]\n"
+                              "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [rpmh] restart-ok",
+                              result.stderr)
                 self.assert_nothing_done()
 
     # Revision 9's debug switches (gdsc=, cxmx=ret): run-time module
@@ -6204,7 +6409,7 @@ exit 0
             (("gdsc=usb", "cxmx=ret"), {}, "gdsc=usb needs pci=remove"),
             (("pci=remove", "gdsc=pcie0"), {"pcie0": None, "pcie0phy": None, "usb": None, "cxmx": None},
              f"this kernel does not offer the debug switch pcie0 ({gcc}/debug_pcie0_off): the kernels of kit "
-             "revisions 9 and 10 have it"),
+             "revisions 9 to 11 have it"),
             (("pci=remove", "gdsc=pcie0", "cxmx=ret"), {"cxmx": None},
              "this kernel does not offer the debug switch cxmx (ROOT/sys/module/rpmhpd/parameters/debug_ret_floor)"),
             (("pci=remove",), {"pcie0": "Y"},
@@ -6383,10 +6588,10 @@ exit 0
             "progress: protected: frozen: /media/stick /; /dev/sda read-only; from here the run ends with a restart",
             f"progress: cycle 1/2: entering the sleep, rtcwake -m freeze -s 30; no pm_test, no trace; {NO_SWITCHES}",
             f"progress: cycle 2/2: entering the sleep, rtcwake -m freeze -s 30; no pm_test, no trace; {NO_SWITCHES}"])
-        # Four evidence lines per cycle in pmsg, the fourth the s2idle one.
+        # Six evidence lines per cycle in pmsg, the sixth the s2idle one.
         evidence = [line for line in pmsg if ": evidence: " in line]
-        self.assertEqual(len(evidence), 8, evidence)
-        self.assertEqual(evidence[3], "cycle 1/2: evidence: s2idle: s2idle entries +8 on 8 of 8 CPUs in state1 "
+        self.assertEqual(len(evidence), 12, evidence)
+        self.assertEqual(evidence[5], "cycle 1/2: evidence: s2idle: s2idle entries +8 on 8 of 8 CPUs in state1 "
                                       "(cpu-sleep-0-0 cpu-sleep-1-0 cpu-sleep-2-0); cluster S0 +0 (s2idle +0, rejected "
                                       "+0), S1 +1 (s2idle +1, rejected +0); asleep 30.0s (1 Timekeeping lines); woken "
                                       "by IRQ 21 (pm8xxx_rtc_alarm)")
@@ -6457,7 +6662,7 @@ exit 0
                               pmsg)
                 self.assertNotIn("s2idle", pmsg)
                 self.assertNotIn("s2idle", (self.ramdir() / "result").read_text())
-                self.assertEqual(pmsg.count(": evidence: "), 3)
+                self.assertEqual(pmsg.count(": evidence: "), 5)
                 self.assertNotIn("evidence: s2idle", log)
                 (logs,) = (self.kit / "logs").glob("*-sleep")
                 self.assertEqual((logs / "before").read_text().splitlines()[0].split(": ", 1)[1],
@@ -6498,8 +6703,8 @@ exit 0
                 SleepTestTest.setUp(self)
                 result = self.run_test("ro", *bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
-                self.assertIn("[trace|trace=live] [mode=s2idle]\n       [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] "
-                              "restart-ok", result.stderr)
+                self.assertIn("[trace|trace=live] [mode=s2idle]\n       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] "
+                              "[cxmx=ret] [rpmh] restart-ok", result.stderr)
                 self.assert_nothing_done()
                 if "pm_test=" in bad:
                     level = bad.split("pm_test=")[1].split()[0]
@@ -6890,6 +7095,303 @@ exit 0
                          result.stdout + result.stderr)
 
 
+    # Revision 11: pcie_0_gdsc OFF_ON from the boot, its debug switch Y and
+    # debug_boot_state saying so (r11_switches).
+
+    def test_revision_11_s_default_is_named_with_its_boot_state_and_needs_no_switch(self):
+        """On revision 11's kernel a run with the root port removed needs no
+        gdsc=: it writes no switch, and every verdict, RESULT and progress
+        line says pcie0 is Y and that it booted so; the header says what
+        pcie_0_gdsc does in the run's sleeps."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.pci_tree()
+        self.r11_switches()
+        result = self.run_test("ro", "1", "pci=remove", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        on = "switches: pcie0 Y, pcie0phy N, usb N, cxmx N; at boot: pcie0 Y"
+        self.assertEqual(self.read("switches-at-freeze"), "Y N N N \n")
+        self.assertEqual(self.read("switches-at-sleep"), "Y N N N \n")
+        self.assertIn("SLEEP-TEST cycle 1/1: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back as "
+                      f"before; floor released; {on}\n", self.out)
+        self.assertIn(f"kernel 68d243e908c0; options: pci=remove; {on}\n", self.out)
+        self.assertFalse([line for line in self.progress_lines() if "debug switches set" in line])
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertIn(f"debug {on} (", before)
+        self.assertIn(f"debug switches at boot: {R11_BOOT} ({self.root}/sys/module/gcc_sm8550/parameters/"
+                      "debug_boot_state); pcie_0_gdsc in this run's sleeps: OFF_ON, collapsed\n", before)
+        self.assertIn("ADSP clients: iio-sensor-proxy inactive, hexagonrpcd-adsp-sensorspd inactive, "
+                      "hexagonrpcd-adsp-rootpd inactive; PipeWire and WirePlumber processes 0; sound streams not "
+                      "closed: none\n", before)
+
+    def test_revision_11_s_default_with_the_pci_devices_kept_needs_pci_keep(self):
+        """A sleep with the PCI devices kept would collapse pcie_0_gdsc under
+        the live host: refused with nothing changed, unless the run removes
+        them, keeps the domain in retention (gdsc-ret=pcie0) or says
+        pci=keep; dry and the pm_test= levels before the noirq phase are not
+        refused; a kernel whose pcie0 booted N (revision 10's) is not
+        either."""
+        refused = ("pcie_0_gdsc collapses in this kernel's suspend (its debug switch pcie0 booted Y: revision 11), "
+                   "and with the PCI devices kept the PCIe host keeps its link through the sleep while genpd "
+                   "collapses that GDSC under it: give pci=remove, or gdsc-ret=pcie0 to keep it in retention for "
+                   "the run, or pci=keep to run it so (the Wi-Fi may not come back, or the tablet may crash at the "
+                   'resume: README, "Revision 11")')
+        for args, ok in ((("ro", "1"), False), (("ro", "1", "pm_test=platform"), False),
+                         (("ro", "1", "mode=s2idle"), False), (("ro", "1", "pm_test=devices"), True),
+                         (("ro", "1", "pm_test=freezer"), True), (("dry",), True),
+                         (("ro", "1", "pci=keep"), True), (("ro", "1", "gdsc-ret=pcie0"), True)):
+            with self.subTest(args):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.pci_tree()
+                self.r11_switches()
+                self.s2idle_files()
+                result = self.run_test(*args, "restart-ok", "hold=0")
+                if ok:
+                    self.assertNotIn("REFUSED", self.out)
+                    self.assertEqual(self.sysrq(), "b", self.out)
+                else:
+                    self.assertEqual(result.returncode, 1, self.out)
+                    self.assertIn("REFUSED: " + refused, self.out)
+                    self.assert_nothing_done()
+        # Revision 10's kernel: every switch boots N, nothing to refuse.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.pci_tree()
+        self.debug_switches()
+        self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertNotIn("REFUSED", self.out)
+        self.assertEqual(self.sysrq(), "b", self.out)
+
+    def test_gdsc_ret_pcie0_keeps_the_domain_in_retention_for_the_run(self):
+        """gdsc-ret=pcie0 writes N to pcie0 right before the freeze, read
+        back, and the record says it: pcie0 N with "at boot: pcie0 Y"."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.pci_tree()
+        self.r11_switches()
+        result = self.run_test("ro", "1", "pci=remove", "gdsc-ret=pcie0", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        off = "switches: pcie0 N, pcie0phy N, usb N, cxmx N; at boot: pcie0 Y"
+        self.assertEqual(self.read("pcie0-at-pci-remove"), "Y\n")
+        self.assertEqual(self.read("switches-at-freeze"), "N N N N \n")
+        self.assertIn(f"kernel 68d243e908c0; options: pci=remove gdsc-ret=pcie0; {off}\n", self.out)
+        self.assertIn(f"progress: debug switches set: (N: pcie0); {off}", self.progress_lines())
+        self.assertIn("gdsc-ret=pcie0: right before it freezes the disks, after the PCI removal, the run writes N to "
+                      "its switch: pcie_0_gdsc stays on in retention in the sleeps, as on revision 10, where every "
+                      "such sleep with the PCI devices removed and the floor released hung (8 of 8): a control "
+                      "run", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("pcie_0_gdsc in this run's sleeps: RET_ON, left on\n", (logs / "before").read_text())
+
+    def test_a_switch_that_does_not_read_as_it_booted_is_refused_and_a_stop_puts_them_back_so(self):
+        """On revision 11's kernel the boot state is the reference: pcie0 N
+        there is a write since the boot, refused; a stop before any sleep
+        puts what the run wrote back as it booted (pcie0 Y)."""
+        self.pci_tree()
+        self.r11_switches(pcie0="N")
+        result = self.run_test("ro", "1", "pci=remove", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn(f"REFUSED: a debug switch does not read as this kernel booted it: pcie0 ({self.root}/sys/module/"
+                      f"gcc_sm8550/parameters/debug_pcie0_off: N) (at boot: pcie0 Y, the others N; {self.root}/sys/"
+                      "module/gcc_sm8550/parameters/debug_boot_state)", self.out)
+        self.assert_nothing_done()
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.pci_tree()
+        self.r11_switches()
+        (self.tmp / "freeze-fails").write_text("/media/stick\n")
+        result = self.run_test("ro", "1", "pci=remove", "gdsc-ret=pcie0", "gdsc=usb", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("the debug switches it set are back as they booted", self.out)
+        self.assertEqual({word: (value or "").strip() for word, value in self.switch_files().items()},
+                         {"pcie0": "Y", "pcie0phy": "N", "usb": "N", "cxmx": "N"})
+        self.assertEqual(self.sysrq(), "")
+
+    def test_pci_keep_ends_the_run_when_the_wifi_did_not_come_back(self):
+        """pci=keep on revision 11's kernel: the Wi-Fi's state after the
+        resume in the evidence, and a cycle whose kernel lines say the Wi-Fi
+        did not come back ends the run with PCIE-DOWN and its restart; one
+        whose lines do not goes on."""
+        lost = "pci 0000:01:00.0: Unable to change power state from D3hot to D0, device inaccessible"
+        self.pci_tree()
+        self.r11_switches()
+        self.cycle(1, log=f"[  100.000001] PM: suspend entry (deep)\n[  100.000002] {lost}\n"
+                          "[  100.000003] ath11k_pci 0000:01:00.0: failed to resume core: -110\n"
+                          "[  100.000004] Timekeeping suspended for 30.002 seconds\n[  100.000005] PM: suspend exit\n")
+        result = self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("pci=keep: the PCI devices stay and the PCIe host keeps its link through each sleep; "
+                      "pcie_0_gdsc collapses under it (OFF_ON)", self.out)
+        self.assertIn(f"cycle 1/2: evidence: wifi: pci 0000:00:00.0 - D0 -, 0000:01:00.0 - D0 -; {lost}\n", self.out)
+        self.assertIn(f"SLEEP-TEST RESULT: PCIE-DOWN after cycle 1/2: with the PCI devices kept, the PCIe host or "
+                      f"the Wi-Fi did not come back ({lost}), and a later suspend would meet a controller that lost "
+                      "its registers under its link, so the run ends here; 1 of 2 cycles came back with the UFS "
+                      "readable", self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem -s 30"), 1)
+        self.assertEqual(self.sysrq(), "b")
+        # A cycle without such a line: the run goes on.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.pci_tree()
+        self.r11_switches()
+        self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
+        self.assertIn("cycle 1/2: evidence: wifi: pci 0000:00:00.0 - D0 -, 0000:01:00.0 - D0 -; no Wi-Fi failure "
+                      "line\n", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles", self.out)
+
+    def rpmh_files(self, tracing_on="1", clock="[local] global counter uptime perf mono mono_raw boot tai"):
+        """tracefs with the RPMh tracepoint off, tracing on, the trace with
+        a line of an earlier command, and the command DB, as squirtle's
+        kernel has them (made-up addresses)."""
+        tr = self.root / "sys/kernel/tracing"
+        (tr / "events/rpmh/rpmh_send_msg").mkdir(parents=True, exist_ok=True)
+        (tr / "events/rpmh/rpmh_send_msg/enable").write_text("0\n")
+        (tr / "tracing_on").write_text(tracing_on + "\n")
+        (tr / "trace_clock").write_text(clock + "\n")
+        (tr / "trace").write_text("# tracer: nop\n" + rpmh_line(5.0, "active", "0x30000", "0x2"))
+        (self.root / "sys/kernel/debug").mkdir(parents=True, exist_ok=True)
+        (self.root / "sys/kernel/debug/cmd-db").write_text(CMD_DB)
+
+    def test_rpmh_names_the_last_flush_before_each_sleep_and_the_levels_it_left_out(self):
+        """rpmh: the tracepoint on right before the freeze and the trace
+        emptied right before each sleep; after it, the last flush before the
+        kernel's "Timekeeping suspended" line, by the command DB's names,
+        with xo.lvl, cx.lvl or mx.lvl that it left out (held at their vote);
+        a sleep with no flush in its trace says so.  The tracepoint stays on
+        to the restart."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.rpmh_files()
+        # Cycle 1: two flushes before the sleep (at 100.000030), the second
+        # (2 ms after the first) with XO off and MC0 without a vote in the
+        # sleep set, SH0 with one, and an LDO's enable register; cx.lvl
+        # voted 0 active, mx.lvl left out with no vote in the trace; a flush
+        # after the sleep.
+        self.cycle(1)
+        (self.tmp / "cycle-1/trace").write_text(
+            rpmh_line(99.990000, "active", "0x30000", "0x0")
+            + rpmh_line(99.998000, "sleep", "0x30010", "0x1") + rpmh_line(99.998001, "wake", "0x30010", "0x2")
+            + rpmh_line(100.000010, "sleep", "0x50000", "0x40000000")
+            + rpmh_line(100.000011, "wake", "0x50000", "0x60004001")
+            + rpmh_line(100.000012, "sleep", "0x30030", "0x0") + rpmh_line(100.000013, "wake", "0x30030", "0x3")
+            + rpmh_line(100.000014, "sleep", "0x50004", "0x60000010")
+            + rpmh_line(100.000015, "wake", "0x50004", "0x60000020")
+            + rpmh_line(100.000016, "sleep", "0x40104", "0x0") + rpmh_line(100.000017, "wake", "0x40104", "0x1")
+            + rpmh_line(100.500000, "sleep", "0x30030", "0x3"))
+        (self.tmp / "cycle-1/log").write_text("[  100.000000] PM: suspend entry (deep)\n"
+                                              "[  100.000030] Timekeeping suspended for 30.002 seconds\n"
+                                              "[  100.000040] PM: suspend exit\n")
+        # Cycle 2: only active votes.
+        self.cycle(2)
+        (self.tmp / "cycle-2/trace").write_text(rpmh_line(700.000000, "active", "0x30010", "0x1"))
+        result = self.run_test("ro", "2", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles", self.out)
+        self.assertIn(f"rpmh: the tracepoint {self.root}/sys/kernel/tracing/events/rpmh/rpmh_send_msg/enable (0 now) "
+                      f"goes on right before the freeze; command DB: {self.root}/sys/kernel/debug/cmd-db, 6 addresses\n",
+                      self.out)
+        self.assertIn("rpmh: the tracepoint rpmh_send_msg is on until the restart; the command DB names 6 RPMh "
+                      "addresses", self.out)
+        # On at each sleep, and the trace emptied right before it.
+        self.assertEqual(self.read("rpmh-at-sleep"), "enable 1 trace 0\nenable 1 trace 0\n")
+        self.assertIn("cycle 1/2: for this sleep: rpmh trace emptied\n", self.out)
+        self.assertIn("cycle 1/2: evidence: rpmh sleep set: the last of 2 flushes before the sleep at 100.000030 (at "
+                      "100.000010, 8 commands), sleep/wake: MC0 0x40000000/0x60004001, xo.lvl 0x0/0x3, SH0 "
+                      "0x60000010/0x60000020, ldob1+4 0x0/0x1; left out, so held at their vote through the sleep: "
+                      "cx.lvl (active 0x0), mx.lvl; active votes before the sleep 1, commands after it 1\n", self.out)
+        self.assertIn("cycle 2/2: evidence: rpmh sleep set: no flush before the sleep at 730.000000 (1 active votes in "
+                      "it): the RSC slept with the sets of an earlier flush\n", self.out)
+        pmsg = [line for line in self.pmsg_lines() if ": evidence: rpmh: " in line]
+        self.assertEqual(pmsg, ["cycle 1/2: evidence: rpmh: flush 2 of 2 at 100.000010, sleep/wake: xo.lvl 0x0/0x3, "
+                                "SH0 0x60000010/0x60000020; held: cx.lvl (active 0x0), mx.lvl",
+                                "cycle 2/2: evidence: rpmh: no flush before the sleep at 730.000000 (1 active votes in "
+                                "it): the RSC slept with the sets of an earlier flush"])
+        self.assertIn("options: rpmh;", self.out)
+        self.assertEqual((self.root / "sys/kernel/tracing/events/rpmh/rpmh_send_msg/enable").read_text(), "1")
+
+    def test_rpmh_is_refused_without_the_tracepoint_tracing_or_the_kernel_log_s_clock_and_a_stop_turns_it_off(self):
+        tr = "sys/kernel/tracing"
+        cases = (
+            ("rpmh needs the RPMh tracepoint (ROOT/sys/kernel/tracing/events/rpmh/rpmh_send_msg/enable): tracefs, "
+             "and a kernel with CONFIG_FTRACE (the kit's kernels have both)", lambda: shutil.rmtree(
+                 self.root / tr / "events")),
+            ("rpmh: tracing is off (ROOT/sys/kernel/tracing/tracing_on reads 0), so the trace would stay empty: echo "
+             "1 | sudo tee ROOT/sys/kernel/tracing/tracing_on, or run without rpmh", lambda: self.rpmh_files("0")),
+            ("rpmh: the trace clock is global (ROOT/sys/kernel/tracing/trace_clock), not local, the kernel log's: "
+             "echo local | sudo tee ROOT/sys/kernel/tracing/trace_clock, or run without rpmh",
+             lambda: self.rpmh_files(clock="local [global] counter")))
+        for message, edit in cases:
+            with self.subTest(message):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.rpmh_files()
+                edit()
+                result = self.run_test("ro", "1", "rpmh", "restart-ok")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("REFUSED: " + message.replace("ROOT/", f"{self.root}/"), self.out)
+                self.assert_nothing_done()
+        # A stop before any sleep: the tracepoint as the run found it.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.rpmh_files()
+        (self.tmp / "freeze-fails").write_text("/media/stick\n")
+        result = self.run_test("ro", "1", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep", self.out)
+        self.assertEqual((self.root / tr / "events/rpmh/rpmh_send_msg/enable").read_text(), "0")
+        self.assertEqual(self.sysrq(), "")
+
+    def test_revision_11_s_evidence_names_xo_s_holders_genpd_s_power_offs_and_the_dsps_interrupts(self):
+        """The prepared clocks below XO with no prepared clock below them,
+        and XO's own consumers; what genpd powered off in the sleep (each
+        domain's idle states' usage); the DSPs' interrupt lines; the
+        subsystems over 5 s awake; every prepared clock once."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.evidence_files()
+        for d, usage in (("cx", 3), ("mx", 0), ("pcie_0_gdsc", 7), ("gpu_cc_cx_gdsc", 2)):
+            (self.root / "sys/kernel/debug/pm_genpd" / d).mkdir(parents=True, exist_ok=True)
+            (self.root / "sys/kernel/debug/pm_genpd" / d / "idle_states").write_text(
+                "State  Time(ms)       Usage      Rejected   Above      Below      S2idle\n"
+                f"S0     1200           {usage:<10} 0          0          0          0\n")
+        (self.root / "proc/interrupts").write_text(INTERRUPTS + " 13:         40          0          0          0     "
+                                                   "     0          0          0          0     GICv3 261 Level     "
+                                                   "ipcc_0\n")
+        self.evidence_cycle(1)
+        d = self.tmp / "cycle-1"
+        (d / "interrupts").write_text((d / "interrupts").read_text() + " 13:         90          0          0          0"
+                                      "          0          0          0          0     GICv3 261 Level     ipcc_0\n")
+        # The sleep powered cx and pcie_0_gdsc off once, mx not.
+        for dom, usage in (("cx", 4), ("pcie_0_gdsc", 8)):
+            (d / "genpd" / dom).mkdir(parents=True)
+            (d / "genpd" / dom / "idle_states").write_text(
+                "State  Time(ms)       Usage      Rejected   Above      Below      S2idle\n"
+                f"S0     1300           {usage:<10} 0          0          0          0\n")
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        held = "gcc_ufs_phy_axi_clk 522/522, gcc_ufs_phy_ice_core_clk 523/523, gcc_ufs_phy_unipro_core_clk " \
+               "522/522, tcsr_ufs_pad_clkref_en 522/522, bi_tcxo itself 5"
+        self.assertIn(f"evidence: XO (bi_tcxo) voted in the sleep set by these prepared clocks below it "
+                      f"(enable/prepare): {held}\n", self.out)
+        self.assertIn(f"cycle 1/1: evidence: before: XO held by: {held}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: after: XO held by: gcc_ufs_phy_axi_clk 523/523, gcc_ufs_phy_ice_core_clk "
+                      "524/524, gcc_ufs_phy_unipro_core_clk 523/523, tcsr_ufs_pad_clkref_en 523/523, bi_tcxo itself "
+                      "6\n", self.out)
+        self.assertIn("evidence:   bi_tcxo 6 6 xo_board", self.out)
+        self.assertIn("cycle 1/1: evidence: genpd powered off in the sleep (idle states usage of each domain): cx +1, "
+                      "mx +0, pcie_0_gdsc +1\n", self.out)
+        self.assertIn("cycle 1/1: evidence: dsp interrupts: 13 ipcc_0 +50\n", self.out)
+        self.assertIn("evidence: awake, 5 s before the first sleep: aosd +0, cxsd +0, ddr +0; subsystems adsp +0, "
+                      "apss +0", self.out)
+        pmsg = [line for line in self.pmsg_lines() if ": evidence: " in line]
+        self.assertEqual(pmsg[3], "cycle 1/1: evidence: genpd off: cx +1, mx +0, pcie_0_gdsc +1; dsp irq 13 ipcc_0 "
+                                  "+50; wifi: pci 0000:00:00.0 - D0 5.0 GT/s PCIe, 0000:01:00.0 - D0 5.0 GT/s PCIe; "
+                                  "no Wi-Fi failure line")
+        self.assertTrue(pmsg[4].startswith("cycle 1/1: evidence: XO held by: gcc_ufs_phy_axi_clk 523/523"), pmsg[4])
+
+
 # llvm-objdump --no-show-raw-insn of qmp_ufs_phy_calibrate in a vmlinux, as
 # revision 7's shows it (abridged): the board gate is the call of
 # of_machine_compatible_match.
@@ -7141,7 +7643,8 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
         for patch in (REPO / "kernel/patches").glob("*.patch"):
             for target in re.findall(r"^\+\+\+ b/(\S+)", patch.read_text(), re.M):
                 touching.setdefault(target, []).append(patch.name)
-        self.assertEqual(sorted(touching[f"{GCC}.c"]), sorted(["gcc-sm8550-usb-gdscs-retention.patch", self.GDSC]))
+        self.assertEqual(sorted(touching[f"{GCC}.c"]), sorted(["gcc-sm8550-usb-gdscs-retention.patch", self.GDSC,
+                                                              GDSC_PATCHES[0]]))
         self.assertEqual(touching[f"{RPMHPD}.c"], [self.FLOOR])
 
     def pinned_files(self, tree, usb=True):
@@ -7208,11 +7711,13 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
             self.assertEqual((pathlib.Path(tmp, "bare") / f"{GCC}.c").read_text(), bare)
 
     @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
-    def test_the_gdsc_table_is_as_it_was_and_the_handler_writes_four_power_states(self):
+    def test_the_gdsc_table_is_as_it_was_and_each_switch_writes_its_own_domains(self):
         """The patch adds code after module_exit() and changes no line of the
-        table: the four GDSCs keep PWRSTS_RET_ON.  The handler refuses a
-        value before SYSTEM_RUNNING (the command line), writes .pwrsts of
-        those four and nothing else, from the three switches."""
+        table: the four GDSCs keep the states the patches under it gave
+        them.  Each switch has a const descriptor of its GDSCs; the handler
+        refuses a value before SYSTEM_RUNNING (the command line) and writes
+        .pwrsts of its own switch's GDSCs and nothing else; a switch reads
+        its first GDSC's state; debug_boot_state is read-only."""
         with tempfile.TemporaryDirectory() as tmp:
             tree = pathlib.Path(tmp)
             self.pinned_files(tree)
@@ -7228,23 +7733,167 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
             body = re.search(rf"^static struct gdsc {name} = {{\n(.*?)^}};", after, re.M | re.S).group(1)
             self.assertIn("\t.pwrsts = PWRSTS_RET_ON,\n", body, name)
         new = after[exit_at:]
+        self.assertEqual(re.findall(r"^static const struct gcc_sm8550_debug_switch (\w+) = \{\n\t\.name = \"(\w+)\",\n"
+                                    r"\t\.gdscs = \{ (.*?) \},\n\};", new, re.M),
+                         [("gcc_sm8550_debug_pcie0", "pcie0", "&pcie_0_gdsc"),
+                          ("gcc_sm8550_debug_pcie0_phy", "pcie0phy", "&pcie_0_phy_gdsc"),
+                          ("gcc_sm8550_debug_usb", "usb", "&usb30_prim_gdsc, &usb3_phy_gdsc")])
         handler = re.search(r"^static int gcc_sm8550_debug_set\(.*?^\}\n", new, re.M | re.S).group(0)
         self.assertIn("\tif (system_state != SYSTEM_RUNNING)\n\t\treturn -EPERM;\n", handler)
-        self.assertEqual(re.findall(r"gcc_sm8550_debug_pwrsts\(&(\w+), (\w+)\);", handler),
-                         [("pcie_0_gdsc", "debug_pcie0_off"), ("pcie_0_phy_gdsc", "debug_pcie0_phy_off"),
-                          ("usb30_prim_gdsc", "debug_usb_off"), ("usb3_phy_gdsc", "debug_usb_off")])
-        self.assertIn("\tWRITE_ONCE(*(u8 *)&sc->pwrsts, off ? PWRSTS_OFF_ON : PWRSTS_RET_ON);\n", new)
+        self.assertLess(handler.index("return -EPERM;"), handler.index("kstrtobool(val, &off)"))
+        self.assertIn("\tfor (i = 0; i < ARRAY_SIZE(sw->gdscs) && sw->gdscs[i]; i++)\n"
+                      "\t\tWRITE_ONCE(*(u8 *)&sw->gdscs[i]->pwrsts, off ? PWRSTS_OFF_ON : PWRSTS_RET_ON);\n", handler)
         # That is the one write: no assignment to a .pwrsts anywhere else.
-        self.assertEqual(new.count("sc->pwrsts"), 1)
+        self.assertEqual(new.count("->pwrsts"), 2)
+        self.assertEqual(new.count("WRITE_ONCE("), 1)
         self.assertIsNone(re.search(r"pwrsts\s*=(?!=)", new))
-        self.assertEqual(sorted(re.findall(r"^module_param_cb\((\w+), &gcc_sm8550_debug_ops, &(\w+), (\d+)\);",
-                                           new, re.M)),
-                         sorted([(n, n, "0644") for n in ("debug_pcie0_off", "debug_pcie0_phy_off",
-                                                          "debug_usb_off")]))
+        self.assertIn("\treturn READ_ONCE(sc->pwrsts) == PWRSTS_OFF_ON;\n", new)
+        params = [" ".join(m.split()) for m in re.findall(r"^module_param_cb\((.*?)\);", new, re.M | re.S)]
+        self.assertEqual(params, [
+            "debug_pcie0_off, &gcc_sm8550_debug_ops, (void *)&gcc_sm8550_debug_pcie0, 0644",
+            "debug_pcie0_phy_off, &gcc_sm8550_debug_ops, (void *)&gcc_sm8550_debug_pcie0_phy, 0644",
+            "debug_usb_off, &gcc_sm8550_debug_ops, (void *)&gcc_sm8550_debug_usb, 0644",
+            "debug_boot_state, &gcc_sm8550_debug_boot_ops, NULL, 0444"])
+        boot_set = re.search(r"^static int gcc_sm8550_debug_boot_set\(.*?^\}\n", new, re.M | re.S).group(0)
+        self.assertEqual(boot_set.count("\n"), 4)
+        self.assertIn("\treturn -EPERM;\n", boot_set)
         # A plain parameter: lockdown refuses only module_param_hw() ones,
         # which the comment names and the code does not use.
         self.assertFalse([line for line in new.splitlines()
                           if "module_param_hw" in line and not line.lstrip().startswith("*")])
+
+    def switch_program(self, source):
+        """A program that runs the debug switches' code of SOURCE (the
+        patched gcc-sm8550.c, from its comment after module_exit() to the
+        end) against four stand-in GDSCs with their compiled power states,
+        the kernel's macros as small C ones, and prints what each step
+        reads and writes."""
+        code = source[source.index("/*\n * SM8550 deep-sleep debug, not for release builds"):]
+        code = code[:code.index("MODULE_DESCRIPTION(\"QTI GCC SM8550 Driver\");")]
+        table = {name: re.search(rf"^static struct gdsc {name} = {{\n.*?\t\.pwrsts = (\w+),", source,
+                                 re.M | re.S).group(1)
+                 for name in ("pcie_0_gdsc", "pcie_0_phy_gdsc", "usb30_prim_gdsc", "usb3_phy_gdsc")}
+        gdscs = "".join(f"static struct gdsc {name} = {{ .pwrsts = {state} }};\n" for name, state in table.items())
+        return r'''
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+typedef unsigned char u8;
+#define BIT(n) (1u << (n))
+#define PWRSTS_OFF BIT(0)
+#define PWRSTS_RET BIT(1)
+#define PWRSTS_ON BIT(2)
+#define PWRSTS_OFF_ON (PWRSTS_OFF | PWRSTS_ON)
+#define PWRSTS_RET_ON (PWRSTS_RET | PWRSTS_ON)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define READ_ONCE(x) (*(const volatile __typeof__(x) *)&(x))
+#define WRITE_ONCE(x, v) (*(volatile __typeof__(x) *)&(x) = (v))
+#define pr_info(...) printf("pr_info: " __VA_ARGS__)
+enum { SYSTEM_BOOTING, SYSTEM_RUNNING };
+static int system_state;
+struct gdsc { const u8 pwrsts; };
+struct kernel_param;
+struct kernel_param_ops {
+	int (*set)(const char *val, const struct kernel_param *kp);
+	int (*get)(char *buffer, const struct kernel_param *kp);
+};
+struct kernel_param { const char *name; const struct kernel_param_ops *ops; void *arg; };
+#define module_param_cb(n, o, a, perm) static const struct kernel_param __param_##n = { #n, o, a }
+#define MODULE_PARM_DESC(n, d)
+static int kstrtobool(const char *s, bool *res)
+{
+	switch (s[0]) {
+	case 'y': case 'Y': case '1': *res = true; return 0;
+	case 'n': case 'N': case '0': *res = false; return 0;
+	}
+	return -EINVAL;
+}
+''' + gdscs + code + r'''
+static void show(const char *when)
+{
+	char b[4096];
+	const struct kernel_param *all[] = { &__param_debug_pcie0_off, &__param_debug_pcie0_phy_off,
+					     &__param_debug_usb_off, &__param_debug_boot_state };
+	printf("%s:", when);
+	for (unsigned i = 0; i < 4; i++) {
+		all[i]->ops->get(b, all[i]);
+		b[strcspn(b, "\n")] = 0;
+		printf(" %s=%s", all[i]->name, b);
+	}
+	printf(" table=%u,%u,%u,%u\n", pcie_0_gdsc.pwrsts, pcie_0_phy_gdsc.pwrsts, usb30_prim_gdsc.pwrsts,
+	       usb3_phy_gdsc.pwrsts);
+}
+static void set(const struct kernel_param *kp, const char *v)
+{
+	printf("set %s=%s: %d\n", kp->name, v, kp->ops->set(v, kp));
+}
+int main(void)
+{
+	show("boot");
+	set(&__param_debug_pcie0_off, "Y");
+	set(&__param_debug_boot_state, "Y");
+	system_state = SYSTEM_RUNNING;
+	set(&__param_debug_usb_off, "x");
+	show("running");
+	set(&__param_debug_usb_off, "Y");
+	show("usb");
+	set(&__param_debug_pcie0_off, "N");
+	show("pcie0 N");
+	set(&__param_debug_pcie0_off, "Y");
+	set(&__param_debug_usb_off, "N");
+	show("back");
+	return 0;
+}
+'''
+
+    def run_switches(self, pcie0_off):
+        """The debug switches' code compiled and run on the pinned file with
+        the USB GDSC patch, and with revision 11's pcie_0_gdsc if PCIE0_OFF."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = pathlib.Path(tmp)
+            self.pinned_files(tree)
+            for patch in ([GDSC_PATCHES[0]] if pcie0_off else []) + [self.GDSC]:
+                subprocess.run(["patch", "-s", "-d", str(tree), "-p1", "--fuzz=0", "--no-backup-if-mismatch"],
+                               input=(REPO / "kernel/patches" / patch).read_text(), check=True, text=True)
+            c = tree / "switches.c"
+            c.write_text(self.switch_program((tree / f"{GCC}.c").read_text()))
+            subprocess.run(["cc", "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-function", "-Wno-unused-variable",
+                            "-o", str(tree / "switches"), str(c)], check=True, capture_output=True, text=True)
+            return subprocess.run([str(tree / "switches")], check=True, capture_output=True, text=True).stdout
+
+    @unittest.skipUnless(kernel_source() and shutil.which("cc"), "no pinned kernel checkout or no C compiler")
+    def test_the_switches_read_the_table_write_their_own_domains_and_keep_the_boot_state(self):
+        """The patch's code compiled with stand-ins for the kernel's macros:
+        without revision 11's patch every switch boots N, with it pcie0 Y; a
+        write before SYSTEM_RUNNING is refused and changes nothing, a bad
+        value too, debug_boot_state takes none; a write changes its own
+        GDSCs' state alone (5 is PWRSTS_OFF_ON, 6 PWRSTS_RET_ON), and
+        debug_boot_state goes on saying how the kernel booted."""
+        r10 = ("boot: debug_pcie0_off=N debug_pcie0_phy_off=N debug_usb_off=N "
+               "debug_boot_state=pcie0 N, pcie0phy N, usb N table=6,6,6,6\n"
+               "set debug_pcie0_off=Y: -1\nset debug_boot_state=Y: -1\nset debug_usb_off=x: -22\n"
+               "running: debug_pcie0_off=N debug_pcie0_phy_off=N debug_usb_off=N "
+               "debug_boot_state=pcie0 N, pcie0phy N, usb N table=6,6,6,6\n"
+               "pr_info: gcc-sm8550: debug switches: pcie_0_gdsc RET_ON, pcie_0_phy_gdsc RET_ON, usb30_prim_gdsc and "
+               "usb3_phy_gdsc OFF_ON, from the next power-off\nset debug_usb_off=Y: 0\n"
+               "usb: debug_pcie0_off=N debug_pcie0_phy_off=N debug_usb_off=Y "
+               "debug_boot_state=pcie0 N, pcie0phy N, usb N table=6,6,5,5\n")
+        out = self.run_switches(False)
+        self.assertTrue(out.startswith(r10), out)
+        out = self.run_switches(True)
+        self.assertEqual(out.splitlines()[0], "boot: debug_pcie0_off=Y debug_pcie0_phy_off=N debug_usb_off=N "
+                                              "debug_boot_state=pcie0 Y, pcie0phy N, usb N table=5,6,6,6")
+        for line in ("set debug_pcie0_off=Y: -1", "set debug_boot_state=Y: -1", "set debug_usb_off=x: -22",
+                     "running: debug_pcie0_off=Y debug_pcie0_phy_off=N debug_usb_off=N "
+                     "debug_boot_state=pcie0 Y, pcie0phy N, usb N table=5,6,6,6",
+                     "usb: debug_pcie0_off=Y debug_pcie0_phy_off=N debug_usb_off=Y "
+                     "debug_boot_state=pcie0 Y, pcie0phy N, usb N table=5,6,5,5",
+                     "pcie0 N: debug_pcie0_off=N debug_pcie0_phy_off=N debug_usb_off=Y "
+                     "debug_boot_state=pcie0 Y, pcie0phy N, usb N table=6,6,5,5",
+                     "back: debug_pcie0_off=Y debug_pcie0_phy_off=N debug_usb_off=N "
+                     "debug_boot_state=pcie0 Y, pcie0phy N, usb N table=5,6,6,6"):
+            self.assertIn(line + "\n", out)
 
     def aggregate_program(self, source):
         """A program that runs rpmhpd_aggregate_corner() of SOURCE, with its
@@ -7728,6 +8377,161 @@ class SleepFixesTest(unittest.TestCase):
             self.assertNotEqual(staged, first)
 
 
+class PcieGdscOffTest(unittest.TestCase):
+    """Revision 11's pcie_0_gdsc: the build script's variable,
+    APPLY_SM8550_PCIE0_GDSC_OFF, run from its own text (off by default, 0 or
+    1 only, refused without APPLY_SM8550_SLEEP_FIXES=1 before the tree is
+    touched, the patch applied strictly and once on top of the USB GDSC
+    patch, a tree that carries it refused without the variable), and the
+    patch against the pinned kernel checkout (only read): one line of the
+    table changed, pcie_0_gdsc's, the line count kept, so that the debug
+    switches go in at the same lines with it and without it."""
+
+    BUILD = REPO / "scripts/build-mainline-kernel.sh"
+    PATCH = GDSC_PATCHES[0]
+
+    def text(self):
+        return self.BUILD.read_text()
+
+    def block(self):
+        """The build script's lines from pcie0_gdsc_patch= to its fi."""
+        text = self.text()
+        start = text.index("pcie0_gdsc_patch=")
+        return text[start:text.index("\nfi\n", start) + len("\nfi\n")]
+
+    def run_block(self, block, tree, value, debug="0"):
+        return subprocess.run(["bash", "-c", "set -euo pipefail\nkernel_tree=$1 pat=$2 apply_pcie0_gdsc_off=$3 "
+                               "apply_deep_sleep_debug=$4\n" + block, "build", str(tree),
+                               str(REPO / "kernel/patches"), value, debug], capture_output=True, text=True)
+
+    def pinned_file(self, tree):
+        """gcc-sm8550.c as the build has it when the block runs: the pinned
+        file with the USB GDSC patch."""
+        (tree / GCC).parent.mkdir(parents=True, exist_ok=True)
+        (tree / f"{GCC}.c").write_text(subprocess.run(["git", "-C", str(kernel_source()), "show", f"HEAD:{GCC}.c"],
+                                                      check=True, capture_output=True, text=True).stdout)
+        subprocess.run(["patch", "-s", "-d", str(tree), "-p1", "--fuzz=0", "--no-backup-if-mismatch"],
+                       input=(REPO / "kernel/patches/gcc-sm8550-usb-gdscs-retention.patch").read_text(),
+                       check=True, text=True)
+
+    def test_the_variable_is_off_by_default_0_or_1_and_needs_the_sleep_fixes(self):
+        text = self.text()
+        self.assertIn("\napply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}\n", text)
+        self.assertIn('\nvalidate_bool APPLY_SM8550_PCIE0_GDSC_OFF "$apply_pcie0_gdsc_off"\n', text)
+        validate = re.search(r"^validate_bool\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        start = text.index('if [ "$apply_pcie0_gdsc_off" = 1 ] && [ "$apply_sm8550_sleep_fixes" != 1 ]; then\n')
+        needs = text[start:text.index("\nfi\n", start) + len("\nfi\n")]
+        # Checked with the other variables, before the source tree is made.
+        self.assertLess(start, text.index('git -C "$kernel_src" worktree add --detach "$kernel_tree" HEAD'))
+        check = ("apply_sm8550_sleep_fixes=${APPLY_SM8550_SLEEP_FIXES:-0}\n"
+                 "apply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}\n" + validate +
+                 'validate_bool APPLY_SM8550_PCIE0_GDSC_OFF "$apply_pcie0_gdsc_off"\n' + needs)
+        for value, fixes, ok in (("", "", True), ("0", "", True), ("0", "1", True), ("1", "1", True),
+                                 ("1", "", False), ("1", "0", False), ("yes", "1", False), ("2", "1", False),
+                                 ("01", "1", False)):
+            with self.subTest(value=value, fixes=fixes):
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("APPLY_SM8550_PCIE0_GDSC_OFF", "APPLY_SM8550_SLEEP_FIXES")}
+                if value:
+                    env["APPLY_SM8550_PCIE0_GDSC_OFF"] = value
+                if fixes:
+                    env["APPLY_SM8550_SLEEP_FIXES"] = fixes
+                result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check], capture_output=True,
+                                        text=True, env=env)
+                self.assertEqual(result.returncode == 0, ok, result.stderr)
+                if not ok and value == "1":
+                    self.assertIn("APPLY_SM8550_PCIE0_GDSC_OFF=1 needs APPLY_SM8550_SLEEP_FIXES=1: without the "
+                                  "PIPE clock revert pcie_0_gdsc does not power up again at the resume",
+                                  result.stderr)
+                elif not ok:
+                    self.assertIn("APPLY_SM8550_PCIE0_GDSC_OFF must be 0 or 1", result.stderr)
+
+    def test_the_patch_goes_on_after_the_usb_patch_and_before_the_debug_switches_on_both_boards(self):
+        """No board in the block or the patch; the patch changes one line of
+        gcc-sm8550.c, pcie_0_gdsc's power states, and nothing else."""
+        text = self.text()
+        block = self.block()
+        at = text.index(block)
+        self.assertLess(text.index("\tdrivers/clk/qcom/gcc-sm8550.c gcc-sm8550-usb-gdscs-retention.patch\n"), at)
+        self.assertLess(at, text.index("deep_sleep_debug_marker='"))
+        self.assertNotIn("DEVICE", block)
+        self.assertNotIn("gts9", block)
+        self.assertEqual(text.count(f"pcie0_gdsc_patch={self.PATCH}\n"), 1)
+        patch = (REPO / "kernel/patches" / self.PATCH).read_text()
+        self.assertEqual(diff_lines(patch), {f"{GCC}.c": ["-\t.pwrsts = PWRSTS_RET_ON,", "+" + PCIE0_LINE[:-1]]})
+        self.assertIn(' \t\t.name = "pcie_0_gdsc",\n \t},\n-\t.pwrsts = PWRSTS_RET_ON,\n', patch)
+        header = patch.split("\n--- a/", 1)[0]
+        for words in ("APPLY_SM8550_PCIE0_GDSC_OFF=1", "APPLY_SM8550_SLEEP_FIXES=1", "967e011013ed",
+                      "No board check"):
+            self.assertIn(words, " ".join(header.split()))
+        self.assertNotIn("of_machine_is_compatible", patch)
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_variable_applies_it_once_and_a_build_without_it_refuses_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = pathlib.Path(tmp)
+            self.pinned_file(tree)
+            before = (tree / f"{GCC}.c").read_text()
+            listing = sorted(p.name for p in (tree / GCC).parent.iterdir())
+            result = self.run_block(self.block(), tree, "0")
+            self.assertEqual((result.returncode, (tree / f"{GCC}.c").read_text()), (0, before), result.stderr)
+            result = self.run_block(self.block(), tree, "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotRegex(result.stdout, "offset|fuzz")
+            after = (tree / f"{GCC}.c").read_text()
+            self.assertEqual(sorted(p.name for p in (tree / GCC).parent.iterdir()), listing)
+            # One line changed, in pcie_0_gdsc, the line count kept.
+            old, new = before.splitlines(True), after.splitlines(True)
+            self.assertEqual(len(old), len(new))
+            changed = [i for i, (a, b) in enumerate(zip(old, new)) if a != b]
+            self.assertEqual(len(changed), 1)
+            self.assertEqual((old[changed[0]], new[changed[0]]), ("\t.pwrsts = PWRSTS_RET_ON,\n", PCIE0_LINE))
+            body = re.search(r"^static struct gdsc pcie_0_gdsc = \{\n(.*?)^\};", after, re.M | re.S).group(1)
+            self.assertIn(PCIE0_LINE, body)
+            self.assertEqual(after.count("PWRSTS_OFF_ON, /* "), 1)
+            # A reused tree: nothing changes.
+            result = self.run_block(self.block(), tree, "1")
+            self.assertEqual((result.returncode, (tree / f"{GCC}.c").read_text()), (0, after), result.stderr)
+            # A build without the variable in that tree: refused, as it was.
+            result = self.run_block(self.block(), tree, "0")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(f"{self.PATCH} remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR "
+                          "for a build without APPLY_SM8550_PCIE0_GDSC_OFF=1.", result.stderr)
+            self.assertEqual((tree / f"{GCC}.c").read_text(), after)
+            # A copy with the line but not the patch's context is refused.
+            damaged = after.replace(PCIE0_LINE + "\t.flags = VOTABLE | POLL_CFG_GDSCR | RETAIN_FF_ENABLE,\n",
+                                    PCIE0_LINE + "\t.flags = VOTABLE | POLL_CFG_GDSCR,\n")
+            self.assertNotEqual(damaged, after)
+            (tree / f"{GCC}.c").write_text(damaged)
+            result = self.run_block(self.block(), tree, "1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((tree / f"{GCC}.c").read_text(), damaged)
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_debug_switches_go_in_at_the_same_lines_with_it_and_without_it(self):
+        """The debug switches' block of the build after this one, in a tree
+        with the patch and in one without: no offset either way, and the
+        two files differ in pcie_0_gdsc's line alone; the debug patch's
+        reverse check passes on both (a reused tree)."""
+        debug = DeepSleepDebugSwitchTest("run").block()
+        files = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for value in ("0", "1"):
+                tree = pathlib.Path(tmp, value)
+                self.pinned_file(tree)
+                (tree / RPMHPD).parent.mkdir(parents=True)
+                (tree / f"{RPMHPD}.c").write_text(subprocess.run(
+                    ["git", "-C", str(kernel_source()), "show", f"HEAD:{RPMHPD}.c"], check=True, capture_output=True,
+                    text=True).stdout)
+                for again in (False, True):
+                    result = self.run_block(self.block() + debug, tree, value, "1")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotRegex(result.stdout, "offset|fuzz")
+                files.append((tree / f"{GCC}.c").read_text().splitlines(True))
+        self.assertEqual(len(files[0]), len(files[1]))
+        self.assertEqual([(a, b) for a, b in zip(*files) if a != b], [("\t.pwrsts = PWRSTS_RET_ON,\n", PCIE0_LINE)])
+
+
 class PipeClockGateTest(unittest.TestCase):
     """make-kit.sh's section 5c for revision 10's PCIe PIPE clock, on
     stand-in vmlinux files: their symbol lists (what llvm-nm gives) and the
@@ -7942,11 +8746,11 @@ class ScriptsTest(unittest.TestCase):
     def test_the_image_check_looks_for_what_only_this_revision_has(self):
         """The first three strings are also in an image built with the plain
         longer timeout before it, and the deadline of the Try.SNK wait is in
-        the second revision of that patch alone.  The last six came after
-        it: the log lines of the three fixes for a swap asked for from
+        the second revision of that patch alone.  The six after them came
+        after it: the log lines of the three fixes for a swap asked for from
         userspace, of which the third has three (the PR_Swap one is in no
         earlier revision of that patch), and the driver's mark for reading
-        its parameters at each attach."""
+        its parameters at each attach.  Then revisions 8 to 11's."""
         text = (KIT_SRC / "make-kit.sh").read_text()
         strings = shlex.split(re.search(r"^new_strings=\((.*?)\)$", text, re.M | re.S).group(1))
         self.assertEqual(strings, ["Requesting DFP before discovery", "sink_host_swap",
@@ -7962,7 +8766,8 @@ class ScriptsTest(unittest.TestCase):
                                    "gcc_sm8550.debug_pcie0_off", "gcc_sm8550.debug_pcie0_phy_off",
                                    "gcc_sm8550.debug_usb_off", "rpmhpd.debug_ret_floor",
                                    "failed to get tx_lane0_sync_clk", "failed to get rx_lane0_sync_clk",
-                                   "failed to get rx_lane1_sync_clk", "power-up write: PWRDN"])
+                                   "failed to get rx_lane1_sync_clk", "power-up write: PWRDN",
+                                   "gcc_sm8550.debug_boot_state"])
         # Revision 10's four: the messages of ufs-qcom's lane clock lookup,
         # in upstream f07317a8d57f's code and no other patch, and the second
         # UFS PHY diagnostic's format string.  The PIPE clock revert, the
@@ -7994,11 +8799,14 @@ class ScriptsTest(unittest.TestCase):
                                   and patch.name not in (UFS_PATCHES[1], UFS_PATCHES[2])], [])
         # Revision 9's four: the names the kernel gives the debug switches'
         # parameters, built in (KBUILD_MODNAME, then the parameter's own),
-        # each made by a module_param_cb() of its patch alone.
+        # each made by a module_param_cb() of its patch alone; and revision
+        # 11's fifth, the same way.  Revision 11's pcie_0_gdsc leaves no
+        # string (PcieGdscOffTest, and the power domain checks).
         for line, patch, target in ((strings[13], DEBUG_PATCHES[0], f"{GCC}.c"),
                                     (strings[14], DEBUG_PATCHES[0], f"{GCC}.c"),
                                     (strings[15], DEBUG_PATCHES[0], f"{GCC}.c"),
-                                    (strings[16], DEBUG_PATCHES[1], f"{RPMHPD}.c")):
+                                    (strings[16], DEBUG_PATCHES[1], f"{RPMHPD}.c"),
+                                    (strings[21], DEBUG_PATCHES[0], f"{GCC}.c")):
             with self.subTest(line):
                 module, name = line.split(".")
                 self.assertEqual(module, pathlib.Path(target).stem.replace("-", "_"))
@@ -8049,10 +8857,11 @@ class ScriptsTest(unittest.TestCase):
 
     def test_the_kit_s_patches_are_patches_the_build_applies(self):
         text = (KIT_SRC / "make-kit.sh").read_text()
-        typec, debug, fix, ufs = kit_patches(text)
-        self.assertEqual((typec, debug, fix, ufs), (TYPEC_PATCHES, DEBUG_PATCHES, FIX_PATCHES, UFS_PATCHES))
-        self.assertIn('\npatches=("${typec_patches[@]}" "${debug_patches[@]}" "${fix_patches[@]}" '
-                      '"${ufs_patches[@]}")\n', text)
+        typec, gdsc, debug, fix, ufs = kit_patches(text)
+        self.assertEqual((typec, gdsc, debug, fix, ufs),
+                         (TYPEC_PATCHES, GDSC_PATCHES, DEBUG_PATCHES, FIX_PATCHES, UFS_PATCHES))
+        self.assertIn('\npatches=("${typec_patches[@]}" "${gdsc_patches[@]}" "${debug_patches[@]}" '
+                      '"${fix_patches[@]}" "${ufs_patches[@]}")\n', text)
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text().replace("\\\n", " ")
         for name in typec:
             with self.subTest(name):
@@ -8077,6 +8886,14 @@ class ScriptsTest(unittest.TestCase):
                 self.assertTrue((REPO / "kernel/patches" / name).is_file())
                 self.assertEqual(flat.count(f"sleep_fix {target} '{line}' {name}"), 1)
         self.assertEqual(build.count(f"drivers/phy/qualcomm/phy-qcom-qmp-pcie.c {UNPARK}"), 1)
+        # Revision 11's behind its variable, by the line it gives
+        # pcie_0_gdsc, which the kit knows it by too.
+        self.assertEqual(gdsc, ["gcc-sm8550-pcie0-gdsc-off-in-suspend.patch"])
+        self.assertIn(f"\npcie0_gdsc_patch={gdsc[0]}\n", build)
+        self.assertIn('\npcie0_gdsc_line="PWRSTS_OFF_ON, /* $pcie0_gdsc_patch */"\n', build)
+        self.assertEqual(build.count('< "$pat/$pcie0_gdsc_patch"'), 2)
+        self.assertIn(f"\npcie0_line='{PCIE0_LINE.strip()[len('.pwrsts = '):]}'\n", text)
+        self.assertIn(PCIE0_LINE, (REPO / "kernel/patches" / gdsc[0]).read_text().replace("\n+\t", "\n\t"))
         # Revision 9's two behind their switch, each by the file it changes.
         for name, target in zip(debug, (f"{GCC}.c", f"{RPMHPD}.c")):
             with self.subTest(name):
@@ -8087,7 +8904,7 @@ class ScriptsTest(unittest.TestCase):
         # build's, and so is the PCIe PHY's, which loses the unpark patch.
         patched = re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1)
         changed = set()
-        for name in typec + debug + fix + ufs:
+        for name in typec + gdsc + debug + fix + ufs:
             changed.update(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / name).read_text(),
                                       re.M))
         self.assertEqual(changed, {f"{TCPM_DIR}/tcpm.c", "include/linux/usb/tcpm.h", f"{GCC}.c",
@@ -8107,7 +8924,7 @@ class ScriptsTest(unittest.TestCase):
             self.assertIn(f"\n{name}={value}\n", text)
         self.assertIn(f"\nunpark={UNPARK}\n", text)
         self.assertIn('fix_files=("$phymux.c" "$gmu.c" "$ufs_qcom.c")\n', text)
-        self.assertIn("\nrevision=10\n", text)
+        self.assertIn("\nrevision=11\n", text)
         # The build tree has to carry each fix whole and not the unpark
         # patch; the hang-log tree none of the fixes and the unpark patch.
         self.assertIn('die "the build tree\'s $f does not carry ${fix_patches[$i]} whole"', text)
@@ -8122,9 +8939,21 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn("die 'the hang-log tree carries the deep-sleep debug switches already'", text)
         self.assertIn('cmp -s "$tmp/rpmhpd.hang.data" "$tmp/rpmhpd.new.data" ||', text)
         for parm in ("gcc_sm8550.parm=debug_pcie0_off:", "gcc_sm8550.parm=debug_pcie0_phy_off:",
-                     "gcc_sm8550.parm=debug_usb_off:", "rpmhpd.parm=debug_ret_floor:"):
+                     "gcc_sm8550.parm=debug_usb_off:", "rpmhpd.parm=debug_ret_floor:",
+                     "gcc_sm8550.parm=debug_boot_state:"):
             self.assertIn(parm, text)
-        self.assertIn("for f in gcc_sm8550_debug_set rpmhpd_debug_ret_floor_set; do", text)
+        self.assertIn("for f in gcc_sm8550_debug_set gcc_sm8550_debug_get gcc_sm8550_debug_boot_get "
+                      "rpmhpd_debug_ret_floor_set; do", text)
+        # Each of those functions is the debug patch's.
+        for f in ("gcc_sm8550_debug_set", "gcc_sm8550_debug_get", "gcc_sm8550_debug_boot_get"):
+            self.assertTrue([a for a in added_lines(DEBUG_PATCHES[0])[f"{GCC}.c"] if a.startswith(f"static int {f}(")],
+                            f)
+        # The build tree has to carry revision 11's line whole, its PCIe
+        # neighbours as upstream has them; the hang-log tree has not.
+        self.assertIn('die "the build tree does not carry ${gdsc_patches[0]} (pcie_0_gdsc)"', text)
+        self.assertIn('die "the build tree\'s $gcc.c does not carry ${gdsc_patches[0]} whole"', text)
+        self.assertIn('die "the hang-log tree\'s pcie_0_gdsc is not upstream\'s PWRSTS_RET_ON"', text)
+        self.assertIn('for p in "${gdsc_patches[@]}" "${debug_patches[@]}"; do', text)
 
     def test_every_changed_source_is_required_dated_and_compared(self):
         """The kit's changes to the kernel tree are the patched files and the
@@ -8184,9 +9013,10 @@ class ScriptsTest(unittest.TestCase):
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text()
         self.assertIn("apply_unless 'dwc3_qcom_set_pstate' \\\n\tdrivers/usb/dwc3/dwc3-qcom.c \\\n"
                       "\tdwc3-qcom-drop-required-opps-vote-in-system-suspend.patch\n", build)
-        self.assertIn('llvm-objcopy -O binary --only-section=.data "$HANG_SCRATCH/linux-gts9wifi/$gcc.o"',
+        self.assertIn('\tllvm-objcopy -O binary --only-section=.data "$1" "$tmp/gcc.hang.data"\n', text)
+        self.assertIn('\tgdsc_table_check "$HANG_SCRATCH/linux-gts9wifi/$gcc.o" "$build/$gcc.o" || exit 1\n', text)
+        self.assertIn("""\tif [ "$(cat "$tmp/gcc.data.got")" = 'pcie_0_gdsc 6 5;usb30_prim_gdsc 5 6;usb3_phy_gdsc 5 6;' ] &&\n""",
                       text)
-        self.assertIn("""tr '\\n' ';')" = '5 6;5 6;' ]""", text)
         self.assertIn('\techo "power domain table: $gdsc_check"\n', text)
         tools = re.search(r"^for t in (.*); do$", text, re.M).group(1).split()
         self.assertIn("llvm-objcopy", tools)
@@ -8259,6 +9089,136 @@ class ScriptsTest(unittest.TestCase):
             self.assertNotRegex(applied.stdout, r"fuzz|offset")
             result = self.power_domain_gate(target.read_text())
         self.assertEqual((result.returncode, result.stderr), (0, ""))
+
+    def pcie0_gate(self, source):
+        """Run make-kit.sh's check of the build tree for revision 11's
+        pcie_0_gdsc on SOURCE, a gcc-sm8550.c."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        pwrsts = re.search(r"^gdsc_pwrsts\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        start = text.index("# Revision 11: pcie_0_gdsc PWRSTS_OFF_ON by the line of its patch")
+        end = text.index('\tdie "the build tree\'s $gcc.c does not carry ${gdsc_patches[0]} whole"\n', start)
+        gate = text[start:end] + '\tdie "the build tree\'s $gcc.c does not carry ${gdsc_patches[0]} whole"\n'
+        lists = re.search(r"^gdsc_patches=\(.*?\)\n", text, re.M).group(0) + \
+            re.search(r"^pcie0_line=.*\n", text, re.M).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = pathlib.Path(tmp, "tree")
+            (tree / GCC).parent.mkdir(parents=True)
+            (tree / f"{GCC}.c").write_text(source)
+            pathlib.Path(tmp, "tmp").mkdir()
+            result = subprocess.run(
+                ["bash", "-c", 'set -euo pipefail; export LC_ALL=C\n'
+                 'die() { echo "$*" >&2; exit 1; }\ntree=$1 tmp=$2 repo=$3 gcc=' + GCC + "\n" + lists + pwrsts + gate,
+                 "gate", str(tree), str(pathlib.Path(tmp, "tmp")), str(REPO)], capture_output=True, text=True)
+            # The tree is only read.
+            self.assertEqual((tree / f"{GCC}.c").read_text(), source)
+            return result.returncode, result.stderr
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_pcie0_check_passes_on_the_file_with_revision_11_s_patch_whole_only(self):
+        upstream = subprocess.run(["git", "-C", str(kernel_source()), "show", f"HEAD:{GCC}.c"],
+                                  check=True, capture_output=True, text=True).stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            target = pathlib.Path(tmp, f"{GCC}.c")
+            target.parent.mkdir(parents=True)
+            target.write_text(upstream)
+            for name in ("gcc-sm8550-usb-gdscs-retention.patch", GDSC_PATCHES[0]):
+                subprocess.run(["patch", "-s", "-d", tmp, "-p1", "--fuzz=0", "--no-backup-if-mismatch"],
+                               input=(REPO / "kernel/patches" / name).read_text(), check=True, text=True)
+                if name != GDSC_PATCHES[0]:
+                    usb = target.read_text()
+            patched = target.read_text()
+        self.assertEqual(self.pcie0_gate(patched), (0, ""))
+        missing = "the build tree does not carry gcc-sm8550-pcie0-gdsc-off-in-suspend.patch (pcie_0_gdsc)\n"
+        for name, source, message in (
+                ("upstream", upstream, missing),
+                ("revision 10", usb, missing),
+                # The state without the patch's line, and the line elsewhere.
+                ("the state alone", usb.replace('"pcie_0_gdsc",\n\t},\n\t.pwrsts = PWRSTS_RET_ON,',
+                                               '"pcie_0_gdsc",\n\t},\n\t.pwrsts = PWRSTS_OFF_ON,'), missing),
+                ("the line on another domain", usb.replace(
+                    '"pcie_0_phy_gdsc",\n\t},\n\t.pwrsts = PWRSTS_RET_ON,',
+                    '"pcie_0_phy_gdsc",\n\t},\n' + PCIE0_LINE[:-1]), missing),
+                ("its PHY's domain off as well", patched.replace(
+                    '"pcie_0_phy_gdsc",\n\t},\n\t.pwrsts = PWRSTS_RET_ON,',
+                    '"pcie_0_phy_gdsc",\n\t},\n\t.pwrsts = PWRSTS_OFF_ON,'),
+                 "the build tree's pcie_0_phy_gdsc is not PWRSTS_RET_ON\n"),
+                ("PCIe1's off", patched.replace('"pcie_1_gdsc",\n\t},\n\t.pwrsts = PWRSTS_RET_ON,',
+                                                '"pcie_1_gdsc",\n\t},\n\t.pwrsts = PWRSTS_OFF_ON,'),
+                 "the build tree's pcie_1_gdsc is not PWRSTS_RET_ON\n"),
+                ("the line without the patch's context", patched.replace(
+                    PCIE0_LINE + "\t.flags = VOTABLE | POLL_CFG_GDSCR | RETAIN_FF_ENABLE,\n",
+                    PCIE0_LINE + "\t.flags = VOTABLE | POLL_CFG_GDSCR,\n"),
+                 "the build tree's drivers/clk/qcom/gcc-sm8550.c does not carry "
+                 "gcc-sm8550-pcie0-gdsc-off-in-suspend.patch whole\n")):
+            with self.subTest(name):
+                self.assertNotEqual(source, patched)
+                code, err = self.pcie0_gate(source)
+                self.assertEqual(code, 1, err)
+                self.assertTrue(err.endswith(message), err)
+
+    def table_check(self, hang, new, new_syms):
+        """Run make-kit.sh's gdsc_table_check() on stand-ins: HANG and NEW are
+        the .data sections (bytes) llvm-objcopy gives, NEW_SYMS the symbol
+        table lines llvm-objdump -t gives for the new object."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        check = re.search(r"^gdsc_table_check\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            bin_ = tmp / "bin"
+            bin_.mkdir()
+            # llvm-objcopy -O binary --only-section=.data IN OUT; llvm-objdump -t IN
+            (bin_ / "llvm-objcopy").write_text('#!/bin/sh\nfor last; do :; done\nin=$(eval echo \\${$(($# - 1))})\n'
+                                               'cp "$in.data" "$last"\n')
+            (bin_ / "llvm-objdump").write_text('#!/bin/sh\nfor last; do :; done\ncat "$last.syms"\n')
+            for stub in bin_.iterdir():
+                stub.chmod(0o755)
+            (tmp / "hang.o.data").write_bytes(hang)
+            (tmp / "new.o.data").write_bytes(new)
+            (tmp / "new.o.syms").write_text(new_syms)
+            (tmp / "hang.o").write_text("ELF\n")
+            (tmp / "new.o").write_text("ELF\n")
+            env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}")
+            result = subprocess.run(["bash", "-c", f"set -euo pipefail; export LC_ALL=C\ntmp={tmp}/w gcc={GCC}\n"
+                                     f"mkdir -p {tmp}/w\n" + check + 'gdsc_table_check "$1" "$2"\n',
+                                     "check", str(tmp / "hang.o"), str(tmp / "new.o")],
+                                    capture_output=True, text=True, env=env)
+            return result.returncode, result.stderr.replace(str(tmp), "TMP")
+
+    def test_the_power_domain_table_check_names_each_changed_byte_by_its_domain(self):
+        """Three domains of 0x40 bytes in .data at 0x100, 0x180 and 0x200,
+        .pwrsts at 0x28 of each, as llvm-objdump -t lists an object's
+        symbols (with a function and a .rodata entry to pass over)."""
+        syms = ("\nnew.o:\tfile format elf64-littleaarch64\n\nSYMBOL TABLE:\n"
+                "0000000000000000 l    df *ABS*\t0000000000000000 gcc-sm8550.c\n"
+                "0000000000000010 l     F .text\t0000000000000020 gcc_sm8550_probe\n"
+                "0000000000000100 l     O .data\t0000000000000040 pcie_0_gdsc\n"
+                "0000000000000180 l     O .data\t0000000000000040 usb30_prim_gdsc\n"
+                "0000000000000200 l     O .data\t0000000000000040 usb3_phy_gdsc\n"
+                "0000000000000300 l     O .rodata\t0000000000000010 gcc_sm8550_desc\n")
+        hang = bytearray(0x300)
+        for at, state in ((0x128, 6), (0x1a8, 5), (0x228, 5)):
+            hang[at] = state
+        def new(changes):
+            data = bytearray(hang)
+            for at, value in changes.items():
+                data[at] = value
+            return bytes(data)
+        r11 = {0x128: 5, 0x1a8: 6, 0x228: 6}
+        self.assertEqual(self.table_check(bytes(hang), new(r11), syms), (0, ""))
+        refused = ("the compiled drivers/clk/qcom/gcc-sm8550 table does not differ from the hang-log build's in the "
+                   "three power-state masks alone")
+        for name, changes, named in (
+                ("revision 10's", {0x1a8: 6, 0x228: 6}, "usb30_prim_gdsc 40 5 6\nusb3_phy_gdsc 40 5 6\n"),
+                ("a fourth byte", {**r11, 0x130: 1}, "pcie_0_gdsc 48 0 1\n"),
+                ("a byte outside every domain", {**r11, 0x2a0: 1}, "? 0 1\n"),
+                ("another byte of a domain", {0x128: 5, 0x1a8: 6, 0x229: 6}, "usb3_phy_gdsc 41 0 6\n"),
+                ("the other way round", {0x128: 7, 0x1a8: 6, 0x228: 6}, "pcie_0_gdsc 40 6 7\n")):
+            with self.subTest(name):
+                code, err = self.table_check(bytes(hang), new(changes), syms)
+                self.assertEqual(code, 1, err)
+                self.assertTrue(err.startswith(refused), err)
+                self.assertIn(named, err)
+        self.assertEqual(self.table_check(bytes(hang), b"", syms), (1, "no .data in TMP/new.o\n"))
 
     def staleness_gate(self, ages=(), out_image=b"image"):
         """Run make-kit.sh's check that the image was made from the sources as
@@ -8383,22 +9343,31 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         kit = sum(kit_patches(text), [])
         self.assertEqual(sorted(set(re.findall(r"`kernel/patches/([^`]+)`", readme))), sorted(kit))
-        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (15, 5))
+        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (16, 5))
         self.assertIn("and the UFS PHY's two (revision 8): nine patches, five of them to TCPM. Revision 9 adds the "
                       "two debug patches above: eleven patches. Revision 10 adds the three upstream fixes and the "
                       "second UFS PHY diagnostic, fifteen patches, and leaves out `unpark-pcie0-pipe-mux.patch`, "
                       "which every default build applies.", readme)
         self.assertIn("In the kernel source tree twelve files differ from the hang-log build:", readme)
         self.assertIn("Against revision 9's tree six differ: those five and `phy-qcom-qmp-ufs.c`.", readme)
+        self.assertIn("Revision 11 adds `kernel/patches/gcc-sm8550-pcie0-gdsc-off-in-suspend.patch` and rewrites "
+                      "the GDSC debug switch patch: sixteen patches, the same twelve files; against revision 10's "
+                      "tree one differs, `gcc-sm8550.c`.", readme)
         # Revision 9: what it is, how it is built, and the runs it was for.
         for said in ("**Revision 9** is revision 8 plus two debug patches, which a release build does not get",
                      "**never set a PCIe one for a suspend in which the PCIe host stays up**",
-                     "**Four debug switches** (revision 9), all off at every boot",
-                     "| `/sys/module/gcc_sm8550/parameters/debug_pcie0_off` | `N` | `gdsc=pcie0` |",
+                     "**Four debug switches** (revision 9), each read as its power domains are, at every boot "
+                     "as the kernel's table has them: off, but `debug_pcie0_off` on from revision 11; and since "
+                     "revision 11 a fifth that says how they booted.",
+                     "| `/sys/module/gcc_sm8550/parameters/debug_pcie0_off` | `N`; `Y` on revision 11 | "
+                     "`gdsc=pcie0` (`Y`), `gdsc-ret=pcie0` (`N`) |",
+                     "| `/sys/module/gcc_sm8550/parameters/debug_boot_state` (revision 11, read-only) | "
+                     "`pcie0 Y, pcie0phy N, usb N` |",
                      "| `/sys/module/rpmhpd/parameters/debug_ret_floor` | `N` | `cxmx=ret` |",
                      "APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 "
                      "APPLY_SM8550_SLEEP_FIXES=1 \\",
-                     "**`gdsc=LIST`** and **`cxmx=ret`** (`ro` and `dry`; the kernels of revisions 9 and 10)",
+                     "**`gdsc=LIST`**, **`gdsc-ret=pcie0`** and **`cxmx=ret`** (`ro` and `dry`; the kernels of "
+                     "revisions 9 to 11)",
                      "**Revision 9: the runs** (2026-11-22 and 23, squirtle;",
                      "each with `ro 1 30 release-floor pci=remove mode=s2idle trace=live hold=60 restart-ok`:",
                      "2. `gdsc=pcie0`;\n3. `gdsc=pcie0,usb`;\n4. `gdsc=pcie0,usb,pcie0phy`;\n"
@@ -8412,7 +9381,35 @@ class ScriptsTest(unittest.TestCase):
                      "A stopped ADSP keeps the DDR at 547 MHz (revision 9's run 2c did the same): do not stop it for a run.",
                      "Revision 10 installs the same way over revision 9, which squirtle has had since 2026-11-22 20:59",
                      "the NEXT line then says that the storage came back and names the PCIe host's line",
-                     "`PCIe came back (no host failure line)`"):
+                     "`PCIe came back (no host failure line)`",
+                     # Revision 11: what it is, the risk of its first boot,
+                     # and its runs.
+                     "**Revision 11** (written 2026-11-23, not built yet) is revision 10 plus one line of the clock "
+                     "controller's power domain table, behind a build variable of its own, "
+                     "`APPLY_SM8550_PCIE0_GDSC_OFF=1`, which needs `APPLY_SM8550_SLEEP_FIXES=1`",
+                     "**in every suspend that keeps the Wi-Fi the domain now collapses under the live PCIe host, "
+                     "and the boot's panel cycle (`ubuntu-gts9u-panel-coldboot-recover`, `pm_test=platform`, "
+                     "about 22 s into every boot) is such a suspend.**",
+                     "a boot loop that only TWRP ends",
+                     "**Revision 11: the runs** (none has run).",
+                     "0. **Choose how the first boot meets the panel cycle.**",
+                     "Masking the unit instead does not do: the floor is then never released",
+                     "   ExecStartPre=-/bin/sh -c 'p=/sys/module/gcc_sm8550/parameters; grep -qx \"pcie0 Y, pcie0phy "
+                     "N, usb N\" $$p/debug_boot_state && echo N > $$p/debug_pcie0_off'\n"
+                     "   ExecStartPost=-/bin/sh -c 'p=/sys/module/gcc_sm8550/parameters; grep -qx \"pcie0 Y, pcie0phy "
+                     "N, usb N\" $$p/debug_boot_state && echo Y > $$p/debug_pcie0_off'\n",
+                     "     sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=remove mode=s2idle hold=60 "
+                     "rpmh restart-ok\n",
+                     "- **`rpmh`** (`ro`; revision 11's script, any kit kernel): what of Linux's own votes stands in "
+                     "the way of XO shutdown, CX collapse and AOSS sleep (`cxsd`, `aosd`).",
+                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 pm_test=platform pci=keep hold=60 restart-ok\n",
+                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep hold=60 "
+                     "restart-ok\n",
+                     "Revision 11 installs the same way over revision 10, which squirtle has had since 2026-11-23 "
+                     "11:37",
+                     "- **`pci=keep`** (`ro`): a sleep with the PCI devices kept on a kernel whose `pcie0` switch "
+                     "reads `Y` at the sleep",
+                     "What none of these is: a fix for normal sleep with Wi-Fi."):
             with self.subTest(said):
                 self.assertIn(said, readme if "\\" not in said and "\n" not in said
                               else (KIT_SRC / "README.md").read_text())

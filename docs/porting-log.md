@@ -9961,8 +9961,8 @@ Run 4 (boot ca924e92, floor held at boot and released by the script at
 `N`), log `squirtle-sleep-r10-4-no-gdsc-20261123.log`, record 000049:
 - the log ends at `suspend-to-idle for 30s` (245.90 s, 12:31:05);
 - the next boot (f3862a68) started at 12:32:35, so the tablet was restarted
-  some 70 s after it entered the sleep. Whether by itself or by the owner's
-  keys is to be asked;
+  some 70 s after it entered the sleep, by itself: the owner did not touch
+  it;
 - the record has the script's four progress lines up to `entering the
   sleep` and, on the console, nothing after `cycle 1` (245.98 s): no line of
   the suspend, as in revision 9's hangs;
@@ -9973,3 +9973,65 @@ clocks) but not the hang: with the root port removed, the sleep returns
 only when `pcie_0_gdsc` is let off (revision 9: 0 of 7 without the switch,
 4 of 4 with it; revision 10: 0 of 1 and 3 of 3). The switch stays a debug
 switch until the owner decides on making `pcie_0_gdsc` `OFF_ON` by default.
+
+### Kit revision 11: `pcie_0_gdsc` collapsed in system suspend, written, not built (2026-11-23)
+
+The owner decided on that default for a test kernel. Revision 11 is
+revision 10 plus, behind a build variable of its own,
+`APPLY_SM8550_PCIE0_GDSC_OFF=1` (it needs `APPLY_SM8550_SLEEP_FIXES=1`; no
+board gate; a default build and the SM-X910's builds are unchanged without
+it, and a tree that carries it is refused for a build without it):
+- `gcc-sm8550-pcie0-gdsc-off-in-suspend.patch`: `pcie_0_gdsc` is
+  `PWRSTS_OFF_ON`, one line of the table, the file's line count kept;
+- `gcc-sm8550-gdsc-debug-switches.patch` rewritten: each switch reads the
+  state its domains have (`debug_pcie0_off` reads `Y` at every boot of
+  revision 11), a write changes its own domains and no other, and a new
+  read-only `debug_boot_state` says how the three booted. `N` to
+  `debug_pcie0_off` gives the domain back its retention until the restart
+  (`sleep-test.sh gdsc-ret=pcie0`, an A/B run).
+
+Checked on scratch copies of v7.2-rc3 with the build script's own steps,
+for every combination of the four variables it allows and both boards:
+without the new variable every tree is revision 10's (the debug switch
+patch aside, which changes `gcc-sm8550.c` alone where it is applied); with
+it the trees differ in `gcc-sm8550.c` alone. `gcc-sm8550.o` built for
+arm64 with revision 10's configuration without a warning; its `.data`
+differs from revision 10's object in one byte, `pcie_0_gdsc`'s `.pwrsts`
+(6 to 5), and from the hang-log build's in three, the two USB domains' and
+that one, which is what `make-kit.sh` now checks, by the symbols that hold
+the bytes.
+
+Upstream history. 967e011013ed (v6.14, Manivannan Sadhasivam, tested by
+Neil Armstrong on the QRD8550, whose PCIe0 has a WCN7850) made the PCIe
+GDSCs `PWRSTS_RET_ON`: with them collapsed, a controller that kept its link
+through a system suspend did not resume. No upstream commit up to v7.4-rc4
+and linux-next makes the domain collapse only when the host has powered
+down; a patch that keeps it on through genpd's runtime flag (2026-01,
+unmerged) would not hold it in a system suspend (`genpd_sync_power_off()`
+does not look at that flag). The SM8550 community kernels with this change
+also put the root port in D3, so their host powers down in every suspend.
+
+The risk, read from the source and not run: every suspend that keeps the
+Wi-Fi now collapses the domain under the live host, the boot's panel cycle
+(`pm_test=platform`, about 22 s into every boot) included. The controller
+comes back with its link down (upstream's commit and the one SM8550 report
+say so; what the GDSC's flop retention keeps of its registers is
+documented nowhere) and nothing trains it again, the PCI core cannot reach
+the Wi-Fi's configuration space, and ath11k's resume reads its registers
+through the dead link: probably the Wi-Fi lost until the next boot, possibly
+an external abort and a panic at every boot. `verify.sh` now checks the
+Wi-Fi after the boot's first suspend; the kit's README gives a drop-in for
+the panel cycle's unit that keeps the domain in retention for that cycle
+alone (the owner's to make, not part of the kit) and the run plan.
+
+`sleep-test.sh`: `gdsc-ret=pcie0`; `pci=keep`, without which a sleep with
+the PCI devices kept is refused on a kernel whose `pcie0` booted `Y`; the
+switches named with their boot state; the clock counts read from each
+clock's own debugfs files (revision 10's read of `clk_summary` failed whole
+with the ADSP stopped); and new evidence: the prepared clocks below XO that
+keep it voted in the sleep set, what genpd powered off in each sleep, the
+DSPs' interrupts, the PCI functions' state, the subsystems' counts over 5 s
+awake, the audio DSP's clients in userspace; and `rpmh`, which turns the
+RPMh tracepoint on for the run and names the last write of the sleep and
+wake sets before each sleep (by the command DB), with the levels it left
+out, held through the sleep at their vote. Not built, not on the tablet.
