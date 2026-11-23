@@ -9704,3 +9704,39 @@ the kit's README says what each verdict means. The analysis, with the
 source lines, is in `~/ubuntu-gts9u/backups/s2idle-analysis-2026-11-22.md`.
 The next run: on the cable, a fresh boot, one cycle, `ro 1 30 release-floor
 pci=remove mode=s2idle trace hold=60 restart-ok`.
+
+**15:49, suspend-to-idle with the root port removed** (that command, boot
+`9c7571e3`, up 189 s, on the PC's cable in device role, the floor released
+by that boot at 32 s; `squirtle-sleep-r7-pcirm-s2idle-20261122.log` and the
+directory of that name). It did not come back either. The console record
+ends at `PM: suspend entry (s2idle)` (204.86 s), the two freezer lines and
+`printk: Suspending console(s)` (205.81 s); pmsg ends at `progress: cycle
+1/1: entering the sleep, rtcwake -m freeze -s 30`, with no verdict. The
+tablet restarted by itself: the next boot's kernel started about 91 s after
+the sleep entry, as after the docked run at 14:18 (about 92 s). That boot
+mounted the root with the orphan cleanup alone, `errors_count` 0. Whether
+anyone touched the tablet during the run is not recorded.
+
+So, by the reading above, it is not the `SYSTEM_SUSPEND` path: with the PCIe
+host powered down, the sleep does not return by either firmware call. The
+kernel's side up to the call returns (13:42, 14:00), so what fails is the
+state the SoC reaches with nothing of PCIe left on, or the way out of it.
+Runtime idle enters the cluster's deepest state all the time with the root
+port present (`power-domain-cluster` S1 usage 142 in that run's header), so
+that state alone is not it either: the difference is what the RPMh sleep set
+holds once the PCIe host has dropped its votes.
+
+Still not known: whether the tablet sleeps and the RTC alarm does not wake
+it, or wakes and hangs in the resume (the consoles are suspended through
+both); and what restarts it. Nothing in Linux does: no watchdog device is
+registered (`/sys/class/watchdog` is empty, `qcom-wdt` is a module that is
+not loaded, systemd's `RuntimeWatchdogSec` is 0), so the restart comes from
+below the kernel. `trace=live` would show the phase lines, but the console
+UART (`ttyMSM0`, and the boot console `qcom_geni0`, both registered) would
+stay powered through the sleep and may change the state reached.
+
+The next run changes the sleep's length alone: `ro 1 60 release-floor
+pci=remove mode=s2idle trace hold=60 restart-ok`. If the restart still comes
+about 91 s after the entry, the timer behind it runs from the entry and the
+alarm plays no part; if it moves to about 121 s, the alarm did something and
+what followed hung.
