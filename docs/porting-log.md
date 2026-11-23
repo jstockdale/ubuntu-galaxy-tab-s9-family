@@ -9778,3 +9778,66 @@ minute after the alarm something below the kernel restarts the tablet. What
 that is, whether the alarm reaches the SoC as a wake at all, and what the
 state without the PCIe host's votes takes away, is what the next work is
 about. The boot loader's command line carries no reset reason.
+
+**18:22, the reset records, and 18:22:45, the same run with the floor
+held** (boot e31e82e8, the boot after the 16:50 hang, on which the loop
+breaker kept the interconnect floor; nothing was rebooted in between).
+
+*The records* (read as root from the regmap debugfs of the PMK8550, the
+`debug` partition and `cmd-db`; copies and the reading in the build host's
+`backups/deep-sleep-plan-2026-11-22/reset-records-boot-e31e82e8*`):
+
+- The PMIC's power-on log (SDAM 0x7400 and 0x7500, 58 entries) holds three
+  whole resets and the end of a fourth, all alike: `Reset Trigger: PS_HOLD`,
+  `Reset Type: WARM_RESET`, the power-on that follows it, then `Reset
+  Trigger: PS_HOLD`, `Reset Type: HARD_RESET`, and a power-on with
+  `RTC_ALARM` among its triggers. So each hang ended with the SoC side
+  letting go of PS_HOLD, twice (a warm reset, then the boot chain's hard
+  one). The log has no PMIC watchdog, fault, over-current, under-voltage,
+  over-temperature or key-combination entry, and the alarm was still
+  latched each time: nothing had acknowledged it. The log carries no times,
+  and it holds no ordinary reboot to compare with.
+- The `debug` partition was not written by these hangs. Its reset record is
+  an old one from a stock-layout kernel (a non-secure watchdog bite 13.5 s
+  into a boot, saved addresses of the 39-bit layout, 62 writes in all).
+- `cmd-db` lists the CX levels as 0, 16 (retention), 64 and up: the lowest
+  index is off, not retention.
+
+A restart by PS_HOLD from the SoC side fits a watchdog in the firmware
+below Linux, or a reset that firmware asks for; by itself it does not say
+which.
+
+*The run*: `ro 1 30 pci=remove mode=s2idle trace=live hold=60 restart-ok`,
+without `release-floor` (`squirtle-sleep-r7-pcirm-s2idle-floorheld-20261122.log`
+and the directory of that name). It came back: `asleep 27.7s, woken by
+IRQ 21`, the RTC's wakeup source +1, the UFS read back as before, verdict
+SHALLOW (aosd +0, cxsd +0, ddr +0), then the run's own restart (`SLEEP-TEST
+RESTART: sysrq b` in pmsg) and a root with errors_count 0.
+
+The kernel's record is line for line the 16:50 one up to the idle entry:
+the root port removed, every suspend phase done, `qcom-pcie 1c00000.pcie:
+Timeout waiting for L2 entry! LTSSM: 0x11` in the noirq phase, `PM:
+suspend-to-idle`. Here it goes on: `Timekeeping suspended for 27.734
+seconds`, `PM: Triggering wakeup from IRQ 21`, `PM: resume from
+suspend-to-idle`, `qcom-pcie 1c00000.pcie: PCIe Gen.2 x1 link up`. So the
+PCIe host went down and came up again in this run as well, and the one
+difference from the four that hung is the interconnect floor.
+
+What that settles: taking the PCIe host down is not what kills the sleep.
+With the floor held the same sleep returns; with it released the SoC goes
+deeper (nothing above Linux holds the bus and DDR votes any more) and the
+way back is lost. What it does not settle: which part of the deeper state
+does it. The candidates, in the order the research report gives them
+(`backups/deep-sleep-plan-2026-11-22/REPORT.md`): the PCIe 0 GDSCs, which
+7.2-rc3 keeps on in hardware through a CX collapse (`PWRSTS_RET_ON`), as a
+merged fix for another SM8550 board describes ("reset about 46 s after
+waking"); the phy-mux rework that 7.2 final reverted; this port's own USB
+GDSC retention; CX voted to off where the stock regulators stop at
+retention.
+
+One number above is corrected by the same report: with the boot loader's
+16.5 to 16.7 s taken off, the restart comes 43 to 44 s after the RTC
+alarm, for the 30 s and the 60 s sleeps alike.
+
+The next step is a kernel with switches for those GDSCs that can be set at
+run time, so that one build tells the candidates apart.

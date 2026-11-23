@@ -621,7 +621,12 @@ kernel (the logs are in `~/ubuntu-gts9u/backups/`; details in
   follows the RTC alarm by about a minute, whatever the hold, so it is not
   the run's own; and with the consoles kept on the record ends at `PM:
   suspend-to-idle`, after every phase of the device suspend, with no line
-  from the resume.
+  from the resume;
+- 18:22, the 16:50 run without `release-floor`, on the boot after that
+  hang (the floor held by the loop breaker): it came back, SHALLOW, woken
+  by the RTC after 27.7 s, with the PCIe host powered down and up again as
+  in the runs that hung. So the host's power-down alone does not lose the
+  sleep; releasing the floor on top of it does.
 
 Not run yet: revision 8, a cycle that reaches AOSS sleep, CX collapse or
 DDR low power and comes back, `mode=s2idle` with the PCI devices kept, and
