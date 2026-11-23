@@ -1,0 +1,127 @@
+Subject: [DEBUG, test builds only] clk: qcom: gcc-sm8550: run-time switches for the PCIe and USB GDSCs' power state
+
+Not for release builds.  scripts/build-mainline-kernel.sh applies this only
+with APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1, after
+gcc-sm8550-usb-gdscs-retention.patch, and refuses a default build in a source
+tree that carries it.
+
+Three switches, all 0 at every boot, that root writes at run time:
+
+  /sys/module/gcc_sm8550/parameters/debug_pcie0_off      pcie_0_gdsc
+  /sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off  pcie_0_phy_gdsc
+  /sys/module/gcc_sm8550/parameters/debug_usb_off        usb30_prim_gdsc and
+                                                         usb3_phy_gdsc
+
+Each moves its GDSCs from PWRSTS_RET_ON to PWRSTS_OFF_ON from the next
+power-off genpd asks for: gdsc_disable() then drops the application
+processor's vote for a PCIe GDSC (they are VOTABLE) or collapses a USB one,
+instead of leaving it on.  They are for telling apart the causes of the
+SM-X710's deep-sleep wake hang (the SoC resets 43-44 s after the RTC alarm,
+2026-11-22): a GDSC left on through a CX collapse, pcie_0_gdsc first; an
+SM8550 board with the same symptom was fixed by making that one OFF_ON
+(ROCKNIX PR 3636, patch 0123).
+
+Set the PCIe ones only for a suspend in which the PCIe host powers itself
+down (tools/inplace/typec-roles/sleep-test.sh pci=remove): genpd powers the
+GDSC off at every system suspend, and a host that stays up would lose its
+registers.  The kernel command line cannot set them (-EPERM before
+SYSTEM_RUNNING): the boot's pm_test=platform panel cycle suspends with the
+PCIe host up.  debug_usb_off gives the USB GDSCs mainline's OFF_ON back,
+under which the docked xHCI dies in a host-role suspend: test undocked.
+
+The code reads and writes nothing until a switch is written: with all three
+0 the four .pwrsts are RET_ON as without this patch.  It sits after
+module_exit() so that clang emits the GDSC objects in the order it did
+without it: the compiled .data of gcc-sm8550.o is byte for byte the one
+without this patch.
+
+--- a/drivers/clk/qcom/gcc-sm8550.c
++++ b/drivers/clk/qcom/gcc-sm8550.c
+@@ -3388,5 +3388,87 @@
+ }
+ module_exit(gcc_sm8550_exit);
+ 
++/*
++ * SM8550 deep-sleep debug, not for release builds: three switches, which
++ * scripts/build-mainline-kernel.sh adds only with
++ * APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (gcc-sm8550-gdsc-debug-switches.patch).
++ *
++ * Each switch moves GDSCs from PWRSTS_RET_ON, which gdsc_disable() leaves on
++ * in hardware (retention comes only with a collapse of their parent, CX), to
++ * PWRSTS_OFF_ON, which it collapses, from the next power-off genpd asks for:
++ *   debug_pcie0_off      pcie_0_gdsc
++ *   debug_pcie0_phy_off  pcie_0_phy_gdsc
++ *   debug_usb_off        usb30_prim_gdsc and usb3_phy_gdsc (mainline's
++ *                        OFF_ON, which gcc-sm8550-usb-gdscs-retention.patch
++ *                        made RET_ON: the docked xHCI dies again in a
++ *                        host-role suspend)
++ * Root writes them at run time, /sys/module/gcc_sm8550/parameters/ (lockdown
++ * refuses only module_param_hw() parameters, kernel/params.c); every boot
++ * starts with all three 0, and the kernel command line cannot set them: the
++ * boot's pm_test=platform panel cycle suspends with the PCIe host up, and
++ * genpd would collapse pcie_0_gdsc under it.  Set the PCIe ones only for a
++ * suspend in which the PCIe host powers itself down (sleep-test.sh
++ * pci=remove).  With all three 0 the table above is what it was without this
++ * patch: nothing writes it.
++ *
++ * What a change of .pwrsts at run time does in gdsc.c (7.2): gdsc_init()
++ * reads it once, at registration, for the PWRSTS_ON force-on and for the
++ * retention bits of sc->cxcs, which these four GDSCs do not have (cxc_count
++ * 0); no genpd flag comes from it.  gdsc_enable() and gdsc_disable() read it
++ * at each call, and for these four it decides one thing: whether
++ * gdsc_disable() returns before gdsc_toggle_logic() (RET_ON), or drops the
++ * application processor's vote for the GDSC (the PCIe ones are VOTABLE, and
++ * probe clears GDSC_SLEEP_ENA_VOTE, so that vote holds in sleep) or collapses
++ * it (the USB ones).  gdsc_enable() turns either kind on the same way.  A write that meets a power transition
++ * is seen by it whole or not at all: one byte, which that one decision reads.
++ * .pwrsts is const in struct gdsc; these objects are writable .data, and only
++ * gdsc.c reads the field, through a struct gdsc pointer, at each call.
++ */
++static bool debug_pcie0_off;
++static bool debug_pcie0_phy_off;
++static bool debug_usb_off;
++
++static void gcc_sm8550_debug_pwrsts(struct gdsc *sc, bool off)
++{
++	WRITE_ONCE(*(u8 *)&sc->pwrsts, off ? PWRSTS_OFF_ON : PWRSTS_RET_ON);
++}
++
++static int gcc_sm8550_debug_set(const char *val, const struct kernel_param *kp)
++{
++	int ret;
++
++	/* Run time only: see above. */
++	if (system_state != SYSTEM_RUNNING)
++		return -EPERM;
++
++	/* param_attr_store() holds the parameter lock: one write at a time. */
++	ret = param_set_bool(val, kp);
++	if (ret)
++		return ret;
++
++	gcc_sm8550_debug_pwrsts(&pcie_0_gdsc, debug_pcie0_off);
++	gcc_sm8550_debug_pwrsts(&pcie_0_phy_gdsc, debug_pcie0_phy_off);
++	gcc_sm8550_debug_pwrsts(&usb30_prim_gdsc, debug_usb_off);
++	gcc_sm8550_debug_pwrsts(&usb3_phy_gdsc, debug_usb_off);
++	pr_info("gcc-sm8550: debug switches: pcie_0_gdsc %s, pcie_0_phy_gdsc %s, usb30_prim_gdsc and usb3_phy_gdsc %s, from the next power-off\n",
++		debug_pcie0_off ? "OFF_ON" : "RET_ON",
++		debug_pcie0_phy_off ? "OFF_ON" : "RET_ON",
++		debug_usb_off ? "OFF_ON" : "RET_ON");
++
++	return 0;
++}
++
++static const struct kernel_param_ops gcc_sm8550_debug_ops = {
++	.set = gcc_sm8550_debug_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(debug_pcie0_off, &gcc_sm8550_debug_ops, &debug_pcie0_off, 0644);
++MODULE_PARM_DESC(debug_pcie0_off, "debug: pcie_0_gdsc OFF_ON instead of RET_ON (run time only)");
++module_param_cb(debug_pcie0_phy_off, &gcc_sm8550_debug_ops, &debug_pcie0_phy_off, 0644);
++MODULE_PARM_DESC(debug_pcie0_phy_off, "debug: pcie_0_phy_gdsc OFF_ON instead of RET_ON (run time only)");
++module_param_cb(debug_usb_off, &gcc_sm8550_debug_ops, &debug_usb_off, 0644);
++MODULE_PARM_DESC(debug_usb_off, "debug: both USB GDSCs OFF_ON instead of RET_ON (run time only)");
++
+ MODULE_DESCRIPTION("QTI GCC SM8550 Driver");
+ MODULE_LICENSE("GPL");

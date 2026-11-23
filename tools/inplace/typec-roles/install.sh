@@ -5,9 +5,10 @@
 # to report a source, and three fixes for a swap asked for from userspace),
 # with the USB power domains kept in retention across suspend and with a NULL
 # check in the dwc3-qcom glue, and since revision 8 with the UFS PHY's PCS
-# reset before every calibration on this tablet too, and its diagnostic, in
-# boot, and its module tree.  The DTB and the configuration are the hang-log
-# kit's, so vendor_boot is checked but not written.
+# reset before every calibration on this tablet too, and its diagnostic, and
+# since revision 9 with the deep-sleep debug switches (all off at every
+# boot), in boot, and its module tree.  The DTB and the configuration are
+# the hang-log kit's, so vendor_boot is checked but not written.
 #
 #   sudo sh ~/typec-roles/install.sh      then reboot
 #   sudo sh ~/typec-roles/rollback.sh     back to the hang-log kit, then reboot
@@ -60,7 +61,7 @@
 # already (reboot soon), and the hang-log kernel with this kit's module tree
 # loads none of the tree's modules (v4l2loopback, netfilter, netconsole and
 # the secure processor's), while Wi-Fi, USB networking and Bluetooth
-# are built in.  Revisions 1 to 7 all have one key: the kernel of one takes
+# are built in.  Revisions 1 to 9 all have one key: the kernel of one takes
 # the modules of another, built for another kernel.  Reboot soon after an
 # upgrade as well.
 #

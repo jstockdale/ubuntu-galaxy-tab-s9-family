@@ -34,6 +34,9 @@ enable_gunyah_cma=${ENABLE_GUNYAH_CMA:-0}
 # Diagnostic only, never in a release: see qmp-ufs-pcs-state-diagnostic.patch
 # below.
 apply_qmp_ufs_diagnostic=${APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC:-0}
+# Debug only, never in a release: see gcc-sm8550-gdsc-debug-switches.patch
+# and rpmhpd-debug-retention-floor.patch below.
+apply_deep_sleep_debug=${APPLY_DEEP_SLEEP_DEBUG_SWITCHES:-0}
 
 validate_bool() {
 	case "$2" in
@@ -48,6 +51,7 @@ validate_bool FINGERPRINT_TOUCH_FOD "$fingerprint_touch"
 validate_bool FINGERPRINT_EL721 "$fingerprint_sensor"
 validate_bool QCOMTEE_ADMIN_NULL_CREDENTIALS "$qtee_admin_null_credentials"
 validate_bool ENABLE_GUNYAH_CMA "$enable_gunyah_cma"
+validate_bool APPLY_DEEP_SLEEP_DEBUG_SWITCHES "$apply_deep_sleep_debug"
 validate_bool APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC "$apply_qmp_ufs_diagnostic"
 # The diagnostic is for the PHY with the PCS reset of
 # stage-ufs-resume-experiment.sh: it tells what a failure with that reset in
@@ -349,6 +353,42 @@ apply_unless 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' \
 # applied here yet.
 apply_unless 'Retention across system suspend, as on sm8650' \
 	drivers/clk/qcom/gcc-sm8550.c gcc-sm8550-usb-gdscs-retention.patch
+# gcc-sm8550-gdsc-debug-switches.patch and rpmhpd-debug-retention-floor.patch
+# are deliberately NOT applied by default, like the UFS PHY diagnostic above.
+# They add run-time switches, all off at every boot and set by root through
+# /sys/module, for telling apart the causes of the SM-X710's deep-sleep wake
+# hang: the PCIe and USB GDSCs collapsed instead of left on, and a RETENTION
+# floor for the CX and MX votes.  They are for test builds: set
+# APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (the SM-X710's Type-C roles kit, revision
+# 9).  The GDSC one goes on top of the USB GDSC patch just above, each
+# strictly; a tree that carries either is refused for a default build, so
+# that a release built in a reused test tree cannot ship them.
+deep_sleep_debug_marker='SM8550 deep-sleep debug, not for release builds'
+for deep_sleep_debug in drivers/clk/qcom/gcc-sm8550.c:gcc-sm8550-gdsc-debug-switches.patch \
+	drivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch; do
+	if [ "$apply_deep_sleep_debug" = 1 ]; then
+		# The GDSC switches give the USB GDSCs back PWRSTS_RET_ON, the state
+		# of the USB GDSC patch: never without it.
+		case $deep_sleep_debug in
+		*gdsc-debug-switches*)
+			grep -q 'Retention across system suspend, as on sm8650' "$kernel_tree/${deep_sleep_debug%%:*}" || {
+				echo "${deep_sleep_debug#*:} goes on top of gcc-sm8550-usb-gdscs-retention.patch, which this tree does not carry" >&2
+				exit 1
+			} ;;
+		esac
+		if grep -q "$deep_sleep_debug_marker" "$kernel_tree/${deep_sleep_debug%%:*}"; then
+			# Reject a marker-only or partially edited copy.
+			patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+				< "$pat/${deep_sleep_debug#*:}"
+		else
+			patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+				< "$pat/${deep_sleep_debug#*:}"
+		fi
+	elif grep -q "$deep_sleep_debug_marker" "$kernel_tree/${deep_sleep_debug%%:*}"; then
+		echo 'The deep-sleep debug switches remain in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a default build.' >&2
+		exit 1
+	fi
+done
 apply_unless 'Match the SM-X910 Samsung kernel at standard mode' \
 	drivers/i2c/busses/i2c-qcom-geni.c \
 	match-samsung-geni-i2c-100khz-timing.patch
