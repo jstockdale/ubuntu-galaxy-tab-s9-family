@@ -124,9 +124,10 @@ restart that ends every run puts them back. By hand, as root:
 suspend without `pci=remove`): genpd collapses the GDSC at every suspend,
 and the live controller loses its registers.
 
-**Revision 10** (built 2026-11-23, not on the tablet yet) is revision 9 plus
-three upstream commits that 7.2-rc3 lacks, and one more diagnostic, all behind a
-build variable of their own, `APPLY_SM8550_SLEEP_FIXES=1` (a default build
+**Revision 10** (built 2026-11-23, on squirtle since 11:37 that day) is
+revision 9 plus three upstream commits that 7.2-rc3 lacks, and one more
+diagnostic, all behind a build variable of their own,
+`APPLY_SM8550_SLEEP_FIXES=1` (a default build
 and the SM-X910's builds are unchanged without it, and a build without it
 refuses a tree that carries any of them). Revision 9's runs and the
 analysis of 2026-11-23 point at them (`docs/porting-log.md`):
@@ -766,9 +767,10 @@ kernel (the logs are in `~/ubuntu-gts9u/backups/`; details in
 
 Revision 8 was never installed: revision 9, which carries it, went on over
 revision 7 (2026-11-22 20:59; "Revision 9: the runs", below, has what ran
-on it). Not run yet: revision 10, a cycle that reaches AOSS sleep, CX
-collapse or DDR low power and comes back, `mode=s2idle` with the PCI
-devices kept, and an ext4 error with an errno under `errors=continue`.
+on it), and revision 10 went on over revision 9 (2026-11-23 11:37;
+"Revision 10: the runs", below). Not run yet: a cycle that reaches AOSS
+sleep or CX collapse and comes back, `mode=s2idle` with the PCI devices
+kept, and an ext4 error with an errno under `errors=continue`.
 
 **Revision 9: the runs** (2026-11-22 and 23, squirtle; the logs are
 `~/ubuntu-gts9u/backups/squirtle-sleep-r9-*-20261122.log` and the pstore
@@ -846,15 +848,16 @@ added. Stop there. Warnings:
 - never set a PCIe switch by hand for a suspend without `pci=remove`; the
   kernel command line cannot set them, and every boot starts with them off.
 
-**Revision 10: the runs** (planned; none has run). Install revision 10 over
-revision 9, reboot, and run `sh ~/typec-roles/verify.sh`, then `sudo sh
-~/typec-roles/verify.sh` for the UFS host's clock counts: the kit's kernel,
-every debug switch `N`, the PCIe link up at boot (`ok   PCIe: the link came
-up this boot (Gen.2 x1 link up)`: without the unpark patch the Wi-Fi's link
-depends on the PIPE clock revert), no GPU RSC failure, one `power-up write`
-line for each calibration, and no UFS host clock enabled more than 3 times.
-Check that Wi-Fi works before any run. Then run 2b's run again, undocked on
-the PC's cable:
+**Revision 10: the runs** (2026-11-23; four have run, listed after the
+command). Install revision 10 over revision 9, reboot, and run `sh
+~/typec-roles/verify.sh`, then `sudo sh ~/typec-roles/verify.sh` for the
+UFS host's clock counts: the kit's kernel, every debug switch `N`, the PCIe
+link up at boot (`ok   PCIe: the link came up this boot (Gen.2 x1 link
+up)`: without the unpark patch the Wi-Fi's link depends on the PIPE clock
+revert), no GPU RSC failure, one `power-up write` line for each
+calibration, and no UFS host clock enabled more than 3 times. Check that
+Wi-Fi works before any run. Then run 2b's run again, undocked on the PC's
+cable:
 
 ```sh
 cd ~/typec-roles && grep ' sleep-test.sh$' SHA256SUMS | sha256sum -c --quiet &&
@@ -868,6 +871,42 @@ The clock lines say whether the UFS host's counts stay low through the
 sleep, and `qcom_stats` and the DDR times whether the GPU and UFS fixes
 moved the depth. A `gdsc=usb` run comes only after the owner has looked at
 these: on revision 9 it cost the storage once.
+
+What ran on squirtle on 2026-11-23, the first three with the command above
+and the fourth without its `gdsc=pcie0` (logs `squirtle-sleep-r10-*.log`).
+The install went on over revision 9 with one command and one reboot, the
+PCIe link came up at boot without the unpark patch, Wi-Fi connected, and
+`sudo sh verify.sh` passed every check (UFS host clocks enabled once or
+twice each, where revision 9's read 522 to 525):
+1. 11:48, the boot had released the floor by itself, the ADSP running: the
+   sleep came back, `PCIe came back` with `PCIe Gen.2 x1 link up`, the UFS
+   host's lane clocks off before and after (`axi 0/0`), `ddr +1311` with
+   28.8 s of the 31.2 in the DDR's low-power mode (0xd4) and 29.1 s at
+   200 MHz, for the first time on this port; `aosd +0 cxsd +0`.
+2. 12:04, the floor held at boot and released by the script, the ADSP
+   stopped first (`echo stop` into its remoteproc `state`): came back, PCIe
+   back; `ddr +0`, the DDR at 547 MHz for the whole sleep; the clock counts
+   not read (`clk_summary not readable`: with the ADSP stopped the codec's
+   clock fails the read).
+3. 12:23, the floor held at boot and released by the script, the ADSP
+   running: came back, PCIe back; `ddr +824` with 30.3 s of the 31.5 in
+   low power and 30.5 s at 200 MHz; `aosd +0 cxsd +0`.
+4. 12:29, as run 3 but without `gdsc=pcie0` (every switch `N`): **the sleep
+   did not come back.** The log ends at `suspend-to-idle for 30s`, the
+   tablet was restarted some 70 s later, and the record of that boot has
+   nothing after the script's `cycle 1` line. Revision 9 hung the same way
+   seven times of seven.
+
+So on revision 10 the PCIe host's resume is fixed with `gdsc=pcie0` (three
+of three), the storage came back each time with `PWRDN 0x1`, and the DDR
+reaches its low-power mode with the ADSP running, whichever way the floor
+was released. A stopped ADSP keeps the DDR at 547 MHz (revision 9's run 2c
+did the same): do not stop it for a run. No run reached AOSS sleep or CX
+collapse: the ADSP went in and out of its own sleep 974 to 1494 times in
+the 31 s, and the DDR as often, some 30 to 45 wakes a second. And the
+three upstream fixes do not cure the hang itself (run 4): with the root
+port removed, `pcie_0_gdsc` still has to be let off (`gdsc=pcie0`) for the
+sleep to return.
 
 `fstrim.timer` (weekly) would, if it fired during a run, send discards to
 the read-only disk, which the block layer logs as a write and the run

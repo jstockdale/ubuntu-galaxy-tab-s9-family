@@ -10087,3 +10087,122 @@ sleep counters.
 The kit was packed from commit ab2c536, the one the kernel was built from,
 and its `SOURCE` says so; its copy of the README is that commit's and still
 calls revision 10 "not built yet". The scripts in it are this tree's.
+
+**11:37 to 11:51, revision 10 on squirtle: installed over revision 9, and
+its first sleep.** `install.sh` ran as an upgrade over revision 9 (one
+command, one reboot). At the boot (c2b5834d) the kernel is the kit's
+(90da273a8a49), the Wi-Fi's PCIe link came up without the unpark patch
+(`PCIe Gen.2 x1 link up`, wlp1s0 connected), and `sudo sh verify.sh` passed
+every check eight minutes in: UFS host clocks enabled once or twice each
+(`gcc_ufs_phy_ahb_clk 2/2`, `gcc_ufs_phy_ice_core_clk 2/2`, the others 1/1)
+where revision 9's read 522 to 525, both calibrations with their `power-up
+write: PWRDN 0x1 right after it, 0x1 100 us later` line.
+
+Run 1 (11:48, run 2b's options: `ro 1 30 release-floor pci=remove
+mode=s2idle hold=60 gdsc=pcie0 restart-ok`, the ADSP running), log
+`squirtle-sleep-r10-1-pcie0-20261123.log`, record 000046:
+- the sleep came back (31.2 s, woken by the RTC), the UFS read back, PWRDN
+  0x1 at the calibration;
+- **the PCIe host came back**: `PCIe Gen.2 x1 link up` 0.27 s into the
+  resume, no `stuck at 'off'`, no `Host init failed`. In revision 9's four
+  returning runs it never did. (`Timeout waiting for L2 entry! LTSSM: 0x11`
+  at the suspend, as before: the root port is removed.);
+- the UFS host's clocks were off before and after the sleep (`axi 0/0`,
+  `unipro_core 0/0`, `pad_clkref 0/0`); `ahb 1/1` and `ice_core 1/1` stay,
+  the inline crypto engine's from its probe, as expected; `bi_tcxo 6/6`;
+- **the DDR counters moved for the first time**: `ddr +1311`, 28.8 s of
+  the 31.2 in its low-power mode (0xd4), 29.1 s at 200 MHz. In every
+  revision 9 run the DDR stayed at 547 or 1555 MHz with `ddr +0`;
+- `aosd +0`, `cxsd +0`: still SHALLOW. The ADSP went in and out of its own
+  sleep 1494 times in the 31 s, and the DDR's 1311 entries are of the same
+  order: something wakes the SoC some 45 times a second. Not known yet
+  whether that is the ADSP or what else holds CX.
+
+After the restart (boot ffb9f962): `errors_count` 0, the PCIe link up,
+Wi-Fi connected. Next: the same run with the ADSP stopped (as run 2c), then
+one without `gdsc=pcie0`.
+
+**12:04, revision 10 run 2: the ADSP stopped. It came back again, no
+deeper, and the DDR's low-power mode did not repeat.**
+
+Run 2 (boot ffb9f962, run 1's options, the ADSP stopped first through
+`/sys/class/remoteproc/remoteproc0/state`, which read `offline`), log
+`squirtle-sleep-r10-2-pcie0-adsp-stopped-20261123.log`, record 000047:
+- the sleep came back (30.9 s, woken by the RTC), the UFS read back, PWRDN
+  0x1, and the PCIe link came up again in the resume: two of two on
+  revision 10;
+- `aosd +0`, `cxsd +0`, `adsp +0`: SHALLOW;
+- **`ddr +0`: the DDR sat at 547 MHz for the whole 30.9 s**, with no time
+  in a low-power mode. Run 1's 28.8 s at 200 MHz did not happen;
+- the clock counts were not read: `clk_summary not readable`, and the
+  kernel's `clk: Failed to runtime PM get '6d44000.codec' for clk 'fsgen'`.
+  With the ADSP stopped the codec cannot resume, and one such clock fails
+  the whole read. A limit of the script as shipped in the kit.
+
+Two things changed between run 1 and run 2, so this run does not say which
+one cost the DDR's low-power mode. The ADSP was stopped; and boot ffb9f962
+followed run 1's forced restart, so it held the interconnect floor and the
+script released it at the run, where run 1's boot (c2b5834d) had released
+it by itself at 33 s. Revision 9's runs point at the ADSP: run 2c (floor
+held at boot, ADSP offline) also sat at 547 MHz, runs 2 and 2b (floor held
+at boot, ADSP running) at 1555 MHz, never lower. So a stopped ADSP does not
+help the depth, and may leave its votes behind.
+
+After the restart (boot af92191a, 12:07): `errors_count` 0, Wi-Fi
+connected, the ADSP running again. Next: run 1's command once more on this
+boot, which holds the floor from boot with the ADSP running; that is the
+one combination revision 10 has not run.
+
+**12:23, revision 10 run 3: floor held at boot, ADSP running. The DDR's
+low-power mode is back: it is the stopped ADSP that cost it.**
+
+Run 3 (boot af92191a, which held the floor from boot; the script released
+it at 962 s and waited its 60 s; run 1's options, the ADSP running), log
+`squirtle-sleep-r10-3-pcie0-floor-held-boot-20261123.log`, record 000048:
+- the sleep came back (31.5 s, woken by the RTC), the UFS read back, PWRDN
+  0x1, `PCIe Gen.2 x1 link up` in the resume: three of three;
+- **`ddr +824`, 30.3 s of the 31.5 in the DDR's low-power mode (0xd4),
+  30.5 s at 200 MHz**: run 1's result, on the kind of boot run 2 had. So
+  the way the floor is released does not matter, and stopping the ADSP is
+  what kept the DDR at 547 MHz in run 2 (and in revision 9's run 2c);
+- `aosd +0`, `cxsd +0`: SHALLOW. `adsp +974` in 32.5 s, some 30 wakes a
+  second (run 1: 1494 and 1311);
+- the clocks before the sleep: `axi 0/0`, `unipro_core 0/0`, `pad_clkref
+  0/0`, `ahb 1/1`, `ice_core 1/1`, `bi_tcxo 5/5`. After it the snapshot
+  caught the UFS host busy (`axi 1/1`, `ahb 2/2`, `bi_tcxo 8/8`), counts of
+  one or two, not a leak;
+- the `thaw_super_locked` WARNING (fs/super.c:1919) as in every returning
+  run.
+
+After the restart (boot ca924e92, 12:26): `errors_count` 0, Wi-Fi
+connected, the ADSP running.
+
+Where revision 10 stands: the PCIe resume failure is fixed with
+`gdsc=pcie0`, the UFS lane clock leak is fixed, the storage came back three
+times of three, and the DDR now reaches low power. What is left before AOSS
+sleep and CX collapse: whatever wakes the SoC 30 to 45 times a second with
+the ADSP running, and the CX holders that remain (the ICE core clock, the
+XO votes). Next on the tablet: one run without `gdsc=pcie0`, to learn
+whether the PIPE clock fix also cures the original hang; it is the more
+likely to hang.
+
+**12:29, revision 10 run 4: without `gdsc=pcie0` the sleep still does not
+come back.**
+
+Run 4 (boot ca924e92, floor held at boot and released by the script at
+170 s, the ADSP running, run 3's options without `gdsc=pcie0`: every switch
+`N`), log `squirtle-sleep-r10-4-no-gdsc-20261123.log`, record 000049:
+- the log ends at `suspend-to-idle for 30s` (245.90 s, 12:31:05);
+- the next boot (f3862a68) started at 12:32:35, so the tablet was restarted
+  some 70 s after it entered the sleep. Whether by itself or by the owner's
+  keys is to be asked;
+- the record has the script's four progress lines up to `entering the
+  sleep` and, on the console, nothing after `cycle 1` (245.98 s): no line of
+  the suspend, as in revision 9's hangs;
+- after the restart: `errors_count` 0, the ADSP running, Wi-Fi back.
+
+So the three upstream fixes repair the resume (the PCIe host, the UFS lane
+clocks) but not the hang: with the root port removed, the sleep returns
+only when `pcie_0_gdsc` is let off (revision 9: 0 of 7 without the switch,
+4 of 4 with it; revision 10: 0 of 1 and 3 of 3). The switch stays a debug
+switch until the owner decides on making `pcie_0_gdsc` `OFF_ON` by default.
