@@ -9650,3 +9650,172 @@ revision 8's UFS PHY change mattered), then `gdsc=pcie0`, then
 `gdsc=pcie0,usb`, then `gdsc=pcie0,usb,pcie0phy`, then the same with
 `cxmx=ret`. A run that comes back with `aosd`, `cxsd` and `ddr` counting
 names the cause: the switch it added.
+
+### Kit revision 9 on squirtle: with `pcie_0_gdsc` collapsed the sleep comes back, without PCIe, and once without the storage (2026-11-22 and 23)
+
+**20:59, revision 9 installed** over revision 7, in place, one command and
+one reboot (squirtle's `/var/log/gts9u-typec-roles.log`: `upgrade: boot
+holds 613c0c12817c`, then `boot written and read back (46620d6d2f92)` at
+20:59:05). The next boot, `8caf38f0`, ran revision 9's kernel (build ID
+`7912707458aa`), and `verify.sh` passed every check on it (its output was
+not kept). Every run below is one 30 s suspend-to-idle cycle with
+`pci=remove`, the interconnect floor released, `hold=60`, undocked on the
+PC's USB cable (USB device role, SSH over `usb0`), each in a boot of its own;
+the logs are `~/ubuntu-gts9u/backups/squirtle-sleep-r9-<n>-<name>-20261122.log`
+with the pstore directory of the same name.
+
+**21:01, run 1, the control** (no switch, `trace=live`; boot `8caf38f0`, up
+132 s). It hung as revision 7's runs did: pmsg ends at `progress: cycle 1/1:
+entering the sleep, rtcwake -m freeze -s 30; console loglevel 8,
+console_suspend N; switches: pcie0 N, pcie0phy N, usb N, cxmx N` (146.9 s),
+the console record at `PM: suspend-to-idle`, and the tablet restarted by
+itself; the next kernel (`b234e7ee`) started about a minute after the RTC
+alarm was due. So revision 8's UFS PHY change does not touch the hang.
+
+**21:49, run 2, `gdsc=pcie0`** (`trace=live`; boot `b234e7ee`). It came back,
+the first sleep with the root port removed and the floor released that did:
+asleep 28.2 s, woken by the RTC (IRQ 21, `pm8xxx_rtc_alarm`), the UFS read
+back as before. The verdict was FAIL, for PCIe alone: at the resume
+`pcie_0_gdsc status stuck at 'off'`, then `gcc_pcie_0_aux_clk status stuck at
+'off'` and `qcom-pcie 1c00000.pcie: Host init failed: -16`. Not deep:
+`aosd`, `cxsd`, `ddr` +0, the cluster domain's S1 +1; the ADSP napped 1418
+times and DDR ran at 1555 MHz for 46.0 s of the cycle. The run's NEXT line
+said "the storage did not come back", which was wrong: the script counted
+the PCIe host's `Host init failed` as a UFS failure line (fixed below).
+
+**23:34, run 2b, `gdsc=pcie0` without `trace=live`** (boot `bfb25de1`). The
+same: asleep 30.9 s, woken by the RTC, the same PCIe failure, the UFS read
+back as before, `aosd`, `cxsd`, `ddr` +0, the ADSP +950 naps, DDR at 1555 MHz
+for 32.7 s. The live console was not what kept the SoC shallow.
+
+**23:46, run 2c, the same with the ADSP stopped** (its remoteproc `offline`
+in the evidence; boot `a2ae4eb8`). The same again (asleep 31.1 s, the same
+PCIe failure, the UFS fine), now with the ADSP +0 and DDR at 547 MHz for
+31.1 s; `aosd`, `cxsd`, `ddr` still +0.
+
+**00:14 (2026-11-23), run 3, `gdsc=pcie0,usb`, the ADSP stopped** (boot
+`60b7b1d9`). Woken by the RTC after 31.4 s, with the same PCIe failure, and
+the UFS did not come back: 15 calibrations of its PHY between 1557.9 and
+1572.7 s, each one starting from `SW_RESET 0x1 START 0x0 PWRDN 0x0 READY 0x4
+C_READY 0x0 CMN 0xa0` and ending in `phy initialization timed-out` and `no
+PCS_READY within 1 s of SERDES_START`, then I/O errors and a read that failed
+(58 failure lines). ext4 logged 5 errors on the read-only disk and, with
+`errors=continue`, saved none and aborted nothing (`SLEEP-TEST NOTE`); the
+run restarted the tablet, and the next boot (`803ce623`) mounted the root
+with `errors_count` 0. Depth +0 again, DDR at 1555 MHz. That is the
+2026-11-21 failure, once more, now with the diagnostic: in runs 2, 2b and 2c
+the calibration entry read `PWRDN 0x1` (the PHY's analog part powered up),
+here `PWRDN 0x0` every time.
+
+**The UFS host's clocks** (a root read of `clk_summary` on boot `803ce623`,
+saved at 01:48; `~/ubuntu-gts9u/backups/squirtle-clk-ufs-20261123.txt`):
+`gcc_ufs_phy_axi_clk`, `gcc_ufs_phy_ahb_clk`, `gcc_ufs_phy_unipro_core_clk`,
+`gcc_ufs_phy_ice_core_clk` and `tcsr_ufs_pad_clkref_en` had enable counts of
+522 to 525 in five reads. ufshcd's own clock handling enables each of them
+once at most.
+
+### Why: the PCIe PIPE clock, votes left behind, and a UFS PHY write that does not hold (2026-11-23)
+
+A read-only analysis of the revision 9 runs against revision 9's source
+tree and upstream up to v7.4-rc4
+(`~/ubuntu-gts9u/backups/ufs-phy-resume-rootcause-2026-11-23.md`; its source
+claims were checked again). What it shows, and how firm each part is:
+
+**PCIe: `pcie_0_gdsc` cannot power up at the resume.** From the source and
+the logs' timing; not tried on the tablet. PCIe0's PIPE clock source is a
+`clk_regmap_phy_mux`. v7.2-rc1 reworked that mux (e108373c54fb) into rate
+operations only: nothing parks it on XO while its GDSC is off, and nothing
+selects the PHY's clock, which is what this port's
+`unpark-pcie0-pipe-mux.patch` does at every PHY power-on. With `gdsc=pcie0`
+the GDSC really collapses in the suspend, the mux still on the clock of a
+PHY that is off. At the resume genpd switches the GDSC on first, before the
+PHY runs; it does not report power-up within its 2 ms (`stuck at 'off'`, 7.6
+to 9.6 ms after the wake in runs 2b, 2c and 3), the aux clock inside it then
+cannot start, and host init fails with -16. v7.2 final reverted the rework
+(0aec16a93bac): the mux parks on XO when the PHY disables its pipe clock and
+selects the PHY's clock when the PHY enables it.
+
+**Depth: votes Linux leaves behind.** From the source; the UFS part also
+from the counts above. With every bus and DDR vote of Linux's sleep set
+dropped and the ADSP stopped, DDR still ran at 547 or 1555 MHz through the
+sleeps, and `cxsd` and `aosd` never counted. Two holders the source shows,
+both fixed upstream after 7.2-rc3:
+- the GPU: `a6xx_rpmh_stop()` returns early exactly when the GMU firmware
+  has started (an inverted test), so the GPU RSC's stop sequence never runs
+  after the GMU powers down, and its last bandwidth votes stay
+  (d9108bfdb746, v7.3-rc1);
+- the UFS host's clocks: `ufs_qcom_enable_lane_clks()` enables every clock
+  of the host, not only its three lane clocks, with no guard. A runtime
+  resume of the UFS host enables them twice (`ufs_qcom_setup_clocks()` with
+  the link in hibern8, then `ufs_qcom_resume()`) and the suspend disables
+  them once, so the counts climb with every runtime resume and the clocks,
+  with XO under them, stay on through every sleep (f07317a8d57f, v7.4-rc1).
+  The counts read at 01:48 are that leak.
+
+Not shown: that either one is what keeps the sleep shallow. A third holder
+the source shows, which no upstream commit up to v7.4-rc4 changes: the
+inline crypto engine's driver enables its core clock and the UFS AHB clock
+at probe (`devm_clk_get_optional_enabled()`) and keeps them, so
+`gcc_ufs_phy_ice_core_clk`, under GPLL0 and XO, stays enabled with the fix
+as well.
+
+**The UFS PHY in run 3.** The mechanism is firm, the cause is not.
+`qmp_ufs_power_on()` sets POWER_DOWN_CONTROL's SW_PWRDN (analog power-up)
+right before the calibration, and nothing between that write and the entry
+line clears it; in run 3 it read 0 at all 15 entries, while the
+calibration's own writes to SW_RESET and START held. With the PHY's analog
+part powered down the PLL cannot lock (`C_READY 0x0`), so PCS_READY never
+comes. The retries cycle the PHY's clocks, the host's reset and Linux's
+votes on L1E and L3E, but not the PHY's own core supply, which stock and
+Qualcomm's reference boards give as L1D and this port's device tree gives
+as L1E (L1D is not described at all), not the PHY's GDSC, and not the
+external `ufsphy` reset. Candidates, none proven: L1D not up after the wake;
+a coupling between the USB3 PHY's collapse and the UFS PHY (run 3 is the
+only one with `gdsc=usb`); an intermittent failure that `gdsc=usb` merely
+made likelier (2026-11-21 failed the same way with the USB GDSCs kept on).
+One failure with the switch against three passes without it is not
+significant.
+
+And revision 8's PCS reset: every calibration entry on record, the 11
+that passed and the 15 that failed, starts with `SW_RESET 0x1 START 0x0`,
+the state of a PCS just reset. The case the reset was written for, a PCS
+that kept its registers (`SW_RESET 0 START 0x1` at entry), has not been
+seen once: the extra reset changes nothing on any path observed.
+
+**02:33, kit revision 10: written, not built, not on the tablet.** Revision
+9 plus, behind one new build variable, `APPLY_SM8550_SLEEP_FIXES=1` (default
+0; no board gate):
+- `clk-qcom-regmap-phy-mux-revert-rework.patch`: 0aec16a93bac, upstream's
+  diff unchanged, and `unpark-pcie0-pipe-mux.patch` left out (a tree that
+  carries it is refused). The PHY's `clk_bulk_prepare_enable()` of its pipe
+  clock enables the mux first, which selects the PHY's clock, at the same
+  point in `qmp_pcie_power_on()` where the unpark patch did; the Wi-Fi's
+  link at boot depends on that;
+- `msm-adreno-a6xx-fix-stale-rpmh-votes.patch`: d9108bfdb746, the hunks
+  moved to this tree's line numbers. The GPU RSC's sleep and wake sequences
+  now run at every GMU power cycle; neither did before;
+- `ufs-qcom-enable-only-lane-clocks.patch`: f07317a8d57f, upstream's diff
+  unchanged; nothing else from 7.3 or 7.4 is needed under it;
+- with `APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1` as well,
+  `qmp-ufs-pwrdn-readback-diagnostic.patch`: before each calibration
+  POWER_DOWN_CONTROL is read back right after the power-up write and 100 us
+  later, `power-up write: PWRDN 0x1 right after it, 0x1 100 us later`.
+  Reads only.
+
+The sources were prepared with the build script's own steps on a copy of
+v7.2-rc3: with the variable off the tree is revision 9's, file for file;
+with it on it differs in `clk-regmap-phy-mux.c`, `phy-qcom-qmp-pcie.c`,
+`a6xx_gmu.c`, `ufs-qcom.c`, `ufs-qcom.h` and `phy-qcom-qmp-ufs.c` alone, and
+the default builds of both tablets are unchanged. The five objects compiled
+for arm64 with revision 9's configuration without a warning, on the SM-X710
+tree and on the SM-X910 one. `sleep-test.sh` now says "the storage did not
+come back" only when it did not (a failed read, or a failure line that is
+not the PCIe host's), and otherwise names the PCIe host; it prints the UFS
+host's and XO's clock counts before each sleep and after each wake, and
+whether the PCIe host came back; `last_hw_sleep` no longer leaks an error.
+`verify.sh` checks the PCIe link at boot, the GPU RSC's sequences, the
+second diagnostic's lines and, under `sudo`, the clock counts.
+
+The first run planned on it is run 2b's: `gdsc=pcie0`, no `trace=live`.
+Expected if the PIPE clock is the cause: no `stuck at 'off'`, and the PCIe
+host back with its link (`PCIe Gen.2 x1 link up`).

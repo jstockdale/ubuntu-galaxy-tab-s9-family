@@ -1,0 +1,99 @@
+Subject: [DIAGNOSTIC, test builds only] phy: qcom: qmp-ufs: read the SM8550 power-up write back
+
+Not for release builds.  scripts/build-mainline-kernel.sh applies this only
+with APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 and APPLY_SM8550_SLEEP_FIXES=1, on
+top of qmp-ufs-pcs-state-diagnostic.patch, and refuses a build without both
+in a source tree that carries it.
+
+On 2026-11-23 (the SM-X710's Type-C roles kit, revision 9, run 3) every
+calibration of a resume began with SW_PWRDN, bit 0 of POWER_DOWN_CONTROL,
+at 0: the PHY's analog part powered down, although qmp_ufs_power_on() sets
+the bit right before, and the calibration's own writes to SW_RESET and
+START held.  The calibration entry line cannot tell whether that write
+never took or was undone after it.  This reads the register back twice in
+the power-on before a calibration, right after the write and 100 us later,
+and logs both at KERN_DEBUG, the level of the calibration entry line that
+follows it:
+
+  power-up write: PWRDN 0x1 right after it, 0x1 100 us later
+
+0x1 and 0x1, then PWRDN 0x0 at the calibration entry: undone after the
+power-on.  0x1, then 0x0: undone within 100 us.  0x0 right after it: the
+write did not take.
+
+It writes no register and changes no return value.  Only the power-on that
+qmp_ufs_set_mode() comes before is read, and it alone waits the 100 us
+(udelay): ufs_qcom_power_up_sequence()'s, one for each calibration.  The
+power-on at every ungating of the UFS clocks is not marked and runs as
+before.  SM8550 PHY only.  No line of qmp-ufs-pcs-state-diagnostic.patch or
+of its context changes, so the build script's strict reverse check of that
+patch still passes in a tree that carries both.
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c b/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+index fdfd7e0e3f1c..089e9f17a93d 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+@@ -1203,6 +1203,14 @@ struct qmp_ufs {
+ 	struct phy *phy;
+ 	u32 mode;
+ 	u32 submode;
++
++	/*
++	 * A second diagnostic for SM8550 resume tests, not for release
++	 * builds: whether the power-up write of POWER_DOWN_CONTROL holds.
++	 * qmp_ufs_set_mode() marks the power-on that comes next, the one
++	 * before a calibration (ufs_qcom_power_up_sequence()).
++	 */
++	bool dbg_pwrdn_pending;
+ };
+ 
+ static inline void qphy_setbits(void __iomem *base, u32 offset, u32 val)
+@@ -1951,6 +1959,29 @@ static void qmp_ufs_tx_pull_down_ctrl(struct qmp_ufs *qmp, bool enable)
+ 	}
+ }
+ 
++#define QMP_UFS_DBG_PWRDN_DELAY_US	100U
++
++/*
++ * The diagnostic (struct qmp_ufs above): POWER_DOWN_CONTROL read back right
++ * after the power-up write and QMP_UFS_DBG_PWRDN_DELAY_US later, logged like
++ * the calibration entry that follows.  Reads only, and one short wait, in
++ * the power-on before a calibration alone: a power-on that ungates the UFS
++ * clocks is not marked.
++ */
++static void qmp_ufs_dbg_pwrdn(struct qmp_ufs *qmp)
++{
++	void __iomem *reg = qmp->pcs + qmp->cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL];
++	u32 now, later;
++
++	qmp->dbg_pwrdn_pending = false;
++	now = readl(reg);
++	udelay(QMP_UFS_DBG_PWRDN_DELAY_US);
++	later = readl(reg);
++	dev_printk(KERN_DEBUG, qmp->dev,
++		   "power-up write: PWRDN %#x right after it, %#x %u us later\n",
++		   now, later, QMP_UFS_DBG_PWRDN_DELAY_US);
++}
++
+ static int qmp_ufs_power_on(struct phy *phy)
+ {
+ 	struct qmp_ufs *qmp = phy_get_drvdata(phy);
+@@ -1970,6 +2001,8 @@ static int qmp_ufs_power_on(struct phy *phy)
+ 
+ 	qmp_ufs_tx_pull_down_ctrl(qmp, false);
+ 	qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL], SW_PWRDN);
++	if (qmp->dbg_pwrdn_pending)
++		qmp_ufs_dbg_pwrdn(qmp);
+ 	return 0;
+ 
+ err_disable_regulators:
+@@ -2107,6 +2140,9 @@ static int qmp_ufs_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+ 
+ 	qmp->mode = mode;
+ 	qmp->submode = submode;
++	/* The diagnostic: the next power-on comes before a calibration. */
++	if (cfg == &sm8550_ufsphy_cfg)
++		qmp->dbg_pwrdn_pending = true;
+ 
+ 	return 0;
+ }

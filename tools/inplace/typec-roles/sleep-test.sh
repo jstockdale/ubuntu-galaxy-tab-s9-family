@@ -146,12 +146,15 @@
 #     SoC up: every qcom_stats file before and after (the SoC's states, each
 #     subsystem's, DDR's modes and frequencies), the wakeup sources and the
 #     interrupts that fired, whether the PCIe link went down and came back,
-#     the power domains of the rails, the UFS, USB and PCIe, the runtime
-#     state of the UFS host and of the USB controller, the DSPs, the panel's
-#     backlight, the warmest thermal zone, and the cycle's kernel lines;
+#     and whether the PCIe host came back at all (a host failure line, or
+#     none), the power domains of the rails, the UFS, USB and PCIe, the
+#     runtime state of the UFS host and of the USB controller, the DSPs, the
+#     panel's backlight, the warmest thermal zone, the enable and prepare
+#     counts of the UFS host's clocks and of XO (clk_summary, right before
+#     the sleep and right after the wake), and the cycle's kernel lines;
 #     once before the first sleep, every power domain, the rails in use, the
 #     bandwidth votes (those in the sleep set marked) and the PCIe
-#     functions.  The terminal gets all of it ("evidence:" lines), pmsg two
+#     functions.  The terminal gets all of it ("evidence:" lines), pmsg three
 #     short lines per cycle; a read that fails changes nothing;
 #   - a suspend that the kernel gave up before the tablet slept (a wakeup
 #     on the way down, such as the touchscreen's double tap, or a device
@@ -386,7 +389,8 @@
 #     cycle is tried again like an ABORTED attempt, within the same aborts=N,
 #     past which the run ends with NO-SLEEP (s2idle).  A cycle in which no
 #     CPU entered its s2idle state and no such wakeup explains it FAILs.
-#   - gdsc=LIST and cxmx=ret (ro and dry; revision 9's kernel): the kernel's
+#   - gdsc=LIST and cxmx=ret (ro and dry; the kernels of revisions 9 and
+#     10): the kernel's
 #     debug switches, run-time module parameters that every boot starts with
 #     off (N) and that nothing but root's write changes
 #     (gcc-sm8550-gdsc-debug-switches.patch, rpmhpd-debug-retention-floor.patch):
@@ -477,7 +481,12 @@ ram_tools='rtcwake dmesg dd sha256sum sleep grep awk sync blockdev fsfreeze nsen
 # EOPNOTSUPP).
 freeze_types=' ext4 '
 ufs_fail='phy initialization timed-out|Failed to calibrate PHY|Enabling the controller failed|Host init failed|ufshcd_wl_resume failed|Trying to write to read-only block-device'
-ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET'
+ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET|power-up write: PWRDN'
+# The lines of the PCIe host and of its PHY.  Two of ufs_fail's are theirs as
+# well, in the same words ("qcom-pcie 1c00000.pcie: Host init failed: -16",
+# "qcom-qmp-pcie-phy 1c06000.phy: phy initialization timed-out"): a failure
+# line of theirs does not say that the storage failed.
+pcie_dev='[0-9a-f]+\.pcie: |qmp-pcie-phy [0-9a-f]+\.phy: '
 # A journal handle started on a frozen ext4 (ext4_journal_check_start's
 # WARN_ON, fs/ext4/ext4_jbd2.c:78): a transaction there would be written
 # while the run thinks nothing is, and the next mount would discard it
@@ -528,9 +537,10 @@ freeze_deadline=120
 mount_deadline=60
 # How many of a cycle's diagnostic lines go to the result file and to pmsg:
 # the first diag_head and the last diag_tail, and one line for the ones
-# between.  A resume whose calibration fails retries it 15 times, up to four
-# lines each (the entry, the state after the timeout, the late poll's
-# outcome, the state 1 s on); the terminal and the run's log in /run get
+# between.  A resume whose calibration fails retries it 15 times, up to five
+# lines each (revision 10's power-up write, the entry, the state after the
+# timeout, the late poll's outcome, the state 1 s on); the terminal and the
+# run's log in /run get
 # every line, and those go with the restart.  pmsg is 128 KiB of ramoops
 # (the hang-log kit's DTB), about 73 KiB of it data with ECC 96, and it is
 # a ring: what goes there must leave room for the verdicts.  A cycle puts at
@@ -539,9 +549,9 @@ mount_deadline=60
 # come to well under 20 KiB with their verdicts; an aborted attempt adds its
 # entry lines and its verdict, about 1 KiB, and a run has at most 21 of them.
 # ext4's own lines, when it recorded or logged an error, add at most 6.
-# Each cycle that was not given up before its sleep adds two evidence lines
-# (ev_keep), at most 700 bytes: 7 KiB for ten; mode=s2idle adds a third, at
-# most 300 bytes more, and a WOKEN EARLY attempt adds its evidence lines
+# Each cycle that was not given up before its sleep adds three evidence
+# lines (ev_keep), at most 1000 bytes: 10 KiB for ten; mode=s2idle adds a
+# fourth, at most 300 bytes more, and a WOKEN EARLY attempt adds its evidence lines
 # and its verdict, about 1.5 KiB, within the same 21.  The progress lines
 # (progress) add the run's start, the PCI removal, the debug switches and
 # the protection, under 1 KiB, and one line of about 200 bytes before each
@@ -564,6 +574,13 @@ genpd_sum=/sys/kernel/debug/pm_genpd/pm_genpd_summary
 reg_sum=/sys/kernel/debug/regulator/regulator_summary
 icc_sum=/sys/kernel/debug/interconnect/interconnect_summary
 wake_sum=/sys/kernel/debug/wakeup_sources
+# The clocks whose enable and prepare counts each cycle shows (clk_summary):
+# XO, and the UFS host's five that the kernels up to revision 9 kept
+# enabled, one more time at each runtime resume of the UFS host (522 to 525 on
+# 2026-11-23), which revision 10's ufs-qcom-enable-only-lane-clocks.patch
+# ends.  Reading clk_summary resumes the clock controllers for a moment.
+clk_sum=/sys/kernel/debug/clk/clk_summary
+ev_clk_names='bi_tcxo tcsr_ufs_pad_clkref_en gcc_ufs_phy_axi_clk gcc_ufs_phy_ahb_clk gcc_ufs_phy_unipro_core_clk gcc_ufs_phy_ice_core_clk'
 ufs_ctl=/sys/bus/platform/devices/1d84000.ufshc
 usb_ctl=/sys/bus/platform/devices/a600000.usb
 pci_devs=/sys/bus/pci/devices
@@ -832,7 +849,9 @@ count_of() { # the Count of qcom_stats NAME, or -
 
 stat_of() { # suspend_stats NAME, or -
 	sv=-
-	read -r sv < "/sys/power/suspend_stats/$1" 2>/dev/null
+	# 2>/dev/null first: dash reports a redirection that fails before a
+	# 2>/dev/null after it takes effect (last_hw_sleep is not in every kernel).
+	read -r sv 2>/dev/null < "/sys/power/suspend_stats/$1"
 	num "$sv" || sv=-
 	echo "$sv"
 }
@@ -1483,6 +1502,35 @@ ev_state() {
 	echo "$evs; warmest $evt"
 }
 
+# clk_summary copied to OUT, in one read (each read resumes the clock
+# controllers for a moment).
+ev_clk_snap() { # OUT
+	awk '{ print }' "$clk_sum" 2>/dev/null > "$1"
+}
+
+# The counts of ev_clk_names in a clk_summary copy, one line:
+# "bi_tcxo 6/6, tcsr_ufs_pad_clkref_en 522/522, ..." (enable/prepare), "-"
+# for a clock it does not list; with short, "xo 6/6, pad_clkref 522/522, axi
+# 522/522, ..." for pmsg; "clk_summary not readable" for an empty copy.
+ev_clk_line() { # FILE full|short
+	[ -s "$1" ] || { echo 'clk_summary not readable'; return 0; }
+	awk -v names="$ev_clk_names" -v short="$2" '
+		BEGIN { n = split(names, want, " ") }
+		$2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && !($1 in got) { got[$1] = $2 "/" $3 }
+		END {
+			for (i = 1; i <= n; i++) {
+				nm = want[i]
+				if (short == "short") {
+					if (nm == "bi_tcxo") nm = "xo"
+					else if (nm == "tcsr_ufs_pad_clkref_en") nm = "pad_clkref"
+					else { sub(/^gcc_ufs_phy_/, "", nm); sub(/_clk$/, "", nm) }
+				}
+				printf "%s%s %s", (i > 1 ? ", " : ""), nm, ((want[i] in got) ? got[want[i]] : "-")
+			}
+			printf "\n"
+		}' "$1" 2>/dev/null
+}
+
 # Once, before the first sleep: the domains, the rails, the bandwidth votes,
 # the wakeup sources and the PCIe functions as they are with the disk frozen.
 # A request on an interconnect node whose tag is 0 or has bit 2
@@ -1615,6 +1663,7 @@ ev_s2idle() { # SFX
 
 # Before a sleep: the snapshots ev_after compares with, and the domains.
 ev_before() { # SFX
+	ev_clk_snap "$ramdir/ev-clk-$1.0"
 	ev_stats "$ramdir/ev-stats-$1.0"
 	ev_irqs "$ramdir/ev-irqs-$1.0"
 	ev_wake "$ramdir/ev-wake-$1.0"
@@ -1624,10 +1673,11 @@ ev_before() { # SFX
 	fi
 	evstate=$(ev_state)
 	say "$cyc: evidence: before: $evstate"
+	say "$cyc: evidence: before: clocks (enable/prepare): $(ev_clk_line "$ramdir/ev-clk-$1.0" full)"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: before: genpd: $evl"; done
 }
 
-# Right after rtcwake returns: the same snapshots.
+# Right after rtcwake returns: the same snapshots, the clocks' last.
 ev_resumed() { # SFX
 	ev_stats "$ramdir/ev-stats-$1.1"
 	ev_irqs "$ramdir/ev-irqs-$1.1"
@@ -1636,6 +1686,7 @@ ev_resumed() { # SFX
 		ev_cpuidle "$ramdir/ev-cpuidle-$1.1"
 		ev_cluster "$ramdir/ev-cluster-$1.1"
 	fi
+	ev_clk_snap "$ramdir/ev-clk-$1.1"
 }
 
 # Once the cycle's kernel lines are in K: what the sleep reached, what woke
@@ -1662,10 +1713,21 @@ ev_after() { # SFX K
 		*) evpcie="pcie: $evlink" ;;
 		esac
 	fi
+	# Did the PCIe host come back at all: a line of pcie_down_re (its link
+	# wait, its init or its noirq resume failed), or none.
+	evback=$(grep -E "$pcie_down_re" "$2" 2>/dev/null | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+	if [ -n "$evback" ]; then
+		evback="PCIe did not come back ($evback)"
+	else
+		evback='PCIe came back (no host failure line)'
+	fi
+	evclk0=$(ev_clk_line "$ramdir/ev-clk-$1.0" short)
+	evclk1=$(ev_clk_line "$ramdir/ev-clk-$1.1" short)
 	say "$cyc: evidence: qcom_stats: $evdepth"
 	say "$cyc: evidence: wakeup sources: $evwake"
 	say "$cyc: evidence: interrupts: $evirq"
-	say "$cyc: evidence: pcie: $evlink"
+	say "$cyc: evidence: pcie: $evlink; $evback"
+	say "$cyc: evidence: after: clocks (enable/prepare): $(ev_clk_line "$ramdir/ev-clk-$1.1" full)"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: after: genpd: $evl"; done
 	awk -v re="$ev_kernel" -v skip="$ev_kernel_skip" -v max="$ev_klines" '
 		$0 ~ skip { next }
@@ -1677,7 +1739,8 @@ ev_after() { # SFX K
 
 ev_keep() { # SFX
 	ev_pmsg "$cyc: evidence: qcom_stats: $evdepth"
-	ev_pmsg "$cyc: evidence: $evpcie; irq $(ev_irq_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1" 3); wakeup $evwake; before: $evstate"
+	ev_pmsg "$cyc: evidence: $evpcie; $evback; irq $(ev_irq_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1" 3); wakeup $evwake; before: $evstate"
+	ev_pmsg "$cyc: evidence: clocks before: $evclk0; after: $evclk1"
 	[ "$sleep_mode" != s2idle ] || ev_pmsg "$cyc: evidence: s2idle: $s2pmsg"
 }
 
@@ -1714,7 +1777,8 @@ storage_lines() { # FILE
 #      SECONDS logs about that);
 #   6. no failure line (fail_re: the UFS and its PHY, I/O and ext4 errors,
 #      a write the block layer logged), and no line of the diagnostic but
-#      its calibration entries (the others come with a timeout);
+#      its calibration entries and revision 10's power-up write lines (the
+#      others come with a timeout);
 #   7. no line about the UFS or its disk that says something failed
 #      (storage_lines, storage_bad_re);
 #   8. every filesystem still frozen (still_frozen);
@@ -1735,7 +1799,8 @@ gave_up_early() {
 	fi
 	[ -z "$prot_why" ] || return 1
 	[ "$storage" = healthy ] && [ "${fails:-0}" = 0 ] || return 1
-	! grep -v 'calibration entry: SW_RESET' "$ramdir/diag-$sfx" | grep -q . || return 1
+	! grep -v -e 'calibration entry: SW_RESET' -e 'power-up write: PWRDN' "$ramdir/diag-$sfx" | grep -q . ||
+		return 1
 	! storage_lines "$k" | grep -qiE "$storage_bad_re" || return 1
 	[ -n "$read_hash" ] && [ "$read_hash" = "$base_hash" ]
 }
@@ -2250,6 +2315,8 @@ finish() { # healthy|failed
 			verdict 'NEXT: the storage did not come back: read the diagnostic lines above against docs/resume-recovery.md ("Reading the diagnostic")'
 	elif [ "$1" = failed ]; then
 		verdict "NEXT: the storage did not come back; after the restart run sh ~/typec-roles/verify.sh and cat /sys/fs/ext4/$rootname/errors_count (0), and read the diagnostic lines above against docs/resume-recovery.md (\"Reading the diagnostic\")"
+	elif [ -n "$pcie_fail" ]; then
+		verdict "NEXT: the storage came back (it read back as before, and no UFS failure line); the PCIe host did not ($pcie_fail): the restart brings it back. After it, sh ~/typec-roles/verify.sh and cat /sys/fs/ext4/$rootname/errors_count (0); the cycle's pcie evidence and kernel lines above say how the host failed"
 	else
 		verdict "NEXT: after the restart, sh ~/typec-roles/verify.sh and cat /sys/fs/ext4/$rootname/errors_count (it must say 0)"
 	fi
@@ -2280,7 +2347,7 @@ run_from_ram() { # CONFIG
 	: > "$ramdir/started"
 	: > "$ramdir/frozen"
 	rmarker="gts9u sleep-test: $stamp start"
-	setro=0 freeze_hung=0 prot_why= prot_bad= ext4_said= slept=0 knobs_set=0 sw_tried=0 sw_back=
+	setro=0 freeze_hung=0 prot_why= prot_bad= ext4_said= slept=0 knobs_set=0 sw_tried=0 sw_back= pcie_fail=
 	sw_note
 	# The first line in pmsg: a run that never comes back from its first
 	# sleep leaves this, the protection's and its cycle's.
@@ -2482,7 +2549,10 @@ run_from_ram() { # CONFIG
 		if [ "${fails:-0}" != 0 ]; then
 			first=$(grep -E "$(fail_re)" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
 			reasons="$reasons; $fails failure lines in the kernel log, the first: $first"
-			storage=failed
+			# Every one of them fails the cycle; the storage failed only
+			# with one that is not the PCIe host's or its PHY's (pcie_dev),
+			# or with the read (below).
+			! grep -E "$(fail_re)" "$k" | grep -qvE "$pcie_dev" || storage=failed
 		fi
 		[ -z "$prot_why" ] || reasons="$reasons; the protection failed: $prot_why"
 		[ "$rtc_rc" = 0 ] || reasons="$reasons; rtcwake returned $rtc_rc ($(awk 'NR == 1' "$ramdir/rtcwake-$sfx"))"
@@ -2615,6 +2685,10 @@ run_from_ram() { # CONFIG
 			an=$(abort_note)
 			verdict "SLEEP-TEST $cyc: FAIL$mword: $reasons ($dline; floor $floor; $swnote)"
 			verdict "SLEEP-TEST RESULT: FAIL$mword at $cyc: $reasons; $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
+			# The storage came back: finish says what did not, if it was
+			# the PCIe host.
+			[ "$storage" != healthy ] ||
+				pcie_fail=$(grep -E "$pcie_down_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
 			finish "$storage"
 		fi
 		case $depth in
@@ -2833,7 +2907,7 @@ fi
 for swn in $sw_set; do
 	swf=$(sw_file "$swn")
 	[ -e "$swf" ] && [ -w "$swf" ] ||
-		refuse "this kernel does not offer the debug switch $swn ($swf): kit revision 9's kernel has it (sh ~/typec-roles/verify.sh says which kernel runs)"
+		refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 and 10 have it (sh ~/typec-roles/verify.sh says which kernel runs)"
 done
 swon=
 for swn in $sw_names; do

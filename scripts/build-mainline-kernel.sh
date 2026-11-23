@@ -37,6 +37,9 @@ apply_qmp_ufs_diagnostic=${APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC:-0}
 # Debug only, never in a release: see gcc-sm8550-gdsc-debug-switches.patch
 # and rpmhpd-debug-retention-floor.patch below.
 apply_deep_sleep_debug=${APPLY_DEEP_SLEEP_DEBUG_SWITCHES:-0}
+# Test builds until they have run on hardware: the SM8550 sleep fixes below,
+# three upstream commits, with unpark-pcie0-pipe-mux.patch left out.
+apply_sm8550_sleep_fixes=${APPLY_SM8550_SLEEP_FIXES:-0}
 
 validate_bool() {
 	case "$2" in
@@ -52,6 +55,7 @@ validate_bool FINGERPRINT_EL721 "$fingerprint_sensor"
 validate_bool QCOMTEE_ADMIN_NULL_CREDENTIALS "$qtee_admin_null_credentials"
 validate_bool ENABLE_GUNYAH_CMA "$enable_gunyah_cma"
 validate_bool APPLY_DEEP_SLEEP_DEBUG_SWITCHES "$apply_deep_sleep_debug"
+validate_bool APPLY_SM8550_SLEEP_FIXES "$apply_sm8550_sleep_fixes"
 validate_bool APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC "$apply_qmp_ufs_diagnostic"
 # The diagnostic is for the PHY with the PCS reset of
 # stage-ufs-resume-experiment.sh: it tells what a failure with that reset in
@@ -287,6 +291,27 @@ elif grep -q "$qmp_ufs_diagnostic_marker" "$qmp_ufs_source"; then
 	echo 'The UFS PHY diagnostic remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a default build.' >&2
 	exit 1
 fi
+# qmp-ufs-pwrdn-readback-diagnostic.patch goes on top of it, only with both
+# APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 and APPLY_SM8550_SLEEP_FIXES=1 (the
+# SM-X710's Type-C roles kit, revision 10): the UFS PHY's power-up write
+# read back right after it and 100 us later, before each calibration.  It
+# changes no line of the diagnostic's own, so the check just above still
+# passes in a tree that carries both.  Strictly, and refused for any other
+# build in a tree that carries it, like the diagnostic.
+qmp_ufs_pwrdn_marker='the power-up write of POWER_DOWN_CONTROL holds'
+if [ "$apply_qmp_ufs_diagnostic" = 1 ] && [ "$apply_sm8550_sleep_fixes" = 1 ]; then
+	if grep -q "$qmp_ufs_pwrdn_marker" "$qmp_ufs_source"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/qmp-ufs-pwrdn-readback-diagnostic.patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/qmp-ufs-pwrdn-readback-diagnostic.patch"
+	fi
+elif grep -q "$qmp_ufs_pwrdn_marker" "$qmp_ufs_source"; then
+	echo 'The UFS PHY power-up diagnostic remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without both APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 and APPLY_SM8550_SLEEP_FIXES=1.' >&2
+	exit 1
+fi
 # genpd drops performance votes on runtime suspend only.  The UFS host is
 # runtime-active at every SM8550 system suspend and dwc3 never runtime
 # suspends, so both kept their CX votes through the sleep once the GCC GDSCs
@@ -339,8 +364,28 @@ apply_unless 'pwrseq_qcom_wcn6855_clk_release' \
 	pwrseq-wcn6855-cold-reset-hold-xo-gts9wifi.patch
 apply_unless 'default y if ARCH_QCOM' \
 	drivers/pci/pwrctrl/Kconfig build-wcn-pcie-providers-in.patch
-apply_unless 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' \
-	drivers/phy/qualcomm/phy-qcom-qmp-pcie.c unpark-pcie0-pipe-mux.patch
+# unpark-pcie0-pipe-mux.patch selects PCIe0's PIPE clock source with
+# clk_set_rate(ULONG_MAX), a request only the phy-mux rework of v7.2-rc1
+# understands.  APPLY_SM8550_SLEEP_FIXES=1 reverts that rework (below): the
+# clock's enable then selects the PHY's clock by itself, and its disable
+# parks the mux on XO.  The patch is left out then, and a tree that carries
+# it is refused.  A build without the fixes in a tree with the revert is
+# refused here, before the patch would go in on top of it (the fixes'
+# block below refuses the other two).
+if [ "$apply_sm8550_sleep_fixes" = 1 ]; then
+	if grep -q 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' \
+		"$kernel_tree/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c"; then
+		echo 'unpark-pcie0-pipe-mux.patch is in this source tree, and APPLY_SM8550_SLEEP_FIXES=1 leaves it out; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR.' >&2
+		exit 1
+	fi
+elif grep -qF 'static int phy_mux_enable(struct clk_hw *hw)' \
+	"$kernel_tree/drivers/clk/qcom/clk-regmap-phy-mux.c"; then
+	echo 'clk-qcom-regmap-phy-mux-revert-rework.patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_SM8550_SLEEP_FIXES=1.' >&2
+	exit 1
+else
+	apply_unless 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' \
+		drivers/phy/qualcomm/phy-qcom-qmp-pcie.c unpark-pcie0-pipe-mux.patch
+fi
 # The USB GDSCs power off in every system suspend, the boot-time panel cycle
 # included, while xhci resumes as if they had kept its context, so in host
 # role the xHCI does not come back from it: what a boot with a dock attached
@@ -471,6 +516,53 @@ apply_unless 'gmu_hub_hz' \
 	drivers/gpu/drm/msm/adreno/adreno_device.c msm-adreno-gmu-hub-clk-param.patch
 apply_unless 'qcom_overlay_all' \
 	drivers/virt/gunyah/qcom_bootinfo.c gunyah-qcom-runtime-overlay-all-param.patch
+# The SM8550 sleep fixes: three upstream commits that v7.2-rc3 lacks, which
+# keep the SoC out of its deep sleep states or keep PCIe from coming back
+# from them (docs/resume-recovery.md).  Test builds until they have run on
+# hardware: set APPLY_SM8550_SLEEP_FIXES=1 (the SM-X710's Type-C roles kit,
+# revision 10).  No board gate: both tablets have the SoC and these drivers.
+#   - clk-qcom-regmap-phy-mux-revert-rework.patch, 0aec16a93bac (v7.2): the
+#     PCIe PIPE clock muxes are gates again, parked on XO while their GDSC
+#     is off and switched to the PHY's clock when it is enabled; that is
+#     why unpark-pcie0-pipe-mux.patch is left out above;
+#   - msm-adreno-a6xx-fix-stale-rpmh-votes.patch, d9108bfdb746 (v7.3-rc1):
+#     the GPU RSC's sleep sequence runs when the GMU powers down, so that
+#     the GPU's last bandwidth votes do not stay; on top of this script's
+#     three a6xx_gmu.c patches above;
+#   - ufs-qcom-enable-only-lane-clocks.patch, f07317a8d57f (v7.4-rc1):
+#     ufs-qcom turns its three lane clocks on and off once, where it turned
+#     every clock of the UFS host on again at each runtime resume, which
+#     kept them, and XO under them, on through every sleep; on top of
+#     ufs-qcom-hs-g5-at-300mhz-sm8550.patch on the SM-X710, on the pinned
+#     file on the SM-X910.
+# Each strictly; a tree that carries any of them is refused for a build
+# without the variable, so that a release built in a reused test tree
+# cannot ship them.  Upstream code has no marker of this port's: each is
+# known by a line it adds.  Once the pinned kernel has one of the three, that
+# line is in every tree: drop its sleep_fix line then.
+sleep_fix() { # FILE LINE PATCH
+	if [ "$apply_sm8550_sleep_fixes" = 1 ]; then
+		if grep -qF -- "$2" "$kernel_tree/$1"; then
+			# Reject a partly applied copy.
+			patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+				< "$pat/$3"
+		else
+			patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+				< "$pat/$3"
+		fi
+	elif grep -qF -- "$2" "$kernel_tree/$1"; then
+		echo "$3 remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_SM8550_SLEEP_FIXES=1." >&2
+		exit 1
+	fi
+}
+sleep_fix drivers/clk/qcom/clk-regmap-phy-mux.c 'static int phy_mux_enable(struct clk_hw *hw)' \
+	clk-qcom-regmap-phy-mux-revert-rework.patch
+sleep_fix drivers/gpu/drm/msm/adreno/a6xx_gmu.c \
+	'if (!test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))' \
+	msm-adreno-a6xx-fix-stale-rpmh-votes.patch
+sleep_fix drivers/ufs/host/ufs-qcom.c \
+	'host->tx_lane0_sync_clk = devm_clk_get(dev, "tx_lane0_sync_clk");' \
+	ufs-qcom-enable-only-lane-clocks.patch
 apply_unless 'adopt_retained_source_ufp' \
 	include/linux/usb/tcpm.h tcpm-adopt-retained-source-ufp-role.patch
 apply_unless 'consume_retained_sink_dfp' \

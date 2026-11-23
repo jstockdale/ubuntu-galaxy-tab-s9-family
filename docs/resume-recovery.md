@@ -302,6 +302,16 @@ That the missing reset caused the failure is probable, not proven:
   reset is what was missing. The diagnostic below is there for the case
   that it is not.
 
+It was not. On 2026-11-23 the same failure came back on Type-C kit revision
+9, which carries the reset, and every calibration entry the diagnostic has
+logged on the SM-X710, 11 that passed and 15 that failed, starts from
+`SW_RESET 0x1 START 0x0`: a PCS fresh from its reset (the host controller's
+reset, or the collapse of the PHY's GDSC, puts it there). The state the
+reset was written for, a PCS that kept its registers, has not been seen
+once, so on every path observed the extra reset writes a bit that is set
+already. What did show is in "Reading the diagnostic" and "What ran on the
+tablet (2026-11-22 and 23, revision 9)", below.
+
 The hardware is the same for this purpose: both mainline trees use
 `sm8550_ufsphy_cfg`, and the SM-X710's stock device tree gives the PHY
 `vdda-phy` on L1D, `vdda-pll` on L3E and `vdda-qref` on L1E, as Qualcomm's
@@ -376,14 +386,36 @@ The source compiled with the recorded flags of both kit builds (the
 SM-X710's and the SM-X910's), without a warning; the test script runs its
 functions with mocked MMIO.
 
+A second diagnostic, `kernel/patches/qmp-ufs-pwrdn-readback-diagnostic.patch`
+(Type-C kit revision 10; applied only with both
+`APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1` and `APPLY_SM8550_SLEEP_FIXES=1`,
+refused otherwise in a tree that carries it), reads POWER_DOWN_CONTROL back
+in the power-on before each calibration: right after the power-up write and
+100 us later (`udelay`), logged at KERN_DEBUG right before the entry line,
+`power-up write: PWRDN 0x1 right after it, 0x1 100 us later`. Only the
+power-on that `qmp_ufs_set_mode()` comes before is read, which is
+`ufs_qcom_power_up_sequence()`'s, one per calibration; the power-on at every
+ungating of the UFS clocks is not. It writes no register.
+
 ### Reading the diagnostic
 
 After a resume, `calibration entry:` shows the state the calibration started
 from. These readings are inferences from what the registers mean, not
-proven. `SW_RESET 0 START 0x1` is what the last calibration left, so the PCS
-kept its registers through the sleep: the case the reset is for. A reset
-PCS would show `SW_RESET 0x1 START 0`. If a calibration still ends in `phy
-initialization timed-out`, the lines after it point to the next step:
+proven. `SW_RESET 0 START 0x1` would be what the last calibration left, so
+the PCS kept its registers through the sleep: the case the reset is for. A
+reset PCS shows `SW_RESET 0x1 START 0x0`, and every entry on record does.
+`PWRDN` is POWER_DOWN_CONTROL's SW_PWRDN, active low: `0x1` means the PHY's
+analog part is powered up, which `qmp_ufs_power_on()` sets right before the
+calibration; `0x0` is analog power-down, its reset value. It read `0x1` in
+every calibration that passed and `0x0` in all 15 of the 2026-11-23 failure,
+while the calibration's own writes to SW_RESET and START held: the PHY did
+not keep the power-up, so its PLL could not lock (`C_READY 0x0`). The
+revision 10 line tells where it went: `0x1` and `0x1` with `PWRDN 0x0` at
+the entry, undone after the power-on; `0x1` then `0x0`, undone within
+100 us; `0x0` right after the write, the write did not take, which a PHY
+without an input it needs (its core supply, L1D, the first suspect) would
+show. If a calibration still ends in `phy initialization timed-out`, the
+lines after it point to the next step:
 - `PCS_READY ... us after the timeout, within 1 s of SERDES_START`: the PHY
   was only slow; give the poll the Kalama driver's 1 s;
 - `no PCS_READY within 1 s` with `C_READY 0x1`: the SerDes PLL is ready and
@@ -415,7 +447,10 @@ section why a freeze). The order:
 
 Steps 1 and 2 ran on 2026-11-22: revision 7 resumed 13 of 13 deep sleeps,
 none of them deep enough to count in `qcom_stats` ("What ran on the
-tablet", below).
+tablet", below). Revision 8 was never installed; revision 9, which carries
+its reset and diagnostic, ran from 2026-11-22 evening, and its fourth run
+lost the UFS the 2026-11-21 way ("What ran on the tablet (2026-11-22 and 23,
+revision 9)", below). Revision 10 adds the second diagnostic above.
 
 The sleep test also has experiment options, each off unless given (the
 kit's README, "The experiment options", has the details and the risks):
@@ -454,6 +489,12 @@ Every `RESULT` line names the options in force, and pmsg gets progress
 lines (`progress: ...`) up to the sleep a run enters, so that a run that
 never comes back still leaves its start, its options and that sleep in the
 next boot's pstore archive.
+
+A failure line of the PCIe host or its PHY in the same words as the UFS's
+(`qcom-pcie 1c00000.pcie: Host init failed: -16`) fails a cycle too, but
+counts as a storage failure only from revision 10's `sleep-test.sh` on,
+which then says that the storage came back and names the PCIe host's line;
+before it, its NEXT line called every such run's storage lost.
 
 Nobody touches the screen during a run: the touchscreen's double tap wakes
 the tablet, and in a suspend under way it makes the kernel give the suspend
@@ -806,6 +847,56 @@ the RTC alarm still pending, and no PMIC watchdog or fault. Until a kernel
 fixes the deeper state, a sleep with the floor held is the one that
 returns; the [porting log](porting-log.md) has the candidates.
 
+#### What ran on the tablet (2026-11-22 and 23, revision 9)
+
+Type-C kit revision 9 (build ID `7912707458aa`: revision 8's reset and
+diagnostic, and run-time switches that collapse the PCIe and USB GDSCs for
+a run) went on over revision 7 at 20:59. Each run: one 30 s suspend-to-idle
+cycle with the root port removed and the floor released, undocked on the
+PC's cable, in a boot of its own (`squirtle-sleep-r9-*-20261122.log` and
+the pstore directories of those names; the [porting log](porting-log.md)
+has the details):
+- 21:01, no switch: hung, restarted by itself about a minute after the RTC
+  alarm, as on revision 7;
+- 21:49 (`trace=live`), 23:34 and 23:46 (the ADSP stopped), `gdsc=pcie0`:
+  each came back, woken by the RTC, the UFS calibrated with `PWRDN 0x1` and
+  read back as before, but the PCIe host did not (`pcie_0_gdsc status stuck
+  at 'off'`, `Host init failed: -16`), and `aosd`, `cxsd`, `ddr` stayed +0;
+- 2026-11-23 00:14, `gdsc=pcie0,usb`, the ADSP stopped: came back with the
+  same PCIe failure, and the UFS PHY failed as on 2026-11-21: 15
+  calibrations, each entry `SW_RESET 0x1 START 0x0 PWRDN 0x0 READY 0x4
+  C_READY 0x0 CMN 0xa0`, each `phy initialization timed-out` and `no
+  PCS_READY within 1 s of SERDES_START`, then I/O errors. The protection
+  held: ext4 logged 5 errors on the read-only disk and saved none, the run
+  restarted the tablet, and the next boot mounted the root with
+  `errors_count` 0.
+
+What that and the analysis of 2026-11-23
+(`~/ubuntu-gts9u/backups/ufs-phy-resume-rootcause-2026-11-23.md`) show:
+- the mechanism of the UFS failure: the PHY did not keep the power-up bit
+  its power-on wrote, so its PLL could not lock, and no retry changed that.
+  Why it did not is not known. The retries never cycle the PHY's core
+  supply, which stock and Qualcomm's reference boards give as L1D while
+  this port's device tree gives L1E and does not describe L1D, nor the
+  PHY's GDSC, nor the external `ufsphy` reset. Whether the USB GDSCs'
+  collapse (run 3's alone) has a part is open: one failure against three
+  passes, and 2026-11-21 failed with them kept on;
+- revision 8's reset is not the fix (above);
+- the PCIe failure is a separate one, from the 7.2-rc phy-mux rework
+  (e108373c54fb), which v7.2 final reverted: the PIPE clock mux is no longer
+  parked on XO while its GDSC is off, so the GDSC cannot power up again;
+- two leftovers keep the SoC out of its deep states, both fixed upstream
+  later: the GPU RSC's stop sequence skipped (d9108bfdb746), and ufs-qcom
+  enabling every UFS host clock once more at each runtime resume
+  (f07317a8d57f; squirtle's counts read 522 to 525 on 2026-11-23). The
+  inline crypto engine's driver also keeps the ICE core clock enabled from
+  its probe on, which nothing upstream changes.
+
+Type-C kit revision 10 carries the three upstream commits (without
+`unpark-pcie0-pipe-mux.patch`) and the second diagnostic; it is not built
+and has not run yet. The device tree's UFS PHY supplies (L1D) are left for
+a later, separate change.
+
 #### Repairing the root from recovery
 
 What the 2026-11-22 repair did, for a root that does not mount. TWRP's own
@@ -843,6 +934,7 @@ the mount. Not changed here; open, as said above.
 
 X710 suspend has so far passed one real deep and one real s2idle cycle
 (2026-11-06, baseline kernel, rpmhpd unsynced and the interconnect floor
-held), failed one real deep sleep (2026-11-21, above) and stays off by
-default; see the [display notes](gts9wifi-display.md) and
-`scripts/diagnostics/suspend/`.
+held), lost the UFS in one real deep sleep (2026-11-21) and in one
+suspend-to-idle with the USB and PCIe GDSCs collapsed (2026-11-23), both
+above, and stays off by default; see the [display notes](gts9wifi-display.md)
+and `scripts/diagnostics/suspend/`.

@@ -1,0 +1,65 @@
+From d9108bfdb746edacdb05bd27959a4ae63c6c7f3f Mon Sep 17 00:00:00 2001
+From: Shivam Rawat <shivrawa@qti.qualcomm.com>
+Date: Fri, 5 Jun 2026 01:38:17 +0530
+Subject: [PATCH] drm/msm/a6xx: Fix stale rpmh votes after suspend
+
+commit d9108bfdb746edacdb05bd27959a4ae63c6c7f3f upstream (v7.3-rc1).
+
+There are stale RPMH votes (BCM votes) observed after GMU suspend. This
+is because the rpmh stop sequences are skipped during gmu suspend. Fix
+this and also move GMU to reset state to avoid any further activity.
+
+Fixes: f248d5d5159a ("drm/msm/a6xx: Fix PDC sleep sequence")
+Signed-off-by: Shivam Rawat <shivrawa@qti.qualcomm.com>
+Signed-off-by: Akhil P Oommen <akhilpo@oss.qualcomm.com>
+Tested-by: Neil Armstrong <neil.armstrong@linaro.org> # on SM8650-HDK
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Patchwork: https://patchwork.freedesktop.org/patch/730652/
+Message-ID: <20260605-assorted-fixes-june-v1-1-2caa04f7287c@oss.qualcomm.com>
+Signed-off-by: Rob Clark <robin.clark@oss.qualcomm.com>
+
+[ Backport to the v7.2-rc3 base of the Galaxy Tab S9 port.  The change is
+  upstream's; only the hunks' line numbers differ, from the port's three
+  patches to this file that come before it:
+  msm-adreno-bound-fault-coredump-wait-gts9u.patch (through
+  scripts/stage-gpu-recovery-experiment.sh),
+  msm-adreno-a740-scm-init-param.patch and
+  msm-adreno-gmu-hub-clk-param.patch.  Upstream's a6xx_gmu.c is the same
+  in v7.2-rc3 and in this commit's parent.
+
+  With the inverted test the GPU RSC's sleep sequence never ran once the
+  GMU firmware had started, which it does at every GMU power-up, so the
+  RSC kept its last votes; and GMU_STATUS_PDC_SLEEP was never set, so
+  a6xx_rpmh_start() never ran the wake sequence either.  From this commit
+  on both run at every GMU power cycle.
+
+  scripts/build-mainline-kernel.sh applies this only with
+  APPLY_SM8550_SLEEP_FIXES=1, after those three. ]
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index dd8a54072315..2e35932eae45 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -649,7 +649,7 @@ static void a6xx_rpmh_stop(struct a6xx_gmu *gmu)
+ 	int ret;
+ 	u32 val;
+ 
+-	if (test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
++	if (!test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
+ 		return;
+ 
+ 	if (adreno_is_a840(adreno_gpu))
+@@ -1488,6 +1488,9 @@ static void a6xx_gmu_shutdown(struct a6xx_gmu *gmu)
+ 	/* Stop the interrupts and mask the hardware */
+ 	a6xx_gmu_irq_disable(gmu);
+ 
++	/* Halt the gmu cm3 core */
++	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
++
+ 	/* Tell RPMh to power off the GPU */
+ 	a6xx_rpmh_stop(gmu);
+ 
