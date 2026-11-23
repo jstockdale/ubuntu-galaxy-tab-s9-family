@@ -783,6 +783,16 @@ return on this port. Not known yet: whether the RTC alarm fails to wake the
 tablet or the resume hangs, and what restarts it (Linux runs no watchdog
 here). The [porting log](porting-log.md) has the reading and the next run.
 
+**Three more, 16:16 to 16:50** (the same run with a 60 s sleep, then with
+`hold=120`, then 30 s with `trace=live`). None came back. The restart came
+about 122 s after the sleep entry for both 60 s sleeps, whatever the hold,
+and about 92 s for the 30 s one: it follows the RTC alarm by about a minute
+and is not the run's own. With the consoles kept on, the record shows every
+phase of the device suspend completing and ends at `PM: suspend-to-idle`,
+with no line from the way back. So the hang is not in a driver's resume:
+Linux does not run again after the CPUs enter the idle state, and something
+below the kernel restarts the tablet.
+
 #### Repairing the root from recovery
 
 What the 2026-11-22 repair did, for a root that does not mount. TWRP's own

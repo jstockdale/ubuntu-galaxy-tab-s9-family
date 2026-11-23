@@ -614,7 +614,14 @@ kernel (the logs are in `~/ubuntu-gts9u/backups/`; details in
   record ends at `printk: Suspending console(s)`), and the tablet restarted
   by itself about 91 s after the sleep entry, as at 14:18. So the failure
   is not in the `SYSTEM_SUSPEND` call: with the PCIe host powered down the
-  sleep returns by neither firmware call.
+  sleep returns by neither firmware call;
+- the same three more times: 16:16 with a 60 s sleep and 16:44 with a 60 s
+  sleep and `hold=120` (the restart about 122 s after the entry both
+  times), 16:50 with 30 s and `trace=live` (about 92 s). The restart
+  follows the RTC alarm by about a minute, whatever the hold, so it is not
+  the run's own; and with the consoles kept on the record ends at `PM:
+  suspend-to-idle`, after every phase of the device suspend, with no line
+  from the resume.
 
 Not run yet: revision 8, a cycle that reaches AOSS sleep, CX collapse or
 DDR low power and comes back, `mode=s2idle` with the PCI devices kept, and

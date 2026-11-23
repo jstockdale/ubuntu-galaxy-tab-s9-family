@@ -9507,3 +9507,41 @@ pci=remove mode=s2idle trace hold=60 restart-ok`. If the restart still comes
 about 91 s after the entry, the timer behind it runs from the entry and the
 alarm plays no part; if it moves to about 121 s, the alarm did something and
 what followed hung.
+
+**16:16, 16:44 and 16:50, three more with the root port removed** (all
+suspend-to-idle on the PC's cable, each on the boot that followed the
+restart before it, so the run released the floor itself and waited its 60 s;
+`squirtle-sleep-r7-pcirm-s2idle-60s-20261122.log`,
+`...-60s-hold120-20261122.log`, `...-live-20261122.log` and the directories
+of those names). None came back, and each time the tablet restarted by
+itself and the next boot mounted the root read-write:
+
+| run | sleep | hold | console | next kernel after the sleep entry |
+|---|---|---|---|---|
+| 15:49 | 30 s | 60 s | suspended | about 91 s |
+| 16:16 | 60 s | 60 s | suspended | about 122 s |
+| 16:44 | 60 s | 120 s | suspended | about 122 s |
+| 16:50 | 30 s | 60 s | `trace=live` | about 92 s |
+
+The restart moves with the sleep's length and not with the hold. So it is
+not the run's own restart (which comes a hold after the wake, and leaves a
+`SLEEP-TEST RESTART` line in pmsg that none of these has), and its timer
+does not run from the entry: it comes about 60 s after the RTC alarm, the
+boot loader's time included.
+
+With `trace=live` the console record goes on past the point where the
+others stop. Every phase of the device suspend completes (`PM: suspend of
+devices complete after 499.934 msecs`, start suspend 953.523, late 6.862,
+noirq 248.754), with one line of note in the noirq phase, `qcom-pcie
+1c00000.pcie: Timeout waiting for L2 entry! LTSSM: 0x11`, from the host
+bridge that stays after the root port is removed; the last line is `PM:
+suspend-to-idle` (256.16 s). Nothing follows: no `PM: resume from
+suspend-to-idle`, no resume phase. The debug UART stayed powered through
+that sleep and the outcome did not change.
+
+So no driver's resume is where it hangs. Linux does not run, or does not
+get as far as its first line, after the CPUs enter the idle state; about a
+minute after the alarm something below the kernel restarts the tablet. What
+that is, whether the alarm reaches the SoC as a wake at all, and what the
+state without the PCIe host's votes takes away, is what the next work is
+about. The boot loader's command line carries no reset reason.
