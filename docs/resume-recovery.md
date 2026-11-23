@@ -767,10 +767,21 @@ The real sleep did not come back here either: the records end at `progress:
 cycle 1/1: entering the sleep` and `printk: Suspending console(s)`, the
 tablet restarted by itself, and the next boot mounted the root clean. So the
 USB role makes no difference: with the PCIe host powered down, a real `deep`
-sleep does not return on this port, docked or not. Suspend-to-idle
-(`mode=s2idle`) reaches the cluster's deepest state by another firmware call
-and has not run yet; the [porting log](porting-log.md) has the reading of the
-source and the next run.
+sleep does not return on this port, docked or not.
+
+**Suspend-to-idle, 15:49** (revision 7, on the PC's cable again, a fresh
+boot, `ro 1 30 release-floor pci=remove mode=s2idle trace hold=60
+restart-ok`; `squirtle-sleep-r7-pcirm-s2idle-20261122.log`). Suspend-to-idle
+reaches the cluster's deepest state by another firmware call (`CPU_SUSPEND`
+instead of `SYSTEM_SUSPEND`). It did not come back either: the records end
+at `progress: cycle 1/1: entering the sleep, rtcwake -m freeze -s 30` and
+`printk: Suspending console(s)`, the tablet restarted by itself about 91 s
+after the sleep entry (about 92 s at 14:18), and the next boot mounted the
+root clean. So the failure is not in one firmware call: with the PCIe host
+powered down, the state the SoC reaches, or the way out of it, does not
+return on this port. Not known yet: whether the RTC alarm fails to wake the
+tablet or the resume hangs, and what restarts it (Linux runs no watchdog
+here). The [porting log](porting-log.md) has the reading and the next run.
 
 #### Repairing the root from recovery
 

@@ -608,11 +608,17 @@ kernel (the logs are in `~/ubuntu-gts9u/backups/`; details in
 - on the powered dock again, 14:18, `ro 1 30 release-floor pci=remove
   trace`, a real sleep with the root port removed: the tablet did not come
   back and restarted by itself, as at 12:05, so the USB role makes no
-  difference to that failure.
+  difference to that failure;
+- on the PC's cable, a fresh boot, 15:49, `ro 1 30 release-floor pci=remove
+  mode=s2idle trace`: suspend-to-idle did not come back either (the console
+  record ends at `printk: Suspending console(s)`), and the tablet restarted
+  by itself about 91 s after the sleep entry, as at 14:18. So the failure
+  is not in the `SYSTEM_SUSPEND` call: with the PCIe host powered down the
+  sleep returns by neither firmware call.
 
 Not run yet: revision 8, a cycle that reaches AOSS sleep, CX collapse or
-DDR low power, `mode=s2idle`, and an ext4 error with an errno under
-`errors=continue`.
+DDR low power and comes back, `mode=s2idle` with the PCI devices kept, and
+an ext4 error with an errno under `errors=continue`.
 `fstrim.timer` (weekly) would, if it fired during a run, send discards to
 the read-only disk, which the block layer logs as a write and the run
 fails; it is not stopped for the run.
