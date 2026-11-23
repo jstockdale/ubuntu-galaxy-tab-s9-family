@@ -793,6 +793,19 @@ with no line from the way back. So the hang is not in a driver's resume:
 Linux does not run again after the CPUs enter the idle state, and something
 below the kernel restarts the tablet.
 
+**18:22, the same run with the floor held** (`ro 1 30 pci=remove
+mode=s2idle trace=live hold=60`, no `release-floor`, on the boot after the
+16:50 hang). It came back: SHALLOW, woken by the RTC after 27.7 s, the UFS
+read back as before, errors_count 0. The PCIe host went down and came up
+again exactly as in the runs that hung (`Timeout waiting for L2 entry`,
+then `PCIe Gen.2 x1 link up`), so the host's power-down is not the cause:
+the sleep is lost only when the floor is released as well and the SoC goes
+deeper. The PMIC's power-on log, read on the same boot, shows each hang
+ending with the SoC side dropping PS_HOLD (a warm reset, then a hard one),
+the RTC alarm still pending, and no PMIC watchdog or fault. Until a kernel
+fixes the deeper state, a sleep with the floor held is the one that
+returns; the [porting log](porting-log.md) has the candidates.
+
 #### Repairing the root from recovery
 
 What the 2026-11-22 repair did, for a root that does not mount. TWRP's own
