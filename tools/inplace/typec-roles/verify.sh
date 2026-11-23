@@ -1,7 +1,9 @@
 #!/bin/sh
 # Checks after booting the Type-C roles kit, and a recorder for plug-in tests.
 #   sh ~/typec-roles/verify.sh                  kernel, key, switches, the root's
-#                                               ext4, roles now
+#                                               ext4, UFS, PCIe, GPU, roles now
+#                                               (with sudo also the UFS host
+#                                               clocks' enable counts)
 #   sudo sh ~/typec-roles/verify.sh dock [N]    N plug-ins of a powered dock
 #                                               (default 10), a verdict for each
 #   sudo sh ~/typec-roles/verify.sh record [N]  the same without a verdict: a
@@ -359,7 +361,7 @@ wait_partner() { # present|absent SECONDS; absent has to hold for 3 s, a
 case ${1:-} in
 dock|record|now|swap) plug_test "$@" ;;
 '') ;;
-*) sed -n '2,16s/^# //p' "$0" >&2; exit 2 ;;
+*) sed -n '2,18s/^# //p' "$0" >&2; exit 2 ;;
 esac
 
 echo "kernel: $(uname -v)"
@@ -411,10 +413,11 @@ param_is sink_host_swap Y
 param_is try_snk_extra_wait_ms 600
 
 # Revision 9's debug switches (gcc-sm8550-gdsc-debug-switches.patch and
-# rpmhpd-debug-retention-floor.patch): run-time module parameters that every
-# boot starts with off.  On the kit's kernel each has to be there and read N:
-# sleep-test.sh sets them for a run only, and every run ends in a restart.
-# Another kernel may have none (revision 8 and before).
+# rpmhpd-debug-retention-floor.patch), in revision 10's kernel too: run-time
+# module parameters that every boot starts with off.  On the kit's kernel
+# each has to be there and read N: sleep-test.sh sets them for a run only,
+# and every run ends in a restart.  Another kernel may have none (revision 8
+# and before).
 sw_others=
 for sw in gcc_sm8550.debug_pcie0_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_off \
 	gcc_sm8550.debug_pcie0_phy_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off \
@@ -432,7 +435,7 @@ if [ -z "$want" ] || [ "$id" != "$want" ]; then
 	if [ -n "$sw_others" ]; then
 		note "debug switches of the running kernel, which is not the kit's:$sw_others"
 	else
-		note 'the running kernel is not the kit'"'"'s and offers no debug switches (revision 9'"'"'s kernel has them)'
+		note 'the running kernel is not the kit'"'"'s and offers no debug switches (the kernels of revisions 9 and 10 have them)'
 	fi
 fi
 
@@ -473,17 +476,22 @@ fi
 # be seen of the change, and make-kit.sh checked on the build that this
 # calibration has no board check.  On any other kernel nothing tells.
 ufs_fail='phy initialization timed-out|Failed to calibrate PHY|Enabling the controller failed|Host init failed|ufshcd_wl_resume failed'
-ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET'
+ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET|power-up write: PWRDN'
+# The PCIe host and its PHY log two of those failures in the same words
+# ("qcom-pcie 1c00000.pcie: Host init failed: -16", "qcom-qmp-pcie-phy
+# 1c06000.phy: phy initialization timed-out"): their lines are the PCIe
+# check's below, not the storage's.
+pcie_dev='[0-9a-f]+\.pcie: |qmp-pcie-phy [0-9a-f]+\.phy: '
 if [ -n "$k" ]; then
 	# The kernel's own lines only: sleep-test.sh writes its verdicts to the
 	# kernel log as well, and a failed cycle's verdict quotes the first
 	# failure line.
 	ku=$(printf '%s\n' "$k" | grep -v 'gts9u sleep-test: ')
 	cal=$(printf '%s\n' "$ku" | grep -c 'calibration entry: SW_RESET')
-	n=$(printf '%s\n' "$ku" | grep -cE "$ufs_fail")
+	n=$(printf '%s\n' "$ku" | grep -E "$ufs_fail" | grep -cvE "$pcie_dev")
 	if [ "$n" != 0 ]; then
 		bad "the UFS PHY or host failed to come up this boot ($n lines; the diagnostic's lines follow theirs):"
-		printf '%s\n' "$ku" | grep -E "$ufs_fail|$ufs_diag" | tail -12
+		printf '%s\n' "$ku" | grep -E "$ufs_fail|$ufs_diag" | grep -vE "$pcie_dev" | tail -12
 	elif [ "$cal" != 0 ]; then
 		ok "UFS PHY: $cal calibrations this boot, each logged by the diagnostic of the kit's kernel, none failed"
 		note "last calibration: $(printf '%s\n' "$ku" | grep 'calibration entry: SW_RESET' | tail -n 1 |
@@ -494,6 +502,82 @@ if [ -n "$k" ]; then
 	else
 		note 'the running kernel is not the kit'"'"'s: whether it resets the UFS PHY'"'"'s PCS before calibration cannot be seen from userspace'
 	fi
+	# Revision 10's second diagnostic (qmp-ufs-pwrdn-readback-diagnostic.patch):
+	# a line right before each calibration entry, with the PHY's power-up
+	# write read back at once and 100 us later.  On the kit's kernel every
+	# calibration has one.
+	pw=$(printf '%s\n' "$ku" | grep -c 'power-up write: PWRDN')
+	if [ "$pw" != 0 ]; then
+		note "last power-up write: $(printf '%s\n' "$ku" | grep 'power-up write: PWRDN' | tail -n 1 |
+			sed 's/.*power-up write: //') (0x1 is the PHY powered up)"
+	fi
+	if [ -n "$want" ] && [ "$id" = "$want" ] && [ "$cal" != "$pw" ]; then
+		bad "$cal UFS PHY calibrations and $pw power-up write lines this boot: the kit's kernel logs one before every calibration"
+	fi
+fi
+
+# Revision 10 leaves out unpark-pcie0-pipe-mux.patch: with the PIPE clock
+# mux revert the clock's own enable switches PCIe0's pipe clock to the PHY.
+# The Wi-Fi's link has to come up at boot as before ("PCIe Gen.2 x1 link
+# up"), and no PCIe host or PHY failure line may follow.
+pcie_fail='Link failed to come up|Host init failed|phy initialization timed-out|failed to resume'
+if [ -n "$k" ]; then
+	up=$(printf '%s\n' "$ku" | grep -E '[0-9a-f]+\.pcie: PCIe Gen\.[0-9]+ x[0-9]+ link up' | tail -n 1)
+	pf=$(printf '%s\n' "$ku" | grep -E "$pcie_dev" | grep -E "$pcie_fail")
+	if [ -n "$pf" ]; then
+		bad "the PCIe host or its PHY failed this boot ($(printf '%s\n' "$pf" | wc -l) lines):"
+		printf '%s\n' "$pf" | tail -n 5
+	elif [ -n "$up" ]; then
+		ok "PCIe: the link came up this boot (${up##*.pcie: })"
+	elif [ -n "$want" ] && [ "$id" = "$want" ]; then
+		bad "no PCIe link-up line this boot: the Wi-Fi's link did not come up (revision 10 switches its pipe clock by the clock's own enable, without unpark-pcie0-pipe-mux.patch)"
+	else
+		note 'no PCIe link-up line this boot'
+	fi
+fi
+
+# Revision 10 runs the GPU RSC's sleep and wake sequences at every power
+# cycle of the GPU's GMU (msm-adreno-a6xx-fix-stale-rpmh-votes.patch); before
+# it neither ran.  One that times out says so.
+gpu_rsc='Unable to power off the GPU RSC|Unable to power on the GPU RSC|GPU RSC sequence stuck while waking up the GPU'
+if [ -n "$k" ]; then
+	n=$(printf '%s\n' "$ku" | grep -cE "$gpu_rsc")
+	if [ "$n" = 0 ]; then
+		ok 'GPU: no RSC sleep or wake sequence failed this boot'
+	else
+		bad "the GPU RSC's sleep or wake sequence failed this boot ($n lines):"
+		printf '%s\n' "$ku" | grep -E "$gpu_rsc" | tail -n 3
+	fi
+fi
+
+# Revision 10's ufs-qcom-enable-only-lane-clocks.patch: ufshcd enables the
+# UFS host's clocks once while UFS works and not while it idles, and the
+# inline crypto engine's driver holds its core and AHB clocks from its probe
+# on, and takes them once more while UFS is resumed: no count above 3.
+# Before it every runtime resume of the UFS host enabled them once more
+# (enable counts of 522 to 525 on 2026-11-23).  debugfs is root's: this runs
+# under sudo only.  Reading clk_summary wakes the clock controllers for a
+# moment, which a check outside a sleep test can afford.
+clk_sum=/sys/kernel/debug/clk/clk_summary
+if [ -r "$clk_sum" ]; then
+	clks=$(awk '$1 ~ /^(gcc_ufs_phy_(axi|ahb|unipro_core|ice_core)_clk|tcsr_ufs_pad_clkref_en)$/ &&
+		$2 ~ /^[0-9]+$/ && !($1 in seen) {
+			seen[$1] = 1
+			printf "%s%s %s/%s", n++ ? ", " : "", $1, $2, $3
+			if ($2 + 0 > m) m = $2 + 0
+		} END { printf "|%d", m }' "$clk_sum" 2>/dev/null)
+	most=${clks##*|} clks=${clks%|*}
+	if [ -z "$clks" ]; then
+		note "no UFS host clock in $clk_sum"
+	elif [ -z "$want" ] || [ "$id" != "$want" ]; then
+		note "UFS host clocks of the running kernel, which is not the kit's (enable/prepare): $clks"
+	elif [ "$most" -gt 3 ]; then
+		bad "UFS host clocks enabled up to $most times ($clks; enable/prepare): with the kit's kernel no count is above 3"
+	else
+		ok "UFS host clocks (enable/prepare): $clks"
+	fi
+else
+	note "the UFS host clocks' enable counts need root: sudo sh $kit/verify.sh"
 fi
 
 # The root's mount this boot, from the kernel's own lines (fs/ext4/super.c,

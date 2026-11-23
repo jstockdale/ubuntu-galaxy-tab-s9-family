@@ -5,12 +5,16 @@
 # USB power domains across suspend and the NULL check of the hcd in the
 # dwc3-qcom glue (docs/usb-c-dock-roles.md), since revision 8 the PCS
 # reset of the SM8550 UFS PHY for both tablets with its diagnostic
-# (docs/resume-recovery.md), and since revision 9 the deep-sleep debug
-# switches (run-time module parameters of gcc-sm8550 and rpmhpd, off at every
-# boot), in boot, plus the build's module tree, signed with its own key.  The
-# configuration and the DTB do not change, so vendor_boot stays the hang-log
-# kit's.  The build for this kit sets APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1
-# and APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1.
+# (docs/resume-recovery.md), since revision 9 the deep-sleep debug switches
+# (run-time module parameters of gcc-sm8550 and rpmhpd, off at every boot),
+# and since revision 10 the SM8550 sleep fixes (three upstream commits: the
+# revert of the PCIe PIPE clock mux rework, with unpark-pcie0-pipe-mux.patch
+# left out, the GPU RSC's stop sequence and ufs-qcom's lane clocks) and a
+# second UFS PHY diagnostic, in boot, plus the build's module tree, signed
+# with its own key.  The configuration and the DTB do not change, so
+# vendor_boot stays the hang-log kit's.  The build for this kit sets
+# APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and
+# APPLY_SM8550_SLEEP_FIXES=1.
 #
 #   bash tools/inplace/typec-roles/make-kit.sh BUILD_SCRATCH KERNEL_OUT_DIR \
 #       HANG_KERNEL_OUT_DIR HANG_KIT_DIR KIT_DIR
@@ -34,14 +38,18 @@
 # Then the changes are checked to be only the intended ones: the DTB, the
 # configuration and the module list are the hang-log build's, the source
 # trees differ in the three Type-C files, the clock controller, the
-# dwc3-qcom glue, the UFS PHY driver and the RPMh power domain driver alone
-# and those are what this checkout's patches, stage script and driver give,
-# the new image has the new code (the debug switches' parameters among it)
-# and the old one does not and was built after the last change to those
-# files, the compiled power domain table differs in the two power-state masks
-# alone and the RPMh power domain driver's tables not at all, the UFS PHY's
-# calibration in the new vmlinux no longer asks which board it runs on, and
-# the new boot image differs only in its kernel.  Nothing is flashed.
+# dwc3-qcom glue, the UFS PHY driver, the RPMh power domain driver, and the
+# PIPE clock mux, the PCIe PHY, the GMU and ufs-qcom files of revision 10
+# alone and those are what this checkout's patches, stage script and driver
+# give (the PCIe PHY's without unpark-pcie0-pipe-mux.patch), the new image
+# has the new code (the debug switches' parameters among it) and the old one
+# does not and was built after the last change to those files, the compiled
+# power domain table differs in the two power-state masks alone and the RPMh
+# power domain driver's tables not at all, the UFS PHY's calibration in the
+# new vmlinux no longer asks which board it runs on, the new vmlinux has the
+# PIPE clock mux's gate operations and not its rate operations and its PCIe
+# PHY power-on sets no clock rate, and the new boot image differs only in
+# its kernel.  Nothing is flashed.
 set -euo pipefail
 export LC_ALL=C
 
@@ -62,32 +70,49 @@ mkbootimg=$tools/mkbootimg.py
 avbtool=$tools/avbtool.py
 size=100663296
 # This kit's revision: revision 7 plus the UFS PHY's PCS reset for both
-# tablets and its diagnostic (8), plus the deep-sleep debug switches (9).
+# tablets and its diagnostic (8), plus the deep-sleep debug switches (9),
+# plus the SM8550 sleep fixes and the second UFS PHY diagnostic (10).
 # Written to the kit for people; install.sh knows a revision by its boot
 # image and kernel build ID.
-revision=9
+revision=10
 dts=sm8550-samsung-gts9wifi
 tcpm_dir=drivers/usb/typec/tcpm
 gcc=drivers/clk/qcom/gcc-sm8550
 dwc3=drivers/usb/dwc3/dwc3-qcom
 qmp=drivers/phy/qualcomm/phy-qcom-qmp-ufs
 rpmhpd=drivers/pmdomain/qcom/rpmhpd
+# Revision 10's files: the PIPE clock mux, the PCIe PHY (which loses
+# unpark-pcie0-pipe-mux.patch), the GMU and ufs-qcom.
+phymux=drivers/clk/qcom/clk-regmap-phy-mux
+qmp_pcie=drivers/phy/qualcomm/phy-qcom-qmp-pcie
+gmu=drivers/gpu/drm/msm/adreno/a6xx_gmu
+ufs_qcom=drivers/ufs/host/ufs-qcom
 # The USB-C dock changes, each applied to the hang-log tree's file as it is.
 typec_patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
 	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch
 	tcpm-keep-queued-swap-pending.patch gcc-sm8550-usb-gdscs-retention.patch
 	dwc3-qcom-check-hcd-before-reading-port-speed.patch)
-# The UFS PHY's two.  The hang-log tree carries the earlier, SM-X910-only
+# The UFS PHY's three.  The hang-log tree carries the earlier, SM-X910-only
 # form of the first, which scripts/stage-ufs-resume-experiment.sh replaces;
-# the diagnostic goes on top, with APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1.
+# the diagnostic goes on top, with APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, and
+# revision 10's second diagnostic on top of it, with that and
+# APPLY_SM8550_SLEEP_FIXES=1.
 ufs_patches=(qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch
-	qmp-ufs-pcs-state-diagnostic.patch)
+	qmp-ufs-pcs-state-diagnostic.patch qmp-ufs-pwrdn-readback-diagnostic.patch)
 # Revision 9's debug switches, with APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1: the
 # GDSC one on top of the USB power domain patch, the RPMh one on its own.
 debug_patches=(gcc-sm8550-gdsc-debug-switches.patch rpmhpd-debug-retention-floor.patch)
-patches=("${typec_patches[@]}" "${debug_patches[@]}" "${ufs_patches[@]}")
-# The files those patches change.
-patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c" "$rpmhpd.c")
+# Revision 10's SM8550 sleep fixes, with APPLY_SM8550_SLEEP_FIXES=1: three
+# upstream commits, one file each (ufs-qcom's two), and the PCIe PHY without
+# unpark-pcie0-pipe-mux.patch, which the hang-log tree carries.
+fix_patches=(clk-qcom-regmap-phy-mux-revert-rework.patch msm-adreno-a6xx-fix-stale-rpmh-votes.patch
+	ufs-qcom-enable-only-lane-clocks.patch)
+fix_files=("$phymux.c" "$gmu.c" "$ufs_qcom.c")
+unpark=unpark-pcie0-pipe-mux.patch
+patches=("${typec_patches[@]}" "${debug_patches[@]}" "${fix_patches[@]}" "${ufs_patches[@]}")
+# The files those patches change, and the PCIe PHY's.
+patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c" "$rpmhpd.c"
+	"$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h")
 
 # The base on the tablet: the hang-log kit, which a first install saves and
 # rollback.sh puts back.
@@ -108,9 +133,14 @@ hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
 # structure, which only a driver that reads its parameters at each attach
 # has.  Then revision 8's UFS PHY diagnostic: the two labels of its state
 # lines and its line for a PCS_READY that never came.  The PCS reset itself
-# leaves no string; the disassembly check below is for it.  Last, revision
+# leaves no string; the disassembly check below is for it.  Then revision
 # 9's debug switches: the names of the four module parameters as the kernel
-# keeps them (built in, so prefixed with the object's name).
+# keeps them (built in, so prefixed with the object's name).  Last, revision
+# 10: the three messages of ufs-qcom's lane clock lookup, and the second UFS
+# PHY diagnostic's line.  The PIPE clock mux revert, the missing
+# unpark-pcie0-pipe-mux.patch and the GMU fix leave no string; the symbol
+# and disassembly checks below are for the first two, the GMU's source and
+# object dates for the last.
 new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
 	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
 	'Swap is still queued, left pending' 'Partner swapped first, queued DR_SWAP_SEND dropped'
@@ -118,13 +148,16 @@ new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait
 	policy_open
 	'calibration entry' 'after the PCS_READY timeout' 'no PCS_READY within 1 s of SERDES_START'
 	gcc_sm8550.debug_pcie0_off gcc_sm8550.debug_pcie0_phy_off gcc_sm8550.debug_usb_off
-	rpmhpd.debug_ret_floor)
+	rpmhpd.debug_ret_floor
+	'failed to get tx_lane0_sync_clk' 'failed to get rx_lane0_sync_clk' 'failed to get rx_lane1_sync_clk'
+	'power-up write: PWRDN')
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
 	"$tcpm_dir/sm5714_usbpd.o:$tcpm_dir/sm5714_usbpd.c"
 	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h" "$dwc3.o:$dwc3.c" "$qmp.o:$qmp.c"
-	"$rpmhpd.o:$rpmhpd.c")
+	"$rpmhpd.o:$rpmhpd.c" "$phymux.o:$phymux.c" "$qmp_pcie.o:$qmp_pcie.c" "$gmu.o:$gmu.c"
+	"$ufs_qcom.o:$ufs_qcom.c" "$ufs_qcom.o:$ufs_qcom.h")
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 die() { echo "$*" >&2; exit 1; }
@@ -133,9 +166,10 @@ for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$hangkit/vendor_boot.img" "${patched[@]/#/$tree/}" \
 	"$build/.config" "$build/certs/signing_key.x509" "$build/vmlinux" \
 	"$build/$gcc.o" "$build/$tcpm_dir/tcpm.o" "$build/$tcpm_dir/sm5714_usbpd.o" "$build/$dwc3.o" \
-	"$build/$qmp.o" "$build/$rpmhpd.o" "$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
+	"$build/$qmp.o" "$build/$rpmhpd.o" "$build/$phymux.o" "$build/$qmp_pcie.o" "$build/$gmu.o" \
+	"$build/$ufs_qcom.o" "$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
 	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}" \
-	"$repo/scripts/stage-ufs-resume-experiment.sh"; do
+	"$repo/kernel/patches/$unpark" "$repo/scripts/stage-ufs-resume-experiment.sh"; do
 	[ -f "$f" ] || die "missing: $f"
 done
 for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy llvm-objdump llvm-nm; do
@@ -260,6 +294,20 @@ for i in "${!debug_patches[@]}"; do
 		< "$repo/kernel/patches/${debug_patches[$i]}" ||
 		die "the build tree's $f does not carry ${debug_patches[$i]} whole"
 done
+# Revision 10's sleep fixes: each upstream commit whole in the build tree
+# (ufs-qcom's in both of its files), and the PCIe PHY without
+# unpark-pcie0-pipe-mux.patch, which the PIPE clock mux revert replaces.
+for i in "${!fix_patches[@]}"; do
+	f=${fix_files[$i]}
+	mkdir -p "$tmp/fix/${f%/*}"
+	cp "$tree/$f" "$tmp/fix/$f"
+	[ "$f" != "$ufs_qcom.c" ] || cp "$tree/$ufs_qcom.h" "$tmp/fix/$ufs_qcom.h"
+	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/fix" -p1 \
+		< "$repo/kernel/patches/${fix_patches[$i]}" ||
+		die "the build tree's $f does not carry ${fix_patches[$i]} whole"
+done
+! grep -q 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' "$tree/$qmp_pcie.c" ||
+	die "the build tree's $qmp_pcie.c carries $unpark, which revision 10 leaves out"
 source_check='marker lines only (HANG_SCRATCH not set)'
 if [ -n "${HANG_SCRATCH:-}" ]; then
 	hang_tree=$HANG_SCRATCH/linux-src-gts9wifi
@@ -278,6 +326,14 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 		die 'the hang-log tree carries the dwc3-qcom guard or the USB power domain patch already'
 	! grep -q 'SM8550 deep-sleep debug, not for release builds' "$hang_tree/$gcc.c" "$hang_tree/$rpmhpd.c" ||
 		die 'the hang-log tree carries the deep-sleep debug switches already'
+	# Revision 10: the hang-log build had none of the three upstream commits
+	# and did apply unpark-pcie0-pipe-mux.patch, as every default build does.
+	! grep -q 'static int phy_mux_enable(struct clk_hw \*hw)' "$hang_tree/$phymux.c" &&
+		! grep -qF 'if (!test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))' "$hang_tree/$gmu.c" &&
+		! grep -q 'tx_lane0_sync_clk' "$hang_tree/$ufs_qcom.c" ||
+		die 'the hang-log tree carries one of the SM8550 sleep fixes already'
+	grep -q 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' "$hang_tree/$qmp_pcie.c" ||
+		die "the hang-log tree's $qmp_pcie.c does not carry $unpark"
 	# Like every build before revision 8, the hang-log build gave the PCS
 	# reset to the SM-X910 alone, and has no diagnostic.
 	grep -q 'SM-X910 experiment: assert PCS reset before calibration tables' "$hang_tree/$qmp.c" &&
@@ -294,14 +350,27 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 			< "$repo/kernel/patches/$p" ||
 			die "$p does not apply to the hang-log tree"
 	done
+	# Revision 10's sleep fixes as the build applies them, strictly, and the
+	# PCIe PHY as a build that leaves out unpark-pcie0-pipe-mux.patch has it.
+	for p in "${fix_patches[@]}"; do
+		patch -s --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
+			< "$repo/kernel/patches/$p" ||
+			die "$p does not apply to the hang-log tree"
+	done
+	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
+		< "$repo/kernel/patches/$unpark" ||
+		die "$unpark does not come out of the hang-log tree's $qmp_pcie.c whole"
 	# The UFS PHY as the build changes it: this checkout's stage script
-	# replaces the SM-X910-only PCS reset, then the diagnostic goes on top.
+	# replaces the SM-X910-only PCS reset, then the diagnostic goes on top,
+	# then revision 10's second diagnostic.
 	UFS_PCS_RESET_EXPERIMENTAL=1 bash "$repo/scripts/stage-ufs-resume-experiment.sh" "$tmp/src" \
 		> "$tmp/stage-ufs.log" ||
 		die "scripts/stage-ufs-resume-experiment.sh does not take the hang-log tree's $qmp.c"
-	patch -s --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
-		< "$repo/kernel/patches/qmp-ufs-pcs-state-diagnostic.patch" ||
-		die "qmp-ufs-pcs-state-diagnostic.patch does not apply to the hang-log tree's $qmp.c"
+	for p in qmp-ufs-pcs-state-diagnostic.patch qmp-ufs-pwrdn-readback-diagnostic.patch; do
+		patch -s --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
+			< "$repo/kernel/patches/$p" ||
+			die "$p does not apply to the hang-log tree's $qmp.c"
+	done
 	for f in "${patched[@]}"; do
 		cmp -s "$tmp/src/$f" "$tree/$f" ||
 			die "$f is not the hang-log tree's with this checkout's patches applied"
@@ -332,23 +401,28 @@ $gcc.c
 $dwc3.c
 $qmp.c
 $rpmhpd.c
+$phymux.c
+$qmp_pcie.c
+$gmu.c
+$ufs_qcom.c
+$ufs_qcom.h
 $tcpm_dir/sm5714_usbpd.c
 $tcpm_dir/tcpm.c
 include/linux/usb/tcpm.h
 EOF
 	cmp -s "$tmp/trees.changed" "$tmp/trees.want" || {
-		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c and rpmhpd.c:' >&2
+		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h:' >&2
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $hang_tree: seven files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, gcc-sm8550.c and rpmhpd.c by its two debug switch patches, phy-qcom-qmp-ufs.c by its stage script and the UFS PHY diagnostic"
-	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c and rpmhpd.c differ from the hang-log tree, by exactly this checkout'"'"'s changes'
+	source_check="compared with $hang_tree: twelve files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, gcc-sm8550.c and rpmhpd.c by its two debug switch patches, clk-regmap-phy-mux.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h by its three sleep fixes, phy-qcom-qmp-pcie.c by $unpark left out, phy-qcom-qmp-ufs.c by its stage script and the two UFS PHY diagnostics"
+	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h differ from the hang-log tree, by exactly this checkout'"'"'s changes'
 	if [ -n "$backups" ]; then
 		source_check="$source_check; passed over, a copy of the hang-log tree's file that patch(1) kept:$backups"
 		echo "sources: passed over$backups, the hang-log tree's file as patch(1) kept it"
 	fi
 else
-	echo 'sources: the eleven patches and this checkout'"'"'s driver are in the build tree (HANG_SCRATCH not set: no tree comparison)'
+	echo 'sources: the fifteen patches and this checkout'"'"'s driver are in the build tree, and unpark-pcie0-pipe-mux.patch is not (HANG_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.
@@ -425,13 +499,13 @@ notes_build_id() { # VMLINUX: the build ID of its .notes
 	llvm-objcopy -O binary --only-section=.notes "$1" "$tmp/notes.bin" &&
 		build_id "$tmp/notes.bin"
 }
-calibrate_calls() { # VMLINUX: what qmp_ufs_phy_calibrate() calls, one per line
-	llvm-objdump -d --no-show-raw-insn --disassemble-symbols=qmp_ufs_phy_calibrate "$1" |
+calls_of() { # VMLINUX FUNCTION: what FUNCTION calls, one per line
+	llvm-objdump -d --no-show-raw-insn --disassemble-symbols="$2" "$1" |
 		sed -n 's/.*[[:space:]]bl[[:space:]].*<\([A-Za-z0-9_.]*\)>$/\1/p' | sort -u
 }
 [ "$(notes_build_id "$build/vmlinux")" = "$new_id" ] ||
 	die "$build/vmlinux is not the ELF of the new image (another build ID)"
-calibrate_calls "$build/vmlinux" > "$tmp/calibrate.calls"
+calls_of "$build/vmlinux" qmp_ufs_phy_calibrate > "$tmp/calibrate.calls"
 grep -qx reset_control_assert "$tmp/calibrate.calls" ||
 	die "no qmp_ufs_phy_calibrate() calling reset_control_assert() in $build/vmlinux"
 ! grep -qx of_machine_compatible_match "$tmp/calibrate.calls" ||
@@ -441,12 +515,44 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 	[ -f "$HANG_SCRATCH/linux-gts9wifi/vmlinux" ] || die "no vmlinux in $HANG_SCRATCH"
 	[ "$(notes_build_id "$HANG_SCRATCH/linux-gts9wifi/vmlinux")" = "$hang_build_id" ] ||
 		die "self-test failed: $HANG_SCRATCH/linux-gts9wifi/vmlinux is not the hang-log kernel's"
-	calibrate_calls "$HANG_SCRATCH/linux-gts9wifi/vmlinux" > "$tmp/calibrate.hang.calls"
+	calls_of "$HANG_SCRATCH/linux-gts9wifi/vmlinux" qmp_ufs_phy_calibrate > "$tmp/calibrate.hang.calls"
 	grep -qx of_machine_compatible_match "$tmp/calibrate.hang.calls" ||
 		die 'self-test failed: the hang-log calibration does not show the board gate either'
 	gate_check="$gate_check; the hang-log build's does"
 fi
 echo "UFS PHY: $gate_check"
+
+# 5c. Revision 10's PCIe PIPE clock, which leaves no string.  With the
+# revert the mux has its gate operations again and not the rework's rate
+# ones, and without unpark-pcie0-pipe-mux.patch the PCIe PHY's power-on
+# sets no clock rate (it is inlined into qmp_pcie_enable(), which has to
+# call clk_bulk_enable(): that shows the function was found).  From the
+# vmlinux the image was made from (5b).  With HANG_SCRATCH the hang-log
+# build's vmlinux has to show the opposite of each.
+llvm-nm --defined-only "$build/vmlinux" > "$tmp/vmlinux.nm"
+nm_has() { grep -q " [tT] $2\$" "$1"; } # NM-LIST FUNCTION
+for f in phy_mux_enable phy_mux_disable phy_mux_is_enabled; do
+	nm_has "$tmp/vmlinux.nm" "$f" || die "no $f in $build/vmlinux: the PIPE clock mux revert is not in it"
+done
+for f in phy_mux_recalc_rate phy_mux_determine_rate phy_mux_set_rate; do
+	! nm_has "$tmp/vmlinux.nm" "$f" || die "$f in $build/vmlinux: the PIPE clock mux has the rework's rate operations"
+done
+calls_of "$build/vmlinux" qmp_pcie_enable > "$tmp/pcie.calls"
+grep -qx clk_bulk_enable "$tmp/pcie.calls" ||
+	die "no qmp_pcie_enable() calling clk_bulk_enable() in $build/vmlinux"
+! grep -qx clk_set_rate "$tmp/pcie.calls" ||
+	die "qmp_pcie_enable() in $build/vmlinux calls clk_set_rate(): $unpark"
+pcie_check="vmlinux (build ID ${new_id:0:12}) has the PIPE clock mux's gate operations and not its rate ones, and its qmp_pcie_enable() calls no clk_set_rate()"
+if [ -n "${HANG_SCRATCH:-}" ]; then
+	llvm-nm --defined-only "$HANG_SCRATCH/linux-gts9wifi/vmlinux" > "$tmp/vmlinux.hang.nm"
+	nm_has "$tmp/vmlinux.hang.nm" phy_mux_set_rate && ! nm_has "$tmp/vmlinux.hang.nm" phy_mux_enable ||
+		die 'self-test failed: the hang-log vmlinux does not have the rework'"'"'s PIPE clock mux'
+	calls_of "$HANG_SCRATCH/linux-gts9wifi/vmlinux" qmp_pcie_enable > "$tmp/pcie.hang.calls"
+	grep -qx clk_set_rate "$tmp/pcie.hang.calls" ||
+		die "self-test failed: the hang-log build's qmp_pcie_enable() does not call clk_set_rate() either"
+	pcie_check="$pcie_check; the hang-log build's has the rate operations and calls it"
+fi
+echo "PCIe PIPE clock: $pcie_check"
 
 # 6. The module key and the modules.  The serial is what modinfo reports as
 # sig_key; the subject key ID is what the kernel logs and the registry files
@@ -483,7 +589,8 @@ echo "modules: $n, the hang-log build's list, all signed with key ${key_id:0:12}
 # each parameter's description is in the module tree's
 # modules.builtin.modinfo under its object's name, where the hang-log
 # build's has none; and the build's vmlinux, the image's by its build ID
-# (5b), has both set handlers.  Their names are in the image (4).
+# (5b), has both set handlers (its symbols as 5c listed them).  Their names
+# are in the image (4).
 tr '\0' '\n' < "$modules/modules.builtin.modinfo" > "$tmp/builtin.modinfo"
 tr '\0' '\n' < "$hang_modules/modules.builtin.modinfo" > "$tmp/builtin.hang.modinfo"
 for parm in gcc_sm8550.parm=debug_pcie0_off: gcc_sm8550.parm=debug_pcie0_phy_off: \
@@ -493,7 +600,6 @@ for parm in gcc_sm8550.parm=debug_pcie0_off: gcc_sm8550.parm=debug_pcie0_phy_off
 	! grep -q "^$parm" "$tmp/builtin.hang.modinfo" ||
 		die "self-test failed: the hang-log build's modules.builtin.modinfo has $parm too"
 done
-llvm-nm --defined-only "$build/vmlinux" > "$tmp/vmlinux.nm"
 for f in gcc_sm8550_debug_set rpmhpd_debug_ret_floor_set; do
 	grep -q " [tT] $f\$" "$tmp/vmlinux.nm" || die "no $f in $build/vmlinux"
 done
@@ -537,7 +643,9 @@ printf '%s\n' "$revision" > "$kit/REVISION"
 	echo "source check: $source_check"
 	echo "power domain table: $gdsc_check"
 	echo "UFS PHY board gate: $gate_check"
+	echo "PCIe PIPE clock: $pcie_check"
 	echo "debug switches: $switch_check"
+	echo "left out: kernel/patches/$unpark (APPLY_SM8550_SLEEP_FIXES=1)"
 } > "$kit/SOURCE"
 install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/sleep-test.sh" \
 	"$here/README.md" "$kit/"

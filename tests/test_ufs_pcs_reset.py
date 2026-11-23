@@ -26,6 +26,10 @@ STAGE = ROOT / "scripts/stage-ufs-resume-experiment.sh"
 PATCHES = ROOT / "kernel/patches"
 PCS_RESET = PATCHES / "qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch"
 DIAGNOSTIC = PATCHES / "qmp-ufs-pcs-state-diagnostic.patch"
+# Revision 10's second diagnostic, on top of the first with
+# APPLY_SM8550_SLEEP_FIXES=1 as well (tests/test_typec_roles_kit.py,
+# SleepFixesTest).
+PWRDN = PATCHES / "qmp-ufs-pwrdn-readback-diagnostic.patch"
 SERDES = PATCHES / "qmp-ufs-reset-serdes-before-power-down-gts9u.patch"
 QMP = "drivers/phy/qualcomm/phy-qcom-qmp-ufs.c"
 MARKER = "Diagnostic for SM8550 resume tests, not for release builds"
@@ -116,11 +120,14 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual(apply_block().count(f"'{MARKER}'"), 1)
 
     def test_no_other_patch_touches_the_ufs_phy_driver(self):
-        """So the order checked above is the whole of what the build does to
-        the file, on either board."""
+        """So the order checked above, and the second diagnostic right after
+        it, are the whole of what the build does to the file, on either
+        board."""
         touching = sorted(p.name for p in PATCHES.glob("*.patch")
                           if re.search(rf"^\+\+\+ b/{re.escape(QMP)}", p.read_text(), re.M))
-        self.assertEqual(touching, sorted([SERDES.name, PCS_RESET.name, DIAGNOSTIC.name]))
+        self.assertEqual(touching, sorted([SERDES.name, PCS_RESET.name, DIAGNOSTIC.name, PWRDN.name]))
+        text = BUILD.read_text()
+        self.assertLess(text.index(apply_block()), text.index("qmp_ufs_pwrdn_marker="))
 
 
 @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
