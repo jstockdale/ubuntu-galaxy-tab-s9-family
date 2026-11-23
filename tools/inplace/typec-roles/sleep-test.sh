@@ -2,8 +2,10 @@
 # Deep sleeps of the SM-X710 with every disk filesystem frozen, to test
 # whether the UFS storage comes back, without risking the data on it.
 #   sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
-#        [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle] restart-ok
-#   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle] restart-ok
+#        [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
+#        [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok
+#   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]
+#        [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok
 #   sh ~/typec-roles/sleep-test.sh status
 # ro (the default): CYCLES deep sleeps (default 3, at most 10) of SECONDS
 # each (15, 30 or 60; default 30), each woken by the RTC.  dry: the same
@@ -31,7 +33,11 @@
 # lines reach ramoops (live up to the console suspend, the rest at the
 # resume); trace=live also keeps the consoles printing while devices
 # suspend and resume (console_suspend N), at a cost: read the risks below
-# first.
+# first.  gdsc=LIST (pcie0, pcie0phy and usb, comma-separated; with
+# pci=remove only) and cxmx=ret set the kernel's debug switches (revision
+# 9's kernel) right before the freeze, until the restart: the PCIe and USB
+# GDSCs collapse in the sleep instead of staying on, and the CX and MX votes
+# stay at RETENTION or above.  Every run prints the switches as they are.
 # status (no root) prints the latest run's result from /run.
 #
 # On 2026-11-21 one deep sleep (rtcwake -m mem -s 30) did not bring the UFS
@@ -380,6 +386,35 @@
 #     cycle is tried again like an ABORTED attempt, within the same aborts=N,
 #     past which the run ends with NO-SLEEP (s2idle).  A cycle in which no
 #     CPU entered its s2idle state and no such wakeup explains it FAILs.
+#   - gdsc=LIST and cxmx=ret (ro and dry; revision 9's kernel): the kernel's
+#     debug switches, run-time module parameters that every boot starts with
+#     off (N) and that nothing but root's write changes
+#     (gcc-sm8550-gdsc-debug-switches.patch, rpmhpd-debug-retention-floor.patch):
+#       pcie0     gcc_sm8550 debug_pcie0_off: pcie_0_gdsc OFF_ON, not RET_ON
+#       pcie0phy  gcc_sm8550 debug_pcie0_phy_off: pcie_0_phy_gdsc the same
+#       usb       gcc_sm8550 debug_usb_off: both USB GDSCs the same
+#                 (mainline's; the docked xHCI dies with it: run undocked)
+#       cxmx=ret  rpmhpd debug_ret_floor: the APPS votes for cx.lvl and
+#                 mx.lvl at RETENTION or above in every RPMh set
+#     With a GDSC switch on, genpd's power-off of that GDSC at the end of the
+#     suspend's noirq phase collapses it (drops the APPS vote of a PCIe one)
+#     instead of leaving it on in hardware.  gdsc= is refused without
+#     pci=remove: with the PCI devices kept the PCIe host stays up through
+#     the sleep, and a collapsed PCIe GDSC would take the controller away
+#     from a live host.  Refused, with nothing changed, when the kernel does
+#     not offer a switch asked for (r8 and before), or when any switch it
+#     offers is on already (set by hand: the run's record would not say
+#     who set it).  The run writes Y to each switch asked for right before
+#     the freeze (after pci=remove's removal, in RAM, the disk still
+#     writable), reads each back (one that does not read Y stops the run
+#     before anything is frozen, with the ones that took put back to N),
+#     and never puts them back after that: the restart that ends every run
+#     does.  The header, the progress line right after the write and the
+#     one before each sleep, every cycle's verdict and every RESULT line
+#     name the switches as read then ("switches: pcie0 Y, pcie0phy N, usb
+#     Y, cxmx N"; "switches: not offered by this kernel" on a kernel
+#     without them), whether a run asked for any or not, so the pmsg record
+#     of a run that never comes back says which were set.
 set -u
 export LC_ALL=C
 umask 022
@@ -413,6 +448,11 @@ console_suspend_ctl=/sys/module/printk/parameters/console_suspend
 ignore_loglevel_ctl=/sys/module/printk/parameters/ignore_loglevel
 print_times_ctl=/sys/power/pm_print_times
 debug_messages_ctl=/sys/power/pm_debug_messages
+# The kernel's debug switches (gdsc=, cxmx=; the header), by the word the
+# options and the record give each: sw_file.
+sw_gcc=/sys/module/gcc_sm8550/parameters
+sw_rpmhpd=/sys/module/rpmhpd/parameters
+sw_names='pcie0 pcie0phy usb cxmx'
 # mode=s2idle's checks and evidence (reads only): each CPU's cpuidle states,
 # and the idle states of the CPU cluster's power domain (debugfs).
 cpu_devs=/sys/devices/system/cpu
@@ -503,9 +543,10 @@ mount_deadline=60
 # (ev_keep), at most 700 bytes: 7 KiB for ten; mode=s2idle adds a third, at
 # most 300 bytes more, and a WOKEN EARLY attempt adds its evidence lines
 # and its verdict, about 1.5 KiB, within the same 21.  The progress lines
-# (progress) add the run's start, the PCI removal and the protection, under
-# 1 KiB, and one line of about 150 bytes before each attempt at a sleep, at
-# most 31 in a run: under 6 KiB in all.
+# (progress) add the run's start, the PCI removal, the debug switches and
+# the protection, under 1 KiB, and one line of about 200 bytes before each
+# attempt at a sleep, at most 31 in a run: under 7 KiB in all.  Every
+# verdict and RESULT line carries the debug switches, under 60 bytes each.
 diag_head=12
 diag_tail=4
 # Evidence around each cycle (added after the r7 baselines of 2026-11-22,
@@ -807,6 +848,35 @@ selected() { # the bracketed choice of a sysfs list
 	echo "$sel"
 }
 
+# The file of the debug switch WORD (gdsc=, cxmx=; the header).
+sw_file() { # WORD
+	case $1 in
+	pcie0) echo "$sw_gcc/debug_pcie0_off" ;;
+	pcie0phy) echo "$sw_gcc/debug_pcie0_phy_off" ;;
+	usb) echo "$sw_gcc/debug_usb_off" ;;
+	cxmx) echo "$sw_rpmhpd/debug_ret_floor" ;;
+	esac
+}
+
+# The debug switches as they read now, for the record: "switches: pcie0 Y,
+# pcie0phy N, usb N, cxmx N", a switch this kernel does not offer left out,
+# or "switches: not offered by this kernel".  The shell reads sysfs itself.
+sw_now() {
+	swl=
+	for swn in $sw_names; do
+		swf=$(sw_file "$swn")
+		[ -e "$swf" ] || continue
+		swv=
+		read -r swv 2>/dev/null < "$swf" || :
+		swl="$swl, $swn ${swv:--}"
+	done
+	if [ -n "$swl" ]; then
+		echo "switches: ${swl#, }"
+	else
+		echo 'switches: not offered by this kernel'
+	fi
+}
+
 roles() {
 	rl=
 	for rf in data_role power_role; do
@@ -1028,6 +1098,21 @@ progress() {
 	[ ! -e /dev/pmsg0 ] || printf 'gts9u sleep-test: %s progress: %.280s\n' "$stamp" "$*" 2>/dev/null >> /dev/pmsg0
 }
 
+# The debug switches as they read now ($swnote), which every cycle's verdict
+# and, through $optnote, every RESULT line ends with.
+sw_note() {
+	swnote=$(sw_now)
+	optnote="; options: $options; $swnote"
+}
+
+# What to do after a debug switch that did not take stopped the run.
+sw_next() {
+	sn='NEXT: the kernel did not take that write (its own line, if it wrote one: sudo dmesg | grep -e gcc-sm8550 -e rpmhpd); run again once that is understood'
+	[ "$pci_remove" = 0 ] ||
+		sn="$sn; what pci=remove removed stays removed until the restart, the Wi-Fi with it (sudo reboot brings it back)"
+	echo "$sn"
+}
+
 # The experiment's knobs for one sleep (pm_test=, trace): set right before
 # rtcwake (knobs_on) and put back right after it returns (knobs_off), so
 # that nothing the run ends with, a stop or the restart, finds one set.
@@ -1071,6 +1156,41 @@ knobs_off() {
 		[ "$trace" != live ] || printf '%s' "$suspend_was" 2>/dev/null > "$console_suspend_ctl"
 	fi
 	knobs_set=0
+}
+
+# gdsc= and cxmx=: Y to each debug switch the run was given ($sw_set),
+# right before the freeze, each read back.  1 and $sw_why when one does not
+# read Y.  They stay until the restart; a stop before any sleep puts them
+# back (sw_off).
+sw_on() {
+	sw_why=
+	sw_tried=1
+	for swn in $sw_set; do
+		swf=$(sw_file "$swn")
+		printf Y 2>/dev/null > "$swf"
+		swv=$(ev_val "$swf")
+		[ "$swv" = Y ] || sw_why="$sw_why; $swn ($swf) reads $swv after a write of Y"
+	done
+	sw_why=${sw_why#; }
+	[ -z "$sw_why" ]
+}
+
+# A stop before any sleep: N to each switch this run wrote Y to.  $sw_back
+# says how that went, for the RESULT line; nothing when the run wrote none.
+sw_off() {
+	sw_back=
+	[ "${sw_tried:-0}" = 1 ] || return 0
+	swl=
+	for swn in $sw_set; do
+		swf=$(sw_file "$swn")
+		printf N 2>/dev/null > "$swf"
+		[ "$(ev_val "$swf")" = N ] || swl="$swl $swn ($swf)"
+	done
+	if [ -n "$swl" ]; then
+		sw_back="; but the debug switch(es)$swl did not go back to N: off at the next restart, or by hand (echo N | sudo tee FILE)"
+	else
+		sw_back="; the debug switches it set are back to N"
+	fi
 }
 
 # Remove the PCI device NAME and everything below it (remove_store ->
@@ -2071,10 +2191,13 @@ unprotect_and_stop() { # WHY NEXT
 		finish healthy
 	fi
 	if thaw_all; then
+		# The debug switches this run set go back to N: the tablet runs on.
+		sw_off
+		sw_note
 		if errors_back; then
-			eb="every filesystem this run froze is thawed again${back_done:+, errors= is back as it was on:$back_done}, and the tablet is not restarted"
+			eb="every filesystem this run froze is thawed again${back_done:+, errors= is back as it was on:$back_done}, and the tablet is not restarted$sw_back"
 		else
-			eb="every filesystem this run froze is thawed again, and the tablet is not restarted; but $back_why"
+			eb="every filesystem this run froze is thawed again, and the tablet is not restarted$sw_back; but $back_why"
 		fi
 		verdict "SLEEP-TEST RESULT: STOPPED before any sleep: $1; $eb; floor $floor; kernel $kernel$optnote"
 		verdict "$2"
@@ -2157,8 +2280,8 @@ run_from_ram() { # CONFIG
 	: > "$ramdir/started"
 	: > "$ramdir/frozen"
 	rmarker="gts9u sleep-test: $stamp start"
-	setro=0 freeze_hung=0 prot_why= prot_bad= ext4_said= slept=0 knobs_set=0
-	optnote="; options: $options"
+	setro=0 freeze_hung=0 prot_why= prot_bad= ext4_said= slept=0 knobs_set=0 sw_tried=0 sw_back=
+	sw_note
 	# The first line in pmsg: a run that never comes back from its first
 	# sleep leaves this, the protection's and its cycle's.
 	if [ "$dry" = 1 ]; then
@@ -2170,6 +2293,16 @@ run_from_ram() { # CONFIG
 	# freeze; a bus that does not empty stops the run here, nothing frozen.
 	if [ "$pci_remove" = 1 ]; then
 		pci_remove_all || unprotect_and_stop "$pci_why" "$(pci_next)"
+	fi
+	# gdsc= and cxmx=: the debug switches, after the PCI removal (a PCIe
+	# GDSC switch is for a host that powers itself down) and before anything
+	# is frozen; one that does not read back Y stops the run here, with the
+	# ones that took put back.
+	if [ -n "$sw_set" ]; then
+		sw_on || unprotect_and_stop "a debug switch did not take: $sw_why" "$(sw_next)"
+		sw_note
+		say "debug switches set right before the freeze:$sw_set; $swnote; they stay so until the restart that ends the run"
+		progress "debug switches set:$sw_set; $swnote"
 	fi
 	# Nothing recorded or given up since the checks before the run (minutes
 	# ago with release-floor's settling): an error saved by now would be in
@@ -2278,7 +2411,7 @@ run_from_ram() { # CONFIG
 		if [ -n "$rw" ] || [ -n "$sw" ] || [ "$ro" != 1 ] || { [ "$sleep_mode" = deep ] && [ "$ms" != deep ]; }; then
 			why="writable and not frozen:${rw:- none}; disk swap:${sw:- none}; /dev/$disk ro=${ro:-?}"
 			[ "$sleep_mode" != deep ] || why="$why; mem_sleep $ms"
-			verdict "SLEEP-TEST $cyc: NOT STARTED$mword: $why"
+			verdict "SLEEP-TEST $cyc: NOT STARTED$mword: $why; $swnote"
 			an=$(abort_note)
 			verdict "SLEEP-TEST RESULT: ABORTED$mword at $cyc, before its sleep ($why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 			finish healthy
@@ -2303,15 +2436,17 @@ run_from_ram() { # CONFIG
 		knobs_on
 		if [ -n "$knobs_why" ]; then
 			knobs_off
-			verdict "SLEEP-TEST $cyc: NOT STARTED$mword: $knobs_why"
+			verdict "SLEEP-TEST $cyc: NOT STARTED$mword: $knobs_why; $swnote"
 			an=$(abort_note)
 			verdict "SLEEP-TEST RESULT: ABORTED$mword at $cyc, before its sleep ($knobs_why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 			finish healthy
 		fi
 		[ -z "$knobs_now" ] || say "$cyc: for this sleep: $knobs_now"
+		# The debug switches as this sleep has them, for its verdict.
+		sw_note
 		slept=1
 		# The last line before the sleep, for a run that never comes back.
-		progress "$cyc: entering the sleep, rtcwake -m $rtc_mode -s $seconds$attempt; ${knobs_now:-no pm_test, no trace}; up $(uptime_s)s"
+		progress "$cyc: entering the sleep, rtcwake -m $rtc_mode -s $seconds$attempt; ${knobs_now:-no pm_test, no trace}; $swnote; up $(uptime_s)s"
 		up0=$(uptime_s)
 		rtcwake -u -d "$rtc" -m "$rtc_mode" -s "$seconds" > "$ramdir/rtcwake-$sfx" 2>&1
 		rtc_rc=$?
@@ -2425,14 +2560,14 @@ run_from_ram() { # CONFIG
 			printf '%s\n' "$abort_by" >> "$ramdir/aborts"
 			gaveup="ABORTED$mword: the kernel gave up the suspend before the tablet slept (rtcwake $rtc_rc, suspend_stats success +0 fail +1): $abort_why; the UFS read back as before"
 			if [ "$aborted" -gt "$aborts" ]; then
-				verdict "SLEEP-TEST $cyc: $gaveup; aborted attempt $aborted, more than aborts=$aborts: the run ends; floor $floor"
+				verdict "SLEEP-TEST $cyc: $gaveup; aborted attempt $aborted, more than aborts=$aborts: the run ends; floor $floor; $swnote"
 				no_sleep_end
 			fi
 			if pcie_down; then
-				verdict "SLEEP-TEST $cyc: $gaveup; aborted attempt $aborted (aborts=$aborts); floor $floor"
+				verdict "SLEEP-TEST $cyc: $gaveup; aborted attempt $aborted (aborts=$aborts); floor $floor; $swnote"
 				pcie_down_end
 			fi
-			verdict "SLEEP-TEST $cyc: $gaveup; aborted attempt $aborted (aborts=$aborts): $cyc again in ${abort_pause} s; floor $floor"
+			verdict "SLEEP-TEST $cyc: $gaveup; aborted attempt $aborted (aborts=$aborts): $cyc again in ${abort_pause} s; floor $floor; $swnote"
 			try=$((try + 1))
 			sleep "$abort_pause"
 			continue
@@ -2443,7 +2578,7 @@ run_from_ram() { # CONFIG
 		if [ -n "$reasons" ] && freezer_failed; then
 			stuck=$(stuck_tasks "$k")
 			an=$(abort_note)
-			verdict "SLEEP-TEST $cyc: NO-SLEEP (freezer$s2fz): the kernel gave up the suspend before the tablet slept because a task did not freeze (rtcwake $rtc_rc, suspend_stats success +0 fail +1): $tfail; stuck: ${stuck:-not named}; the UFS read back as before; not tried again; floor $floor"
+			verdict "SLEEP-TEST $cyc: NO-SLEEP (freezer$s2fz): the kernel gave up the suspend before the tablet slept because a task did not freeze (rtcwake $rtc_rc, suspend_stats success +0 fail +1): $tfail; stuck: ${stuck:-not named}; the UFS read back as before; not tried again; floor $floor; $swnote"
 			verdict "SLEEP-TEST RESULT: NO-SLEEP (freezer$s2fz) at $cyc: a task did not freeze (${stuck:-not named}); $passes of $cycles cycles passed before it${an:+; $an and tried again}; this run does not answer whether the storage comes back from a deep sleep; floor $floor; kernel $kernel$optnote"
 			verdict 'NEXT: no storage verdict: a task that waits behind a writer of the frozen disk (on a memory map'"'"'s lock) cannot be frozen; touch nothing during the run, and if it happens again, run the test from multi-user.target, without the desktop (README, "The sleep test")'
 			finish healthy
@@ -2459,14 +2594,14 @@ run_from_ram() { # CONFIG
 			printf 'woken early by %s\n' "$abort_by" >> "$ramdir/aborts"
 			early="WOKEN EARLY$mword: the suspend-to-idle was cut short ($s2v; ${seconds}s asked for) by $abort_why; the UFS read back as before"
 			if [ "$aborted" -gt "$aborts" ]; then
-				verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted, more than aborts=$aborts: the run ends; floor $floor"
+				verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted, more than aborts=$aborts: the run ends; floor $floor; $swnote"
 				no_sleep_end
 			fi
 			if pcie_down; then
-				verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted (aborts=$aborts); floor $floor"
+				verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted (aborts=$aborts); floor $floor; $swnote"
 				pcie_down_end
 			fi
-			verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted (aborts=$aborts): $cyc again in ${abort_pause} s; floor $floor"
+			verdict "SLEEP-TEST $cyc: $early; counted as aborted attempt $aborted (aborts=$aborts): $cyc again in ${abort_pause} s; floor $floor; $swnote"
 			try=$((try + 1))
 			sleep "$abort_pause"
 			continue
@@ -2478,21 +2613,21 @@ run_from_ram() { # CONFIG
 		fi
 		if [ -n "$reasons" ]; then
 			an=$(abort_note)
-			verdict "SLEEP-TEST $cyc: FAIL$mword: $reasons ($dline; floor $floor)"
+			verdict "SLEEP-TEST $cyc: FAIL$mword: $reasons ($dline; floor $floor; $swnote)"
 			verdict "SLEEP-TEST RESULT: FAIL$mword at $cyc: $reasons; $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 			finish "$storage"
 		fi
 		case $depth in
 		pm_test)
-			verdict "SLEEP-TEST $cyc: PM-TEST $pm_test$mword: the suspend went as far as pm_test=$pm_test ($(pm_test_what "$pm_test")), waited there and came back with $no_sleep_call, and the UFS read back as before; qcom_stats $dline (CPU idle during the wait, not a depth test); floor $floor" ;;
+			verdict "SLEEP-TEST $cyc: PM-TEST $pm_test$mword: the suspend went as far as pm_test=$pm_test ($(pm_test_what "$pm_test")), waited there and came back with $no_sleep_call, and the UFS read back as before; qcom_stats $dline (CPU idle during the wait, not a depth test); floor $floor; $swnote" ;;
 		deep)
 			deep=$((deep + 1))
-			verdict "SLEEP-TEST $cyc: PASS$mword: deep ($dline), resumed, the UFS read back as before${s2v:+; $s2v}; floor $floor" ;;
+			verdict "SLEEP-TEST $cyc: PASS$mword: deep ($dline), resumed, the UFS read back as before${s2v:+; $s2v}; floor $floor; $swnote" ;;
 		shallow)
-			verdict "SLEEP-TEST $cyc: SHALLOW$mword: resumed and the UFS read back as before, but not every sleep state was reached ($dline${s2v:+; $s2v}); floor $floor" ;;
+			verdict "SLEEP-TEST $cyc: SHALLOW$mword: resumed and the UFS read back as before, but not every sleep state was reached ($dline${s2v:+; $s2v}); floor $floor; $swnote" ;;
 		*)
 			unknown=$((unknown + 1))
-			verdict "SLEEP-TEST $cyc: DEPTH-UNKNOWN$mword: resumed and the UFS read back as before; qcom_stats not readable ($dline${s2v:+; $s2v}); floor $floor" ;;
+			verdict "SLEEP-TEST $cyc: DEPTH-UNKNOWN$mword: resumed and the UFS read back as before; qcom_stats not readable ($dline${s2v:+; $s2v}); floor $floor; $swnote" ;;
 		esac
 		passes=$((passes + 1))
 		! pcie_down || pcie_down_end
@@ -2524,7 +2659,7 @@ fi
 
 # ------------------------------------------------------ before: the disk ---
 cycles=3 seconds=30 hold=300 aborts=5 release=0 confirmed=0 numbers=0 dry=0 mode= aborts_given=0
-pci_remove=0 pm_test= trace= sleep_mode=
+pci_remove=0 pm_test= trace= sleep_mode= sw_set= gdsc_given=0 cxmx_given=0
 for a in "$@"; do
 	case $a in
 	ro|dry)
@@ -2553,6 +2688,28 @@ for a in "$@"; do
 		[ -z "$sleep_mode" ] || { echo "$me: one mode= at most" >&2; usage; }
 		sleep_mode=${a#mode=} ;;
 	mode=*) echo "$me: mode= is deep or s2idle, not '${a#mode=}'" >&2; usage ;;
+	gdsc=*)
+		[ "$gdsc_given" = 0 ] || { echo "$me: one gdsc= at most" >&2; usage; }
+		gdsc_given=1
+		gl=${a#gdsc=}
+		case $gl in
+		''|,*|*,|*,,*) echo "$me: gdsc= is one or more of pcie0, pcie0phy and usb, comma-separated, not '$gl'" >&2; usage ;;
+		esac
+		while [ -n "$gl" ]; do
+			gw=${gl%%,*}
+			case $gl in *,*) gl=${gl#*,} ;; *) gl= ;; esac
+			case $gw in
+			pcie0|pcie0phy|usb) ;;
+			*) echo "$me: gdsc= is one or more of pcie0, pcie0phy and usb, comma-separated: not '$gw'" >&2; usage ;;
+			esac
+			case " $sw_set " in *" $gw "*) echo "$me: gdsc= names $gw twice" >&2; usage ;; esac
+			sw_set="$sw_set $gw"
+		done ;;
+	cxmx=ret)
+		[ "$cxmx_given" = 0 ] || { echo "$me: one cxmx= at most" >&2; usage; }
+		cxmx_given=1
+		sw_set="$sw_set cxmx" ;;
+	cxmx=*) echo "$me: cxmx=ret is the only cxmx= option, not '$a'" >&2; usage ;;
 	*)
 		num "$a" || { echo "$me: unknown argument '$a'" >&2; usage; }
 		numbers=$((numbers + 1))
@@ -2593,6 +2750,15 @@ on) trace_word=trace ;;
 live) trace_word=trace=live ;;
 esac
 [ -z "$trace_word" ] || options="$options $trace_word"
+# The debug switches asked for, in sw_names' order: " pcie0 usb cxmx".
+sw_asked=$sw_set sw_set= gdsc_word=
+for swn in $sw_names; do
+	case " $sw_asked " in *" $swn "*) ;; *) continue ;; esac
+	sw_set="$sw_set $swn"
+	[ "$swn" = cxmx ] || gdsc_word="$gdsc_word,$swn"
+done
+[ -z "$gdsc_word" ] || options="$options gdsc=${gdsc_word#,}"
+[ "$cxmx_given" = 0 ] || options="$options cxmx=ret"
 options=${options# }
 options=${options:-none}
 
@@ -2657,6 +2823,27 @@ if [ "$pci_remove" = 1 ]; then
 		[ -e "$pci_devs/$pr/remove" ] || refuse "pci=remove: no $pci_devs/$pr/remove"
 	done
 fi
+# gdsc= and cxmx= (the header): a GDSC switch only with pci=remove, each
+# switch asked for offered by this kernel, and none of those it offers on
+# already, whether asked for or not: the run sets them itself and records
+# what it set.
+if [ -n "$gdsc_word" ] && [ "$pci_remove" = 0 ]; then
+	refuse "gdsc=${gdsc_word#,} needs pci=remove: with the PCI devices kept the PCIe host stays up through the sleep, and a PCIe GDSC that collapses (OFF_ON) takes the controller away from a live host; the GDSC switches are for runs with pci=remove"
+fi
+for swn in $sw_set; do
+	swf=$(sw_file "$swn")
+	[ -e "$swf" ] && [ -w "$swf" ] ||
+		refuse "this kernel does not offer the debug switch $swn ($swf): kit revision 9's kernel has it (sh ~/typec-roles/verify.sh says which kernel runs)"
+done
+swon=
+for swn in $sw_names; do
+	swf=$(sw_file "$swn")
+	[ -e "$swf" ] || continue
+	swv=$(cat "$swf" 2>/dev/null)
+	[ "$swv" = N ] || swon="$swon $swn ($swf: ${swv:-unreadable})"
+done
+[ -z "$swon" ] ||
+	refuse "a debug switch is on already:$swon; a run sets the ones it is given itself, right before the freeze, and records what it set: put it back (echo N | sudo tee FILE) or restart the tablet"
 # The first resume with a filesystem frozen from userspace logs one kernel
 # warning (fs/super.c:1919, may_unfreeze: the suspend's own thaw finds no
 # freeze of its own), and a writer that waits on the frozen disk for
@@ -2928,6 +3115,7 @@ fi
 	pci_list=$(pci_names)
 	echo "PCI: $(pci_count) devices${pci_list:+:$pci_list}; root ports:$(pci_root_ports | awk '{ printf " %s", $0 } END { if (!NR) printf " none" }')$([ "$pci_remove" = 0 ] || echo '; pci=remove: all of them go right before the freeze')"
 	echo "printk: kernel.printk ${printk_was:-n/a}, console_suspend ${suspend_was:-n/a}, ignore_loglevel $(cat "$ignore_loglevel_ctl" 2>/dev/null || echo n/a); pm_debug_messages ${debug_was:-n/a}$debug_plan, pm_print_times $(cat "$print_times_ctl" 2>/dev/null || echo n/a); pm_test [$(selected "$pm_test_ctl")], pm_test_delay ${pm_test_delay}s"
+	echo "debug $(sw_now) ($sw_gcc/debug_pcie0_off, debug_pcie0_phy_off, debug_usb_off; $sw_rpmhpd/debug_ret_floor)$([ -z "$sw_set" ] || echo "; this run sets$sw_set to Y right before the freeze")"
 	echo "root: $rootsrc ext4, ext4 errors_count $rooterr, state $rootstate; to freeze, the root last:$(freeze_order "$rootsrc" | awk '!seen[$1]++ { printf " %s", $2 }')"
 	echo 'ext4, as the run found it (errors_count, error behaviour, the superblock'"'"'s default):'
 	printf '%s\n' "$targets" |
@@ -2995,7 +3183,7 @@ sync
 
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for v in stamp ramdir part disk cycles seconds hold aborts dry rootsrc rootname floor armed kernel mount_cmd ufs_host \
-	pci_remove pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note; do
+	pci_remove pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note sw_set; do
 	eval "printf '%s=%s\n' $v \"\$(q \"\$$v\")\""
 done > "$ramdir/run.conf"
 say 'the run goes on from RAM in a session of its own: it ends with a restart even if this terminal goes away'
@@ -3004,6 +3192,14 @@ say 'while the disk is frozen, programs that write to it wait (the desktop, the 
 say 'do not touch the screen until the restart: a double tap on it wakes the tablet and aborts the sleep it is in'
 if [ "$pci_remove" = 1 ]; then
 	say "pci=remove: right before it freezes the disks the run removes the PCI root port(s)$pci_roots and everything below them, the Wi-Fi with them: Wi-Fi is gone from then until the restart, and an SSH session over Wi-Fi drops there while the run carries on; follow it over the USB cable (usb0), or read its result in pstore after the restart"
+fi
+if [ -n "$sw_set" ]; then
+	say "debug switches$sw_set: right before it freezes the disks$([ "$pci_remove" = 0 ] || echo ', after the PCI removal,') the run writes Y to each and reads it back; they stay so until the restart that ends the run, and every verdict says how they read"
+	case " $sw_set " in
+	*" usb "*)
+		[ "$(selected /sys/class/typec/port0/data_role)" != host ] || [ ! -e /sys/class/typec/port0-partner ] ||
+			say "gdsc=usb with the tablet as USB host: with its GDSCs collapsed in the sleep the xHCI is not expected to come back (the reason for the retention patch); run undocked" ;;
+	esac
 fi
 if [ -n "$pm_test" ]; then
 	if [ "$sleep_mode" = s2idle ]; then

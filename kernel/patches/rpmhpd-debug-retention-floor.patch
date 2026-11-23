@@ -1,0 +1,158 @@
+Subject: [DEBUG, test builds only] pmdomain: qcom: rpmhpd: a run-time RETENTION floor for the CX and MX votes
+
+Not for release builds.  scripts/build-mainline-kernel.sh applies this only
+with APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and refuses a default build in a source
+tree that carries it.
+
+One switch, 0 at every boot, that root writes at run time:
+
+  /sys/module/rpmhpd/parameters/debug_ret_floor
+
+With 1, this driver's votes for the cx.lvl and mx.lvl RPMh resources never go
+below the first non-zero level of their cmd-db table (enable_corner), in the
+active, wake and sleep sets alike, whichever of a resource's two domains (the
+domain and its active-only peer) sends them.  On the SM-X710 cmd-db gives
+both "0, 16 (RETENTION), 64, ..." (read on squirtle 2026-11-22), so the floor
+is RETENTION, where the downstream kernel's ARC regulators stop.  Without it
+genpd's power-off of CX at the end of a system suspend's noirq phase votes
+hlvl 0 (OFF) for cx.lvl in all three sets, and mx.lvl gets 0 from
+sync_state on.  Writing the switch sends both resources' votes again at once,
+the way rpmhpd_sync_state() does, so that mx.lvl, which no consumer on the
+SM-X710 powers on, has the floor too; writing 0 sends them again without it.
+rpmhpd_lock covers the switch, the re-vote and every other vote.
+
+For the SM-X710's deep-sleep wake hang (2026-11-22): whether the APPS voting
+CX/MX OFF rather than RETENTION is what the wake does not survive.
+
+With 0, as at every boot, every vote is what it was without this patch:
+rpmhpd_debug_floor() returns 0 and max(x, 0) is x.  The compiled .data of
+rpmhpd.o is byte for byte the one without this patch.
+
+--- a/drivers/pmdomain/qcom/rpmhpd.c
++++ b/drivers/pmdomain/qcom/rpmhpd.c
+@@ -12,6 +12,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_opp.h>
++#include <linux/string.h>
+ #include <soc/qcom/cmd-db.h>
+ #include <soc/qcom/rpmh.h>
+ #include <dt-bindings/power/qcom-rpmpd.h>
+@@ -922,6 +923,38 @@
+ };
+ MODULE_DEVICE_TABLE(of, rpmhpd_match_table);
+ 
++/*
++ * SM8550 deep-sleep debug, not for release builds: a switch, which
++ * scripts/build-mainline-kernel.sh adds only with
++ * APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (rpmhpd-debug-retention-floor.patch).
++ *
++ * /sys/module/rpmhpd/parameters/debug_ret_floor, written by root at run time:
++ * with 1, this driver's votes for cx.lvl and mx.lvl never go below the first
++ * non-zero level of their cmd-db table (enable_corner: RETENTION, hlvl 1,
++ * vlvl 16 on the SM-X710), in the active, wake and sleep sets alike, whichever
++ * of a resource's two domains sends them.  Without it genpd's power-off of CX
++ * at the end of a system suspend's noirq phase votes hlvl 0 (OFF in cmd-db)
++ * for cx.lvl in all three, and this driver votes 0 for mx.lvl from its
++ * sync_state on; the downstream kernel's ARC regulators stop at RETENTION.
++ * Writing the switch sends both resources' votes again at once, as
++ * rpmhpd_sync_state() does, so that mx.lvl has the floor too when no
++ * consumer has powered it on (on the SM-X710 none does).  Every boot starts
++ * with 0, and with 0 the votes are what they were without this patch.
++ * rpmhpd_lock covers the switch and every vote.
++ */
++static bool debug_ret_floor;
++static const struct rpmhpd_desc *debug_ret_floor_desc;
++
++static bool rpmhpd_debug_floored(const struct rpmhpd *pd)
++{
++	return !strcmp(pd->res_name, "cx.lvl") || !strcmp(pd->res_name, "mx.lvl");
++}
++
++static unsigned int rpmhpd_debug_floor(const struct rpmhpd *pd)
++{
++	return debug_ret_floor && rpmhpd_debug_floored(pd) ? pd->enable_corner : 0;
++}
++
+ static int rpmhpd_send_corner(struct rpmhpd *pd, int state,
+ 			      unsigned int corner, bool sync)
+ {
+@@ -984,6 +1017,7 @@
+ 	}
+ 
+ 	active_corner = max(this_active_corner, peer_active_corner);
++	active_corner = max(active_corner, rpmhpd_debug_floor(pd));
+ 
+ 	ret = rpmhpd_send_corner(pd, RPMH_ACTIVE_ONLY_STATE, active_corner,
+ 				 active_corner > pd->active_corner);
+@@ -1001,6 +1035,7 @@
+ 			return ret;
+ 
+ 		sleep_corner = max(this_sleep_corner, peer_sleep_corner);
++		sleep_corner = max(sleep_corner, rpmhpd_debug_floor(pd));
+ 
+ 		return rpmhpd_send_corner(pd, RPMH_SLEEP_STATE, sleep_corner,
+ 					  false);
+@@ -1183,6 +1218,10 @@
+ 					       &rpmhpds[i]->pd);
+ 	}
+ 
++	mutex_lock(&rpmhpd_lock);
++	debug_ret_floor_desc = desc;
++	mutex_unlock(&rpmhpd_lock);
++
+ 	return of_genpd_add_provider_onecell(pdev->dev.of_node, data);
+ }
+ 
+@@ -1216,6 +1255,51 @@
+ 	mutex_unlock(&rpmhpd_lock);
+ }
+ 
++static int rpmhpd_debug_ret_floor_set(const char *val, const struct kernel_param *kp)
++{
++	const struct rpmhpd_desc *desc;
++	struct rpmhpd *pd;
++	unsigned int i;
++	bool on;
++	int ret;
++
++	ret = kstrtobool(val ? val : "1", &on);
++	if (ret)
++		return ret;
++
++	mutex_lock(&rpmhpd_lock);
++	debug_ret_floor = on;
++	desc = debug_ret_floor_desc;
++	for (i = 0; desc && i < desc->num_pds; i++) {
++		pd = desc->rpmhpds[i];
++		/*
++		 * A resource's domain and its active-only peer send the same
++		 * votes; the one that is not active-only sends them for both.
++		 */
++		if (!pd || pd->active_only || !rpmhpd_debug_floored(pd))
++			continue;
++		ret = rpmhpd_aggregate_corner(pd, pd->enabled ?
++					      max(pd->corner, pd->enable_corner) : 0);
++		if (ret)
++			break;
++	}
++	mutex_unlock(&rpmhpd_lock);
++
++	pr_info("rpmhpd: debug_ret_floor %d: cx.lvl and mx.lvl %s (%d)\n", on,
++		on ? "at RETENTION or above in every set" : "as voted", ret);
++
++	return ret;
++}
++
++static const struct kernel_param_ops rpmhpd_debug_ret_floor_ops = {
++	.set = rpmhpd_debug_ret_floor_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(debug_ret_floor, &rpmhpd_debug_ret_floor_ops, &debug_ret_floor, 0644);
++MODULE_PARM_DESC(debug_ret_floor,
++		 "debug: votes for cx.lvl and mx.lvl at RETENTION or above in every set");
++
+ static struct platform_driver rpmhpd_driver = {
+ 	.driver = {
+ 		.name = "qcom-rpmhpd",

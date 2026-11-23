@@ -410,6 +410,32 @@ param_is() { # name value
 param_is sink_host_swap Y
 param_is try_snk_extra_wait_ms 600
 
+# Revision 9's debug switches (gcc-sm8550-gdsc-debug-switches.patch and
+# rpmhpd-debug-retention-floor.patch): run-time module parameters that every
+# boot starts with off.  On the kit's kernel each has to be there and read N:
+# sleep-test.sh sets them for a run only, and every run ends in a restart.
+# Another kernel may have none (revision 8 and before).
+sw_others=
+for sw in gcc_sm8550.debug_pcie0_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_off \
+	gcc_sm8550.debug_pcie0_phy_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off \
+	gcc_sm8550.debug_usb_off:/sys/module/gcc_sm8550/parameters/debug_usb_off \
+	rpmhpd.debug_ret_floor:/sys/module/rpmhpd/parameters/debug_ret_floor; do
+	v=$(cat "${sw#*:}" 2>/dev/null)
+	if [ -n "$want" ] && [ "$id" = "$want" ]; then
+		[ "$v" = N ] && ok "debug switch ${sw%%:*} = N (off)" ||
+			bad "debug switch ${sw%%:*} is ${v:-missing}, expected N (off): the kit's kernel starts every boot with it off, and only a sleep test sets it, until its restart"
+	elif [ -e "${sw#*:}" ]; then
+		sw_others="$sw_others ${sw%%:*}=${v:--}"
+	fi
+done
+if [ -z "$want" ] || [ "$id" != "$want" ]; then
+	if [ -n "$sw_others" ]; then
+		note "debug switches of the running kernel, which is not the kit's:$sw_others"
+	else
+		note 'the running kernel is not the kit'"'"'s and offers no debug switches (revision 9'"'"'s kernel has them)'
+	fi
+fi
+
 # What the hang-log kit brought is still there: same configuration, same DTB.
 cfg=$(zcat /proc/config.gz 2>/dev/null)
 for c in CONFIG_DETECT_HUNG_TASK=y CONFIG_SOFTLOCKUP_DETECTOR=y CONFIG_WQ_WATCHDOG=y \

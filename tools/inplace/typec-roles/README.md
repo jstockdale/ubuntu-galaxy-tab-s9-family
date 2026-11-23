@@ -3,9 +3,10 @@
 This kit goes on top of the [hang-log kit](../hang-log/README.md). It carries
 the kernel changes for powered USB-C docks described in
 [`docs/usb-c-dock-roles.md`](../../../docs/usb-c-dock-roles.md), so that they
-can be tested on a tablet, and since revision 8 the UFS PHY change described
+can be tested on a tablet, since revision 8 the UFS PHY change described
 in [`docs/resume-recovery.md`](../../../docs/resume-recovery.md#sm-x710-gts9wifi)
-with a sleep test that cannot damage the storage. Everything the hang-log kit
+with a sleep test that cannot damage the storage, and since revision 9 the
+deep-sleep debug switches (below, "Revision 9"). Everything the hang-log kit
 set stays: the same configuration, the same DTB, the same ramoops region and
 sysctl drop-in.
 
@@ -84,6 +85,41 @@ nothing else in the kernel:
   within 1 s. It changes no result. If the reset does not fix the sleep, the
   one failed sleep says what to try next (below, "The sleep test").
 
+**Revision 9** is revision 8 plus two debug patches, which a release build
+does not get (the build applies them only with
+`APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1`, and refuses a default build in a tree
+that carries them). They add four run-time switches, off at every boot, for
+telling apart why a sleep with the PCIe root port removed and the
+interconnect floor released never comes back (2026-11-22: the SoC drops
+PS_HOLD 43 to 44 s after the RTC alarm; below, "Revision 9: the runs"):
+- `kernel/patches/gcc-sm8550-gdsc-debug-switches.patch`:
+  `/sys/module/gcc_sm8550/parameters/debug_pcie0_off`, `debug_pcie0_phy_off`
+  and `debug_usb_off`. Each moves its power domains (GDSCs) from
+  `PWRSTS_RET_ON`, which the kernel's `gdsc_disable()` leaves on in hardware
+  so that they only enter retention when CX collapses, to `PWRSTS_OFF_ON`,
+  which it collapses, from the next power-off genpd asks for: the PCIe host's
+  `pcie_0_gdsc`, its PHY's `pcie_0_phy_gdsc`, and the two USB GDSCs, which go
+  back to mainline's `OFF_ON` (the docked xHCI dies with that: run
+  undocked). An SM8550 board with the same symptom ("reset about 46 s after
+  the RTC alarm") was fixed by making `pcie_0_gdsc` `OFF_ON` (ROCKNIX PR 3636);
+- `kernel/patches/rpmhpd-debug-retention-floor.patch`:
+  `/sys/module/rpmhpd/parameters/debug_ret_floor` keeps this kernel's votes
+  for the CX and MX rails (`cx.lvl`, `mx.lvl`) at RETENTION or above in every
+  RPMh set, where without it the suspend votes CX off (level 0) and MX gets
+  0 throughout; Samsung's kernel stops at RETENTION.
+
+With every switch off the kernel does what revision 8's does: nothing writes
+the power domain table until a switch is written, and its compiled tables
+are byte for byte revision 8's (`make-kit.sh` checks them against the
+hang-log build's). The kernel command line cannot set the GDSC switches,
+because the boot's suspend cycle for the panel runs with the PCIe host up.
+`sleep-test.sh` sets them for a run (`gdsc=`, `cxmx=ret`, below), and the
+restart that ends every run puts them back. By hand, as root:
+`echo Y | sudo tee /sys/module/gcc_sm8550/parameters/debug_pcie0_off`; but
+**never set a PCIe one for a suspend in which the PCIe host stays up** (any
+suspend without `pci=remove`): genpd collapses the GDSC at every suspend,
+and the live controller loses its registers.
+
 `sleep-test.sh` is new in revision 8: deep sleeps with every disk
 filesystem frozen, so that a resume that loses the storage costs a restart
 and nothing else. It also runs on revision 7's kernel, for a baseline
@@ -108,13 +144,15 @@ without a sleep.
   `kernel/patches/dwc3-qcom-check-hcd-before-reading-port-speed.patch`,
   which lets the USB controller's glue suspend when an xHCI failed to
   start, and the UFS PHY's two (revision 8): nine patches, five of them to
-  TCPM. In the kernel source tree six files differ from the hang-log build:
+  TCPM. Revision 9 adds the two debug patches above: eleven patches. In the
+  kernel source tree seven files differ from the hang-log build:
   `tcpm.c`, `tcpm.h`, the driver, `gcc-sm8550.c`, `dwc3-qcom.c` (the
-  hang-log build's has the dwc3-qcom CX vote patch already) and
+  hang-log build's has the dwc3-qcom CX vote patch already),
   `phy-qcom-qmp-ufs.c` (the hang-log build's has the SM-X910-only form of
-  the PCS reset, which `scripts/stage-ufs-resume-experiment.sh` replaces).
-  `make-kit.sh` checks that, and that the configuration and the DTB are byte
-  for byte the hang-log build's.
+  the PCS reset, which `scripts/stage-ufs-resume-experiment.sh` replaces)
+  and `rpmhpd.c` (revision 9). Against revision 8's tree two differ:
+  `gcc-sm8550.c` and `rpmhpd.c`. `make-kit.sh` checks that, and that the
+  configuration and the DTB are byte for byte the hang-log build's.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
   the DTB, which did not change. `install.sh` checks that it still holds the
   hang-log kit's image.
@@ -155,6 +193,16 @@ without a sleep.
 
   The power domain change, the NULL check and the UFS PHY's PCS reset have
   no switch; `rollback.sh` is the way back.
+- **Four debug switches** (revision 9), all off at every boot; `sleep-test.sh`
+  sets them for a run (`gdsc=`, `cxmx=ret`), `verify.sh` checks that they
+  are there and off:
+
+  | Parameter | Default | `sleep-test.sh` | Meaning when `Y` |
+  | --- | --- | --- | --- |
+  | `/sys/module/gcc_sm8550/parameters/debug_pcie0_off` | `N` | `gdsc=pcie0` | `pcie_0_gdsc` collapses at the next power-off (`OFF_ON`) |
+  | `/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off` | `N` | `gdsc=pcie0phy` | `pcie_0_phy_gdsc` the same |
+  | `/sys/module/gcc_sm8550/parameters/debug_usb_off` | `N` | `gdsc=usb` | both USB GDSCs the same (mainline's state) |
+  | `/sys/module/rpmhpd/parameters/debug_ret_floor` | `N` | `cxmx=ret` | votes for CX and MX at RETENTION or above |
 
 **What it can change for other things you plug in** (the write-up has the
 detail):
@@ -186,7 +234,7 @@ commit the hang-log kernel came from with the change on top.
 X=/path/to/scratch/build-typec     # on the external drive, no spaces
 git worktree add --detach $X/source <commit>
 DEVICE=gts9wifi UBUNTU_WORKDIR=$HOME/ubuntu-gts9u TMPDIR=$HOME/ubuntu-gts9u/tmp \
-  APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 \
+  APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 \
   KERNEL_WORKTREE=$X/linux-src-gts9wifi KERNEL_BUILD_DIR=$X/linux-gts9wifi \
   KERNEL_OUT_DIR=$HOME/ubuntu-gts9u/out/kernel-gts9wifi-typec \
   bash $X/source/scripts/build-mainline-kernel.sh
@@ -199,9 +247,20 @@ HANG_SCRATCH=/path/to/scratch/build-hang \
 ```
 
 Without `APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1` the kernel has no
-diagnostic and `make-kit.sh` refuses it (its strings are not in the image).
-A build tree that carries the diagnostic is refused for a build without the
-switch, so a release cannot be built from it by mistake.
+diagnostic, and without `APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1` no debug
+switches; `make-kit.sh` refuses either (their strings are not in the
+image). A build tree that carries the diagnostic or the switches is refused
+for a build without its variable, so a release cannot be built from it by
+mistake.
+
+Revisions 2 to 8 were built in one directory, `build-typec`, which holds
+their module key. Revision 9 was built from scratch in a directory of its
+own (`build-r9`), whose `linux-gts9wifi/certs` was given that key before the
+first `make`: `signing_key.pem`, `signing_key.x509`, `x509.genkey` and
+`.signing_key.pem.cmd`, copied with their times kept (`cp -p`), so that
+kbuild found the key up to date and did not make a new one (no `GENKEY` in
+the build's log). The build archived its row under the same key ID in the
+registry.
 
 The build archives its module key in the registry
 (`scripts/kernel-key-registry.sh`); `make-kit.sh` refuses a build whose key is
@@ -267,7 +326,10 @@ kernel, not for the running one. If an upgrade stops half-way, run
 revision that is installed already says so and changes nothing. Revision 8
 over revision 7 is such an upgrade; the tablet's revision 7, installed by
 revision 7's own `install.sh` after a rollback of revision 6, is the state
-the tests start the upgrade from.
+the tests start the upgrade from. Revision 9 installs the same way over
+revision 7, which is what squirtle has on 2026-11-22 (revision 7 installed
+and running, revision 8's files copied into `~/typec-roles` and never
+installed: they changed nothing), and over an installed revision 8 alike.
 
 `rollback.sh` writes boot and the module tree back first and syncs. If it
 stops after that, it says that the hang-log kernel and its modules are back
@@ -301,8 +363,10 @@ The whole form, with the experiment options (each off unless given; below,
 
 ```sh
 sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
-     [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle] restart-ok
-sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle] restart-ok
+     [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
+     [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok
+sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]
+     [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok
 ```
 
 Each run freezes every disk filesystem and **ends with a restart of the
@@ -628,9 +692,63 @@ kernel (the logs are in `~/ubuntu-gts9u/backups/`; details in
   in the runs that hung. So the host's power-down alone does not lose the
   sleep; releasing the floor on top of it does.
 
-Not run yet: revision 8, a cycle that reaches AOSS sleep, CX collapse or
-DDR low power and comes back, `mode=s2idle` with the PCI devices kept, and
-an ext4 error with an errno under `errors=continue`.
+Not run yet: revision 8, revision 9, a cycle that reaches AOSS sleep, CX
+collapse or DDR low power and comes back, `mode=s2idle` with the PCI devices
+kept, and an ext4 error with an errno under `errors=continue`.
+
+**Revision 9: the runs** (planned; none has run). Install revision 9,
+reboot, and run `sh ~/typec-roles/verify.sh` first: it has to say the kit's
+kernel runs and every debug switch is `N`. Then, each run in a boot of its
+own (every run ends in a restart), undocked on the PC's USB cable (with
+`pci=remove` the Wi-Fi is gone: follow over `usb0`), nobody touching the
+tablet, all with `ro 1 30 release-floor pci=remove mode=s2idle trace=live
+hold=60 restart-ok`:
+
+1. no switch: the control. It is expected to hang and restart by itself as
+   revision 7's runs did at 15:49, 16:16, 16:44 and 16:50. If it comes back,
+   revision 8's UFS PHY change mattered (the only other change in the
+   kernel), and the order below has to be thought over before going on;
+2. `gdsc=pcie0`;
+3. `gdsc=pcie0,usb`;
+4. `gdsc=pcie0,usb,pcie0phy`;
+5. `gdsc=pcie0,usb,pcie0phy cxmx=ret`.
+
+```sh
+cd ~/typec-roles && grep ' sleep-test.sh$' SHA256SUMS | sha256sum -c --quiet &&
+  sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=remove mode=s2idle trace=live hold=60 \
+    gdsc=pcie0 restart-ok
+```
+
+A run that comes back with the deep counters moving (`aosd`, `cxsd` and
+`ddr` all +1 or more: `PASS (s2idle)`) identifies the cause: the switch it
+added. Stop there. Warnings:
+- each run that does not come back costs a forced restart, about 45 s after
+  the RTC alarm, as on 2026-11-22. Before the next run read its record in
+  pstore (above, "The result after the restart"; the RESULT is missing, the
+  last progress line names the switches of the sleep it entered) and the
+  PMIC's reset log (`~/ubuntu-gts9u/backups/deep-sleep-plan-2026-11-22/`);
+- the boot after a forced restart holds the interconnect floor once; every
+  run above releases it (`release-floor`);
+- `gdsc=usb` gives the USB GDSCs mainline's state, under which the docked
+  xHCI dies: undocked only;
+- with a PCIe GDSC collapsed the PCIe host and its PHY are set up from
+  scratch at the resume. v7.2-rc3 does not park the PCIe pipe clock mux on
+  XO while its GDSC is off (the phy-mux rework that v7.2 final reverted, and
+  `unpark-pcie0-pipe-mux.patch` only selects the PHY's clock at power-on),
+  so the resume may log a kernel warning `pcie_0_gdsc status stuck at
+  'off'` (or `pcie_0_phy_gdsc`). If the link then does not come up, the run
+  ends with `PCIE-DOWN` and its restart, which is what it is for; the
+  warning itself counts for nothing in the verdict (`panic_on_warn` is 0).
+  A GDSC that stays off under the host's first register access can also
+  stall the bus or crash the kernel: the tablet then restarts by itself or
+  has to be forced, and with `trace=live` the console record ends at that
+  warning;
+- a run that comes back `SHALLOW` never reached the state in which the
+  others hang, so it says nothing for or against its switch (with
+  `trace=live` the debug UART stays powered, which may keep the SoC up);
+- never set a PCIe switch by hand for a suspend without `pci=remove`; the
+  kernel command line cannot set them, and every boot starts with them off.
+
 `fstrim.timer` (weekly) would, if it fired during a run, send discards to
 the read-only disk, which the block layer logs as a write and the run
 fails; it is not stopped for the run.
@@ -826,6 +944,28 @@ name the ones in force (`options: none` without them).
   - **ABORTED (s2idle)**, **NO-SLEEP (freezer, s2idle)**, **PM-TEST LEVEL
     (s2idle)**, **PCIE-DOWN (s2idle)**: as in `deep`; a PM-TEST cycle
     never enters the idle loop (`no suspend-to-idle`).
+- **`gdsc=LIST`** and **`cxmx=ret`** (`ro` and `dry`; revision 9's kernel):
+  the debug switches (above, "Revision 9"). `gdsc=` takes one or more of
+  `pcie0`, `pcie0phy` and `usb`, comma-separated, and is refused without
+  `pci=remove`: with the PCI devices kept the PCIe host stays up through
+  the sleep, and a PCIe GDSC that collapses would take the controller away
+  from a live host. Refused too, with nothing changed, when the kernel does
+  not offer a switch asked for (revisions 8 and before), or when any switch
+  it offers is on already (set by hand: put it back, `echo N | sudo tee
+  FILE`, or restart). The run writes `Y` to each switch asked for right
+  before the freeze, after `pci=remove`'s removal, and reads each back; one
+  that does not read `Y` stops the run before anything is frozen, with the
+  ones that took put back to `N`. After that nothing puts them back but the
+  restart that ends the run. Every run, with switches or not, prints them as
+  they read: the header (`debug switches: pcie0 N, pcie0phy N, usb N, cxmx
+  N (...)`, or `debug switches: not offered by this kernel` on revision 8's
+  and older kernels), a progress line in pmsg right after the write, the
+  progress line before each sleep, every cycle's verdict and every `RESULT`
+  line (`...; floor released; switches: pcie0 Y, pcie0phy N, usb N, cxmx
+  N`, and `; options: pci=remove gdsc=pcie0; switches: ...` at the end of a
+  `RESULT`). So the pstore record of a run that never comes back says which
+  were set for the sleep it entered. With `gdsc=usb` while the tablet is USB
+  host the run says the xHCI is not expected to survive: run undocked.
 
 **The interconnect floor.** `ubuntu-gts9u-icc-late-release` releases it
 about 45 s into a boot. After a boot that released it and then ended
@@ -954,7 +1094,8 @@ again, up to three per attach; the verdict is still the roles.
 ## Physical checks still to run (owner)
 
 1. After installing and rebooting: `verify.sh`. On revision 8 it should
-   count at least one `calibration entry` and no UFS failure.
+   count at least one `calibration entry` and no UFS failure; on revision 9
+   also `ok   debug switch ... = N (off)` for each of the four.
 2. `sudo sh ~/typec-roles/verify.sh dock 10` with each powered dock. Note
    whether the battery charges; near 100 % it reports `Full` and no current.
    Keep a dock's own charger plugged in: without it the dock has no power
@@ -1001,6 +1142,7 @@ again, up to three per attach; the verdict is still the roles.
    Done on 2026-11-22: `dry` and two revision 7 baselines, 13 of 13 cycles
    resumed, all SHALLOW ("What has run on the tablet", above). No run has
    reached a PASS yet: no recorded sleep of the SM-X710 has counted AOSS
-   sleep, CX collapse or DDR low power.
+   sleep, CX collapse or DDR low power. Revision 9's five runs ("Revision 9:
+   the runs", above) come before any of the rest.
 7. Bluetooth, Wi-Fi, audio and the rear camera at a known size: the kernel was
    rebuilt, and nothing else in it changed.

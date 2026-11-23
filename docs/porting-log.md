@@ -9841,3 +9841,45 @@ alarm, for the 30 s and the 60 s sleeps alike.
 
 The next step is a kernel with switches for those GDSCs that can be set at
 run time, so that one build tells the candidates apart.
+
+**20:30, kit revision 9: that kernel, built and packed, not yet on the
+tablet.** It is revision 8's kernel plus two debug patches that a release
+build does not get (`APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1`; a default build
+refuses a tree that carries them). Build ID 7912707458aa, signed with the
+module key of revisions 2 to 8; the configuration, the DTB and the module
+list are unchanged.
+
+- `gcc-sm8550-gdsc-debug-switches.patch`: three switches under
+  `/sys/module/gcc_sm8550/parameters/`. `debug_pcie0_off` and
+  `debug_pcie0_phy_off` move `pcie_0_gdsc` and `pcie_0_phy_gdsc` from
+  `PWRSTS_RET_ON` to `PWRSTS_OFF_ON`; `debug_usb_off` gives the two USB GDSCs
+  back mainline's `OFF_ON`. They can only be written once the system runs,
+  so the kernel command line cannot set them.
+- `rpmhpd-debug-retention-floor.patch`:
+  `/sys/module/rpmhpd/parameters/debug_ret_floor` keeps the votes for
+  `cx.lvl` and `mx.lvl` at RETENTION or above in the active, wake and sleep
+  sets.
+
+All four are off at every boot, and with them off the compiled tables of
+both drivers are what they were (`make-kit.sh` checks that against the
+hang-log build). `sleep-test.sh` sets them for one run with `gdsc=pcie0`,
+`gdsc=pcie0phy`, `gdsc=usb` (comma-separated, only with `pci=remove`) and
+`cxmx=ret`, reads them back, and names them in every verdict and in the
+pmsg line before each sleep, so that the record of a run that never
+returns says which were set.
+
+Two candidates have no switch. Keeping the PCIe host's own votes is the
+floor-held run again in another form, and that one came back. The revert of
+the phy-mux rework cannot be made a run-time switch; it would be a kernel of
+its own, and would have to drop `unpark-pcie0-pipe-mux.patch`.
+
+Nothing of this has run on hardware: the sysfs paths and the switches'
+behaviour are shown from the source, the vmlinux and the tests only.
+
+The planned runs, each in a boot of its own, undocked, all with `ro 1 30
+release-floor pci=remove mode=s2idle trace=live hold=60 restart-ok`: no
+switch (the control, expected to hang as revision 7 did; if it returns,
+revision 8's UFS PHY change mattered), then `gdsc=pcie0`, then
+`gdsc=pcie0,usb`, then `gdsc=pcie0,usb,pcie0phy`, then the same with
+`cxmx=ret`. A run that comes back with `aosd`, `cxsd` and `ddr` counting
+names the cause: the switch it added.
