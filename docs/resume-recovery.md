@@ -894,9 +894,14 @@ What that and the analysis of 2026-11-23
 
 Type-C kit revision 10 carries the three upstream commits (without
 `unpark-pcie0-pipe-mux.patch`) and the second diagnostic; it was built on
-2026-11-23 (kernel build ID 90da273a8a49) and has not run yet. The device
-tree's UFS PHY supplies (L1D) are left for
-a later, separate change.
+2026-11-23 (kernel build ID 90da273a8a49) and ran four sleeps on squirtle
+that day. The three with `gdsc=pcie0` came back: the PCIe host every time,
+the storage too, and with the ADSP running the DDR reached its low-power
+mode for the first time; none reached AOSS sleep or CX collapse. The one
+without `gdsc=pcie0` did not come back, as on revision 9: the fixes do not
+cure the hang itself (the kit's README, "Revision 10: the runs", has all
+four). The device tree's UFS PHY
+supplies (L1D) are left for a later, separate change.
 
 #### Repairing the root from recovery
 

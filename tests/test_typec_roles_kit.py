@@ -8405,9 +8405,11 @@ class ScriptsTest(unittest.TestCase):
                      "5. `gdsc=pcie0,usb,pcie0phy cxmx=ret`.",
                      "Revision 9 installs the same way over revision 7, which is what squirtle has on 2026-11-22",
                      # Revision 10: what it is, what it leaves out, and its run.
-                     "**Revision 10** (built 2026-11-23, not on the tablet yet) is revision 9 plus three upstream commits",
+                     "**Revision 10** (built 2026-11-23, on squirtle since 11:37 that day) is revision 9 plus three upstream commits",
                      "`unpark-pcie0-pipe-mux.patch`, which selected the PHY's clock at each PHY power-on, is left out",
-                     "**Revision 10: the runs** (planned; none has run).",
+                     "**Revision 10: the runs** (2026-11-23; four have run, listed after the command).",
+                     "`pcie_0_gdsc` still has to be let off (`gdsc=pcie0`) for the sleep to return.",
+                     "A stopped ADSP keeps the DDR at 547 MHz (revision 9's run 2c did the same): do not stop it for a run.",
                      "Revision 10 installs the same way over revision 9, which squirtle has had since 2026-11-22 20:59",
                      "the NEXT line then says that the storage came back and names the PCIe host's line",
                      "`PCIe came back (no host failure line)`"):
