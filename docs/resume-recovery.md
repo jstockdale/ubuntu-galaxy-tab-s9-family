@@ -893,8 +893,9 @@ What that and the analysis of 2026-11-23
   its probe on, which nothing upstream changes.
 
 Type-C kit revision 10 carries the three upstream commits (without
-`unpark-pcie0-pipe-mux.patch`) and the second diagnostic; it is not built
-and has not run yet. The device tree's UFS PHY supplies (L1D) are left for
+`unpark-pcie0-pipe-mux.patch`) and the second diagnostic; it was built on
+2026-11-23 (kernel build ID 90da273a8a49) and has not run yet. The device
+tree's UFS PHY supplies (L1D) are left for
 a later, separate change.
 
 #### Repairing the root from recovery

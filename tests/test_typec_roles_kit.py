@@ -8405,7 +8405,7 @@ class ScriptsTest(unittest.TestCase):
                      "5. `gdsc=pcie0,usb,pcie0phy cxmx=ret`.",
                      "Revision 9 installs the same way over revision 7, which is what squirtle has on 2026-11-22",
                      # Revision 10: what it is, what it leaves out, and its run.
-                     "**Revision 10** (not built yet, not on the tablet) is revision 9 plus three upstream commits",
+                     "**Revision 10** (built 2026-11-23, not on the tablet yet) is revision 9 plus three upstream commits",
                      "`unpark-pcie0-pipe-mux.patch`, which selected the PHY's clock at each PHY power-on, is left out",
                      "**Revision 10: the runs** (planned; none has run).",
                      "Revision 10 installs the same way over revision 9, which squirtle has had since 2026-11-22 20:59",

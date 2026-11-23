@@ -124,8 +124,8 @@ restart that ends every run puts them back. By hand, as root:
 suspend without `pci=remove`): genpd collapses the GDSC at every suspend,
 and the live controller loses its registers.
 
-**Revision 10** (not built yet, not on the tablet) is revision 9 plus three
-upstream commits that 7.2-rc3 lacks, and one more diagnostic, all behind a
+**Revision 10** (built 2026-11-23, not on the tablet yet) is revision 9 plus
+three upstream commits that 7.2-rc3 lacks, and one more diagnostic, all behind a
 build variable of their own, `APPLY_SM8550_SLEEP_FIXES=1` (a default build
 and the SM-X910's builds are unchanged without it, and a build without it
 refuses a tree that carries any of them). Revision 9's runs and the
@@ -312,7 +312,10 @@ first `make`: `signing_key.pem`, `signing_key.x509`, `x509.genkey` and
 `.signing_key.pem.cmd`, copied with their times kept (`cp -p`), so that
 kbuild found the key up to date and did not make a new one (no `GENKEY` in
 the build's log). The build archived its row under the same key ID in the
-registry. Revision 10 is built the same way, in `build-r10`.
+registry. Revision 10 was built the same way, in `build-r10`, on
+2026-11-23 from commit ab2c536: kernel build ID
+`90da273a8a49a60284ad7b06c15288b05913d931`, the same module key, no
+`GENKEY`, and the three warnings of revision 9's build.
 
 The build archives its module key in the registry
 (`scripts/kernel-key-registry.sh`); `make-kit.sh` refuses a build whose key is

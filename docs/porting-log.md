@@ -9819,3 +9819,38 @@ second diagnostic's lines and, under `sudo`, the clock counts.
 The first run planned on it is run 2b's: `gdsc=pcie0`, no `trace=live`.
 Expected if the PIPE clock is the cause: no `stuck at 'off'`, and the PCIe
 host back with its link (`PCIe Gen.2 x1 link up`).
+
+**11:18, kit revision 10: built and packed, not on the tablet.** The first
+build, started at 03:25 from commit ab2c536, died at 03:46 when the external
+drive that holds the build tree dropped off USB (it came back as a USB 2.0
+device); nothing of it was kept. With the drive mounted again the tree was
+made afresh and given revision 9's module key before the first `make`, and
+the build ran from 10:40 to 11:18: no `GENKEY`, the three warnings of
+revision 9's build and no other, the key's row recorded in the registry
+under the same key ID (51029e652d6e). Kernel build ID
+`90da273a8a49a60284ad7b06c15288b05913d931`; `Image.gz` sha256
+d653f1d941caffbd70ff22420a3103e2804bc88be6813f9cefac847f1a892f98; the DTB
+and the configuration are the hang-log build's, byte for byte.
+
+`make-kit.sh` passed each of its checks on it: the sources differ from the
+hang-log tree in the twelve files expected and no other; the power-domain
+table differs in two bytes; `qmp_ufs_phy_calibrate()` has no board gate; the
+image has the debug switches' and the diagnostics' strings; the PIPE clock
+mux has `phy_mux_enable`, `phy_mux_disable` and `phy_mux_is_enabled` and no
+rate operation, and `qmp_pcie_enable()` calls no `clk_set_rate()` (the
+hang-log build shows the opposite on both); 63 modules, each signed with
+the key above. `boot.img` sha256
+9c09ec008578550159e6a50088cf14e9bbf2099d93cd0e0948d95e109757a606;
+`sleep-test.sh` sha256
+99e02b4d2015e3bca340ce459f241e59bd12a784bb90733d6424fc5af28a204b.
+
+Not yet known, and what the first boot and the first run are for: whether
+the Wi-Fi's PCIe link comes up at boot without the unpark patch (shown from
+the source only), whether `pcie_0_gdsc` powers up again at a resume, whether
+the UFS host's clock counts stay at 3 or less (a ceiling worked out from the
+drivers, not measured), and whether any of it moves the AOSS, CX or DDR
+sleep counters.
+
+The kit was packed from commit ab2c536, the one the kernel was built from,
+and its `SOURCE` says so; its copy of the README is that commit's and still
+calls revision 10 "not built yet". The scripts in it are this tree's.
