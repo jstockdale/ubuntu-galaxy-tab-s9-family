@@ -18,8 +18,9 @@ Description: Device support for the Samsung Galaxy Tab S9 Ultra and S9 Wi-Fi
  userspace on a mainline kernel:
  .
   * first-boot root filesystem expansion on the microSD;
-  * two-tier swap, which this image had none of: 8 GiB of zstd-compressed zram
-    in front of a 16 GiB swapfile created on the internal UFS at first boot;
+  * two-tier swap, which this image had none of: up to 4 GiB of zstd-compressed
+    zram in front of a swapfile as large as the RAM, created on the internal
+    UFS at first boot;
   * ANA38407 panel recovery after Samsung's cold-boot hand-off;
   * late audio DSP boot, which the ALSA card and the sensors both depend on;
   * the native Bluetooth address, read read-only from the Samsung EFS;

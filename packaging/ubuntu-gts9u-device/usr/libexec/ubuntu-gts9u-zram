@@ -1,26 +1,49 @@
 #!/bin/sh
-# Compressed RAM swap for the SM-X910.
+# Compressed RAM swap for the SM-X910 and the SM-X710.
 #
-# This tablet has 14.2 GiB of usable RAM and, until now, no swap at all: the
+# The SM-X910 has 14.2 GiB of usable RAM and, until now, no swap at all: the
 # OOM killer was the only backstop under a Proton game plus a browser.  zram is
-# the first tier because it costs no UFS writes at all.
+# the first tier because it costs no UFS writes at all, and because a page comes
+# back from it about ten times faster than from the swapfile behind it
+# (measured on the SM-X910: about 15 us a page from zram, 114 us for a 4 KiB
+# random read from the UFS on the fastest core).
 #
 # zstd rather than the kernel default lzo-rle.  CONFIG_CRYPTO_ZSTD is only a
 # module here and this port does not install the generic module tree, but that
 # does not matter: modern zram carries its own zstd backend, and the device
 # advertises it in comp_algorithm.  Measured on this board, zstd holds desktop
-# anonymous pages at roughly 3:1, so the 8 GiB below occupies well under 3 GiB
+# anonymous pages at 3:1 to 4.5:1, so the 4 GiB below occupies 0.9 to 1.4 GiB
 # of real memory when completely full.
 #
-# 8 GiB is half of RAM, which is the usual ceiling: sized larger, a worst-case
-# run of incompressible pages could claim more memory than it saves.
+# The size is a ceiling, never a reservation: zram only takes memory for the
+# pages it holds.  4 GiB at most, and half of the RAM the kernel reports if that
+# is less (the default of systemd's zram-generator), so that a worst-case run of
+# incompressible pages cannot claim more memory than it saves.  The swapfile,
+# sized to the RAM, takes what does not fit.  Up to 2026-11 this was a fixed
+# 8 GiB, which a full device at 4.5:1 would have paid for with 1.8 GiB of RAM.
 set -eu
 
-size_bytes=$((8 * 1024 * 1024 * 1024))
+cap_mib=4096
 algorithm=zstd
 priority=100
 
 log() { echo "ubuntu-gts9u-zram: $*" >&2; }
+
+# Half of MemTotal in MiB, at most cap_mib.  Without a readable MemTotal, the
+# cap: it is half of the smallest model in the family.
+zram_mib() {
+	kb=$(sed -n 's/^MemTotal:[[:space:]]*\([1-9][0-9]\{0,11\}\) kB$/\1/p' \
+		/proc/meminfo 2>/dev/null) || kb=
+	case $kb in
+		''|*[!0-9]*)
+			log "cannot read MemTotal; using $cap_mib MiB"
+			echo "$cap_mib"
+			return 0
+			;;
+	esac
+	half=$((kb / 2048))
+	if [ "$half" -lt "$cap_mib" ]; then echo "$half"; else echo "$cap_mib"; fi
+}
 
 find_device() {
 	# Reuse ours if it is already there, otherwise ask the driver for one.
@@ -49,6 +72,7 @@ start() {
 	fi
 	dev=/dev/zram$zram_index
 	sys=/sys/block/zram$zram_index
+	size_mib=$(zram_mib)
 
 	# comp_algorithm only accepts a write while disksize is still unset, so the
 	# order here matters and cannot be swapped.
@@ -57,13 +81,13 @@ start() {
 	else
 		log "$algorithm unavailable; keeping the kernel default"
 	fi
-	echo "$size_bytes" > "$sys/disksize"
+	echo $((size_mib * 1024 * 1024)) > "$sys/disksize"
 
 	# -U clear: a zram device is recreated from scratch on every boot, so a
 	# stable UUID would be a lie and would confuse anything caching by UUID.
 	mkswap -U clear "$dev" >/dev/null
 	swapon --priority "$priority" "$dev"
-	log "enabled $dev, $((size_bytes / 1024 / 1024 / 1024)) GiB, $(cat "$sys/comp_algorithm" | sed 's/.*\[\([^]]*\)\].*/\1/')"
+	log "enabled $dev, $size_mib MiB, $(cat "$sys/comp_algorithm" | sed 's/.*\[\([^]]*\)\].*/\1/')"
 }
 
 stop() {

@@ -207,37 +207,57 @@ extended first, and the script tells the two cases apart by device and label.
 
 The image carried **no** swap at all: with 14.2 GiB of usable RAM and a real
 desktop load (Steam plus a browser), the only backstop against a spike was the
-OOM killer. Since v2.22 of the device package there are two tiers, 23 GiB in
-total:
+OOM killer. Since v2.22 of the device package there are two tiers, sized from
+the RAM since 2026-11-22 (20 GiB in all on the 16 GB SM-X910, 16 GiB on the
+12 GB SM-X710):
 
 | Tier | Size | Priority | Unit |
 |---|---|---|---|
-| zram (zstd) | 8 GiB | 100 | `ubuntu-gts9u-zram.service` |
-| swapfile on the UFS | 16 GiB | 10 | `ubuntu-gts9u-swapfile.service` |
+| zram (zstd) | 4 GiB at most | 100 | `ubuntu-gts9u-zram.service` |
+| swapfile on the UFS | the RAM: 8, 12 or 16 GiB | 10 | `ubuntu-gts9u-swapfile.service` |
 
 The decisions, and why:
 
-- **zram first, and with `zstd`.** It costs not one write to the UFS. The
-  kernel's default algorithm here is `lzo-rle`, but `zstd` is available:
+- **zram first, and with `zstd`.** It costs not one write to the UFS. A page
+  also comes back from it about ten times faster than from the swapfile:
+  about 15 µs a page from zram, against 114 µs for a 4 KiB random read from
+  the UFS on the fastest core (SM-X910, 2026-11-22). The kernel's default
+  algorithm here is `lzo-rle`, but `zstd` is available:
   `CONFIG_CRYPTO_ZSTD` is module-only and this port installs no generic tree,
   but modern zram carries its own zstd backend and announces it in
   `comp_algorithm`. Measured on the tablet: **4.53×** — 0.65 GiB of pages
-  occupying 0.16 GiB of RAM.
-- **8 GiB of zram, half the RAM.** That is the reasonable ceiling: any larger
-  and a run of incompressible pages could claim more memory than it saves.
-  `comp_algorithm` only accepts writes while `disksize` is still unset, so that
-  order in the script is not interchangeable.
-- **The swapfile does not travel in the image.** 16 GiB of zeros would dwarf
-  the flashable ZIP; it is created on the device, which is why the unit is
-  ordered `After=` the root filesystem expansion: before that the filesystem is
-  still the small one that was shipped.
+  occupying 0.16 GiB of RAM. After 16 hours of a desktop under memory
+  pressure it was 4.46×.
+- **4 GiB of zram at most, or half the RAM if that is less.** The size is a
+  ceiling, not a reservation: zram only takes memory for the pages it holds.
+  At 4.46× a full 4 GiB costs about 0.9 GiB of RAM; the 8 GiB of before
+  would have cost 1.8 GiB. The cap bounds that worst case, and the swapfile
+  takes what does not fit. Half of `MemTotal` is below 4 GiB only on an 8 GB
+  model. The rule is also the default of systemd's zram-generator.
+  `comp_algorithm` only accepts writes while `disksize` is still unset, so
+  that order in the script is not interchangeable.
+- **The swapfile does not travel in the image.** Gigabytes of zeros would
+  dwarf the flashable ZIP; it is created on the device, which is why the unit
+  is ordered `After=` the root filesystem expansion: before that the
+  filesystem is still the small one that was shipped.
 - **`fallocate`, not `dd`.** ext4 with this kernel accepts a swapfile of
   unwritten extents — `mkswap` and `swapon` accept it, verified on the tablet —
   so creation is instant and adds nothing to boot. The `dd` is kept only as a
   fallback should `swapon` ever reject the file.
-- **16 GiB, larger than RAM, on purpose.** It is 2 % of the free space and
-  leaves hibernation arithmetically possible for anyone who wants to wire up
-  `resume=`; it is not promised to work.
+- **The swapfile is as large as the RAM the tablet is sold with.** It is
+  sized from `MemTotal`, never from the model. `MemTotal` is lower by what the
+  firmware and the kernel keep (14.2 GiB on the 16 GB SM-X910, 10.3 GiB on the
+  12 GB SM-X710), so it is rounded up to the next multiple of 4 GiB, the step
+  between the models, and clamped to the 8–16 GiB the family ships. Still
+  larger than `MemTotal`, it leaves hibernation arithmetically possible for
+  anyone who wants to wire up `resume=`; it is not promised to work.
+- **Installed tablets change at the next boot.** A package upgrade restarts
+  neither unit, so nothing is swapped off under a running desktop. zram is
+  made anew at every boot. At boot, before the swapfile is turned on, a file
+  of another size is replaced: the new one is built beside it and moved over
+  it only when it is complete, and only if the root keeps its 20 GiB of
+  headroom with both on disk; otherwise the old file stays in service for
+  that boot. A swapfile that is already active is never touched.
 - **`vm.swappiness = 100` and `vm.page-cluster = 0`** (`90-gts9u-swap.conf`).
   With a compressed tier in front, evicting an anonymous page is cheap and
   worth preferring over dropping cache. The 180 of a zram-only machine is not
@@ -245,12 +265,11 @@ The decisions, and why:
   zram has no seek penalty and reading clusters of pages only wastes
   decompression.
 
-Validated after an unattended reboot: both units active, the swapfile reused
-rather than recreated, and a test that reserves 11 GiB without a single OOM
-kill.
-
-Both sizes are fixed, the same on the SM-X710. With its 8 or 12 GB of RAM,
-8 GiB of zram is more than half of it there; that has not been revisited.
+Validated with the fixed sizes of v2.22 (8 GiB of zram, a 16 GiB swapfile)
+after an unattended reboot: both units active, the swapfile reused rather than
+recreated, and a test that reserves 11 GiB without a single OOM kill. The
+sizing from the RAM is covered by offline tests (`tests/test_swap_sizing.py`)
+and has not yet run on a tablet.
 
 ## Ubuntu's own initramfs
 

@@ -1,11 +1,11 @@
 #!/bin/sh
-# Second-tier swap on the internal UFS for the SM-X910.
+# Second-tier swap on the internal UFS for the SM-X910 and the SM-X710.
 #
 # zram takes the traffic; this file is the overflow that stops a Proton game or
 # a big build from reaching the OOM killer.  It is deliberately lower priority,
 # so it is only touched once zram is full.
 #
-# The file is created on the device, never shipped in the image: 16 GiB of
+# The file is created on the device, never shipped in the image: gigabytes of
 # zeroes would dwarf the flashable ZIP.  It is made after the first-boot
 # resize2fs, because before that the filesystem is still the small shipped one.
 #
@@ -15,38 +15,90 @@
 # case where swapon refuses the fallocated file, which is what happens on
 # filesystems that cannot map it.
 #
-# 16 GiB is larger than the 14.2 GiB of RAM on purpose: it keeps suspend-to-disk
-# arithmetically possible for whoever wires up resume=, without promising it
-# works.  It is 2% of the free space on this partition.
+# The size is the RAM the tablet is sold with: 8, 12 or 16 GiB, taken from
+# MemTotal and never from the model.  MemTotal is lower by what the firmware
+# and the kernel keep for themselves (14.2 GiB on the 16 GB SM-X910, 10.3 GiB
+# on the 12 GB SM-X710, under 2 GiB less on both), so rounding it up to the
+# next multiple of 4 GiB, the step between the models, gives the RAM back.
+# Outside the 8 to 16 GiB the family ships, the result is clamped to that
+# range, so a misread or a boot with mem= can neither shrink the file below the
+# smallest model's nor grow it past the 16 GiB it has always been at most.
+# Being larger than MemTotal still keeps suspend-to-disk arithmetically
+# possible for whoever wires up resume=, without promising it works.
+#
+# A file of another size, such as the 16 GiB every model got before 2026-11, is
+# replaced here at boot, while it is not in use: a file that is already active
+# swap is never removed, so nothing can swap off pages the RAM cannot take back.
+# The new file is built beside the old one and moved over it only when it is
+# complete, so running out of space part way leaves the old one in service.
 set -eu
 
 swapfile=/swapfile
-size_gib=16
+new=$swapfile.new
 priority=10
 # Refuse to create it if that would leave the root filesystem tight.
 headroom_gib=20
 
 log() { echo "ubuntu-gts9u-swapfile: $*" >&2; }
 
-already_on() {
-	swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$swapfile"
+# The RAM as sold, in GiB.  Fails if MemTotal cannot be read.
+ram_gib() {
+	kb=$(sed -n 's/^MemTotal:[[:space:]]*\([1-9][0-9]\{0,11\}\) kB$/\1/p' \
+		/proc/meminfo 2>/dev/null) || kb=
+	case $kb in ''|*[!0-9]*) return 1 ;; esac
+	gib=$(((kb + 4194303) / 4194304 * 4))
+	[ "$gib" -ge 8 ] || gib=8
+	[ "$gib" -le 16 ] || gib=16
+	echo "$gib"
 }
 
+already_on() {
+	# If swapon cannot list the active areas, count the file as one of them,
+	# so that it is left exactly as it is.
+	if ! active=$(swapon --show=NAME --noheadings 2>/dev/null); then
+		log 'swapon cannot list the active swap; treating the swapfile as active'
+		return 0
+	fi
+	printf '%s\n' "$active" | grep -qxF "$swapfile"
+}
+
+bytes() { stat -c %s "$1" 2>/dev/null || echo 0; }
+
+size_text() {
+	if [ $(($1 % 1073741824)) -eq 0 ]; then
+		echo "$(($1 / 1073741824)) GiB"
+	else
+		echo "$1 bytes"
+	fi
+}
+
+zeroes() {
+	dd if=/dev/zero of="$1" bs=1M count=$((size_gib * 1024)) \
+		status=none conv=fsync
+}
+
+# Every step is checked by hand: set -e does not apply inside a function that
+# is called as `create || ...`.
 create() {
-	avail_gib=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+	# An old file still counts against the free space: both exist until the
+	# new one is moved over it.
+	avail_gib=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
 	if [ "${avail_gib:-0}" -lt $((size_gib + headroom_gib)) ]; then
-		log "only ${avail_gib} GiB free; not creating a ${size_gib} GiB swapfile"
+		log "only ${avail_gib:-0} GiB free; not creating a ${size_gib} GiB swapfile"
 		return 1
 	fi
 
-	rm -f "$swapfile"
-	if ! fallocate -l "${size_gib}G" "$swapfile" 2>/dev/null; then
+	rm -f "$new"
+	if ! fallocate -l "${size_gib}G" "$new" 2>/dev/null; then
 		log 'fallocate unavailable; falling back to dd'
-		dd if=/dev/zero of="$swapfile" bs=1M count=$((size_gib * 1024)) \
-			status=none conv=fsync
+		rm -f "$new"
+		zeroes "$new" || { rm -f "$new"; return 1; }
 	fi
-	chmod 0600 "$swapfile"
-	mkswap "$swapfile" >/dev/null
+	if ! { chmod 0600 "$new" && mkswap "$new" >/dev/null &&
+		mv -f "$new" "$swapfile"; }; then
+		rm -f "$new"
+		return 1
+	fi
 
 	if swapon --priority "$priority" "$swapfile" 2>/dev/null; then
 		return 0
@@ -56,32 +108,73 @@ create() {
 	# and try again; if that also fails, leave nothing behind.
 	log 'swapon refused the fallocated file; rewriting it with dd'
 	rm -f "$swapfile"
-	dd if=/dev/zero of="$swapfile" bs=1M count=$((size_gib * 1024)) \
-		status=none conv=fsync
-	chmod 0600 "$swapfile"
-	mkswap "$swapfile" >/dev/null
-	if ! swapon --priority "$priority" "$swapfile"; then
-		log 'swapon failed; removing the file'
-		rm -f "$swapfile"
-		return 1
+	if zeroes "$swapfile" && chmod 0600 "$swapfile" &&
+		mkswap "$swapfile" >/dev/null &&
+		swapon --priority "$priority" "$swapfile"; then
+		return 0
 	fi
+	log 'swapon failed; removing the file'
+	rm -f "$swapfile"
+	return 1
 }
 
 start() {
-	already_on && { log 'already active'; return 0; }
+	if ! size_gib=$(ram_gib); then
+		size_gib=
+		log 'cannot read MemTotal; using an existing swapfile as it is, making none'
+	fi
+	want=$((${size_gib:-0} * 1024 * 1024 * 1024))
+	have=$(bytes "$swapfile")
 
-	if [ -f "$swapfile" ]; then
-		# Present from an earlier boot: just turn it back on.  Re-make the
-		# signature only if it is missing, which is what a half-finished
-		# creation would leave behind.
-		chmod 0600 "$swapfile"
-		if swapon --priority "$priority" "$swapfile" 2>/dev/null; then
-			log 'enabled the existing swapfile'
-			return 0
+	if already_on; then
+		if [ -n "$size_gib" ] && [ "$have" != "$want" ]; then
+			log "already active at $(size_text "$have"); it becomes" \
+				"${size_gib} GiB at a boot that finds it inactive"
+		else
+			log 'already active'
 		fi
-		log 'existing swapfile is unusable; rebuilding it'
+		return 0
 	fi
 
+	# What an interrupted replacement left behind; it was never enabled.
+	rm -f "$new"
+
+	if [ -e "$swapfile" ] && [ ! -f "$swapfile" ]; then
+		log "$swapfile is not a regular file; leaving it alone"
+		return 0
+	fi
+
+	if [ -f "$swapfile" ]; then
+		chmod 0600 "$swapfile"
+		if [ -z "$size_gib" ] || [ "$have" = "$want" ]; then
+			# Present from an earlier boot: just turn it back on.  One that
+			# swapon refuses, which is what a half-finished creation would
+			# leave behind, is rebuilt.
+			if swapon --priority "$priority" "$swapfile" 2>/dev/null; then
+				log 'enabled the existing swapfile'
+				return 0
+			fi
+			if [ -z "$size_gib" ]; then
+				log 'existing swapfile is unusable; not rebuilding it'
+				return 0
+			fi
+			log 'existing swapfile is unusable; rebuilding it'
+		else
+			log "replacing the $(size_text "$have") swapfile with a ${size_gib} GiB one"
+			if create; then
+				log "enabled $swapfile, ${size_gib} GiB, priority $priority"
+				return 0
+			fi
+			# Keep the old one in service until a later boot can replace it.
+			if [ -f "$swapfile" ] &&
+				swapon --priority "$priority" "$swapfile" 2>/dev/null; then
+				log "kept the $(size_text "$have") swapfile for this boot"
+			fi
+			return 0
+		fi
+	fi
+
+	[ -n "$size_gib" ] || return 0
 	create || return 0
 	log "enabled $swapfile, ${size_gib} GiB, priority $priority"
 }

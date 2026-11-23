@@ -7164,3 +7164,61 @@ IOPS, with the IOMMU in strict mode (the S9's figures were taken in lazy
 mode). 403 MHz is covered there only because rpmhpd has not synced on the
 SM-X910, which holds CX at its maximum, and the module refuses to load once
 it has.
+
+### Swap sized to the RAM (2026-11-22)
+
+The owner chose new sizes for the two swap tiers. Since device package v2.22
+(Session 55) they had been a fixed 8 GiB of zram and a 16 GiB swapfile on
+every model; on the 12 GB SM-X710 that let zram grow to 78 % of `MemTotal`.
+
+Measured read-only on the 16 GB SM-X910 that day, about 16 h after boot,
+with the desktop under memory pressure:
+
+- zram held 1,092,009,984 bytes of pages in 244,773,024 bytes (4.46:1) and
+  used 494,342,144 bytes of memory in all, 757,096,448 at most that boot.
+  The 8 GiB was a ceiling, never a reservation. At that ratio a full 4 GiB
+  zram costs about 0.9 GiB of RAM, a full 8 GiB about 1.8 GiB.
+- zram's own counters: 538,839 reads in 7,920 ms (about 15 µs a page) and
+  880,403 writes in 28,044 ms (about 32 µs a page). That is 36 s of CPU time
+  in 58,893 s of uptime (0.06 %).
+- UFS 4 KiB random reads, `O_DIRECT`, queue depth 1 (fio, psync, 8 s,
+  read-only): 114 µs mean on the X3 core (8,731 IOPS, p99 187 µs), 123 µs on
+  an A715 (8,049 IOPS, p99 251 µs), 165 µs on an A510 (5,949 IOPS, p99
+  285 µs). UFS writes were not measured.
+- zstd level 3 on 4 KiB blocks of a binary (ratio 1.86, harder than real
+  swap pages): 170 MB/s compress and 513 MB/s decompress on the X3 (about
+  24 µs and 8 µs a page), 128 and 441 MB/s on an A715, 38 and 121 MB/s on an
+  A510 (about 107 µs and 34 µs a page).
+
+A page comes back from zram about ten times faster than from the swapfile,
+so zram stays the first swap. Its cap comes down to 4 GiB to bound how much
+RAM compressed pages can take in the worst case, and the swapfile, sized to
+the RAM, takes what does not fit. The desktop stalls seen that day happened
+with swap nearly idle (0.4 of 24 GiB used), so this change is not their fix.
+
+Both boards take the same path, sized from `MemTotal` and never from the
+model:
+
+- zram: half of `MemTotal`, at most 4 GiB. That is 4 GiB on the 12 and 16 GB
+  models; an 8 GB model, whose `MemTotal` is below 8 GiB, gets half of it.
+- swapfile: `MemTotal` rounded up to the next multiple of 4 GiB, clamped to
+  8–16 GiB. `MemTotal` read that day was 14,903,260 kB (14.2 GiB) on the
+  SM-X910 and 10,816,184 kB (10.3 GiB) on the SM-X710, which give 16 and
+  12 GiB.
+
+Installed tablets change at their next boot, with no step by hand: the
+package upgrade restarts neither unit. At boot the swapfile script replaces
+a file of another size while it is still inactive. It builds the new one as
+`/swapfile.new` and moves it over the old one only when it is complete. If
+the root would drop below the 20 GiB headroom with both files on disk, or
+the new file cannot be made, the old one stays in service for that boot. A
+file that is already active is never touched. So the SM-X710 test unit's
+16 GiB file becomes 12 GiB, and the SM-X910's stays as it is.
+
+Rewriting the script showed a fault in the old one: `create` ran as
+`create || return 0`, where `set -e` does not apply. A failed `dd` would
+have been given a signature and enabled at whatever size it had reached.
+Every step is now checked by hand.
+
+Not yet run on a tablet. `tests/test_swap_sizing.py` runs both scripts
+against a fake root.

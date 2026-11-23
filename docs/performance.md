@@ -111,7 +111,9 @@ and cooling devices keep their limits. GPU boost is part of its OPP table and
 is not controlled by the CPU boost switch.
 
 The baseline audit also found working energy-aware scheduling, deep CPU idle,
-8 GiB of compressed zram ahead of disk swap, and dynamic UFS frequency scaling.
+8 GiB of compressed zram ahead of disk swap (4 GiB at most since 2026-11-22,
+see [Two-tier swap](ubuntu-userspace.md#two-tier-swap)), and dynamic UFS
+frequency scaling.
 During a 15-second idle sample, total CPU busy time was 3.15% and every core's
 deep-idle residency counter advanced. The earlier camera-relay idle fixes are
 already installed. There is no evidence here for changing their behavior,
