@@ -9854,3 +9854,37 @@ sleep counters.
 The kit was packed from commit ab2c536, the one the kernel was built from,
 and its `SOURCE` says so; its copy of the README is that commit's and still
 calls revision 10 "not built yet". The scripts in it are this tree's.
+
+**11:37 to 11:51, revision 10 on squirtle: installed over revision 9, and
+its first sleep.** `install.sh` ran as an upgrade over revision 9 (one
+command, one reboot). At the boot (c2b5834d) the kernel is the kit's
+(90da273a8a49), the Wi-Fi's PCIe link came up without the unpark patch
+(`PCIe Gen.2 x1 link up`, wlp1s0 connected), and `sudo sh verify.sh` passed
+every check eight minutes in: UFS host clocks enabled once or twice each
+(`gcc_ufs_phy_ahb_clk 2/2`, `gcc_ufs_phy_ice_core_clk 2/2`, the others 1/1)
+where revision 9's read 522 to 525, both calibrations with their `power-up
+write: PWRDN 0x1 right after it, 0x1 100 us later` line.
+
+Run 1 (11:48, run 2b's options: `ro 1 30 release-floor pci=remove
+mode=s2idle hold=60 gdsc=pcie0 restart-ok`, the ADSP running), log
+`squirtle-sleep-r10-1-pcie0-20261123.log`, record 000046:
+- the sleep came back (31.2 s, woken by the RTC), the UFS read back, PWRDN
+  0x1 at the calibration;
+- **the PCIe host came back**: `PCIe Gen.2 x1 link up` 0.27 s into the
+  resume, no `stuck at 'off'`, no `Host init failed`. In revision 9's four
+  returning runs it never did. (`Timeout waiting for L2 entry! LTSSM: 0x11`
+  at the suspend, as before: the root port is removed.);
+- the UFS host's clocks were off before and after the sleep (`axi 0/0`,
+  `unipro_core 0/0`, `pad_clkref 0/0`); `ahb 1/1` and `ice_core 1/1` stay,
+  the inline crypto engine's from its probe, as expected; `bi_tcxo 6/6`;
+- **the DDR counters moved for the first time**: `ddr +1311`, 28.8 s of
+  the 31.2 in its low-power mode (0xd4), 29.1 s at 200 MHz. In every
+  revision 9 run the DDR stayed at 547 or 1555 MHz with `ddr +0`;
+- `aosd +0`, `cxsd +0`: still SHALLOW. The ADSP went in and out of its own
+  sleep 1494 times in the 31 s, and the DDR's 1311 entries are of the same
+  order: something wakes the SoC some 45 times a second. Not known yet
+  whether that is the ADSP or what else holds CX.
+
+After the restart (boot ffb9f962): `errors_count` 0, the PCIe link up,
+Wi-Fi connected. Next: the same run with the ADSP stopped (as run 2c), then
+one without `gdsc=pcie0`.
