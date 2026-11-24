@@ -10627,3 +10627,46 @@ before the sleep (`bi_tcxo itself 1`, by the counts the USB PHY's reference
 clock, which goes with the PHY's other clocks in the suspend: inferred),
 `mx.lvl` left out of the sleep set with no vote in the trace, and the other
 requesters, which only the AOP can name.
+
+### Device 2.75: the sensor clients stopped before every system sleep (2026-11-24)
+
+What both boards get over 2.74:
+- The system-sleep hook `ubuntu-gts9u-sensors` stops
+  `ubuntu-gts9u-sensors-resume`, `iio-sensor-proxy` and
+  `hexagonrpcd-adsp-sensorspd` before every system sleep, in that order,
+  each `systemctl` call waited for 10 s at most, and after the sleep resets
+  and restarts the resume unit (`--no-block`). It does nothing where the
+  resume unit cannot run (no `ssccli`, or the unit masked or missing), and
+  it never fails or holds up the sleep. On a `systemctl suspend` the file
+  server's `Conflicts=suspend.target` stops it as well, a fraction of a
+  second before the hook stops the proxy. 2.74's hook stopped only the
+  resume unit.
+- `ubuntu-gts9u-sensors-resume.service` tries a failed recovery again after
+  30 s, three starts at most in 15 minutes; its stop waits 5 s at most.
+
+Why: with the sensor streams open the audio DSP left its sleep 30 to 50
+times a second through a system sleep (about 1,500 wakes in 30 s on the
+SM-X710, none with both clients stopped by hand, kit revision 10 run 6 and
+revision 11 run 5), and the DDR left its low-power mode with it. With the
+old hook the proxy also crashed (SIGSEGV) after 21 of the SM-X910's 64
+returns from sleep, before the resume unit replaced it. Stock Android keeps
+its sensor daemons across a suspend and tells the DSP that the application
+processor sleeps, through an SMP2P bit that mainline has no driver for; here
+the clients are stopped instead. Details:
+[gts9wifi-sensors.md](gts9wifi-sensors.md#across-a-system-suspend).
+
+Measured with the old hook on the SM-X910 (59 resumes, read from its
+journal): the sensors were back 14 to 15 s after each resume, and all 118
+recoveries in both tablets' journals were ready at the first attempt, so the
+retry has never run on hardware.
+
+`postinst` and `prerm` run the same steps as 2.74's: the daemon-reload loads
+the new unit, and the next sleep runs the new hook. A tablet that cannot take
+the package yet (the SM-X710 test unit while the Type-C roles kit is
+installed) gets the three files from the in-place kit
+[`tools/inplace/sensors-hook`](../tools/inplace/sensors-hook/README.md); a
+device package installed later puts its own files over the kit's.
+
+Nothing of the new hook has run on a tablet. No 2.75 package has been built
+for a tablet, and none is installed: the SM-X710 test unit has 2.69 and the
+SM-X910 one 2.72, both with the hook from before this change.

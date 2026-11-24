@@ -322,7 +322,7 @@ environment to disable writes.
 
 State on 2026-11-07, one SM-X710 with bootloader revision 5
 (`X710XXS5CYG1`), built with `DEVICE=gts9wifi` from this tree (kernel 7.2-rc3,
-device package 2.56; this tree now builds 2.74, the first device package built from the SM-X710 and SM-X910 lines together, [porting log](porting-log.md#device-274-the-first-package-from-both-lines-2026-11-21); before it, 2.57 fixes the fingerprint-gate generator's mode, and on the SM-X710 line 2.58 lets the USB controller runtime-suspend, 2.59 brings Bluetooth back by itself after a UART IRQ storm, 2.60 pins the full-resolution camera packages and carries 2.59's changes). The unit was first installed from an earlier gts9wifi
+device package 2.56; this tree now builds 2.75: 2.74 was the first device package built from the SM-X710 and SM-X910 lines together, [porting log](porting-log.md#device-274-the-first-package-from-both-lines-2026-11-21), and 2.75 stops the sensor clients before every system sleep, [porting log](porting-log.md#device-275-the-sensor-clients-stopped-before-every-system-sleep-2026-11-24); before it, 2.57 fixes the fingerprint-gate generator's mode, and on the SM-X710 line 2.58 lets the USB controller runtime-suspend, 2.59 brings Bluetooth back by itself after a UART IRQ storm, 2.60 pins the full-resolution camera packages and carries 2.59's changes). The unit was first installed from an earlier gts9wifi
 ZIP and updated in place to this kernel and these packages; a ZIP built from
 this tree has not yet been flashed end to end. The evidence levels are the
 ones above. The SM-X710
