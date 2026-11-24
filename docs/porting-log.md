@@ -10035,3 +10035,72 @@ awake, the audio DSP's clients in userspace; and `rpmh`, which turns the
 RPMh tracepoint on for the run and names the last write of the sleep and
 wake sets before each sleep (by the command DB), with the levels it left
 out, held through the sleep at their vote. Not built, not on the tablet.
+
+### Kit revision 11, second form: the guard and the root port switch, written, not built (2026-11-23)
+
+The first form's risk was its first boot: the panel cycle keeps the
+Wi-Fi's link, and genpd collapsed `pcie_0_gdsc` under it. Revision 11 now
+keeps the domain on in every suspend in which the PCIe host keeps its link,
+and lets it collapse only when the host has powered itself down (a guard):
+- `gcc-sm8550-pcie0-gdsc-off-in-suspend.patch` gives `pcie_0_gdsc`
+  `GENPD_FLAG_ACTIVE_WAKEUP` besides `PWRSTS_OFF_ON`: two lines of its
+  entry in one hunk, one line more in the file. Set in the table and not in
+  the probe or the init function: from either of those clang moved
+  `pcie_0_gdsc` in `.data` (tried on a scratch build);
+- `pcie-qcom-keep-power-domain-while-link-kept.patch`
+  (`APPLY_SM8550_PCIE0_GDSC_GUARD=1`, which goes together with
+  `APPLY_SM8550_PCIE0_GDSC_OFF=1`, each refused without the other): at the
+  end of a `qcom_pcie_suspend_noirq()` that succeeded the host calls
+  `device_set_awake_path()` when `dw_pcie_suspend_noirq()` kept the link
+  (`pci->suspended` false), and `device_set_out_band_wakeup()` when it
+  powered the host down. `genpd_finish_suspend()` calls the driver's
+  callback first, then skips the power-off for a device on the awake path
+  in a domain with the flag unless it is out-of-band, and
+  `genpd_finish_resume()` skips the power-on the same way
+  (`drivers/pmdomain/core.c:1556` and `:1612` in 7.2-rc3); both flags are
+  cleared in the next `device_prepare()` (`drivers/base/power/main.c:2211`),
+  and an awake path set in the noirq phase reaches no parent
+  (`dpm_propagate_wakeup_to_parent()` runs in the suspend and late suspend
+  phases only, `:2033` and `:1752`). No other domain has the flag, so the
+  PCIe1 host and every other board's are as before. The cost while the link
+  is kept: CX stays voted at retention or above.
+- The record: a genpd notifier on the host's domain notes a power-off
+  between `suspend_noirq` and `resume_noirq`, and the resume logs one line
+  per sleep (`system sleep: the link was kept, and its power domain stayed
+  on`, `the host powered down, and genpd powered its power domain off`, and
+  the warning `the link was kept, but genpd powered its power domain off`).
+  `verify.sh` requires the first in the boot's first suspend on the kit's
+  kernel and fails the warning on any kernel; `sleep-test.sh` reads them
+  from the boot's log and refuses a sleep with the PCI devices kept without
+  `pci=keep` unless the guard held this boot.
+
+`pcie-qcom-debug-root-port-d3.patch` (with `APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1`
+and the guard): `pcie_qcom.debug_root_port_d3`, `N` at every boot, `-EPERM`
+before `SYSTEM_RUNNING`. `Y` sets `bridge_d3` on each root port of a qcom
+host that the PCI core keeps in D0. The PCI core gives it none: the root
+port is hot-plug capable (33a76fc3c3e6), and `pci_bridge_d3_possible()`
+returns false for a hot-plug port that pciehp does not handle natively
+(`drivers/pci/pci.c:3008`; `pciehp_is_native()` is false without
+`CONFIG_HOTPLUG_PCI_PCIE`, which revision 10's configuration leaves unset)
+before it reads `pcie_port_pm=force` (`:3011`); d4c79b63d82 (v7.3) makes
+the later `is_pciehp` check (`:3027`) x86-only and does not reach this one. No configuration change: `sleep-test.sh
+root-port-d3` sets the switch for a `pci=keep` run. Not the default in this
+revision.
+
+`sleep-test.sh sensors=stop` stops `iio-sensor-proxy` and
+`hexagonrpcd-adsp-sensorspd` for a run, for an A/B of the audio DSP's
+wakes; the record names the units' state before and after.
+
+Checked on scratch builds (not on the tablet): `gcc-sm8550.o` and
+`pcie-qcom.o` for arm64 with revision 10's configuration, no warning, with
+and without `W=1`; `gcc-sm8550.o`'s `.data` differs from revision 10's in two
+bytes, `pcie_0_gdsc`'s `.pwrsts` (6 to 5) and its genpd flags (0 to 8), and
+from the hang-log build's in four, which `make-kit.sh`'s check (now with
+the members' offsets from pahole) accepts, and it refuses revision 10's
+object. The build script's patch steps for every allowed combination of
+the five variables on both boards: without the two new ones every tree is
+the one the previous commit's script makes, byte for byte; with them two
+files differ, `gcc-sm8550.c` and `pcie-qcom.c`, the patches apply strictly
+(the debug switches one line further down), and a reused tree is refused
+for a build without them, and so is one with the first form of the GDSC
+patch. Not built, not run.

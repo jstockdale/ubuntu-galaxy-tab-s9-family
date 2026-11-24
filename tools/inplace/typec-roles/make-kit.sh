@@ -11,12 +11,17 @@
 # revert of the PCIe PIPE clock mux rework, with unpark-pcie0-pipe-mux.patch
 # left out, the GPU RSC's stop sequence and ufs-qcom's lane clocks) and a
 # second UFS PHY diagnostic, and since revision 11 pcie_0_gdsc collapsed in
-# system suspend (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch), in boot, plus
-# the build's module tree, signed with its own key.  The configuration and
-# the DTB do not change, so vendor_boot stays the hang-log kit's.  The build
-# for this kit sets APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1,
-# APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1, APPLY_SM8550_SLEEP_FIXES=1 and
-# APPLY_SM8550_PCIE0_GDSC_OFF=1.
+# system suspend when the PCIe host has powered itself down, and kept on
+# while it keeps its link (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch, with
+# the guard's genpd flag, and the guard's other half,
+# pcie-qcom-keep-power-domain-while-link-kept.patch), with a run-time debug
+# switch that lets the PCIe root port go to D3hot in system suspend
+# (pcie-qcom-debug-root-port-d3.patch), in boot, plus the build's module
+# tree, signed with its own key.  The configuration and the DTB do not
+# change, so vendor_boot stays the hang-log kit's.  The build for this kit
+# sets APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1,
+# APPLY_SM8550_SLEEP_FIXES=1, APPLY_SM8550_PCIE0_GDSC_OFF=1 and
+# APPLY_SM8550_PCIE0_GDSC_GUARD=1.
 #
 #   bash tools/inplace/typec-roles/make-kit.sh BUILD_SCRATCH KERNEL_OUT_DIR \
 #       HANG_KERNEL_OUT_DIR HANG_KIT_DIR KIT_DIR
@@ -40,15 +45,17 @@
 # Then the changes are checked to be only the intended ones: the DTB, the
 # configuration and the module list are the hang-log build's, the source
 # trees differ in the three Type-C files, the clock controller, the
-# dwc3-qcom glue, the UFS PHY driver, the RPMh power domain driver, and the
-# PIPE clock mux, the PCIe PHY, the GMU and ufs-qcom files of revision 10
-# alone and those are what this checkout's patches, stage script and driver
-# give (the PCIe PHY's without unpark-pcie0-pipe-mux.patch), the new image
-# has the new code (the debug switches' parameters among it) and the old one
-# does not and was built after the last change to those files, the compiled
-# power domain table differs in three power-state masks alone (the two USB
-# domains' and pcie_0_gdsc's) and the RPMh power domain driver's tables not
-# at all, the UFS PHY's calibration in the new vmlinux no longer asks which
+# dwc3-qcom glue, the UFS PHY driver, the RPMh power domain driver, the
+# PIPE clock mux, the PCIe PHY, the GMU and ufs-qcom files of revision 10,
+# and the PCIe host driver of revision 11 alone, and those are what this
+# checkout's patches, stage script and driver give (the PCIe PHY's without
+# unpark-pcie0-pipe-mux.patch), the new image has the new code (the debug
+# switches' parameters among it) and the old one does not and was built
+# after the last change to those files, the compiled power domain table
+# differs in three power-state masks (the two USB domains' and
+# pcie_0_gdsc's) and pcie_0_gdsc's genpd flags alone and the RPMh power
+# domain driver's tables not at all, the UFS PHY's calibration in the new
+# vmlinux no longer asks which
 # board it runs on, the new vmlinux has the PIPE clock mux's gate operations
 # and not its rate operations and its PCIe PHY power-on sets no clock rate,
 # and the new boot image differs only in its kernel.  Nothing is flashed.
@@ -74,8 +81,9 @@ size=100663296
 # This kit's revision: revision 7 plus the UFS PHY's PCS reset for both
 # tablets and its diagnostic (8), plus the deep-sleep debug switches (9),
 # plus the SM8550 sleep fixes and the second UFS PHY diagnostic (10), plus
-# pcie_0_gdsc collapsed in system suspend (11).  Written to the kit for
-# people; install.sh knows a revision by its boot image and kernel build ID.
+# pcie_0_gdsc collapsed in system suspend with its guard and the root port's
+# debug switch (11).  Written to the kit for people; install.sh knows a
+# revision by its boot image and kernel build ID.
 revision=11
 dts=sm8550-samsung-gts9wifi
 tcpm_dir=drivers/usb/typec/tcpm
@@ -89,6 +97,9 @@ phymux=drivers/clk/qcom/clk-regmap-phy-mux
 qmp_pcie=drivers/phy/qualcomm/phy-qcom-qmp-pcie
 gmu=drivers/gpu/drm/msm/adreno/a6xx_gmu
 ufs_qcom=drivers/ufs/host/ufs-qcom
+# Revision 11's PCIe host driver: the guard's half, and the root port's
+# debug switch.
+pcie_qcom=drivers/pci/controller/dwc/pcie-qcom
 # The USB-C dock changes, each applied to the hang-log tree's file as it is.
 typec_patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
 	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch
@@ -101,11 +112,20 @@ typec_patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extr
 # APPLY_SM8550_SLEEP_FIXES=1.
 ufs_patches=(qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch
 	qmp-ufs-pcs-state-diagnostic.patch qmp-ufs-pwrdn-readback-diagnostic.patch)
-# Revision 11's pcie_0_gdsc, with APPLY_SM8550_PCIE0_GDSC_OFF=1: one line of
-# the power domain table, on top of the USB power domain patch.
+# Revision 11's pcie_0_gdsc, with APPLY_SM8550_PCIE0_GDSC_OFF=1: two lines of
+# the power domain table, its power states and the guard's genpd flag, on
+# top of the USB power domain patch.
 gdsc_patches=(gcc-sm8550-pcie0-gdsc-off-in-suspend.patch)
-# The line it gives pcie_0_gdsc, by which the build script knows it.
+# The line it gives pcie_0_gdsc's power states, by which the build script
+# knows it, and the one it gives its genpd.
 pcie0_line='PWRSTS_OFF_ON, /* gcc-sm8550-pcie0-gdsc-off-in-suspend.patch */'
+guard_line='		.flags = GENPD_FLAG_ACTIVE_WAKEUP,'
+# The PCIe host's: the guard's other half (APPLY_SM8550_PCIE0_GDSC_GUARD=1),
+# then the root port's debug switch on top of it (with
+# APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 as well), each known by a line it adds.
+pcie_patches=(pcie-qcom-keep-power-domain-while-link-kept.patch pcie-qcom-debug-root-port-d3.patch)
+pcie_lines=('qcom_pcie_mark_sleep_path(dev, pcie->link_kept);'
+	'PCIe root port to D3 for a sleep test, not for release builds')
 # Revision 9's debug switches, with APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1: the
 # GDSC one on top of the USB power domain patch (and of revision 11's), the
 # RPMh one on its own.
@@ -117,10 +137,11 @@ fix_patches=(clk-qcom-regmap-phy-mux-revert-rework.patch msm-adreno-a6xx-fix-sta
 	ufs-qcom-enable-only-lane-clocks.patch)
 fix_files=("$phymux.c" "$gmu.c" "$ufs_qcom.c")
 unpark=unpark-pcie0-pipe-mux.patch
-patches=("${typec_patches[@]}" "${gdsc_patches[@]}" "${debug_patches[@]}" "${fix_patches[@]}" "${ufs_patches[@]}")
+patches=("${typec_patches[@]}" "${gdsc_patches[@]}" "${debug_patches[@]}" "${fix_patches[@]}" "${ufs_patches[@]}"
+	"${pcie_patches[@]}")
 # The files those patches change, and the PCIe PHY's.
 patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c" "$rpmhpd.c"
-	"$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h")
+	"$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c")
 
 # The base on the tablet: the hang-log kit, which a first install saves and
 # rollback.sh puts back.
@@ -149,8 +170,11 @@ hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
 # unpark-pcie0-pipe-mux.patch and the GMU fix leave no string; the symbol
 # and disassembly checks below are for the first two, the GMU's source and
 # object dates for the last.  Last, revision 11: the debug switches' fifth
-# parameter, debug_boot_state.  Its pcie_0_gdsc is one byte of a table: the
-# power domain check below is for it.
+# parameter, debug_boot_state; two of the four lines the guard's PCIe half
+# logs at a resume (the one a kept link should give, and its warning); the
+# root port's debug switch, as the kernel keeps it.  Its pcie_0_gdsc's power
+# states and genpd flags are two bytes of a table: the power domain check
+# below is for them.
 new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
 	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
 	'Swap is still queued, left pending' 'Partner swapped first, queued DR_SWAP_SEND dropped'
@@ -161,14 +185,17 @@ new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait
 	rpmhpd.debug_ret_floor
 	'failed to get tx_lane0_sync_clk' 'failed to get rx_lane0_sync_clk' 'failed to get rx_lane1_sync_clk'
 	'power-up write: PWRDN'
-	gcc_sm8550.debug_boot_state)
+	gcc_sm8550.debug_boot_state
+	'system sleep: the link was kept, and its power domain stayed on'
+	'system sleep: the link was kept, but genpd powered its power domain off'
+	pcie_qcom.debug_root_port_d3)
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
 	"$tcpm_dir/sm5714_usbpd.o:$tcpm_dir/sm5714_usbpd.c"
 	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h" "$dwc3.o:$dwc3.c" "$qmp.o:$qmp.c"
 	"$rpmhpd.o:$rpmhpd.c" "$phymux.o:$phymux.c" "$qmp_pcie.o:$qmp_pcie.c" "$gmu.o:$gmu.c"
-	"$ufs_qcom.o:$ufs_qcom.c" "$ufs_qcom.o:$ufs_qcom.h")
+	"$ufs_qcom.o:$ufs_qcom.c" "$ufs_qcom.o:$ufs_qcom.h" "$pcie_qcom.o:$pcie_qcom.c")
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 die() { echo "$*" >&2; exit 1; }
@@ -178,12 +205,12 @@ for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$build/.config" "$build/certs/signing_key.x509" "$build/vmlinux" \
 	"$build/$gcc.o" "$build/$tcpm_dir/tcpm.o" "$build/$tcpm_dir/sm5714_usbpd.o" "$build/$dwc3.o" \
 	"$build/$qmp.o" "$build/$rpmhpd.o" "$build/$phymux.o" "$build/$qmp_pcie.o" "$build/$gmu.o" \
-	"$build/$ufs_qcom.o" "$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
+	"$build/$ufs_qcom.o" "$build/$pcie_qcom.o" "$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
 	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}" \
 	"$repo/kernel/patches/$unpark" "$repo/scripts/stage-ufs-resume-experiment.sh"; do
 	[ -f "$f" ] || die "missing: $f"
 done
-for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy llvm-objdump llvm-nm; do
+for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy llvm-objdump llvm-nm pahole; do
 	command -v "$t" >/dev/null || die "missing tool: $t"
 done
 [ "$(sha "$hang/Image.gz")" = "$hang_image" ] || die "$hang is not the hang-log kit's kernel build"
@@ -278,20 +305,43 @@ for d in usb30_prim_gdsc usb3_phy_gdsc; do
 done
 grep -q 'Retention across system suspend, as on sm8650' "$tree/$gcc.c" ||
 	die 'the build tree does not carry the USB power domain patch'
-# Revision 11: pcie_0_gdsc PWRSTS_OFF_ON by the line of its patch, the patch
-# whole in the build tree's file (it comes out again with no fuzz), and its
-# PHY's domain and the PCIe1 ones as upstream has them.
+# Revision 11: pcie_0_gdsc PWRSTS_OFF_ON by the line of its patch, and the
+# guard's GENPD_FLAG_ACTIVE_WAKEUP in its entry and nowhere else in the
+# file, the patch whole in the build tree's file (it comes out again with no
+# fuzz), and its PHY's domain and the PCIe1 ones as upstream has them.
 [ "$(gdsc_pwrsts "$tree/$gcc.c" pcie_0_gdsc)" = 'PWRSTS_OFF_ON,' ] && grep -qF -- "$pcie0_line" "$tree/$gcc.c" ||
 	die "the build tree does not carry ${gdsc_patches[0]} (pcie_0_gdsc)"
+awk -v head='static struct gdsc pcie_0_gdsc = {' -v line="$guard_line" '
+	$0 == head { inside = 1; next }
+	inside && /^};/ { exit }
+	inside && $0 == line { found = 1 }
+	END { exit !found }' "$tree/$gcc.c" && [ "$(grep -cF -- GENPD_FLAG_ACTIVE_WAKEUP "$tree/$gcc.c")" = 1 ] ||
+	die "the build tree does not carry ${gdsc_patches[0]} whole (GENPD_FLAG_ACTIVE_WAKEUP for pcie_0_gdsc, and nowhere else)"
 for d in pcie_0_phy_gdsc pcie_1_gdsc pcie_1_phy_gdsc; do
 	[ "$(gdsc_pwrsts "$tree/$gcc.c" "$d")" = 'PWRSTS_RET_ON,' ] ||
 		die "the build tree's $d is not PWRSTS_RET_ON"
 done
 mkdir -p "$tmp/gdsc/${gcc%/*}"
 cp "$tree/$gcc.c" "$tmp/gdsc/$gcc.c"
-patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/gdsc" -p1 \
-	< "$repo/kernel/patches/${gdsc_patches[0]}" ||
-	die "the build tree's $gcc.c does not carry ${gdsc_patches[0]} whole"
+for ((i = ${#gdsc_patches[@]} - 1; i >= 0; i--)); do
+	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/gdsc" -p1 \
+		< "$repo/kernel/patches/${gdsc_patches[$i]}" ||
+		die "the build tree's $gcc.c does not carry ${gdsc_patches[$i]} whole"
+done
+# The PCIe host driver: the guard's half and the root port's debug switch,
+# each known by its line, both whole in the build tree's file (they come out
+# again with no fuzz, the switch first).
+for i in "${!pcie_patches[@]}"; do
+	grep -qF -- "${pcie_lines[$i]}" "$tree/$pcie_qcom.c" ||
+		die "the build tree does not carry ${pcie_patches[$i]}"
+done
+mkdir -p "$tmp/pcie/${pcie_qcom%/*}"
+cp "$tree/$pcie_qcom.c" "$tmp/pcie/$pcie_qcom.c"
+for ((i = ${#pcie_patches[@]} - 1; i >= 0; i--)); do
+	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/pcie" -p1 \
+		< "$repo/kernel/patches/${pcie_patches[$i]}" ||
+		die "the build tree's $pcie_qcom.c does not carry ${pcie_patches[$i]} whole"
+done
 # The guard adds no string to the image; its comment is the marker.
 grep -q 'no hcd and no root hub' "$tree/$dwc3.c" ||
 	die 'the build tree does not carry the dwc3-qcom guard'
@@ -354,6 +404,11 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 	! grep -qF -- "$pcie0_line" "$hang_tree/$gcc.c" &&
 		[ "$(gdsc_pwrsts "$hang_tree/$gcc.c" pcie_0_gdsc)" = 'PWRSTS_RET_ON,' ] ||
 		die "the hang-log tree's pcie_0_gdsc is not upstream's PWRSTS_RET_ON"
+	# Revision 11's guard and the root port's switch: in neither of its
+	# files.
+	! grep -qF -- GENPD_FLAG_ACTIVE_WAKEUP "$hang_tree/$gcc.c" &&
+		! grep -qF -e "${pcie_lines[0]}" -e "${pcie_lines[1]}" "$hang_tree/$pcie_qcom.c" ||
+		die "the hang-log tree carries revision 11's guard or the root port's debug switch already"
 	# Revision 10: the hang-log build had none of the three upstream commits
 	# and did apply unpark-pcie0-pipe-mux.patch, as every default build does.
 	! grep -q 'static int phy_mux_enable(struct clk_hw \*hw)' "$hang_tree/$phymux.c" &&
@@ -372,9 +427,10 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 		patch -s -d "$tmp/src" -p1 --no-backup-if-mismatch < "$repo/kernel/patches/$p" ||
 			die "$p does not apply to the hang-log tree"
 	done
-	# Revision 11's pcie_0_gdsc, then the debug switches, as the build
-	# applies them, strictly.
-	for p in "${gdsc_patches[@]}" "${debug_patches[@]}"; do
+	# Revision 11's pcie_0_gdsc, then the debug switches (one line further
+	# down than without it), then the PCIe host's two, as the build applies
+	# them, strictly.
+	for p in "${gdsc_patches[@]}" "${debug_patches[@]}" "${pcie_patches[@]}"; do
 		patch -s --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
 			< "$repo/kernel/patches/$p" ||
 			die "$p does not apply to the hang-log tree"
@@ -435,23 +491,24 @@ $qmp_pcie.c
 $gmu.c
 $ufs_qcom.c
 $ufs_qcom.h
+$pcie_qcom.c
 $tcpm_dir/sm5714_usbpd.c
 $tcpm_dir/tcpm.c
 include/linux/usb/tcpm.h
 EOF
 	cmp -s "$tmp/trees.changed" "$tmp/trees.want" || {
-		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h:' >&2
+		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c, ufs-qcom.h and pcie-qcom.c:' >&2
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $hang_tree: twelve files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, gcc-sm8550.c by revision 11's pcie_0_gdsc, gcc-sm8550.c and rpmhpd.c by its two debug switch patches, clk-regmap-phy-mux.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h by its three sleep fixes, phy-qcom-qmp-pcie.c by $unpark left out, phy-qcom-qmp-ufs.c by its stage script and the two UFS PHY diagnostics"
-	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h differ from the hang-log tree, by exactly this checkout'"'"'s changes'
+	source_check="compared with $hang_tree: thirteen files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, gcc-sm8550.c by revision 11's pcie_0_gdsc, gcc-sm8550.c and rpmhpd.c by its two debug switch patches, clk-regmap-phy-mux.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h by its three sleep fixes, phy-qcom-qmp-pcie.c by $unpark left out, phy-qcom-qmp-ufs.c by its stage script and the two UFS PHY diagnostics, pcie-qcom.c by revision 11's guard and the root port's debug switch"
+	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c, ufs-qcom.h and pcie-qcom.c differ from the hang-log tree, by exactly this checkout'"'"'s changes'
 	if [ -n "$backups" ]; then
 		source_check="$source_check; passed over, a copy of the hang-log tree's file that patch(1) kept:$backups"
 		echo "sources: passed over$backups, the hang-log tree's file as patch(1) kept it"
 	fi
 else
-	echo 'sources: the sixteen patches and this checkout'"'"'s driver are in the build tree, and unpark-pcie0-pipe-mux.patch is not (HANG_SCRATCH not set: no tree comparison)'
+	echo 'sources: the eighteen patches and this checkout'"'"'s driver are in the build tree, and unpark-pcie0-pipe-mux.patch is not (HANG_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.
@@ -474,14 +531,24 @@ done
 [ "$build/arch/arm64/boot/Image.gz" -nt "$build/vmlinux" ] || die 'Image.gz is older than vmlinux'
 cmp -s "$build/arch/arm64/boot/Image.gz" "$out/Image.gz" || die "$out/Image.gz is not the build directory's"
 echo 'build: the changed objects are newer than their sources, vmlinux newer than them, and Image.gz is the build directory'"'"'s'
-# The power domain changes are three numbers in a table and leave no string.
+# The power domain changes are four numbers in a table and leave no string.
 # The table was compiled from the patched source and linked into this image
 # (the check above), and against the hang-log build's it differs in exactly
-# those three: the two USB domains' 5 (PWRSTS_OFF_ON) became 6
-# (PWRSTS_RET_ON), and pcie_0_gdsc's 6 became 5 (revision 11).  Each changed
-# byte is named by the object of the new build that holds it (its symbol
-# table's .data entries: in an object file a symbol's value is its offset in
-# its section), and it has to be the same byte of each, .pwrsts.
+# those four bytes: the two USB domains' 5 (PWRSTS_OFF_ON) became 6
+# (PWRSTS_RET_ON), pcie_0_gdsc's 6 became 5 (revision 11), and pcie_0_gdsc's
+# genpd flags 0 became 8 (GENPD_FLAG_ACTIVE_WAKEUP, the guard's; little
+# endian, so the low byte).  Each changed byte is named by the object of the
+# new build that holds it (its symbol table's .data entries: in an object
+# file a symbol's value is its offset in its section), and has to be the
+# member it is: .pwrsts of struct gdsc for the three, .pd.flags for the
+# fourth, at the offsets the object's own debug information gives them
+# (pahole).
+member_offset() { # OBJECT STRUCT MEMBER: the member's offset in the struct, or nothing
+	# (pahole failing gives nothing, which the caller refuses, rather than
+	# a silent exit under pipefail.)
+	{ pahole -C "$2" "$1" 2>/dev/null || :; } | awk -v m="$3" '
+		{ for (i = 1; i + 2 <= NF; i++) if ($i == m ";" && $(i + 1) == "/*") { print $(i + 2); exit } }'
+}
 gdsc_table_check() { # HANG_OBJECT NEW_OBJECT: 0, or 1 with what differs on stderr
 	llvm-objcopy -O binary --only-section=.data "$1" "$tmp/gcc.hang.data"
 	llvm-objcopy -O binary --only-section=.data "$2" "$tmp/gcc.new.data"
@@ -511,12 +578,19 @@ gdsc_table_check() { # HANG_OBJECT NEW_OBJECT: 0, or 1 with what differs on stde
 				if (o >= at[j] && o < at[j] + size[j]) { s = name[j] " " o - at[j]; break }
 			print s, $2, $3
 		}' "$tmp/gcc.new.syms" "$tmp/gcc.data.diff" | sort > "$tmp/gcc.data.named"
-	awk '{ print $1, $3, $4 }' "$tmp/gcc.data.named" | tr '\n' ';' > "$tmp/gcc.data.got"
-	if [ "$(cat "$tmp/gcc.data.got")" = 'pcie_0_gdsc 6 5;usb30_prim_gdsc 5 6;usb3_phy_gdsc 5 6;' ] &&
-		[ "$(awk '{ print $2 }' "$tmp/gcc.data.named" | sort -u | wc -l)" = 1 ]; then
+	pwrsts_at=$(member_offset "$2" gdsc pwrsts)
+	pd_at=$(member_offset "$2" gdsc pd)
+	flags_in=$(member_offset "$2" generic_pm_domain flags)
+	case $pwrsts_at:$pd_at:$flags_in in
+	*[!0-9:]*|:*|*::*|*:) echo "pahole gives no offsets of struct gdsc's pwrsts and pd and of struct generic_pm_domain's flags in $2" >&2; return 1 ;;
+	esac
+	flags_at=$((pd_at + flags_in))
+	printf '%s\n' "pcie_0_gdsc $flags_at 0 10" "pcie_0_gdsc $pwrsts_at 6 5" "usb30_prim_gdsc $pwrsts_at 5 6" \
+		"usb3_phy_gdsc $pwrsts_at 5 6" | sort > "$tmp/gcc.data.want"
+	if cmp -s "$tmp/gcc.data.named" "$tmp/gcc.data.want"; then
 		return 0
 	fi
-	echo "the compiled $gcc table does not differ from the hang-log build's in the three power-state masks alone (pcie_0_gdsc 6 to 5, the two USB domains 5 to 6, at one offset in each; byte, old, new, octal):" >&2
+	echo "the compiled $gcc table does not differ from the hang-log build's in the four bytes alone (pcie_0_gdsc's .pd.flags at $flags_at 0 to 8, and the .pwrsts at $pwrsts_at of pcie_0_gdsc 6 to 5 and of the two USB domains 5 to 6; symbol, byte in it, old, new, octal):" >&2
 	cat "$tmp/gcc.data.named" >&2
 	return 1
 }
@@ -524,10 +598,10 @@ gdsc_check='the object is newer than the patched source and older than vmlinux (
 if [ -n "${HANG_SCRATCH:-}" ]; then
 	[ -f "$HANG_SCRATCH/linux-gts9wifi/$gcc.o" ] || die "no $gcc.o in $HANG_SCRATCH"
 	gdsc_table_check "$HANG_SCRATCH/linux-gts9wifi/$gcc.o" "$build/$gcc.o" || exit 1
-	gdsc_check="the compiled table differs from the hang-log build's in three bytes, pcie_0_gdsc's .pwrsts 6 to 5 and the two USB domains' 5 to 6"
+	gdsc_check="the compiled table differs from the hang-log build's in four bytes, pcie_0_gdsc's .pwrsts 6 to 5 and the two USB domains' 5 to 6 (.pwrsts at $pwrsts_at in each), and pcie_0_gdsc's .pd.flags 0 to 8 (GENPD_FLAG_ACTIVE_WAKEUP, at $flags_at)"
 	# The debug switches write nothing until one is set: the RPMh power
 	# domain driver's compiled tables are the hang-log build's, byte for byte
-	# (the GDSC table's three bytes are the USB power domain patch's and
+	# (the GDSC table's four bytes are the USB power domain patch's and
 	# revision 11's).
 	[ -f "$HANG_SCRATCH/linux-gts9wifi/$rpmhpd.o" ] || die "no $rpmhpd.o in $HANG_SCRATCH"
 	llvm-objcopy -O binary --only-section=.data "$HANG_SCRATCH/linux-gts9wifi/$rpmhpd.o" "$tmp/rpmhpd.hang.data"
@@ -650,24 +724,28 @@ done < <(list "$modules")
 echo "modules: $n, the hang-log build's list, all signed with key ${key_id:0:12} (archived)"
 
 # 6b. Revision 9's debug switches as the kernel knows them, with revision
-# 11's debug_boot_state: built in, so each parameter's description is in the
-# module tree's modules.builtin.modinfo under its object's name, where the
-# hang-log build's has none; and the build's vmlinux, the image's by its
-# build ID (5b), has their handlers (its symbols as 5c listed them).  Their
-# names are in the image (4).
+# 11's debug_boot_state and the root port's switch: built in, so each
+# parameter's description is in the module tree's modules.builtin.modinfo
+# under its object's name, where the hang-log build's has none; and the
+# build's vmlinux, the image's by its build ID (5b), has their handlers (its
+# symbols as 5c listed them), and the guard's genpd notifier, whose address
+# its probe hands genpd (the guard's other two functions are inlined).
+# Their names are in the image (4).
 tr '\0' '\n' < "$modules/modules.builtin.modinfo" > "$tmp/builtin.modinfo"
 tr '\0' '\n' < "$hang_modules/modules.builtin.modinfo" > "$tmp/builtin.hang.modinfo"
 for parm in gcc_sm8550.parm=debug_pcie0_off: gcc_sm8550.parm=debug_pcie0_phy_off: \
-	gcc_sm8550.parm=debug_usb_off: rpmhpd.parm=debug_ret_floor: gcc_sm8550.parm=debug_boot_state:; do
+	gcc_sm8550.parm=debug_usb_off: rpmhpd.parm=debug_ret_floor: gcc_sm8550.parm=debug_boot_state: \
+	pcie_qcom.parm=debug_root_port_d3:; do
 	grep -q "^$parm" "$tmp/builtin.modinfo" ||
 		die "the module tree's modules.builtin.modinfo has no $parm"
 	! grep -q "^$parm" "$tmp/builtin.hang.modinfo" ||
 		die "self-test failed: the hang-log build's modules.builtin.modinfo has $parm too"
 done
-for f in gcc_sm8550_debug_set gcc_sm8550_debug_get gcc_sm8550_debug_boot_get rpmhpd_debug_ret_floor_set; do
+for f in gcc_sm8550_debug_set gcc_sm8550_debug_get gcc_sm8550_debug_boot_get rpmhpd_debug_ret_floor_set \
+	qcom_pcie_debug_rp_d3_set qcom_pcie_pd_notify; do
 	grep -q " [tT] $f\$" "$tmp/vmlinux.nm" || die "no $f in $build/vmlinux"
 done
-switch_check="the five parameters' names in the image and their descriptions in modules.builtin.modinfo, none in the hang-log build's; the set and get handlers in vmlinux (build ID ${new_id:0:12})"
+switch_check="the six parameters' names in the image and their descriptions in modules.builtin.modinfo, none in the hang-log build's; the set and get handlers and the guard's genpd notifier in vmlinux (build ID ${new_id:0:12})"
 echo "debug switches: $switch_check"
 
 # 7. The kit's boot image, and what changed in it.
@@ -711,6 +789,8 @@ printf '%s\n' "$revision" > "$kit/REVISION"
 	echo "debug switches: $switch_check"
 	echo "left out: kernel/patches/$unpark (APPLY_SM8550_SLEEP_FIXES=1)"
 	echo "pcie_0_gdsc: PWRSTS_OFF_ON (kernel/patches/${gdsc_patches[0]}, APPLY_SM8550_PCIE0_GDSC_OFF=1)"
+	echo "pcie_0_gdsc guard: GENPD_FLAG_ACTIVE_WAKEUP (kernel/patches/${gdsc_patches[0]}) and the PCIe host on the awake path while it keeps its link (kernel/patches/${pcie_patches[0]}, APPLY_SM8550_PCIE0_GDSC_GUARD=1)"
+	echo "root port debug switch: pcie_qcom.debug_root_port_d3, N at boot (kernel/patches/${pcie_patches[1]}, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 with APPLY_SM8550_PCIE0_GDSC_GUARD=1)"
 } > "$kit/SOURCE"
 install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/sleep-test.sh" \
 	"$here/README.md" "$kit/"

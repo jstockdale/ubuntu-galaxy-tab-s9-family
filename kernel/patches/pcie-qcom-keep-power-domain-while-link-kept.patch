@@ -1,0 +1,191 @@
+Subject: [TEST builds only] PCI: qcom: keep the power domain on while the link is kept in system suspend
+
+Test builds only.  scripts/build-mainline-kernel.sh applies this only with
+APPLY_SM8550_PCIE0_GDSC_GUARD=1 (which goes together with
+APPLY_SM8550_PCIE0_GDSC_OFF=1), and refuses a build without the variable in
+a source tree that carries it.  No board check.  It is the PCIe host's half
+of the guard; the clock controller's is the genpd flag that
+gcc-sm8550-pcie0-gdsc-off-in-suspend.patch gives pcie_0_gdsc.
+
+1. The guard.  qcom_pcie_suspend_noirq() knows whether the host kept its
+   link: dw_pcie_suspend_noirq() keeps it, and leaves pci->suspended false,
+   when a bound function on the bus, the root port included, is not in
+   D3hot (or has wakeup on and no PME from D3cold:
+   pci_host_common_d3cold_possible()), and powers the host down otherwise,
+   or when the link is down.  It now tells genpd: device_set_awake_path()
+   when the link is kept, device_set_out_band_wakeup() when the host powered
+   down, each only for a suspend_noirq that succeeded.
+   genpd's genpd_finish_suspend() runs this callback first and then, for a
+   domain with GENPD_FLAG_ACTIVE_WAKEUP, leaves the domain on for a device
+   on the awake path that is not out-of-band, and genpd_finish_resume() reads
+   the same two flags before it would power the domain on (they are cleared
+   only in the next suspend's device_prepare()), so the two stay balanced.
+   The awake path set this late, in the noirq phase, reaches no parent:
+   dpm_propagate_wakeup_to_parent() runs in the suspend and late suspend
+   phases only.  out-of-band matters only when a wakeup-enabled function
+   below put the host on the awake path in those phases: genpd then powers
+   the domain off for a host that is down all the same.  Nothing else in the
+   tree reads either flag of this device.  A domain without the genpd flag
+   ignores both: pcie_1_gdsc, and every other qcom PCIe host's in this
+   tree's device trees (each host's power domain is a GDSC of its clock
+   controller, and no other GDSC has the flag), so nothing changes there,
+   and a board with two hosts keeps the second's behaviour.
+
+2. A record, for test builds: a genpd power notifier on the host's domain
+   (dev_pm_genpd_add_notifier(), at the end of a probe that succeeded) notes
+   a power-off between suspend_noirq and resume_noirq, and the resume logs
+   one line per system sleep, which tools/inplace/typec-roles/verify.sh and
+   sleep-test.sh read:
+     qcom-pcie 1c00000.pcie: system sleep: the link was kept, and its power domain stayed on
+     qcom-pcie 1c00000.pcie: system sleep: the host powered down, and genpd powered its power domain off
+   and the two that should not happen with the guard, the first a warning:
+     ... the link was kept, but genpd powered its power domain off
+     ... the host powered down, and its power domain stayed on
+   With pcie_0_gdsc in retention (PWRSTS_RET_ON, sleep-test.sh
+   gdsc-ret=pcie0) genpd's power-off leaves it on in hardware: "genpd
+   powered its power domain off" is what genpd did.  A pm_test cycle prints
+   its line as well (the boot's panel cycle among them).  Info lines,
+   so below a console loglevel of 7 they go to the log only.
+
+Why.  pcie_0_gdsc PWRSTS_OFF_ON (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch)
+is what the SM-X710's sleeps with the PCIe host powered down needed (kit
+revisions 9 and 10: 7 of 7 with it collapsed, 0 of 8 without), and it
+collapsed the domain under a host that kept its link as well: every
+suspend with the Wi-Fi bound, the boot's panel cycle among them.  967e011013ed
+upstream keeps the PCIe GDSCs in retention for that reason.  With the guard
+the domain collapses only when the host has powered itself down.
+
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -25,6 +25,7 @@
+ #include <linux/pci.h>
+ #include <linux/pci-ecam.h>
+ #include <linux/pci-pwrctrl.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_opp.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/platform_device.h>
+@@ -292,6 +293,15 @@
+ 	struct list_head ports;
+ 	struct gpio_desc *reset;
+ 	bool use_pm_opp;
++	/*
++	 * System sleep: whether the last system suspend kept the link
++	 * (qcom_pcie_suspend_noirq()), and, recorded by pd_nb for the line the
++	 * resume logs, whether genpd powered the host's power domain off since.
++	 */
++	bool link_kept;
++	bool pd_off;
++	bool pd_nb_registered;
++	struct notifier_block pd_nb;
+ };
+ 
+ #define to_qcom_pcie(x)		dev_get_drvdata((x)->dev)
+@@ -1980,6 +1990,65 @@
+ 	return 0;
+ }
+ 
++/*
++ * A host that keeps its link through a system suspend needs its power domain
++ * on, or the controller loses its state under the live link and its resume
++ * breaks (why SM8550's PCIe GDSCs are PWRSTS_RET_ON upstream, 967e011013ed).
++ * genpd leaves the domain on for a device on the awake path when the domain
++ * has GENPD_FLAG_ACTIVE_WAKEUP, and powers it on again for the resume the
++ * same way (genpd_finish_suspend() and genpd_finish_resume(),
++ * drivers/pmdomain/core.c).  A host that powered itself down needs the
++ * domain no more, whatever its endpoints' wakeup settings are (an endpoint
++ * that wakes the system with the host powered down does so out of band, by
++ * WAKE#): out_band_wakeup lets genpd power the domain off even when a
++ * wakeup-enabled function below set the awake path in the suspend phase
++ * (dpm_propagate_wakeup_to_parent(), drivers/base/power/main.c).  Both last
++ * until the next suspend's prepare.  A domain without the flag ignores both.
++ * Test builds only (pcie-qcom-keep-power-domain-while-link-kept.patch, with
++ * gcc-sm8550-pcie0-gdsc-off-in-suspend.patch for SM8550's pcie_0_gdsc).
++ */
++static void qcom_pcie_mark_sleep_path(struct device *dev, bool link_kept)
++{
++	if (link_kept)
++		device_set_awake_path(dev);
++	else
++		device_set_out_band_wakeup(dev);
++}
++
++/*
++ * Test builds: what genpd did with the host's power domain in a system sleep,
++ * for the line qcom_pcie_report_sleep() logs at the resume.  The power-off,
++ * when genpd makes one, comes after qcom_pcie_suspend_noirq() returns, and
++ * the power-on before qcom_pcie_resume_noirq() is called.
++ */
++static int qcom_pcie_pd_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	struct qcom_pcie *pcie = container_of(nb, struct qcom_pcie, pd_nb);
++
++	if (action == GENPD_NOTIFY_OFF)
++		WRITE_ONCE(pcie->pd_off, true);
++
++	return NOTIFY_OK;
++}
++
++static void qcom_pcie_report_sleep(struct qcom_pcie *pcie)
++{
++	struct device *dev = pcie->pci->dev;
++	bool off = READ_ONCE(pcie->pd_off);
++
++	if (!pcie->pd_nb_registered)
++		return;
++
++	if (pcie->link_kept && off)
++		dev_warn(dev, "system sleep: the link was kept, but genpd powered its power domain off\n");
++	else if (pcie->link_kept)
++		dev_info(dev, "system sleep: the link was kept, and its power domain stayed on\n");
++	else if (off)
++		dev_info(dev, "system sleep: the host powered down, and genpd powered its power domain off\n");
++	else
++		dev_info(dev, "system sleep: the host powered down, and its power domain stayed on\n");
++}
++
+ static int qcom_pcie_probe(struct platform_device *pdev)
+ {
+ 	struct qcom_pcie_perst *perst, *tmp_perst;
+@@ -2140,6 +2209,10 @@
+ 	if (pcie->mhi)
+ 		qcom_pcie_init_debugfs(pcie);
+ 
++	/* Test builds: see qcom_pcie_report_sleep(). */
++	pcie->pd_nb.notifier_call = qcom_pcie_pd_notify;
++	pcie->pd_nb_registered = !dev_pm_genpd_add_notifier(dev, &pcie->pd_nb);
++
+ 	return 0;
+ 
+ err_phy_exit:
+@@ -2165,6 +2238,8 @@
+ 	if (!pcie)
+ 		return 0;
+ 
++	WRITE_ONCE(pcie->pd_off, false);
++
+ 	ret = dw_pcie_suspend_noirq(pcie->pci);
+ 	if (ret)
+ 		return ret;
+@@ -2211,6 +2286,12 @@
+ 				dev_pm_opp_set_opp(pcie->pci->dev, NULL);
+ 		}
+ 	}
++
++	if (!ret) {
++		pcie->link_kept = !pcie->pci->suspended;
++		qcom_pcie_mark_sleep_path(dev, pcie->link_kept);
++	}
++
+ 	return ret;
+ }
+ 
+@@ -2223,6 +2304,8 @@
+ 	if (!pcie)
+ 		return 0;
+ 
++	qcom_pcie_report_sleep(pcie);
++
+ 	if (pcie->pci->suspended) {
+ 		if (pcie->use_pm_opp) {
+ 			ret = qcom_pcie_set_max_opp(dev);

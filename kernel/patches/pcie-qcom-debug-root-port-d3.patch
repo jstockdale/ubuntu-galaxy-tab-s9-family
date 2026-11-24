@@ -1,0 +1,137 @@
+Subject: [DEBUG, test builds only] PCI: qcom: run-time switch to let the root ports go to D3hot in system suspend
+
+Not for release builds.  scripts/build-mainline-kernel.sh applies this only
+with both APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and
+APPLY_SM8550_PCIE0_GDSC_GUARD=1, on top of
+pcie-qcom-keep-power-domain-while-link-kept.patch, and refuses any other
+build in a source tree that carries it.  No board check.
+
+One switch, which root writes at run time and nothing else changes:
+
+  /sys/module/pcie_qcom/parameters/debug_root_port_d3   N at every boot
+
+Y gives each root port of a qcom PCIe host bridge_d3, the PCI core's
+permission for a bridge to go to D3hot, where the PCI core gave it none;
+N takes it away again.  From the next system suspend such a root port goes
+to D3hot once the functions below it are (pci_pm_suspend_noirq(): a bridge
+is put in a low-power state only with bridge_d3, pci_power_manageable()),
+the host then finds every function in D3hot, sends PME_Turn_Off and powers
+itself down (dw_pcie_suspend_noirq(), pci_host_common_d3cold_possible()),
+and with the guard genpd collapses pcie_0_gdsc; the resume sets the host up
+again, trains the link, and the PCI core restores the root port's and the
+functions' configuration (pci_pm_resume_noirq()); ath11k powers its chip
+down and up at every suspend anyway (its default PM policy).  It is what a
+sleep with the PCIe root port removed (sleep-test.sh pci=remove) does with
+the Wi-Fi kept: tools/inplace/typec-roles/sleep-test.sh root-port-d3 sets it
+for a pci=keep run.
+
+Why the PCI core gives none: the SM8550's root ports are hot-plug capable
+(33a76fc3c3e6, v7.1), and pci_bridge_d3_possible() refuses D3 to a
+hot-plug port that pciehp does not handle natively before it looks at
+pcie_port_pm=force (drivers/pci/pci.c); this kernel has CONFIG_ACPI=y and
+no CONFIG_HOTPLUG_PCI_PCIE, so pciehp_is_native() is false.  d4c79b63d82
+(v7.3) lifts the check after that one, for non-x86, and does not help
+without pciehp.  The community SM8550 kernels build pciehp in and boot with
+pcie_port_pm=force (ROCKNIX); a kernel configuration change is what this
+switch avoids, and it can be tried inside the sleep test's protection
+first.
+
+Refused before SYSTEM_RUNNING (-EPERM), so the kernel command line cannot
+set it: the boot's pm_test=platform panel cycle keeps the link.  A Y that
+finds no such root port (sleep-test.sh pci=remove took it away) gets
+-ENODEV.  A root port whose D3 the PCI core allows itself is left alone.
+bridge_d3 is recomputed only for a port the PCI core can put in D3 itself
+(pci_bridge_d3_update()), so nothing but an N changes it back before the
+restart.  It is a bit-field next to others the PCI core writes in a suspend
+or from sysfs (skip_bus_pm, d3cold_allowed); the write is made with the
+system running and before a run, under pci_lock_rescan_remove(), which
+guards against a removal and not against those, none of which runs then.
+
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -2422,3 +2422,85 @@
+ 	},
+ };
+ builtin_platform_driver(qcom_pcie_driver);
++
++/*
++ * PCIe root port to D3 for a sleep test, not for release builds:
++ * pcie_qcom.debug_root_port_d3, which scripts/build-mainline-kernel.sh adds
++ * only with APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and
++ * APPLY_SM8550_PCIE0_GDSC_GUARD=1 (pcie-qcom-debug-root-port-d3.patch).
++ *
++ * A host powers itself down in a system suspend only when every function
++ * on its bus is in D3hot, its root port included
++ * (pci_host_common_d3cold_possible(), from dw_pcie_suspend_noirq()).  The
++ * root port goes to D3hot only when the PCI core gave it bridge_d3
++ * (pci_power_manageable(), from pci_pm_suspend_noirq()), which it gives a
++ * root port that is hot-plug capable, as the SM8550's are (33a76fc3c3e6),
++ * only when pciehp handles it: CONFIG_HOTPLUG_PCI_PCIE, which this kernel
++ * leaves out, and pcie_port_pm=force or d4c79b63d82 (pci_bridge_d3_possible(),
++ * drivers/pci/pci.c).  So with the Wi-Fi bound the host keeps its link in
++ * every suspend.  Y gives each root port of a qcom PCIe host that the PCI
++ * core keeps in D0 bridge_d3 until the restart or an N: from the next
++ * suspend it goes to D3hot after its functions, the host sends PME_Turn_Off
++ * and powers down, and its resume sets the host up again, trains the link
++ * and restores the functions' configuration (pci_pm_resume_noirq()).  It is
++ * that switch alone: whether the Wi-Fi comes back from it is what a run with
++ * it is for (tools/inplace/typec-roles/sleep-test.sh root-port-d3).  Root
++ * writes it at run time; the kernel command line cannot (-EPERM before
++ * SYSTEM_RUNNING): the boot's pm_test=platform panel cycle keeps the link.
++ * A Y finds no such port (pci=remove took it away): -ENODEV.  The PCI core
++ * recomputes bridge_d3 only for a port it can put in D3 itself
++ * (pci_bridge_d3_update()), so nothing changes it back but N; it is a
++ * bit-field next to others that the PCI core writes in a suspend or from
++ * sysfs, which this write, made before a run, does not meet.
++ */
++static bool qcom_pcie_debug_rp_d3;
++
++static int qcom_pcie_debug_rp_d3_set(const char *val, const struct kernel_param *kp)
++{
++	struct pci_dev *pdev = NULL;
++	bool on;
++	int ret, n = 0;
++
++	/* Run time only: see above. */
++	if (system_state != SYSTEM_RUNNING)
++		return -EPERM;
++
++	ret = kstrtobool(val, &on);
++	if (ret)
++		return ret;
++
++	pci_lock_rescan_remove();
++	for_each_pci_dev(pdev) {
++		struct pci_host_bridge *bridge;
++
++		if (!pci_is_pcie(pdev) || pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT)
++			continue;
++		bridge = pci_find_host_bridge(pdev->bus);
++		if (!bridge || !bridge->dev.parent ||
++		    bridge->dev.parent->driver != &qcom_pcie_driver.driver)
++			continue;
++		/* A port the PCI core can put in D3 itself is left to it. */
++		if (pci_bridge_d3_possible(pdev))
++			continue;
++		pdev->bridge_d3 = on;
++		pci_info(pdev, "debug: %s in system suspend (pcie_qcom.debug_root_port_d3 %c)\n",
++			 on ? "goes to D3hot" : "stays in D0", on ? 'Y' : 'N');
++		n++;
++	}
++	pci_unlock_rescan_remove();
++
++	if (on && !n)
++		return -ENODEV;
++
++	*(bool *)kp->arg = on;
++	return 0;
++}
++
++static const struct kernel_param_ops qcom_pcie_debug_rp_d3_ops = {
++	.set = qcom_pcie_debug_rp_d3_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(debug_root_port_d3, &qcom_pcie_debug_rp_d3_ops, &qcom_pcie_debug_rp_d3, 0644);
++MODULE_PARM_DESC(debug_root_port_d3,
++		 "debug: Y: the root ports of qcom PCIe hosts go to D3hot in system suspend (run time only)");

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Checks after booting the Type-C roles kit, and a recorder for plug-in tests.
 #   sh ~/typec-roles/verify.sh                  kernel, key, switches, the root's
-#                                               ext4, UFS, PCIe, Wi-Fi, GPU,
+#                                               ext4, UFS, PCIe, its power
+#                                               domain's guard, Wi-Fi, GPU,
 #                                               roles now
 #                                               (with sudo also the UFS host
 #                                               clocks' enable counts)
@@ -362,7 +363,7 @@ wait_partner() { # present|absent SECONDS; absent has to hold for 3 s, a
 case ${1:-} in
 dock|record|now|swap) plug_test "$@" ;;
 '') ;;
-*) sed -n '2,19s/^# //p' "$0" >&2; exit 2 ;;
+*) sed -n '2,20s/^# //p' "$0" >&2; exit 2 ;;
 esac
 
 echo "kernel: $(uname -v)"
@@ -419,10 +420,12 @@ param_is try_snk_extra_wait_ms 600
 # starts as the kernel's table has them.  Revision 11's kernel
 # (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch) boots with pcie_0_gdsc
 # PWRSTS_OFF_ON: its switch reads Y, the others N, and debug_boot_state
-# says so ("pcie0 Y, pcie0phy N, usb N").  On the kit's kernel each has to be
-# there and read as it boots: sleep-test.sh changes them for a run only, and
-# every run ends in a restart.  Another kernel may have none (revision 8 and
-# before), or boot with every one N (revisions 9 and 10).
+# says so ("pcie0 Y, pcie0phy N, usb N").  Revision 11 adds a sixth, the
+# root port's (pcie-qcom-debug-root-port-d3.patch), N at every boot.  On the
+# kit's kernel each has to be there and read as it boots: sleep-test.sh
+# changes them for a run only, and every run ends in a restart.  Another
+# kernel may have none (revision 8 and before), or boot with every one N
+# (revisions 9 and 10).
 sw_boot_file=/sys/module/gcc_sm8550/parameters/debug_boot_state
 sw_others=
 b=$(cat "$sw_boot_file" 2>/dev/null)
@@ -434,7 +437,8 @@ fi
 for sw in gcc_sm8550.debug_pcie0_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_off:Y \
 	gcc_sm8550.debug_pcie0_phy_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off:N \
 	gcc_sm8550.debug_usb_off:/sys/module/gcc_sm8550/parameters/debug_usb_off:N \
-	rpmhpd.debug_ret_floor:/sys/module/rpmhpd/parameters/debug_ret_floor:N; do
+	rpmhpd.debug_ret_floor:/sys/module/rpmhpd/parameters/debug_ret_floor:N \
+	pcie_qcom.debug_root_port_d3:/sys/module/pcie_qcom/parameters/debug_root_port_d3:N; do
 	name=${sw%%:*} rest=${sw#*:}
 	file=${rest%:*} boot=${rest##*:}
 	v=$(cat "$file" 2>/dev/null)
@@ -454,7 +458,7 @@ if [ -z "$want" ] || [ "$id" != "$want" ]; then
 	if [ -n "$sw_others" ]; then
 		note "debug switches of the running kernel, which is not the kit's:$sw_others${b:+ (at boot: $b)}"
 	else
-		note 'the running kernel is not the kit'"'"'s and offers no debug switches (the kernels of revisions 9 to 11 have them)'
+		note 'the running kernel is not the kit'"'"'s and offers no debug switches (the kernels of revisions 9 to 11 have them, the root port'"'"'s from revision 11)'
 	fi
 fi
 
@@ -555,16 +559,55 @@ if [ -n "$k" ]; then
 	fi
 fi
 
-# Revision 11 collapses pcie_0_gdsc in every system suspend, and the boot's
-# panel cycle (ubuntu-gts9u-panel-coldboot-recover, pm_test=platform, about
-# 22 s in) suspends with the Wi-Fi bound and its link kept: the root port
-# stays in D0, so the PCIe host keeps its link, and genpd collapses the GDSC
-# under it at the end of the noirq phase.  Did the Wi-Fi come back from it:
-# no line of the PCI core, ath11k, MHI or the root port since the boot's
-# first suspend that says it did not (a FAIL on any kernel), its PCI
-# function on the bus with ath11k bound, and its firmware loaded again after
-# that suspend (ath11k powers the chip down and up at each one); without
-# the function on the bus it is a note (a sleep test's pci=remove).
+# Revision 11's guard (the genpd flag of gcc-sm8550-pcie0-gdsc-off-in-suspend.patch
+# and pcie-qcom-keep-power-domain-while-link-kept.patch): pcie_0_gdsc, which
+# revision 11 lets collapse in system suspend, stays on in a suspend in which
+# the PCIe host keeps its link, and the boot's panel cycle
+# (ubuntu-gts9u-panel-coldboot-recover, pm_test=platform, about 22 s in) is
+# such a suspend, with the Wi-Fi bound: the root port stays in D0.  At each
+# resume the host logs what genpd did with its power domain in that sleep
+# (a genpd notifier's record).  On the kit's kernel the boot's first suspend
+# has to have "the link was kept, and its power domain stayed on" (the panel
+# cycle, unless a sleep test ran before it), and no suspend this boot may
+# have "the link was kept, but genpd powered its power domain off", which is
+# a FAIL on any kernel: the guard did not hold, and the controller lost its
+# state under the live link.  "the host powered down" is what a sleep with
+# the root port removed (pci=remove) or in D3hot (root-port-d3) logs.
+guard_re='[0-9a-f]+\.pcie: system sleep: '
+guard_kept='the link was kept, and its power domain stayed on'
+guard_bad='the link was kept, but genpd powered its power domain off'
+if [ -n "$k" ]; then
+	first=$(printf '%s\n' "$ku" | awk '/PM: suspend entry/ { on = 1 } on { print } on && /PM: suspend exit/ { exit }')
+	gall=$(printf '%s\n' "$ku" | grep -E "$guard_re")
+	gn=$(printf '%s\n' "$gall" | grep -cE "$guard_re")
+	gbad=$(printf '%s\n' "$gall" | grep -F "$guard_bad")
+	if [ -n "$gbad" ]; then
+		bad "the guard did not hold this boot: genpd powered the PCIe host's power domain off under a link it kept ($(printf '%s\n' "$gbad" | wc -l) of $gn sleeps; the Wi-Fi's controller lost its state under it):"
+		printf '%s\n' "$gbad" | head -n 3
+	elif [ -z "$first" ]; then
+		note "no suspend has run yet this boot (the panel cycle runs about 22 s in): the PCIe power domain's guard was not checked; run this again later"
+	else
+		g1=$(printf '%s\n' "$first" | grep -E "$guard_re" | sed 's/.*\.pcie: system sleep: //' | head -n 1)
+		if [ -n "$want" ] && [ "$id" = "$want" ]; then
+			case $g1 in
+			"$guard_kept") ok "PCIe power domain guard: in this boot's first suspend (the panel cycle) the host kept its link and pcie_0_gdsc stayed on ($gn sleeps logged this boot, none with the domain off under a kept link)" ;;
+			'') bad "no line of the PCIe power domain's guard in this boot's first suspend: the kit's kernel logs one at every resume (\"system sleep: ...\"); without it nothing shows that pcie_0_gdsc stayed on under the Wi-Fi's link" ;;
+			*) note "PCIe power domain guard, this boot's first suspend: $g1 (a sleep test before the panel cycle, or a Wi-Fi without its link); $gn sleeps logged this boot, none with the domain off under a kept link" ;;
+			esac
+		elif [ "$gn" != 0 ]; then
+			note "the running kernel is not the kit's; its PCIe host logged $gn sleeps, the first: ${g1:-none in the first suspend}"
+		else
+			note 'the running kernel is not the kit'"'"'s and logs no line of the PCIe power domain'"'"'s guard (revision 11'"'"'s kernel has it)'
+		fi
+	fi
+fi
+
+# Did the Wi-Fi come back from the boot's first suspend: no line of the PCI
+# core, ath11k, MHI or the root port since then that says it did not (a FAIL
+# on any kernel), its PCI function on the bus with ath11k bound, and its
+# firmware loaded again after that suspend (ath11k powers the chip down and
+# up at each one); without the function on the bus it is a note (a sleep
+# test's pci=remove).
 wifi_fail='Unable to change power state from [A-Za-z0-9]+ to D0, device inaccessible|ath11k_pci [0-9a-f:.]+: .*(failed|timeout|link down)|mhi mhi[0-9]+: .*(fail|[Ee]rror|timeout|not in valid state|Did not enter)|pcieport [0-9a-f:.]+: AER: |Internal error:|SError'
 if [ -n "$k" ]; then
 	after=$(printf '%s\n' "$ku" | sed -n '/PM: suspend entry/,$p')
@@ -584,7 +627,7 @@ if [ -n "$k" ]; then
 			bad "the Wi-Fi did not come back from this boot's first suspend (the panel cycle, unless a sleep test ran before it) ($(printf '%s\n' "$wf" | wc -l) lines):"
 			printf '%s\n' "$wf" | head -n 5
 			[ -z "$want" ] || [ "$id" != "$want" ] ||
-				note 'revision 11 collapses pcie_0_gdsc under the kept link in that suspend: README, "Revision 11: the runs", says what to do'
+				note 'on revision 11'"'"'s kernel the guard keeps pcie_0_gdsc on in that suspend (the guard'"'"'s line above): README, "Revision 11: the runs", says what to do when the Wi-Fi did not come back all the same'
 		elif [ -z "$wfn" ]; then
 			note 'no Wi-Fi function on the PCI bus with ath11k_pci bound, and no line that says it did not come back from this boot'"'"'s first suspend (a sleep test'"'"'s pci=remove leaves the bus so until a restart)'
 		else

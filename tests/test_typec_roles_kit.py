@@ -137,6 +137,8 @@ PHYMUX = "drivers/clk/qcom/clk-regmap-phy-mux"
 QMP_PCIE = "drivers/phy/qualcomm/phy-qcom-qmp-pcie"
 GMU = "drivers/gpu/drm/msm/adreno/a6xx_gmu"
 UFS_QCOM = "drivers/ufs/host/ufs-qcom"
+# Revision 11's.
+PCIE_QCOM = "drivers/pci/controller/dwc/pcie-qcom"
 # make-kit.sh's patches: the USB-C dock changes, the deep-sleep debug
 # switches (revision 9), which the build applies behind their switch, the
 # SM8550 sleep fixes (revision 10) behind theirs, then the UFS PHY's three
@@ -153,6 +155,15 @@ DEBUG_PATCHES = ["gcc-sm8550-gdsc-debug-switches.patch", "rpmhpd-debug-retention
 # it gives that domain, by which the build script and make-kit.sh know it.
 GDSC_PATCHES = ["gcc-sm8550-pcie0-gdsc-off-in-suspend.patch"]
 PCIE0_LINE = "\t.pwrsts = PWRSTS_OFF_ON, /* gcc-sm8550-pcie0-gdsc-off-in-suspend.patch */\n"
+# The genpd flag the same patch gives pcie_0_gdsc (the guard's clock
+# controller half), and the PCIe host's patches: the guard's other half,
+# behind APPLY_SM8550_PCIE0_GDSC_GUARD, and the root port's debug switch,
+# behind that and APPLY_DEEP_SLEEP_DEBUG_SWITCHES; each with a line the build
+# script and make-kit.sh know it by.
+GUARD_FLAG_LINE = "\t\t.flags = GENPD_FLAG_ACTIVE_WAKEUP,\n"
+PCIE_PATCHES = ["pcie-qcom-keep-power-domain-while-link-kept.patch", "pcie-qcom-debug-root-port-d3.patch"]
+GUARD_LINE = "qcom_pcie_mark_sleep_path(dev, pcie->link_kept);"
+RPD3_MARKER = "PCIe root port to D3 for a sleep test, not for release builds"
 # Revision 10's three upstream commits, each with the file it changes (and
 # ufs-qcom.h with ufs-qcom.c), its upstream hash, and the line the build
 # script knows it by; and the patch it leaves out.
@@ -174,12 +185,22 @@ SWITCHES = (("pcie0", "gcc_sm8550/parameters/debug_pcie0_off"),
 # Revision 11's read-only fifth, and what it says on that kernel.
 BOOT_STATE = "gcc_sm8550/parameters/debug_boot_state"
 R11_BOOT = "pcie0 Y, pcie0phy N, usb N"
+# Revision 11's root port switch (sleep-test.sh's root-port-d3, the record's
+# rpd3), N at every boot.
+RPD3_SWITCH = "pcie_qcom/parameters/debug_root_port_d3"
+# The lines revision 11's PCIe host logs at each resume
+# (pcie-qcom-keep-power-domain-while-link-kept.patch): the guard holding in
+# a sleep that kept the link, failing, and a host that powered down.
+GUARD_KEPT = "qcom-pcie 1c00000.pcie: system sleep: the link was kept, and its power domain stayed on"
+GUARD_BAD = "qcom-pcie 1c00000.pcie: system sleep: the link was kept, but genpd powered its power domain off"
+GUARD_DOWN = "qcom-pcie 1c00000.pcie: system sleep: the host powered down, and genpd powered its power domain off"
 
 
 def kit_patches(text):
-    """make-kit.sh's five lists of patches, as it names them."""
+    """make-kit.sh's six lists of patches, as it names them."""
     return [re.search(rf"^{name}=\((.*?)\)$", text, re.M | re.S).group(1).split()
-            for name in ("typec_patches", "gdsc_patches", "debug_patches", "fix_patches", "ufs_patches")]
+            for name in ("typec_patches", "gdsc_patches", "debug_patches", "fix_patches", "ufs_patches",
+                         "pcie_patches")]
 
 PREFIXES = (
     "/dev/disk/by-partlabel/", "/usr/lib/modules/", "/var/backups", "/var/log/", "/run/",
@@ -207,6 +228,9 @@ PREFIXES = (
     "/sys/kernel/tracing", "/sys/kernel/debug/cmd-db",
     # Revision 11's evidence of the audio DSP's clients and the command line.
     "/proc/asound/", "/proc/[0-9]", "/proc/cmdline",
+    # Revision 11's root port debug switch (verify.sh, sleep-test.sh's
+    # root-port-d3).
+    "/sys/module/pcie_qcom/parameters",
 )
 
 STUBS = {
@@ -887,9 +911,10 @@ class FakeTablet(unittest.TestCase):
         VALUES says otherwise (by word: pcie0="Y"); a value of None leaves
         that switch out.  BOOT is revision 11's debug_boot_state (R11_BOOT
         on its kernel), and None leaves it out, as the kernels of revisions
-        9 and 10 have it."""
-        for word, path in SWITCHES:
-            value = values.get(word, "N")
+        9 and 10 have it.  rpd3, revision 11's root port switch, is left out
+        unless VALUES gives it."""
+        for word, path in SWITCHES + (("rpd3", RPD3_SWITCH),):
+            value = values.get(word, None if word == "rpd3" else "N")
             f = self.root / "sys/module" / path
             if value is None:
                 f.unlink(missing_ok=True)
@@ -905,8 +930,9 @@ class FakeTablet(unittest.TestCase):
 
     def r11_switches(self, **values):
         """The debug switches as revision 11's kernel boots with them:
-        pcie0 Y (pcie_0_gdsc OFF_ON), the others N, and debug_boot_state."""
-        self.debug_switches(boot=R11_BOOT, **{"pcie0": "Y", **values})
+        pcie0 Y (pcie_0_gdsc OFF_ON), the others N, the root port's N, and
+        debug_boot_state."""
+        self.debug_switches(boot=R11_BOOT, **{"pcie0": "Y", "rpd3": "N", **values})
 
     def r7_kit(self):
         """The kit directory as revision 7's packed kit, with stand-ins for
@@ -2844,7 +2870,18 @@ class VerifyTest(FakeTablet):
         # Nothing is attached, so there is no bus to count devices on.
         self.assertNotIn("on the bus", result.stdout)
 
-    def journal_add(self, text):
+    def journal_add(self, text, guard=None):
+        """TEXT at the end of this boot's kernel log.  On a kernel with
+        revision 11's root port switch (the kit's), each suspend of TEXT gets
+        the PCIe host's line that its guard held (GUARD_KEPT, right after the
+        suspend's first line) unless TEXT has a "system sleep:" line of its
+        own, as that kernel logs one at every resume; GUARD says so for any
+        kernel (True) or none (False)."""
+        if guard is None:
+            guard = (self.root / "sys/module" / RPD3_SWITCH).exists() and "system sleep:" not in text
+        if guard:
+            text = text.replace("kernel: PM: suspend entry (deep)\n",
+                                f"kernel: PM: suspend entry (deep)\nkernel: {GUARD_KEPT}\n")
         with (self.root / "journal").open("a") as journal:
             journal.write(text)
 
@@ -2861,12 +2898,14 @@ class VerifyTest(FakeTablet):
         (bus / "0000:01:00.0").symlink_to(os.path.relpath(d, bus))
 
     def test_the_wifi_is_checked_after_the_boot_s_first_suspend(self):
-        """Revision 11 collapses pcie_0_gdsc under the kept link in the boot's
-        panel cycle: after the boot's first suspend a PCI core, ath11k or MHI
-        line that says the Wi-Fi did not come back fails, on any kernel; with
-        none and the function bound it passes; before any suspend, or
-        without the function, it is a note."""
-        cycle = "kernel: PM: suspend entry (deep)\nkernel: PM: suspend debug: Waiting for 0 second(s).\n"
+        """Revision 11 lets pcie_0_gdsc collapse in system suspend, and its
+        guard keeps it on under the kept link of the boot's panel cycle:
+        after the boot's first suspend a PCI core, ath11k or MHI line that
+        says the Wi-Fi did not come back fails, on any kernel; with none and
+        the function bound it passes; before any suspend, or without the
+        function, it is a note."""
+        cycle = (f"kernel: PM: suspend entry (deep)\nkernel: {GUARD_KEPT}\n"
+                 "kernel: PM: suspend debug: Waiting for 0 second(s).\n")
         fw = ("kernel: ath11k_pci 0000:01:00.0: fw_version 0x11021302 fw_build_timestamp 2026-02-04 08:10\n"
               "kernel: PM: suspend exit\n")
         self.boot_kit()
@@ -2893,8 +2932,9 @@ class VerifyTest(FakeTablet):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("FAIL the Wi-Fi did not come back from this boot's first suspend (the panel cycle, unless "
                               f"a sleep test ran before it) (1 lines):\n{line}\n", result.stdout)
-                self.assertIn('note revision 11 collapses pcie_0_gdsc under the kept link in that suspend: README, '
-                              '"Revision 11: the runs", says what to do\n', result.stdout)
+                self.assertIn("note on revision 11's kernel the guard keeps pcie_0_gdsc on in that suspend (the "
+                              'guard\'s line above): README, "Revision 11: the runs", says what to do when the Wi-Fi '
+                              "did not come back all the same\n", result.stdout)
                 self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
         # Such a line before the first suspend is not about it; and the
         # function taken off the bus (pci=remove) is a note.
@@ -2907,6 +2947,68 @@ class VerifyTest(FakeTablet):
         self.assertIn("note no Wi-Fi function on the PCI bus with ath11k_pci bound, and no line that says it did not "
                       "come back from this boot's first suspend (a sleep test's pci=remove leaves the bus so until a "
                       "restart)\n", result.stdout)
+
+    def test_the_guard_of_the_pcie_power_domain_is_checked_in_the_boot_s_first_suspend(self):
+        """Revision 11's guard: on the kit's kernel the boot's first suspend
+        (the panel cycle) has to have the PCIe host's line of a kept link
+        with its power domain on, and none this boot may have the domain off
+        under a kept link (a FAIL on any kernel); a first suspend without the
+        host's line fails on the kit's kernel; another of its lines there is
+        a note (a sleep test before the panel cycle); before any suspend,
+        and on another kernel, it is a note."""
+        panel = ("kernel: PM: suspend entry (deep)\nkernel: PM: suspend debug: Waiting for 0 second(s).\n"
+                 "kernel: {line}\nkernel: PM: suspend exit\n")
+        self.boot_kit()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("note no suspend has run yet this boot (the panel cycle runs about 22 s in): the PCIe power "
+                      "domain's guard was not checked; run this again later\n", result.stdout)
+        self.journal_add(panel.format(line=GUARD_KEPT) + panel.format(line=GUARD_DOWN))
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   PCIe power domain guard: in this boot's first suspend (the panel cycle) the host kept its "
+                      "link and pcie_0_gdsc stayed on (2 sleeps logged this boot, none with the domain off under a "
+                      "kept link)\n", result.stdout)
+        # The guard failing, in any suspend of the boot.
+        self.boot_kit()
+        self.journal_add(panel.format(line=GUARD_KEPT) + panel.format(line=GUARD_BAD))
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL the guard did not hold this boot: genpd powered the PCIe host's power domain off under a "
+                      "link it kept (1 of 2 sleeps; the Wi-Fi's controller lost its state under it):\n"
+                      f"kernel: {GUARD_BAD}\n", result.stdout)
+        self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+        # No line in the first suspend: the kit's kernel logs one at every
+        # resume.
+        self.boot_kit()
+        self.journal_add("kernel: PM: suspend entry (deep)\nkernel: PM: suspend exit\n", guard=False)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL no line of the PCIe power domain's guard in this boot's first suspend: the kit's kernel "
+                      "logs one at every resume (\"system sleep: ...\"); without it nothing shows that pcie_0_gdsc "
+                      "stayed on under the Wi-Fi's link\n", result.stdout)
+        self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+        # A sleep test with pci=remove before the panel cycle: a note.
+        self.boot_kit()
+        self.journal_add(panel.format(line=GUARD_DOWN))
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("note PCIe power domain guard, this boot's first suspend: the host powered down, and genpd "
+                      "powered its power domain off (a sleep test before the panel cycle, or a Wi-Fi without its "
+                      "link); 1 sleeps logged this boot, none with the domain off under a kept link\n", result.stdout)
+        # Another kernel: a note, with the lines or without.
+        for lines, said in ((GUARD_KEPT, "note the running kernel is not the kit's; its PCIe host logged 1 sleeps, "
+                                         "the first: the link was kept, and its power domain stayed on\n"),
+                            (None, "note the running kernel is not the kit's and logs no line of the PCIe power "
+                                   "domain's guard (revision 11's kernel has it)\n")):
+            with self.subTest(said):
+                self.boot_kit()
+                self.running(HANG_BUILD_ID)
+                self.journal_add(panel.format(line=lines) if lines else
+                                 "kernel: PM: suspend entry (deep)\nkernel: PM: suspend exit\n", guard=False)
+                result = self.run_script("verify.sh")
+                self.assertIn(said, result.stdout)
+                self.assertNotIn("guard did not hold", result.stdout)
 
     def test_checks_see_the_ufs_phy_through_the_diagnostic_s_lines(self):
         """Revision 8: the PCS reset logs nothing; on the kit's kernel the
@@ -2983,7 +3085,8 @@ class VerifyTest(FakeTablet):
         so; a switch that reads otherwise, or one missing, fails.  On
         another kernel they are a note: listed if it has them, said to be
         absent if not."""
-        names = ("gcc_sm8550.debug_pcie0_phy_off", "gcc_sm8550.debug_usb_off", "rpmhpd.debug_ret_floor")
+        names = ("gcc_sm8550.debug_pcie0_phy_off", "gcc_sm8550.debug_usb_off", "rpmhpd.debug_ret_floor",
+                 "pcie_qcom.debug_root_port_d3")
         self.boot_kit()
         result = self.run_script("verify.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -2997,6 +3100,12 @@ class VerifyTest(FakeTablet):
                 ({"usb": "Y"}, "FAIL debug switch gcc_sm8550.debug_usb_off is Y, expected N (off): the kit's kernel "
                                "starts every boot with it off, and only a sleep test sets it, until its restart\n"),
                 ({"cxmx": None}, "FAIL debug switch rpmhpd.debug_ret_floor is missing, expected N (off)"),
+                # Revision 11's root port switch: set by hand, or a kernel
+                # without it (revision 11 as first prepared).
+                ({"rpd3": "Y"}, "FAIL debug switch pcie_qcom.debug_root_port_d3 is Y, expected N (off): the kit's "
+                                "kernel starts every boot with it off, and only a sleep test sets it, until its "
+                                "restart\n"),
+                ({"rpd3": None}, "FAIL debug switch pcie_qcom.debug_root_port_d3 is missing, expected N (off)"),
                 # gdsc-ret=pcie0 by hand, or a kernel without the new default.
                 ({"pcie0": "N"}, "FAIL debug switch gcc_sm8550.debug_pcie0_off is N, expected Y: the kit's kernel "
                                  "starts every boot with pcie_0_gdsc OFF_ON, and only a sleep test (gdsc-ret=pcie0) "
@@ -3009,7 +3118,7 @@ class VerifyTest(FakeTablet):
             with self.subTest(line):
                 self.boot_kit()
                 self.r11_switches(**values) if "boot" not in values else self.debug_switches(
-                    pcie0="Y", **values)
+                    pcie0="Y", rpd3="N", **values)
                 result = self.run_script("verify.sh")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(line, result.stdout)
@@ -3021,7 +3130,7 @@ class VerifyTest(FakeTablet):
         self.debug_switches(pcie0=None, pcie0phy=None, usb=None, cxmx=None)
         result = self.run_script("verify.sh")
         self.assertIn("note the running kernel is not the kit's and offers no debug switches (the kernels of "
-                      "revisions 9 to 11 have them)\n", result.stdout)
+                      "revisions 9 to 11 have them, the root port's from revision 11)\n", result.stdout)
         self.assertNotIn("debug switch gcc_sm8550", result.stdout)
         self.debug_switches(usb="Y")
         result = self.run_script("verify.sh")
@@ -3034,7 +3143,8 @@ class VerifyTest(FakeTablet):
         result = self.run_script("verify.sh")
         self.assertIn("note debug switches of the running kernel, which is not the kit's: "
                       "gcc_sm8550.debug_pcie0_off=Y gcc_sm8550.debug_pcie0_phy_off=N gcc_sm8550.debug_usb_off=N "
-                      "rpmhpd.debug_ret_floor=N (at boot: pcie0 Y, pcie0phy N, usb N)\n", result.stdout)
+                      "rpmhpd.debug_ret_floor=N pcie_qcom.debug_root_port_d3=N (at boot: pcie0 Y, pcie0phy N, usb N)\n",
+                      result.stdout)
 
     def test_checks_see_revision_10_s_pcie_gpu_and_power_up_lines(self):
         """Revision 10: the Wi-Fi's PCIe link has to come up at boot without
@@ -3720,6 +3830,15 @@ is-active)
 	[ "${2:-}" != --quiet ] || shift
 	if [ -e "$T/active-$2" ]; then cat "$T/active-$2"; exit 0; fi
 	echo inactive; exit 3 ;;
+# sensors=stop's: each unit inactive after it, but one named in
+# $T/stop-ignored (still running, status 1).
+stop)
+	shift
+	rc=0
+	for u; do
+		if grep -qxF -- "$u" "$T/stop-ignored" 2>/dev/null; then rc=1; else rm -f "$T/active-$u"; fi
+	done
+	exit "$rc" ;;
 restart)
 	[ "$2" = ubuntu-gts9u-icc-late-release.service ] || exit 1
 	if [ -e "$T/release-fails" ]; then
@@ -3762,12 +3881,15 @@ MANIFEST = r'''manifest() {
 }
 kl() { printf '[  731.500000] %s\n' "$*" >> "$F/dev/kmsg"; }
 # Revision 9's debug switches, pcie0 pcie0phy usb cxmx: each value, "-" for
-# one the fake kernel does not offer.
+# one the fake kernel does not offer; then revision 11's root port switch,
+# rpd3, on a fake kernel that offers it.
 switches() {
 	for s in gcc_sm8550/parameters/debug_pcie0_off gcc_sm8550/parameters/debug_pcie0_phy_off \
 		gcc_sm8550/parameters/debug_usb_off rpmhpd/parameters/debug_ret_floor; do
 		printf '%s ' "$(cat "$F/sys/module/$s" 2>/dev/null || echo -)"
 	done
+	[ ! -e "$F/sys/module/pcie_qcom/parameters/debug_root_port_d3" ] ||
+		printf '%s ' "$(cat "$F/sys/module/pcie_qcom/parameters/debug_root_port_d3")"
 	echo
 }
 sb_default() { cat "$T/sb-errors-$1" 2>/dev/null || echo remount-ro; }
@@ -6296,15 +6418,23 @@ exit 0
                     "gdsc-ret=", "gdsc-ret=usb", "gdsc-ret=pcie0phy", "gdsc-ret=pcie0 gdsc-ret=pcie0",
                     "gdsc=pcie0 gdsc-ret=pcie0", "gdsc=usb,pcie0 gdsc-ret=pcie0",
                     # Revision 11's rpmh: once, and no sleep in dry.
-                    "rpmh rpmh", "dry rpmh", "rpmh=1"):
+                    "rpmh rpmh", "dry rpmh", "rpmh=1",
+                    # Revision 11's root-port-d3: once, with pci=keep, not with
+                    # gdsc-ret=pcie0 or a pm_test= level short of the noirq
+                    # phase, and no sleep in dry; sensors=stop: that word
+                    # alone, once, and no sleep in dry.
+                    "root-port-d3", "pci=remove root-port-d3", "pci=keep root-port-d3 root-port-d3",
+                    "pci=keep root-port-d3 gdsc-ret=pcie0", "pci=keep root-port-d3 pm_test=devices",
+                    "pci=keep root-port-d3 pm_test=freezer", "dry root-port-d3", "root-port-d3=1",
+                    "sensors=", "sensors=start", "sensors=stop sensors=stop", "dry sensors=stop", "sensors"):
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
                 self.assertIn("sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]\n"
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok", result.stderr)
                 self.assertIn("[pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]\n"
-                              "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [rpmh] restart-ok",
-                              result.stderr)
+                              "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]\n"
+                              "       [sensors=stop] restart-ok", result.stderr)
                 self.assert_nothing_done()
 
     # Revision 9's debug switches (gdsc=, cxmx=ret): run-time module
@@ -6357,8 +6487,9 @@ exit 0
         before = (logs / "before").read_text()
         self.assertIn("debug switches: pcie0 N, pcie0phy N, usb N, cxmx N "
                       f"({self.root}/sys/module/gcc_sm8550/parameters/debug_pcie0_off, debug_pcie0_phy_off, "
-                      f"debug_usb_off; {self.root}/sys/module/rpmhpd/parameters/debug_ret_floor); this run sets pcie0 "
-                      "usb cxmx to Y right before the freeze\n", before)
+                      f"debug_usb_off; {self.root}/sys/module/rpmhpd/parameters/debug_ret_floor; {self.root}/sys/module/"
+                      "pcie_qcom/parameters/debug_root_port_d3); this run sets pcie0 usb cxmx to Y right before the "
+                      "freeze\n", before)
         progress = self.progress_lines()
         self.assertEqual(progress[1:3], ["progress: pci=remove: removed 0000:00:00.0; PCI devices 2 -> 0",
                                          f"progress: debug switches set: pcie0 usb cxmx; {on}"])
@@ -6480,9 +6611,10 @@ exit 0
                               "gdsc=pcie0,usb; switches: pcie0 N, pcie0phy N, usb N, cxmx N\n", self.out)
                 if name == "a switch that does not take":
                     self.assertIn("NEXT: the kernel did not take that write (its own line, if it wrote one: sudo dmesg "
-                                  "| grep -e gcc-sm8550 -e rpmhpd); run again once that is understood; what pci=remove "
-                                  "removed stays removed until the restart, the Wi-Fi with it (sudo reboot brings it "
-                                  "back)", self.out)
+                                  "| grep -e gcc-sm8550 -e rpmhpd -e debug_root_port_d3; a root-port-d3 that found no "
+                                  "root port of a qcom PCIe host gets -ENODEV); run again once that is understood; what "
+                                  "pci=remove removed stays removed until the restart, the Wi-Fi with it (sudo reboot "
+                                  "brings it back)", self.out)
                     self.assertEqual(self.read("fsfreeze.calls"), "--version\n")
                     self.assertFalse([line for line in self.progress_lines() if "debug switches set" in line])
                 else:
@@ -6704,7 +6836,7 @@ exit 0
                 result = self.run_test("ro", *bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
                 self.assertIn("[trace|trace=live] [mode=s2idle]\n       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] "
-                              "[cxmx=ret] [rpmh] restart-ok", result.stderr)
+                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [sensors=stop] restart-ok", result.stderr)
                 self.assert_nothing_done()
                 if "pm_test=" in bad:
                     level = bad.split("pm_test=")[1].split()[0]
@@ -7109,9 +7241,9 @@ exit 0
         result = self.run_test("ro", "1", "pci=remove", "restart-ok", "hold=0")
         self.assertEqual(result.returncode, 1, self.out)
         self.assert_read_only_rules()
-        on = "switches: pcie0 Y, pcie0phy N, usb N, cxmx N; at boot: pcie0 Y"
-        self.assertEqual(self.read("switches-at-freeze"), "Y N N N \n")
-        self.assertEqual(self.read("switches-at-sleep"), "Y N N N \n")
+        on = "switches: pcie0 Y, pcie0phy N, usb N, cxmx N, rpd3 N; at boot: pcie0 Y"
+        self.assertEqual(self.read("switches-at-freeze"), "Y N N N N \n")
+        self.assertEqual(self.read("switches-at-sleep"), "Y N N N N \n")
         self.assertIn("SLEEP-TEST cycle 1/1: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back as "
                       f"before; floor released; {on}\n", self.out)
         self.assertIn(f"kernel 68d243e908c0; options: pci=remove; {on}\n", self.out)
@@ -7120,41 +7252,87 @@ exit 0
         before = (logs / "before").read_text()
         self.assertIn(f"debug {on} (", before)
         self.assertIn(f"debug switches at boot: {R11_BOOT} ({self.root}/sys/module/gcc_sm8550/parameters/"
-                      "debug_boot_state); pcie_0_gdsc in this run's sleeps: OFF_ON, collapsed\n", before)
+                      "debug_boot_state); pcie_0_gdsc in this run's sleeps: OFF_ON, collapsed when the PCIe host has "
+                      "powered down\n", before)
         self.assertIn("ADSP clients: iio-sensor-proxy inactive, hexagonrpcd-adsp-sensorspd inactive, "
                       "hexagonrpcd-adsp-rootpd inactive; PipeWire and WirePlumber processes 0; sound streams not "
                       "closed: none\n", before)
 
-    def test_revision_11_s_default_with_the_pci_devices_kept_needs_pci_keep(self):
-        """A sleep with the PCI devices kept would collapse pcie_0_gdsc under
-        the live host: refused with nothing changed, unless the run removes
-        them, keeps the domain in retention (gdsc-ret=pcie0) or says
-        pci=keep; dry and the pm_test= levels before the noirq phase are not
-        refused; a kernel whose pcie0 booted N (revision 10's) is not
+    def boot_log(self, *lines, journal=False):
+        """This boot's kernel log before the run, with LINES (the PCIe host's
+        "system sleep:" lines of the boot's panel cycle and earlier sleeps),
+        in the ring buffer (dmesg) or, with JOURNAL, only in the journal (a
+        ring buffer that dropped them)."""
+        text = "".join(f"[   2{i}.500000] {line}\n" for i, line in enumerate(lines))
+        if journal:
+            with (self.root / "journal").open("a") as f:
+                f.write(text)
+        else:
+            with (self.root / "dev/kmsg").open("a") as f:
+                f.write(text)
+
+    def test_revision_11_s_default_with_the_pci_devices_kept_needs_a_guard_that_held(self):
+        """A sleep with the PCI devices kept on a kernel that lets pcie_0_gdsc
+        collapse goes ahead without pci=keep only when this boot's kernel log
+        says its guard held (a kept link with the domain on, and never the
+        domain off under a kept link), read from dmesg or, if the ring
+        buffer has none of the host's lines, the journal; otherwise it is
+        refused with nothing changed, unless the run removes the PCI
+        devices, keeps the domain in retention (gdsc-ret=pcie0) or says
+        pci=keep; dry and the pm_test= levels before the noirq phase are
+        not refused; a kernel whose pcie0 booted N (revision 10's) is not
         either."""
         refused = ("pcie_0_gdsc collapses in this kernel's suspend (its debug switch pcie0 booted Y: revision 11), "
-                   "and with the PCI devices kept the PCIe host keeps its link through the sleep while genpd "
-                   "collapses that GDSC under it: give pci=remove, or gdsc-ret=pcie0 to keep it in retention for "
-                   "the run, or pci=keep to run it so (the Wi-Fi may not come back, or the tablet may crash at the "
-                   'resume: README, "Revision 11")')
-        for args, ok in ((("ro", "1"), False), (("ro", "1", "pm_test=platform"), False),
-                         (("ro", "1", "mode=s2idle"), False), (("ro", "1", "pm_test=devices"), True),
-                         (("ro", "1", "pm_test=freezer"), True), (("dry",), True),
-                         (("ro", "1", "pci=keep"), True), (("ro", "1", "gdsc-ret=pcie0"), True)):
-            with self.subTest(args):
+                   "and {why}, so with the PCI devices kept genpd may collapse that GDSC under the live PCIe host: "
+                   "give pci=remove, or gdsc-ret=pcie0 to keep it in retention for the run, or pci=keep to run it "
+                   'so (the Wi-Fi may not come back, or the tablet may crash at the resume: README, "Revision 11")')
+        none = ('it has no guard (no "system sleep:" line of the PCIe host in this boot\'s kernel log: revision 11 '
+                "as first prepared, or no suspend yet)")
+        unseen = ("its guard's line of a kept link with the domain on is not in this boot's kernel log (the first "
+                  "sleep logged: the host powered down, and genpd powered its power domain off)")
+        failed = ('its guard did not hold this boot (a sleep logged "the link was kept, but genpd powered its power '
+                  'domain off")')
+        for lines, journal, args, why in (
+                ((), False, ("ro", "1"), none),
+                ((), False, ("ro", "1", "pm_test=platform"), none),
+                ((), False, ("ro", "1", "mode=s2idle"), none),
+                ((GUARD_DOWN,), False, ("ro", "1"), unseen),
+                ((GUARD_KEPT, GUARD_BAD), False, ("ro", "1"), failed),
+                ((GUARD_KEPT,), False, ("ro", "1"), None),
+                ((GUARD_KEPT, GUARD_DOWN), False, ("ro", "1", "mode=s2idle"), None),
+                ((GUARD_KEPT,), True, ("ro", "1"), None),
+                ((), False, ("ro", "1", "pm_test=devices"), None),
+                ((), False, ("ro", "1", "pm_test=freezer"), None),
+                ((), False, ("dry",), None),
+                ((GUARD_BAD,), False, ("ro", "1", "pci=keep"), None),
+                ((), False, ("ro", "1", "gdsc-ret=pcie0"), None),
+                ((GUARD_BAD,), False, ("ro", "1", "pci=remove"), None)):
+            with self.subTest(lines=lines, journal=journal, args=args):
                 FakeTablet.setUp(self)
                 SleepTestTest.setUp(self)
                 self.pci_tree()
                 self.r11_switches()
                 self.s2idle_files()
+                self.boot_log(*lines, journal=journal)
                 result = self.run_test(*args, "restart-ok", "hold=0")
-                if ok:
+                if why is None:
                     self.assertNotIn("REFUSED", self.out)
                     self.assertEqual(self.sysrq(), "b", self.out)
                 else:
                     self.assertEqual(result.returncode, 1, self.out)
-                    self.assertIn("REFUSED: " + refused, self.out)
+                    self.assertIn("REFUSED: " + refused.format(why=why), self.out)
                     self.assert_nothing_done()
+        # What the record says of the guard.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.pci_tree()
+        self.r11_switches()
+        self.boot_log(GUARD_KEPT, GUARD_DOWN)
+        self.run_test("ro", "1", "restart-ok", "hold=0")
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("PCIe power domain guard: held this boot (2 sleeps logged, none with the domain off under a "
+                      "kept link; the first: the link was kept, and its power domain stayed on)\n",
+                      (logs / "before").read_text())
         # Revision 10's kernel: every switch boots N, nothing to refuse.
         FakeTablet.setUp(self)
         SleepTestTest.setUp(self)
@@ -7163,6 +7341,156 @@ exit 0
         self.run_test("ro", "1", "restart-ok", "hold=0")
         self.assertNotIn("REFUSED", self.out)
         self.assertEqual(self.sysrq(), "b", self.out)
+
+    def test_a_guard_that_does_not_hold_in_a_sleep_ends_the_run(self):
+        """With the PCI devices kept (a guard that held at boot, pci=keep or
+        not), a cycle whose kernel lines have the guard's warning ends the
+        run with PCIE-DOWN and its restart; its pcie evidence names what the
+        host logged."""
+        for extra in ((), ("pci=keep",)):
+            with self.subTest(extra):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.pci_tree()
+                self.r11_switches()
+                self.boot_log(GUARD_KEPT)
+                self.cycle(1, log=f"[  100.000001] PM: suspend entry (deep)\n[  100.000002] {GUARD_BAD}\n"
+                                  "[  100.000004] Timekeeping suspended for 30.002 seconds\n"
+                                  "[  100.000005] PM: suspend exit\n")
+                result = self.run_test("ro", "2", *extra, "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                self.assertIn("cycle 1/2: evidence: pcie: no link-up line: the PCIe host kept its link, clocks and "
+                              "votes through the sleep; the host logged: the link was kept, but genpd powered its "
+                              "power domain off; PCIe came back (no host failure line)\n", self.out)
+                self.assertIn(f"SLEEP-TEST RESULT: PCIE-DOWN after cycle 1/2: with the PCI devices kept, the PCIe "
+                              f"host or the Wi-Fi did not come back ({GUARD_BAD}), and a later suspend would meet a "
+                              "controller that lost its registers under its link, so the run ends here", self.out)
+                self.assertEqual(self.read("rtcwake.calls").count("-m mem -s 30"), 1)
+                self.assertEqual(self.sysrq(), "b")
+
+    def test_root_port_d3_lets_the_root_port_go_to_d3hot_for_a_pci_keep_run(self):
+        """root-port-d3 on revision 11's kernel, with pci=keep and a guard
+        that held this boot: Y to its switch right before the freeze, read
+        back, named in the header, every verdict and the RESULT line; the
+        cycle's evidence names the host's power-down and the Wi-Fi's
+        firmware load.  Nothing puts it back: the restart does."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.pci_tree()
+        self.r11_switches()
+        self.boot_log(GUARD_KEPT)
+        self.cycle(1, log="[  100.000001] PM: suspend entry (deep)\n"
+                          "[  100.000004] Timekeeping suspended for 30.002 seconds\n"
+                          "[  100.000005] qcom-pcie 1c00000.pcie: PCIe Gen.2 x1 link up\n"
+                          f"[  100.000006] {GUARD_DOWN}\n"
+                          "[  100.000007] ath11k_pci 0000:01:00.0: fw_version 0x11021302 fw_build_timestamp "
+                          "2026-02-04 08:10\n[  100.000008] PM: suspend exit\n")
+        result = self.run_test("ro", "1", "pci=keep", "root-port-d3", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        on = "switches: pcie0 Y, pcie0phy N, usb N, cxmx N, rpd3 Y; at boot: pcie0 Y"
+        self.assertEqual(self.read("switches-at-freeze"), "Y N N N Y \n")
+        self.assertEqual(self.read("switches-at-sleep"), "Y N N N Y \n")
+        self.assertEqual((self.root / "sys/module" / RPD3_SWITCH).read_text(), "Y")
+        self.assertEqual(self.sysrq(), "b")
+        self.assertIn("pci=keep: the PCI devices stay, and with root-port-d3 the root port goes to D3hot after the "
+                      "Wi-Fi in each sleep, so that the PCIe host powers itself down and is set up again at the "
+                      "resume; pcie_0_gdsc collapses once the host is down (the guard marks it out-of-band)", self.out)
+        self.assertIn(f"root-port-d3: right before it freezes the disks the run writes Y to {self.root}/sys/module/"
+                      "pcie_qcom/parameters/debug_root_port_d3 and reads it back; it stays so until the restart "
+                      "that ends the run", self.out)
+        self.assertIn("the host logged: the host powered down, and genpd powered its power domain off; PCIe came "
+                      "back (no host failure line)\n", self.out)
+        self.assertIn("cycle 1/1: evidence: wifi: pci 0000:00:00.0 - D0 -, 0000:01:00.0 - D0 -; no Wi-Fi failure "
+                      "line; ath11k firmware loads 1\n", self.out)
+        self.assertIn(f"kernel 68d243e908c0; options: pci=keep root-port-d3; {on}\n", self.out)
+        self.assertIn(f"progress: debug switches set: rpd3; {on}", self.progress_lines())
+
+    def test_root_port_d3_is_refused_without_its_switch_or_a_guard_that_held(self):
+        """root-port-d3 needs the switch (revision 11's kernel), reading N as
+        it boots, and a guard that held this boot; a stop before any sleep
+        puts it back to N."""
+        for name, switches, lines, refused in (
+                ("no switch", {"rpd3": None}, (GUARD_KEPT,),
+                 "this kernel does not offer the debug switch rpd3 ({switch}): the kernels of kit revisions 9 to 11 "
+                 "have it, revision 11's alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"),
+                ("no guard", {}, (), 'root-port-d3 needs a guard that held this boot (a sleep that logged "the link '
+                                    'was kept, and its power domain stayed on", none that logged it off): guard none'),
+                ("a guard that failed", {}, (GUARD_KEPT, GUARD_BAD),
+                 'root-port-d3 needs a guard that held this boot (a sleep that logged "the link was kept, and its '
+                 'power domain stayed on", none that logged it off): guard failed, the first sleep logged: the link '
+                 'was kept, and its power domain stayed on'),
+                ("set since the boot", {"rpd3": "Y"}, (GUARD_KEPT,),
+                 "a debug switch does not read as this kernel booted it: rpd3 ({switch}: Y) (at boot: pcie0 Y, the "
+                 "others N;")):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.pci_tree()
+                self.r11_switches(**switches)
+                self.boot_log(*lines)
+                result = self.run_test("ro", "1", "pci=keep", "root-port-d3", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("REFUSED: " + refused.replace("{switch}", f"{self.root}/sys/module/{RPD3_SWITCH}"),
+                              self.out)
+                self.assert_nothing_done()
+        # A stop before any sleep: the switch back to N.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.pci_tree()
+        self.r11_switches()
+        self.boot_log(GUARD_KEPT)
+        (self.tmp / "freeze-fails").write_text("/media/stick\n")
+        result = self.run_test("ro", "1", "pci=keep", "root-port-d3", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("the debug switches it set are back to N", self.out)
+        self.assertEqual((self.root / "sys/module" / RPD3_SWITCH).read_text().strip(), "N")
+        self.assertEqual(self.sysrq(), "")
+
+    def test_sensors_stop_stops_the_audio_dsp_s_sensor_clients_before_the_run(self):
+        """sensors=stop: systemctl stop of the two units after the record of
+        the state before the run and before the freeze, their state after
+        it in the log, the option in every RESULT line; a unit still running
+        stops the run before anything is frozen, and says that the two stay
+        stopped until the next boot."""
+        for unit in ("iio-sensor-proxy", "hexagonrpcd-adsp-sensorspd", "hexagonrpcd-adsp-rootpd"):
+            (self.tmp / f"active-{unit}.service").write_text("active\n")
+        self.pci_tree()
+        result = self.run_test("ro", "1", "pci=remove", "sensors=stop", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("stop iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service\n",
+                      self.read("systemctl.calls"))
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("ADSP clients: iio-sensor-proxy active, hexagonrpcd-adsp-sensorspd active, "
+                      "hexagonrpcd-adsp-rootpd active; PipeWire and WirePlumber processes 0; sound streams not "
+                      "closed: none; sensors=stop: this run stops iio-sensor-proxy.service "
+                      "hexagonrpcd-adsp-sensorspd.service next, until the restart\n", (logs / "before").read_text())
+        log = (self.ramdir() / "log").read_text()
+        order = ["sensors=stop: systemctl stop iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service "
+                 "(auto-rotation and auto-brightness are off until the restart)",
+                 "sensors=stop: ADSP clients now: iio-sensor-proxy inactive, hexagonrpcd-adsp-sensorspd inactive, "
+                 "hexagonrpcd-adsp-rootpd active (systemctl stop status 0); 10s to settle",
+                 "frozen: /media/stick", "cycle 1/1: deep sleep"]
+        self.assertEqual([log.index(said) for said in order], sorted(log.index(said) for said in order))
+        self.assertIn("options: pci=remove sensors=stop; switches: not offered by this kernel\n", self.out)
+        self.assertEqual(self.sysrq(), "b")
+        # One that does not stop: nothing frozen, nothing slept.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        for unit in ("iio-sensor-proxy", "hexagonrpcd-adsp-sensorspd"):
+            (self.tmp / f"active-{unit}.service").write_text("active\n")
+        (self.tmp / "stop-ignored").write_text("hexagonrpcd-adsp-sensorspd.service\n")
+        result = self.run_test("ro", "1", "sensors=stop", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("STOPPED before freezing anything: sensors=stop: still running after systemctl stop (status "
+                      "1): hexagonrpcd-adsp-sensorspd.service; ADSP clients now: iio-sensor-proxy inactive, "
+                      "hexagonrpcd-adsp-sensorspd active, hexagonrpcd-adsp-rootpd inactive", self.out)
+        self.assertIn("iio-sensor-proxy and hexagonrpcd-adsp-sensorspd stay stopped until the next boot (sudo "
+                      "reboot brings them back)", self.out)
+        self.assertEqual(self.read("frozen"), "")
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
+        self.assertEqual(self.sysrq(), "")
 
     def test_gdsc_ret_pcie0_keeps_the_domain_in_retention_for_the_run(self):
         """gdsc-ret=pcie0 writes N to pcie0 right before the freeze, read
@@ -7173,9 +7501,9 @@ exit 0
         result = self.run_test("ro", "1", "pci=remove", "gdsc-ret=pcie0", "restart-ok", "hold=0")
         self.assertEqual(result.returncode, 1, self.out)
         self.assert_read_only_rules()
-        off = "switches: pcie0 N, pcie0phy N, usb N, cxmx N; at boot: pcie0 Y"
+        off = "switches: pcie0 N, pcie0phy N, usb N, cxmx N, rpd3 N; at boot: pcie0 Y"
         self.assertEqual(self.read("pcie0-at-pci-remove"), "Y\n")
-        self.assertEqual(self.read("switches-at-freeze"), "N N N N \n")
+        self.assertEqual(self.read("switches-at-freeze"), "N N N N N \n")
         self.assertIn(f"kernel 68d243e908c0; options: pci=remove gdsc-ret=pcie0; {off}\n", self.out)
         self.assertIn(f"progress: debug switches set: (N: pcie0); {off}", self.progress_lines())
         self.assertIn("gdsc-ret=pcie0: right before it freezes the disks, after the PCI removal, the run writes N to "
@@ -7224,8 +7552,12 @@ exit 0
         self.assertEqual(result.returncode, 1, self.out)
         self.assert_read_only_rules()
         self.assertIn("pci=keep: the PCI devices stay and the PCIe host keeps its link through each sleep; "
-                      "pcie_0_gdsc collapses under it (OFF_ON)", self.out)
-        self.assertIn(f"cycle 1/2: evidence: wifi: pci 0000:00:00.0 - D0 -, 0000:01:00.0 - D0 -; {lost}\n", self.out)
+                      "pcie_0_gdsc may collapse under the kept link (OFF_ON, and no guard that held this boot): the "
+                      "Wi-Fi may not come back, or the tablet may crash at the resume and restart by itself; a cycle "
+                      "whose kernel lines say the PCIe host or the Wi-Fi did not come back, or that the guard did not "
+                      "hold, ends the run (PCIE-DOWN); give it one cycle", self.out)
+        self.assertIn(f"cycle 1/2: evidence: wifi: pci 0000:00:00.0 - D0 -, 0000:01:00.0 - D0 -; {lost}; ath11k "
+                      "firmware loads 0\n", self.out)
         self.assertIn(f"SLEEP-TEST RESULT: PCIE-DOWN after cycle 1/2: with the PCI devices kept, the PCIe host or "
                       f"the Wi-Fi did not come back ({lost}), and a later suspend would meet a controller that lost "
                       "its registers under its link, so the run ends here; 1 of 2 cycles came back with the UFS "
@@ -7239,7 +7571,7 @@ exit 0
         self.r11_switches()
         self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
         self.assertIn("cycle 1/2: evidence: wifi: pci 0000:00:00.0 - D0 -, 0000:01:00.0 - D0 -; no Wi-Fi failure "
-                      "line\n", self.out)
+                      "line; ath11k firmware loads 0\n", self.out)
         self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles", self.out)
 
     def rpmh_files(self, tracing_on="1", clock="[local] global counter uptime perf mono mono_raw boot tai"):
@@ -7386,9 +7718,9 @@ exit 0
         self.assertIn("evidence: awake, 5 s before the first sleep: aosd +0, cxsd +0, ddr +0; subsystems adsp +0, "
                       "apss +0", self.out)
         pmsg = [line for line in self.pmsg_lines() if ": evidence: " in line]
-        self.assertEqual(pmsg[3], "cycle 1/1: evidence: genpd off: cx +1, mx +0, pcie_0_gdsc +1; dsp irq 13 ipcc_0 "
-                                  "+50; wifi: pci 0000:00:00.0 - D0 5.0 GT/s PCIe, 0000:01:00.0 - D0 5.0 GT/s PCIe; "
-                                  "no Wi-Fi failure line")
+        self.assertEqual(pmsg[3], "cycle 1/1: evidence: wifi: pci 0000:00:00.0 - D0 5.0 GT/s PCIe, 0000:01:00.0 - D0 "
+                                  "5.0 GT/s PCIe; no Wi-Fi failure line; ath11k firmware loads 0; genpd off: cx +1, "
+                                  "mx +0, pcie_0_gdsc +1; dsp irq 13 ipcc_0 +50")
         self.assertTrue(pmsg[4].startswith("cycle 1/1: evidence: XO held by: gcc_ufs_phy_axi_clk 523/523"), pmsg[4])
 
 
@@ -8382,10 +8714,11 @@ class PcieGdscOffTest(unittest.TestCase):
     APPLY_SM8550_PCIE0_GDSC_OFF, run from its own text (off by default, 0 or
     1 only, refused without APPLY_SM8550_SLEEP_FIXES=1 before the tree is
     touched, the patch applied strictly and once on top of the USB GDSC
-    patch, a tree that carries it refused without the variable), and the
-    patch against the pinned kernel checkout (only read): one line of the
-    table changed, pcie_0_gdsc's, the line count kept, so that the debug
-    switches go in at the same lines with it and without it."""
+    patch, a tree that carries it refused without the variable, and so is
+    one with its first form), and the patch against the pinned kernel
+    checkout (only read): two lines of the table, pcie_0_gdsc's .pwrsts
+    changed and its genpd flag added, so that the debug switches go in one
+    line further down with it than without it."""
 
     BUILD = REPO / "scripts/build-mainline-kernel.sh"
     PATCH = GDSC_PATCHES[0]
@@ -8447,8 +8780,9 @@ class PcieGdscOffTest(unittest.TestCase):
                     self.assertIn("APPLY_SM8550_PCIE0_GDSC_OFF must be 0 or 1", result.stderr)
 
     def test_the_patch_goes_on_after_the_usb_patch_and_before_the_debug_switches_on_both_boards(self):
-        """No board in the block or the patch; the patch changes one line of
-        gcc-sm8550.c, pcie_0_gdsc's power states, and nothing else."""
+        """No board in the block or the patch; the patch changes two lines of
+        gcc-sm8550.c in one hunk, pcie_0_gdsc's power states and its genpd
+        flag, and nothing else."""
         text = self.text()
         block = self.block()
         at = text.index(block)
@@ -8458,11 +8792,17 @@ class PcieGdscOffTest(unittest.TestCase):
         self.assertNotIn("gts9", block)
         self.assertEqual(text.count(f"pcie0_gdsc_patch={self.PATCH}\n"), 1)
         patch = (REPO / "kernel/patches" / self.PATCH).read_text()
-        self.assertEqual(diff_lines(patch), {f"{GCC}.c": ["-\t.pwrsts = PWRSTS_RET_ON,", "+" + PCIE0_LINE[:-1]]})
-        self.assertIn(' \t\t.name = "pcie_0_gdsc",\n \t},\n-\t.pwrsts = PWRSTS_RET_ON,\n', patch)
+        self.assertEqual(diff_lines(patch), {f"{GCC}.c": ["+" + GUARD_FLAG_LINE[:-1], "-\t.pwrsts = PWRSTS_RET_ON,",
+                                                          "+" + PCIE0_LINE[:-1]]})
+        self.assertIn(' \t\t.name = "pcie_0_gdsc",\n+' + GUARD_FLAG_LINE + ' \t},\n-\t.pwrsts = PWRSTS_RET_ON,\n',
+                      patch)
+        # One hunk, so that a reused tree's reverse check takes both lines
+        # or neither.
+        self.assertEqual(patch.count("\n@@ "), 1)
         header = patch.split("\n--- a/", 1)[0]
         for words in ("APPLY_SM8550_PCIE0_GDSC_OFF=1", "APPLY_SM8550_SLEEP_FIXES=1", "967e011013ed",
-                      "No board check"):
+                      "No board check", "APPLY_SM8550_PCIE0_GDSC_GUARD=1", "GENPD_FLAG_ACTIVE_WAKEUP",
+                      PCIE_PATCHES[0], "genpd_finish_suspend()"):
             self.assertIn(words, " ".join(header.split()))
         self.assertNotIn("of_machine_is_compatible", patch)
 
@@ -8480,15 +8820,17 @@ class PcieGdscOffTest(unittest.TestCase):
             self.assertNotRegex(result.stdout, "offset|fuzz")
             after = (tree / f"{GCC}.c").read_text()
             self.assertEqual(sorted(p.name for p in (tree / GCC).parent.iterdir()), listing)
-            # One line changed, in pcie_0_gdsc, the line count kept.
+            # pcie_0_gdsc's entry alone: its genpd flag added below its
+            # name, its .pwrsts changed; one line more.
             old, new = before.splitlines(True), after.splitlines(True)
-            self.assertEqual(len(old), len(new))
-            changed = [i for i, (a, b) in enumerate(zip(old, new)) if a != b]
-            self.assertEqual(len(changed), 1)
-            self.assertEqual((old[changed[0]], new[changed[0]]), ("\t.pwrsts = PWRSTS_RET_ON,\n", PCIE0_LINE))
+            name = old.index('\t\t.name = "pcie_0_gdsc",\n')
+            self.assertEqual(old[name + 1:name + 3], ["\t},\n", "\t.pwrsts = PWRSTS_RET_ON,\n"])
+            self.assertEqual(new, old[:name + 1] + [GUARD_FLAG_LINE, "\t},\n", PCIE0_LINE] + old[name + 3:])
             body = re.search(r"^static struct gdsc pcie_0_gdsc = \{\n(.*?)^\};", after, re.M | re.S).group(1)
             self.assertIn(PCIE0_LINE, body)
+            self.assertIn("\t.pd = {\n" + '\t\t.name = "pcie_0_gdsc",\n' + GUARD_FLAG_LINE + "\t},\n", body)
             self.assertEqual(after.count("PWRSTS_OFF_ON, /* "), 1)
+            self.assertEqual(after.count("GENPD_FLAG_ACTIVE_WAKEUP"), 1)
             # A reused tree: nothing changes.
             result = self.run_block(self.block(), tree, "1")
             self.assertEqual((result.returncode, (tree / f"{GCC}.c").read_text()), (0, after), result.stderr)
@@ -8498,21 +8840,29 @@ class PcieGdscOffTest(unittest.TestCase):
             self.assertIn(f"{self.PATCH} remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR "
                           "for a build without APPLY_SM8550_PCIE0_GDSC_OFF=1.", result.stderr)
             self.assertEqual((tree / f"{GCC}.c").read_text(), after)
-            # A copy with the line but not the patch's context is refused.
+            # A copy with the line but not the patch's context is refused,
+            # and so is the patch's first form (revision 11 as first
+            # prepared): the .pwrsts line without the genpd flag, which
+            # would build a kernel without the guard's clock half.
+            first_form = after.replace(GUARD_FLAG_LINE, "")
             damaged = after.replace(PCIE0_LINE + "\t.flags = VOTABLE | POLL_CFG_GDSCR | RETAIN_FF_ENABLE,\n",
                                     PCIE0_LINE + "\t.flags = VOTABLE | POLL_CFG_GDSCR,\n")
-            self.assertNotEqual(damaged, after)
-            (tree / f"{GCC}.c").write_text(damaged)
-            result = self.run_block(self.block(), tree, "1")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual((tree / f"{GCC}.c").read_text(), damaged)
+            for copy in (damaged, first_form):
+                self.assertNotEqual(copy, after)
+                (tree / f"{GCC}.c").write_text(copy)
+                result = self.run_block(self.block(), tree, "1")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"{self.PATCH} is in this source tree only in part (or in its first form, without "
+                              "the genpd flag); use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR.", result.stderr)
+                self.assertEqual((tree / f"{GCC}.c").read_text(), copy)
 
     @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
-    def test_the_debug_switches_go_in_at_the_same_lines_with_it_and_without_it(self):
+    def test_the_debug_switches_go_in_one_line_further_down_with_it(self):
         """The debug switches' block of the build after this one, in a tree
-        with the patch and in one without: no offset either way, and the
-        two files differ in pcie_0_gdsc's line alone; the debug patch's
-        reverse check passes on both (a reused tree)."""
+        with the patch and in one without: no offset without it, one line
+        with it (the genpd flag's), no fuzz either way, and the two files
+        differ in pcie_0_gdsc's two lines alone; the debug patch's reverse
+        check passes on both (a reused tree)."""
         debug = DeepSleepDebugSwitchTest("run").block()
         files = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -8526,10 +8876,239 @@ class PcieGdscOffTest(unittest.TestCase):
                 for again in (False, True):
                     result = self.run_block(self.block() + debug, tree, value, "1")
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertNotRegex(result.stdout, "offset|fuzz")
+                    self.assertNotIn("fuzz", result.stdout)
+                    # The debug patch's hunk, applied or checked in reverse.
+                    self.assertEqual(re.findall(r"offset .*", result.stdout),
+                                     ["offset 1 line)."] if value == "1" else [], result.stdout)
                 files.append((tree / f"{GCC}.c").read_text().splitlines(True))
-        self.assertEqual(len(files[0]), len(files[1]))
-        self.assertEqual([(a, b) for a, b in zip(*files) if a != b], [("\t.pwrsts = PWRSTS_RET_ON,\n", PCIE0_LINE)])
+        old, new = files
+        name = old.index('\t\t.name = "pcie_0_gdsc",\n')
+        self.assertEqual(new, old[:name + 1] + [GUARD_FLAG_LINE, "\t},\n", PCIE0_LINE] + old[name + 3:])
+
+
+class PcieGuardTest(unittest.TestCase):
+    """Revision 11's guard and root port switch in the build script, run from
+    its own text: APPLY_SM8550_PCIE0_GDSC_GUARD (off by default, 0 or 1 only,
+    refused without APPLY_SM8550_PCIE0_GDSC_OFF=1 and the other way round,
+    before the tree is touched), the PCIe host's half of the guard applied
+    strictly and once, the root port switch only with the guard and the
+    debug switches, a tree that carries either refused for any other build;
+    and the two patches against the pinned kernel checkout (only read)."""
+
+    BUILD = REPO / "scripts/build-mainline-kernel.sh"
+    GUARD = PCIE_PATCHES[0]
+    RPD3 = PCIE_PATCHES[1]
+
+    def text(self):
+        return self.BUILD.read_text()
+
+    def block(self, start):
+        text = self.text()
+        at = text.index(start)
+        return text[at:text.index("\nfi\n", at) + len("\nfi\n")]
+
+    def run_block(self, block, tree, guard, debug="0"):
+        return subprocess.run(["bash", "-c", "set -euo pipefail\nkernel_tree=$1 pat=$2 apply_pcie0_gdsc_guard=$3 "
+                               "apply_deep_sleep_debug=$4\n" + block, "build", str(tree),
+                               str(REPO / "kernel/patches"), guard, debug], capture_output=True, text=True)
+
+    def pinned_file(self, tree):
+        (tree / PCIE_QCOM).parent.mkdir(parents=True, exist_ok=True)
+        (tree / f"{PCIE_QCOM}.c").write_text(subprocess.run(
+            ["git", "-C", str(kernel_source()), "show", f"HEAD:{PCIE_QCOM}.c"], check=True, capture_output=True,
+            text=True).stdout)
+
+    def test_the_variable_is_off_by_default_0_or_1_and_goes_with_the_gdsc_one(self):
+        text = self.text()
+        self.assertIn("\napply_pcie0_gdsc_guard=${APPLY_SM8550_PCIE0_GDSC_GUARD:-0}\n", text)
+        validate = re.search(r"^validate_bool\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        start = text.index('if [ "$apply_pcie0_gdsc_off" != "$apply_pcie0_gdsc_guard" ]; then\n')
+        together = text[start:text.index("\nfi\n", start) + len("\nfi\n")]
+        self.assertLess(text.index('\nvalidate_bool APPLY_SM8550_PCIE0_GDSC_GUARD "$apply_pcie0_gdsc_guard"\n'),
+                        start)
+        self.assertLess(start, text.index('git -C "$kernel_src" worktree add --detach "$kernel_tree" HEAD'))
+        check = ("apply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}\n"
+                 "apply_pcie0_gdsc_guard=${APPLY_SM8550_PCIE0_GDSC_GUARD:-0}\n" + validate +
+                 'validate_bool APPLY_SM8550_PCIE0_GDSC_OFF "$apply_pcie0_gdsc_off"\n'
+                 'validate_bool APPLY_SM8550_PCIE0_GDSC_GUARD "$apply_pcie0_gdsc_guard"\n' + together)
+        for off, guard, ok in (("", "", True), ("0", "0", True), ("1", "1", True), ("1", "", False),
+                               ("1", "0", False), ("", "1", False), ("0", "1", False), ("1", "yes", False),
+                               ("1", "01", False)):
+            with self.subTest(off=off, guard=guard):
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("APPLY_SM8550_PCIE0_GDSC_OFF", "APPLY_SM8550_PCIE0_GDSC_GUARD")}
+                if off:
+                    env["APPLY_SM8550_PCIE0_GDSC_OFF"] = off
+                if guard:
+                    env["APPLY_SM8550_PCIE0_GDSC_GUARD"] = guard
+                result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check], capture_output=True,
+                                        text=True, env=env)
+                self.assertEqual(result.returncode == 0, ok, result.stderr)
+                if not ok and guard in ("", "0", "1"):
+                    self.assertIn("APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 go together: "
+                                  "without the guard genpd collapses pcie_0_gdsc under a PCIe host that keeps its "
+                                  "link (the boot's panel cycle)", result.stderr)
+                elif not ok:
+                    self.assertIn("APPLY_SM8550_PCIE0_GDSC_GUARD must be 0 or 1", result.stderr)
+
+    def test_the_blocks_go_in_order_on_both_boards(self):
+        """The guard after pcie_0_gdsc's patch, the root port switch after
+        the debug switches; no board in either block or patch; pcie-qcom.c
+        is changed by these two patches alone."""
+        text = self.text()
+        guard = self.block("pcie0_guard_patch=")
+        rpd3 = self.block("pcie_rp_d3_patch=")
+        self.assertLess(text.index("pcie0_gdsc_patch="), text.index(guard))
+        self.assertLess(text.index(guard), text.index("deep_sleep_debug_marker='"))
+        self.assertLess(text.index("\tdrivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch; do\n"),
+                        text.index(rpd3))
+        self.assertIn(f"\npcie0_guard_patch={self.GUARD}\n", "\n" + guard)
+        self.assertIn(f"\npcie0_guard_line='{GUARD_LINE}'\n", "\n" + guard)
+        self.assertIn(f"\npcie_rp_d3_patch={self.RPD3}\n", "\n" + rpd3)
+        self.assertIn(f"\npcie_rp_d3_marker='{RPD3_MARKER}'\n", rpd3)
+        self.assertIn('if [ "$apply_deep_sleep_debug" = 1 ] && [ "$apply_pcie0_gdsc_guard" = 1 ]; then\n', rpd3)
+        for block in (guard, rpd3):
+            self.assertNotIn("DEVICE", block)
+            self.assertNotIn("gts9", block)
+        touching = sorted(patch.name for patch in (REPO / "kernel/patches").glob("*.patch")
+                          if re.search(rf"^\+\+\+ b/{re.escape(PCIE_QCOM)}\.c", patch.read_text(), re.M))
+        self.assertEqual(touching, sorted(PCIE_PATCHES))
+        for name in PCIE_PATCHES:
+            with self.subTest(name):
+                patch = (REPO / "kernel/patches" / name).read_text()
+                self.assertEqual(list(diff_lines(patch)), [f"{PCIE_QCOM}.c"])
+                self.assertNotIn("of_machine_is_compatible", patch)
+                self.assertIn("No board check", patch.split("\n--- a/", 1)[0])
+        guard_patch = (REPO / "kernel/patches" / self.GUARD).read_text()
+        self.assertIn("+" + "\t\t" + GUARD_LINE + "\n", guard_patch)
+        self.assertNotIn("-", "".join(l[0] for l in diff_lines(guard_patch)[f"{PCIE_QCOM}.c"]))
+        rpd3_patch = (REPO / "kernel/patches" / self.RPD3).read_text()
+        self.assertIn(RPD3_MARKER, "\n".join(added_lines(self.RPD3)[f"{PCIE_QCOM}.c"]))
+        self.assertNotIn("-", "".join(l[0] for l in diff_lines(rpd3_patch)[f"{PCIE_QCOM}.c"]))
+
+    def test_the_guard_marks_the_awake_path_only_after_a_suspend_that_worked(self):
+        """What the PCIe host's half does, read from its added lines: the
+        awake path for a kept link, out-of-band for a host that powered
+        down, both at the end of a suspend_noirq that succeeded; the
+        notifier registered at the end of a probe that succeeded; one line
+        per sleep at the resume, the four that verify.sh and sleep-test.sh
+        read."""
+        patch = (REPO / "kernel/patches" / self.GUARD).read_text()
+        added = "\n".join(line[1:] for line in diff_lines(patch)[f"{PCIE_QCOM}.c"])
+        self.assertIn("#include <linux/pm_domain.h>", added)
+        self.assertIn("\tif (link_kept)\n\t\tdevice_set_awake_path(dev);\n\telse\n"
+                      "\t\tdevice_set_out_band_wakeup(dev);\n", added)
+        self.assertIn("\n\tif (!ret) {\n\t\tpcie->link_kept = !pcie->pci->suspended;\n\t\t" + GUARD_LINE + "\n\t}\n",
+                      added)
+        self.assertIn(" \t}\n+\n+\tif (!ret) {\n+\t\tpcie->link_kept = !pcie->pci->suspended;\n+\t\t" + GUARD_LINE
+                      + "\n+\t}\n+\n \treturn ret;\n }\n", patch)
+        self.assertIn("+\tWRITE_ONCE(pcie->pd_off, false);\n+\n \tret = dw_pcie_suspend_noirq(pcie->pci);\n", patch)
+        self.assertIn("+\tpcie->pd_nb_registered = !dev_pm_genpd_add_notifier(dev, &pcie->pd_nb);\n+\n \treturn 0;\n"
+                      " \n err_phy_exit:\n", patch)
+        self.assertIn("+\tqcom_pcie_report_sleep(pcie);\n+\n \tif (pcie->pci->suspended) {\n", patch)
+        self.assertIn("\tif (action == GENPD_NOTIFY_OFF)\n\t\tWRITE_ONCE(pcie->pd_off, true);\n", added)
+        lines = re.findall(r'dev_(?:warn|info)\(dev, "(system sleep: [^"]*)\\n"\)', added)
+        self.assertEqual(lines, ["system sleep: the link was kept, but genpd powered its power domain off",
+                                 "system sleep: the link was kept, and its power domain stayed on",
+                                 "system sleep: the host powered down, and genpd powered its power domain off",
+                                 "system sleep: the host powered down, and its power domain stayed on"])
+        self.assertIn('dev_warn(dev, "system sleep: the link was kept, but genpd', added)
+        # The kit's readers know them by the same words.
+        for script in ("verify.sh", "sleep-test.sh"):
+            text = (KIT_SRC / script).read_text()
+            with self.subTest(script):
+                self.assertIn("guard_re='[0-9a-f]+\\.pcie: system sleep: '", text)
+                # The guard failing, and holding.
+                for line in lines[:2]:
+                    self.assertIn(line[len("system sleep: "):], text)
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_guard_applies_once_and_a_build_without_it_refuses_it(self):
+        block = self.block("pcie0_guard_patch=")
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = pathlib.Path(tmp)
+            self.pinned_file(tree)
+            before = (tree / f"{PCIE_QCOM}.c").read_text()
+            listing = sorted(p.name for p in (tree / PCIE_QCOM).parent.iterdir())
+            result = self.run_block(block, tree, "0")
+            self.assertEqual((result.returncode, (tree / f"{PCIE_QCOM}.c").read_text()), (0, before), result.stderr)
+            result = self.run_block(block, tree, "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotRegex(result.stdout, "offset|fuzz")
+            after = (tree / f"{PCIE_QCOM}.c").read_text()
+            self.assertEqual(sorted(p.name for p in (tree / PCIE_QCOM).parent.iterdir()), listing)
+            self.assertEqual(after.count(GUARD_LINE), 1)
+            # Lines added, none taken away.
+            self.assertEqual([l for l in before.splitlines(True) if l not in after.splitlines(True)], [])
+            # A reused tree: nothing changes.
+            result = self.run_block(block, tree, "1")
+            self.assertEqual((result.returncode, (tree / f"{PCIE_QCOM}.c").read_text()), (0, after), result.stderr)
+            # A build without the variable in that tree: refused.
+            result = self.run_block(block, tree, "0")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(f"{self.GUARD} remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR "
+                          "for a build without APPLY_SM8550_PCIE0_GDSC_GUARD=1.", result.stderr)
+            self.assertEqual((tree / f"{PCIE_QCOM}.c").read_text(), after)
+            # A copy with the line but not the rest is refused.
+            damaged = after.replace("\tWRITE_ONCE(pcie->pd_off, false);\n", "")
+            self.assertNotEqual(damaged, after)
+            (tree / f"{PCIE_QCOM}.c").write_text(damaged)
+            result = self.run_block(block, tree, "1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((tree / f"{PCIE_QCOM}.c").read_text(), damaged)
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_root_port_switch_needs_the_guard_and_the_debug_switches(self):
+        guard = self.block("pcie0_guard_patch=")
+        rpd3 = self.block("pcie_rp_d3_patch=")
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = pathlib.Path(tmp)
+            self.pinned_file(tree)
+            self.assertEqual(self.run_block(guard, tree, "1").returncode, 0)
+            guarded = (tree / f"{PCIE_QCOM}.c").read_text()
+            # Without both: not applied.
+            for g, d in (("0", "0"), ("0", "1"), ("1", "0")):
+                with self.subTest(guard=g, debug=d):
+                    result = self.run_block(rpd3, tree, g, d)
+                    self.assertEqual((result.returncode, (tree / f"{PCIE_QCOM}.c").read_text()), (0, guarded),
+                                     result.stderr)
+            # With both: on top of the guard, at the end of the file.
+            result = self.run_block(guard + rpd3, tree, "1", "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotRegex(result.stdout, "offset|fuzz")
+            switched = (tree / f"{PCIE_QCOM}.c").read_text()
+            self.assertTrue(switched.startswith(guarded.rstrip("\n")))
+            self.assertEqual(switched.count(RPD3_MARKER), 1)
+            # Again: a reused tree, nothing changes.
+            result = self.run_block(guard + rpd3, tree, "1", "1")
+            self.assertEqual((result.returncode, (tree / f"{PCIE_QCOM}.c").read_text()), (0, switched), result.stderr)
+            # Any other build in that tree: refused, the tree as it was.
+            for g, d in (("0", "0"), ("0", "1"), ("1", "0")):
+                with self.subTest(refused=(g, d)):
+                    result = self.run_block(rpd3, tree, g, d)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(f"{self.RPD3} remains in this source tree; use a fresh KERNEL_WORKTREE/"
+                                  "KERNEL_BUILD_DIR for a build without both APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and "
+                                  "APPLY_SM8550_PCIE0_GDSC_GUARD=1.", result.stderr)
+                    self.assertEqual((tree / f"{PCIE_QCOM}.c").read_text(), switched)
+
+    def test_the_root_port_switch_is_run_time_only_and_for_qcom_root_ports_alone(self):
+        added = "\n".join(added_lines(self.RPD3)[f"{PCIE_QCOM}.c"])
+        patch = (REPO / "kernel/patches" / self.RPD3).read_text()
+        self.assertIn(" builtin_platform_driver(qcom_pcie_driver);\n+\n+/*\n", patch)
+        self.assertIn("static bool qcom_pcie_debug_rp_d3;", added)
+        self.assertIn("\tif (system_state != SYSTEM_RUNNING)\n\t\treturn -EPERM;", added)
+        self.assertIn("\t\tif (!pci_is_pcie(pdev) || pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT)\n\t\t\tcontinue;",
+                      added)
+        self.assertIn("\t\t    bridge->dev.parent->driver != &qcom_pcie_driver.driver)\n\t\t\tcontinue;", added)
+        self.assertIn("\t\tif (pci_bridge_d3_possible(pdev))\n\t\t\tcontinue;\n\t\tpdev->bridge_d3 = on;", added)
+        self.assertIn("\tpci_lock_rescan_remove();", added)
+        self.assertIn("\tpci_unlock_rescan_remove();", added)
+        self.assertIn("\tif (on && !n)\n\t\treturn -ENODEV;", added)
+        self.assertIn("module_param_cb(debug_root_port_d3, &qcom_pcie_debug_rp_d3_ops, &qcom_pcie_debug_rp_d3, 0644);",
+                      added)
+        # It writes bridge_d3 and nothing else of the PCI core's.
+        self.assertEqual(re.findall(r"pdev->(\w+) =", added), ["bridge_d3"])
 
 
 class PipeClockGateTest(unittest.TestCase):
@@ -8767,7 +9346,18 @@ class ScriptsTest(unittest.TestCase):
                                    "gcc_sm8550.debug_usb_off", "rpmhpd.debug_ret_floor",
                                    "failed to get tx_lane0_sync_clk", "failed to get rx_lane0_sync_clk",
                                    "failed to get rx_lane1_sync_clk", "power-up write: PWRDN",
-                                   "gcc_sm8550.debug_boot_state"])
+                                   "gcc_sm8550.debug_boot_state",
+                                   "system sleep: the link was kept, and its power domain stayed on",
+                                   "system sleep: the link was kept, but genpd powered its power domain off",
+                                   "pcie_qcom.debug_root_port_d3"])
+        # Revision 11's guard: two of the lines its PCIe half logs at a
+        # resume, format strings of that patch's code and of no other patch.
+        guard = added_lines(PCIE_PATCHES[0])[f"{PCIE_QCOM}.c"]
+        for line in strings[22:24]:
+            with self.subTest(line):
+                self.assertEqual(len([added for added in guard if f'"{line}\\n"' in added]), 1, line)
+                self.assertEqual([patch.name for patch in (REPO / "kernel/patches").glob("*.patch")
+                                  if line in patch.read_text()], [PCIE_PATCHES[0]])
         # Revision 10's four: the messages of ufs-qcom's lane clock lookup,
         # in upstream f07317a8d57f's code and no other patch, and the second
         # UFS PHY diagnostic's format string.  The PIPE clock revert, the
@@ -8806,7 +9396,8 @@ class ScriptsTest(unittest.TestCase):
                                     (strings[14], DEBUG_PATCHES[0], f"{GCC}.c"),
                                     (strings[15], DEBUG_PATCHES[0], f"{GCC}.c"),
                                     (strings[16], DEBUG_PATCHES[1], f"{RPMHPD}.c"),
-                                    (strings[21], DEBUG_PATCHES[0], f"{GCC}.c")):
+                                    (strings[21], DEBUG_PATCHES[0], f"{GCC}.c"),
+                                    (strings[24], PCIE_PATCHES[1], f"{PCIE_QCOM}.c")):
             with self.subTest(line):
                 module, name = line.split(".")
                 self.assertEqual(module, pathlib.Path(target).stem.replace("-", "_"))
@@ -8857,11 +9448,11 @@ class ScriptsTest(unittest.TestCase):
 
     def test_the_kit_s_patches_are_patches_the_build_applies(self):
         text = (KIT_SRC / "make-kit.sh").read_text()
-        typec, gdsc, debug, fix, ufs = kit_patches(text)
-        self.assertEqual((typec, gdsc, debug, fix, ufs),
-                         (TYPEC_PATCHES, GDSC_PATCHES, DEBUG_PATCHES, FIX_PATCHES, UFS_PATCHES))
+        typec, gdsc, debug, fix, ufs, pcie = kit_patches(text)
+        self.assertEqual((typec, gdsc, debug, fix, ufs, pcie),
+                         (TYPEC_PATCHES, GDSC_PATCHES, DEBUG_PATCHES, FIX_PATCHES, UFS_PATCHES, PCIE_PATCHES))
         self.assertIn('\npatches=("${typec_patches[@]}" "${gdsc_patches[@]}" "${debug_patches[@]}" '
-                      '"${fix_patches[@]}" "${ufs_patches[@]}")\n', text)
+                      '"${fix_patches[@]}" "${ufs_patches[@]}"\n\t"${pcie_patches[@]}")\n', text)
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text().replace("\\\n", " ")
         for name in typec:
             with self.subTest(name):
@@ -8894,6 +9485,21 @@ class ScriptsTest(unittest.TestCase):
         self.assertEqual(build.count('< "$pat/$pcie0_gdsc_patch"'), 2)
         self.assertIn(f"\npcie0_line='{PCIE0_LINE.strip()[len('.pwrsts = '):]}'\n", text)
         self.assertIn(PCIE0_LINE, (REPO / "kernel/patches" / gdsc[0]).read_text().replace("\n+\t", "\n\t"))
+        # The guard's genpd flag, by its line, in the same patch.
+        self.assertIn(f"\nguard_line='{GUARD_FLAG_LINE[:-1]}'\n", text)
+        self.assertIn("\n+" + GUARD_FLAG_LINE, (REPO / "kernel/patches" / gdsc[0]).read_text())
+        # Revision 11's PCIe host patches behind theirs, each by the line
+        # the build script and the kit know it by.
+        self.assertIn(f"\npcie0_guard_patch={pcie[0]}\n", build)
+        self.assertIn(f"\npcie0_guard_line='{GUARD_LINE}'\n", build)
+        self.assertEqual(build.count('< "$pat/$pcie0_guard_patch"'), 2)
+        self.assertIn(f"\npcie_rp_d3_patch={pcie[1]}\n", build)
+        self.assertIn(f"\npcie_rp_d3_marker='{RPD3_MARKER}'\n", build)
+        self.assertEqual(build.count('< "$pat/$pcie_rp_d3_patch"'), 2)
+        self.assertIn(f"\npcie_lines=('{GUARD_LINE}'\n\t'{RPD3_MARKER}')\n", text)
+        for name in pcie:
+            with self.subTest(name):
+                self.assertTrue((REPO / "kernel/patches" / name).is_file())
         # Revision 9's two behind their switch, each by the file it changes.
         for name, target in zip(debug, (f"{GCC}.c", f"{RPMHPD}.c")):
             with self.subTest(name):
@@ -8914,13 +9520,14 @@ class ScriptsTest(unittest.TestCase):
                          [f"{QMP_PCIE}.c"])
         self.assertEqual(" ".join(patched.split()),
                          '"$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c" '
-                         '"$rpmhpd.c" "$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h"')
+                         '"$rpmhpd.c" "$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c"')
         self.assertIn("\ntcpm_dir=drivers/usb/typec/tcpm\n", text)
         self.assertIn("\ngcc=drivers/clk/qcom/gcc-sm8550\n", text)
         self.assertIn("\ndwc3=drivers/usb/dwc3/dwc3-qcom\n", text)
         self.assertIn(f"\nqmp={QMP}\n", text)
         self.assertIn(f"\nrpmhpd={RPMHPD}\n", text)
-        for name, value in (("phymux", PHYMUX), ("qmp_pcie", QMP_PCIE), ("gmu", GMU), ("ufs_qcom", UFS_QCOM)):
+        for name, value in (("phymux", PHYMUX), ("qmp_pcie", QMP_PCIE), ("gmu", GMU), ("ufs_qcom", UFS_QCOM),
+                            ("pcie_qcom", PCIE_QCOM)):
             self.assertIn(f"\n{name}={value}\n", text)
         self.assertIn(f"\nunpark={UNPARK}\n", text)
         self.assertIn('fix_files=("$phymux.c" "$gmu.c" "$ufs_qcom.c")\n', text)
@@ -8940,20 +9547,24 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn('cmp -s "$tmp/rpmhpd.hang.data" "$tmp/rpmhpd.new.data" ||', text)
         for parm in ("gcc_sm8550.parm=debug_pcie0_off:", "gcc_sm8550.parm=debug_pcie0_phy_off:",
                      "gcc_sm8550.parm=debug_usb_off:", "rpmhpd.parm=debug_ret_floor:",
-                     "gcc_sm8550.parm=debug_boot_state:"):
+                     "gcc_sm8550.parm=debug_boot_state:", "pcie_qcom.parm=debug_root_port_d3:"):
             self.assertIn(parm, text)
         self.assertIn("for f in gcc_sm8550_debug_set gcc_sm8550_debug_get gcc_sm8550_debug_boot_get "
-                      "rpmhpd_debug_ret_floor_set; do", text)
-        # Each of those functions is the debug patch's.
+                      "rpmhpd_debug_ret_floor_set \\\n\tqcom_pcie_debug_rp_d3_set qcom_pcie_pd_notify; do", text)
+        # Each of those functions is the debug patch's, and revision 11's
+        # two the PCIe host patches': the root port switch's handler and the
+        # guard record's notifier.
         for f in ("gcc_sm8550_debug_set", "gcc_sm8550_debug_get", "gcc_sm8550_debug_boot_get"):
             self.assertTrue([a for a in added_lines(DEBUG_PATCHES[0])[f"{GCC}.c"] if a.startswith(f"static int {f}(")],
                             f)
+        for f, patch in (("qcom_pcie_debug_rp_d3_set", PCIE_PATCHES[1]), ("qcom_pcie_pd_notify", PCIE_PATCHES[0])):
+            self.assertTrue([a for a in added_lines(patch)[f"{PCIE_QCOM}.c"] if a.startswith(f"static int {f}(")], f)
         # The build tree has to carry revision 11's line whole, its PCIe
         # neighbours as upstream has them; the hang-log tree has not.
         self.assertIn('die "the build tree does not carry ${gdsc_patches[0]} (pcie_0_gdsc)"', text)
-        self.assertIn('die "the build tree\'s $gcc.c does not carry ${gdsc_patches[0]} whole"', text)
+        self.assertIn('die "the build tree\'s $gcc.c does not carry ${gdsc_patches[$i]} whole"', text)
         self.assertIn('die "the hang-log tree\'s pcie_0_gdsc is not upstream\'s PWRSTS_RET_ON"', text)
-        self.assertIn('for p in "${gdsc_patches[@]}" "${debug_patches[@]}"; do', text)
+        self.assertIn('for p in "${gdsc_patches[@]}" "${debug_patches[@]}" "${pcie_patches[@]}"; do', text)
 
     def test_every_changed_source_is_required_dated_and_compared(self):
         """The kit's changes to the kernel tree are the patched files and the
@@ -8964,7 +9575,7 @@ class ScriptsTest(unittest.TestCase):
         for revision 10's GMU fix."""
         text = (KIT_SRC / "make-kit.sh").read_text()
         names = {"tcpm_dir": TCPM_DIR, "gcc": GCC, "dwc3": DWC3, "qmp": QMP, "rpmhpd": RPMHPD,
-                 "phymux": PHYMUX, "qmp_pcie": QMP_PCIE, "gmu": GMU, "ufs_qcom": UFS_QCOM}
+                 "phymux": PHYMUX, "qmp_pcie": QMP_PCIE, "gmu": GMU, "ufs_qcom": UFS_QCOM, "pcie_qcom": PCIE_QCOM}
 
         def expand(word):
             return re.sub(r"\$\{?(\w+)\}?", lambda match: names[match.group(1)], word)
@@ -9015,11 +9626,18 @@ class ScriptsTest(unittest.TestCase):
                       "\tdwc3-qcom-drop-required-opps-vote-in-system-suspend.patch\n", build)
         self.assertIn('\tllvm-objcopy -O binary --only-section=.data "$1" "$tmp/gcc.hang.data"\n', text)
         self.assertIn('\tgdsc_table_check "$HANG_SCRATCH/linux-gts9wifi/$gcc.o" "$build/$gcc.o" || exit 1\n', text)
-        self.assertIn("""\tif [ "$(cat "$tmp/gcc.data.got")" = 'pcie_0_gdsc 6 5;usb30_prim_gdsc 5 6;usb3_phy_gdsc 5 6;' ] &&\n""",
-                      text)
+        # The four bytes, each named by its domain and member (pahole).
+        self.assertIn('\tprintf \'%s\\n\' "pcie_0_gdsc $flags_at 0 10" "pcie_0_gdsc $pwrsts_at 6 5" '
+                      '"usb30_prim_gdsc $pwrsts_at 5 6" \\\n\t\t"usb3_phy_gdsc $pwrsts_at 5 6" | sort > '
+                      '"$tmp/gcc.data.want"\n', text)
+        self.assertIn('\tflags_at=$((pd_at + flags_in))\n', text)
+        # The hang-log tree has neither half of revision 11's guard.
+        self.assertIn('\t! grep -qF -- GENPD_FLAG_ACTIVE_WAKEUP "$hang_tree/$gcc.c" &&\n'
+                      '\t\t! grep -qF -e "${pcie_lines[0]}" -e "${pcie_lines[1]}" "$hang_tree/$pcie_qcom.c" ||\n', text)
         self.assertIn('\techo "power domain table: $gdsc_check"\n', text)
         tools = re.search(r"^for t in (.*); do$", text, re.M).group(1).split()
         self.assertIn("llvm-objcopy", tools)
+        self.assertIn("pahole", tools)
         # Only for the UFS PHY's board gate (UfsGateTest).
         self.assertIn("llvm-objdump", tools)
 
@@ -9096,10 +9714,10 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         pwrsts = re.search(r"^gdsc_pwrsts\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
         start = text.index("# Revision 11: pcie_0_gdsc PWRSTS_OFF_ON by the line of its patch")
-        end = text.index('\tdie "the build tree\'s $gcc.c does not carry ${gdsc_patches[0]} whole"\n', start)
-        gate = text[start:end] + '\tdie "the build tree\'s $gcc.c does not carry ${gdsc_patches[0]} whole"\n'
+        last = '\t\tdie "the build tree\'s $gcc.c does not carry ${gdsc_patches[$i]} whole"\ndone\n'
+        gate = text[start:text.index(last, start)] + last
         lists = re.search(r"^gdsc_patches=\(.*?\)\n", text, re.M).group(0) + \
-            re.search(r"^pcie0_line=.*\n", text, re.M).group(0)
+            re.search(r"^pcie0_line=.*\n", text, re.M).group(0) + re.search(r"^guard_line=.*\n", text, re.M).group(0)
         with tempfile.TemporaryDirectory() as tmp:
             tree = pathlib.Path(tmp, "tree")
             (tree / GCC).parent.mkdir(parents=True)
@@ -9149,19 +9767,89 @@ class ScriptsTest(unittest.TestCase):
                     PCIE0_LINE + "\t.flags = VOTABLE | POLL_CFG_GDSCR | RETAIN_FF_ENABLE,\n",
                     PCIE0_LINE + "\t.flags = VOTABLE | POLL_CFG_GDSCR,\n"),
                  "the build tree's drivers/clk/qcom/gcc-sm8550.c does not carry "
-                 "gcc-sm8550-pcie0-gdsc-off-in-suspend.patch whole\n")):
+                 "gcc-sm8550-pcie0-gdsc-off-in-suspend.patch whole\n"),
+                # The patch's first form (revision 11 as first prepared), and
+                # the guard's flag on another domain as well.
+                ("without the genpd flag", patched.replace(GUARD_FLAG_LINE, ""),
+                 "the build tree does not carry gcc-sm8550-pcie0-gdsc-off-in-suspend.patch whole "
+                 "(GENPD_FLAG_ACTIVE_WAKEUP for pcie_0_gdsc, and nowhere else)\n"),
+                ("the flag on PCIe1 too", patched.replace('"pcie_1_gdsc",\n\t},', '"pcie_1_gdsc",\n'
+                                                          + GUARD_FLAG_LINE + '\t},'),
+                 "the build tree does not carry gcc-sm8550-pcie0-gdsc-off-in-suspend.patch whole "
+                 "(GENPD_FLAG_ACTIVE_WAKEUP for pcie_0_gdsc, and nowhere else)\n")):
             with self.subTest(name):
                 self.assertNotEqual(source, patched)
                 code, err = self.pcie0_gate(source)
                 self.assertEqual(code, 1, err)
                 self.assertTrue(err.endswith(message), err)
 
-    def table_check(self, hang, new, new_syms):
+    def pcie_gate(self, source):
+        """Run make-kit.sh's check of the build tree for revision 11's two
+        PCIe host patches on SOURCE, a pcie-qcom.c."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        start = text.index("# The PCIe host driver: the guard's half and the root port's debug switch,")
+        end = text.index('\t\tdie "the build tree\'s $pcie_qcom.c does not carry ${pcie_patches[$i]} whole"\ndone\n', start)
+        gate = text[start:end] + '\t\tdie "the build tree\'s $pcie_qcom.c does not carry ${pcie_patches[$i]} whole"\ndone\n'
+        lists = re.search(r"^pcie_patches=\(.*?\)\n", text, re.M).group(0) + \
+            re.search(r"^pcie_lines=\(.*?\)\n", text, re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = pathlib.Path(tmp, "tree")
+            (tree / PCIE_QCOM).parent.mkdir(parents=True)
+            (tree / f"{PCIE_QCOM}.c").write_text(source)
+            pathlib.Path(tmp, "tmp").mkdir()
+            result = subprocess.run(
+                ["bash", "-c", 'set -euo pipefail; export LC_ALL=C\n'
+                 'die() { echo "$*" >&2; exit 1; }\ntree=$1 tmp=$2 repo=$3 pcie_qcom=' + PCIE_QCOM + "\n" + lists + gate,
+                 "gate", str(tree), str(pathlib.Path(tmp, "tmp")), str(REPO)], capture_output=True, text=True)
+            self.assertEqual((tree / f"{PCIE_QCOM}.c").read_text(), source)
+            return result.returncode, result.stderr
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_pcie_host_check_passes_on_the_file_with_both_patches_whole_only(self):
+        upstream = subprocess.run(["git", "-C", str(kernel_source()), "show", f"HEAD:{PCIE_QCOM}.c"],
+                                  check=True, capture_output=True, text=True).stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            target = pathlib.Path(tmp, f"{PCIE_QCOM}.c")
+            target.parent.mkdir(parents=True)
+            target.write_text(upstream)
+            for name in PCIE_PATCHES:
+                subprocess.run(["patch", "-s", "-d", tmp, "-p1", "--fuzz=0", "--no-backup-if-mismatch"],
+                               input=(REPO / "kernel/patches" / name).read_text(), check=True, text=True)
+                if name == PCIE_PATCHES[0]:
+                    guard = target.read_text()
+            both = target.read_text()
+        self.assertEqual(self.pcie_gate(both), (0, ""))
+        for name, source, message in (
+                ("upstream", upstream, f"the build tree does not carry {PCIE_PATCHES[0]}\n"),
+                ("the guard alone", guard, f"the build tree does not carry {PCIE_PATCHES[1]}\n"),
+                ("the guard's line without the rest", both.replace("\tWRITE_ONCE(pcie->pd_off, false);\n", ""),
+                 f"the build tree's {PCIE_QCOM}.c does not carry {PCIE_PATCHES[0]} whole\n"),
+                ("the switch's marker without the switch", both.replace("\t\tif (pci_bridge_d3_possible(pdev))\n"
+                                                                       "\t\t\tcontinue;\n", ""),
+                 f"the build tree's {PCIE_QCOM}.c does not carry {PCIE_PATCHES[1]} whole\n")):
+            with self.subTest(name):
+                self.assertNotEqual(source, both)
+                code, err = self.pcie_gate(source)
+                self.assertEqual(code, 1, err)
+                self.assertTrue(err.endswith(message), err)
+
+    # pahole -C STRUCT OBJECT, as it prints a member: struct gdsc's pd at 0
+    # and pwrsts at 0x28 (40), struct generic_pm_domain's flags at 8.
+    PAHOLE = ('#!/bin/sh\ncase $2 in\n'
+              'gdsc) printf \'struct gdsc {\\n\\tstruct generic_pm_domain   pd;                   /*     0    32 */\\n'
+              '\\tu8                         pwrsts;               /*    40     1 */\\n};\\n\' ;;\n'
+              'generic_pm_domain) printf \'struct generic_pm_domain {\\n'
+              '\\tunsigned int               flags;                /*     8     4 */\\n};\\n\' ;;\n'
+              'esac\n')
+
+    def table_check(self, hang, new, new_syms, pahole=PAHOLE):
         """Run make-kit.sh's gdsc_table_check() on stand-ins: HANG and NEW are
         the .data sections (bytes) llvm-objcopy gives, NEW_SYMS the symbol
-        table lines llvm-objdump -t gives for the new object."""
+        table lines llvm-objdump -t gives for the new object, PAHOLE the
+        stand-in for pahole, which gives the members' offsets."""
         text = (KIT_SRC / "make-kit.sh").read_text()
-        check = re.search(r"^gdsc_table_check\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        check = (re.search(r"^member_offset\(\) \{.*?^\}\n", text, re.M | re.S).group(0) +
+                 re.search(r"^gdsc_table_check\(\) \{.*?^\}\n", text, re.M | re.S).group(0))
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
             bin_ = tmp / "bin"
@@ -9170,6 +9858,7 @@ class ScriptsTest(unittest.TestCase):
             (bin_ / "llvm-objcopy").write_text('#!/bin/sh\nfor last; do :; done\nin=$(eval echo \\${$(($# - 1))})\n'
                                                'cp "$in.data" "$last"\n')
             (bin_ / "llvm-objdump").write_text('#!/bin/sh\nfor last; do :; done\ncat "$last.syms"\n')
+            (bin_ / "pahole").write_text(pahole)
             for stub in bin_.iterdir():
                 stub.chmod(0o755)
             (tmp / "hang.o.data").write_bytes(hang)
@@ -9186,8 +9875,9 @@ class ScriptsTest(unittest.TestCase):
 
     def test_the_power_domain_table_check_names_each_changed_byte_by_its_domain(self):
         """Three domains of 0x40 bytes in .data at 0x100, 0x180 and 0x200,
-        .pwrsts at 0x28 of each, as llvm-objdump -t lists an object's
-        symbols (with a function and a .rodata entry to pass over)."""
+        .pwrsts at 0x28 of each and the genpd flags at 8, as llvm-objdump -t
+        lists an object's symbols (with a function and a .rodata entry to
+        pass over) and pahole the members."""
         syms = ("\nnew.o:\tfile format elf64-littleaarch64\n\nSYMBOL TABLE:\n"
                 "0000000000000000 l    df *ABS*\t0000000000000000 gcc-sm8550.c\n"
                 "0000000000000010 l     F .text\t0000000000000020 gcc_sm8550_probe\n"
@@ -9203,22 +9893,32 @@ class ScriptsTest(unittest.TestCase):
             for at, value in changes.items():
                 data[at] = value
             return bytes(data)
-        r11 = {0x128: 5, 0x1a8: 6, 0x228: 6}
+        # The two USB domains' and pcie_0_gdsc's .pwrsts, and pcie_0_gdsc's
+        # genpd flags (GENPD_FLAG_ACTIVE_WAKEUP, 8: 010 in cmp's octal).
+        r11 = {0x128: 5, 0x1a8: 6, 0x228: 6, 0x108: 8}
         self.assertEqual(self.table_check(bytes(hang), new(r11), syms), (0, ""))
         refused = ("the compiled drivers/clk/qcom/gcc-sm8550 table does not differ from the hang-log build's in the "
-                   "three power-state masks alone")
+                   "four bytes alone (pcie_0_gdsc's .pd.flags at 8 0 to 8, and the .pwrsts at 40 of pcie_0_gdsc 6 to "
+                   "5 and of the two USB domains 5 to 6; symbol, byte in it, old, new, octal):\n")
         for name, changes, named in (
                 ("revision 10's", {0x1a8: 6, 0x228: 6}, "usb30_prim_gdsc 40 5 6\nusb3_phy_gdsc 40 5 6\n"),
-                ("a fourth byte", {**r11, 0x130: 1}, "pcie_0_gdsc 48 0 1\n"),
+                ("revision 11 as first prepared, without the flag", {0x128: 5, 0x1a8: 6, 0x228: 6},
+                 "pcie_0_gdsc 40 6 5\nusb30_prim_gdsc 40 5 6\n"),
+                ("the flag on another domain", {0x128: 5, 0x1a8: 6, 0x228: 6, 0x188: 8}, "usb30_prim_gdsc 8 0 10\n"),
+                ("a fifth byte", {**r11, 0x130: 1}, "pcie_0_gdsc 48 0 1\n"),
                 ("a byte outside every domain", {**r11, 0x2a0: 1}, "? 0 1\n"),
-                ("another byte of a domain", {0x128: 5, 0x1a8: 6, 0x229: 6}, "usb3_phy_gdsc 41 0 6\n"),
-                ("the other way round", {0x128: 7, 0x1a8: 6, 0x228: 6}, "pcie_0_gdsc 40 6 7\n")):
+                ("another byte of a domain", {0x128: 5, 0x1a8: 6, 0x229: 6, 0x108: 8}, "usb3_phy_gdsc 41 0 6\n"),
+                ("the other way round", {0x128: 7, 0x1a8: 6, 0x228: 6, 0x108: 8}, "pcie_0_gdsc 40 6 7\n")):
             with self.subTest(name):
                 code, err = self.table_check(bytes(hang), new(changes), syms)
                 self.assertEqual(code, 1, err)
                 self.assertTrue(err.startswith(refused), err)
                 self.assertIn(named, err)
         self.assertEqual(self.table_check(bytes(hang), b"", syms), (1, "no .data in TMP/new.o\n"))
+        # Without the members' offsets nothing is named: refused.
+        code, err = self.table_check(bytes(hang), new(r11), syms, pahole="#!/bin/sh\nexit 1\n")
+        self.assertEqual((code, err), (1, "pahole gives no offsets of struct gdsc's pwrsts and pd and of struct "
+                                          "generic_pm_domain's flags in TMP/new.o\n"))
 
     def staleness_gate(self, ages=(), out_image=b"image"):
         """Run make-kit.sh's check that the image was made from the sources as
@@ -9242,6 +9942,7 @@ class ScriptsTest(unittest.TestCase):
                  f"tree/{QMP_PCIE}.c": 100, f"build/{QMP_PCIE}.o": 200,
                  f"tree/{GMU}.c": 100, f"build/{GMU}.o": 200,
                  f"tree/{UFS_QCOM}.c": 100, f"tree/{UFS_QCOM}.h": 100, f"build/{UFS_QCOM}.o": 200,
+                 f"tree/{PCIE_QCOM}.c": 100, f"build/{PCIE_QCOM}.o": 200,
                  f"build/{TCPM_DIR}/sm5714_usbpd.o": 200, "build/vmlinux": 300,
                  "build/arch/arm64/boot/Image.gz": 400, "out/Image.gz": 400}
         files.update(ages)
@@ -9256,7 +9957,8 @@ class ScriptsTest(unittest.TestCase):
                 ["bash", "-c", 'set -euo pipefail; export LC_ALL=C\n'
                  'die() { echo "$*" >&2; exit 1; }\ntree=$1/tree build=$1/build out=$1/out\n'
                  f'tcpm_dir={TCPM_DIR}\ngcc={GCC}\ndwc3={DWC3}\nqmp={QMP}\nrpmhpd={RPMHPD}\n'
-                 f'phymux={PHYMUX}\nqmp_pcie={QMP_PCIE}\ngmu={GMU}\nufs_qcom={UFS_QCOM}\n' + objects.group(0) + "\n"
+                 f'phymux={PHYMUX}\nqmp_pcie={QMP_PCIE}\ngmu={GMU}\nufs_qcom={UFS_QCOM}\npcie_qcom={PCIE_QCOM}\n'
+                 + objects.group(0) + "\n"
                  + gate.group(0),
                  "gate", tmp], capture_output=True, text=True)
             return result.returncode, result.stdout, result.stderr.replace(tmp, "TMP")
@@ -9290,6 +9992,9 @@ class ScriptsTest(unittest.TestCase):
                                                   stale % (QMP_PCIE, QMP_PCIE + ".c")),
             "no a6xx_gmu object": ({f"build/{GMU}.o": None}, stale % (GMU, GMU + ".c")),
             "ufs-qcom.h changed since": ({f"tree/{UFS_QCOM}.h": 250}, stale % (UFS_QCOM, UFS_QCOM + ".h")),
+            # Revision 11: the PCIe host driver, its guard and root port switch.
+            "pcie-qcom.c changed since": ({f"tree/{PCIE_QCOM}.c": 250}, stale % (PCIE_QCOM, PCIE_QCOM + ".c")),
+            "no pcie-qcom object": ({f"build/{PCIE_QCOM}.o": None}, stale % (PCIE_QCOM, PCIE_QCOM + ".c")),
             # The driver includes the header too.
             "the driver's object alone is old": (
                 {f"build/{driver}.o": 50, f"tree/{driver}.c": 40}, stale % (driver, header)),
@@ -9343,22 +10048,24 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         kit = sum(kit_patches(text), [])
         self.assertEqual(sorted(set(re.findall(r"`kernel/patches/([^`]+)`", readme))), sorted(kit))
-        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (16, 5))
+        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (18, 5))
         self.assertIn("and the UFS PHY's two (revision 8): nine patches, five of them to TCPM. Revision 9 adds the "
                       "two debug patches above: eleven patches. Revision 10 adds the three upstream fixes and the "
                       "second UFS PHY diagnostic, fifteen patches, and leaves out `unpark-pcie0-pipe-mux.patch`, "
                       "which every default build applies.", readme)
         self.assertIn("In the kernel source tree twelve files differ from the hang-log build:", readme)
         self.assertIn("Against revision 9's tree six differ: those five and `phy-qcom-qmp-ufs.c`.", readme)
-        self.assertIn("Revision 11 adds `kernel/patches/gcc-sm8550-pcie0-gdsc-off-in-suspend.patch` and rewrites "
-                      "the GDSC debug switch patch: sixteen patches, the same twelve files; against revision 10's "
-                      "tree one differs, `gcc-sm8550.c`.", readme)
+        self.assertIn("Revision 11 adds `kernel/patches/gcc-sm8550-pcie0-gdsc-off-in-suspend.patch`, the PCIe "
+                      "host's half of the guard and the root port's debug switch, and rewrites the GDSC debug switch "
+                      "patch: eighteen patches, thirteen files (`pcie-qcom.c` the new one); against revision 10's "
+                      "tree two differ, `gcc-sm8550.c` and `pcie-qcom.c`.", readme)
         # Revision 9: what it is, how it is built, and the runs it was for.
         for said in ("**Revision 9** is revision 8 plus two debug patches, which a release build does not get",
                      "**never set a PCIe one for a suspend in which the PCIe host stays up**",
                      "**Four debug switches** (revision 9), each read as its power domains are, at every boot "
-                     "as the kernel's table has them: off, but `debug_pcie0_off` on from revision 11; and since "
-                     "revision 11 a fifth that says how they booted.",
+                     "as the kernel's table has them: off, but `debug_pcie0_off` on from revision 11; since "
+                     "revision 11 a fifth that says how they booted, and a sixth, the root port's, off at every "
+                     "boot.",
                      "| `/sys/module/gcc_sm8550/parameters/debug_pcie0_off` | `N`; `Y` on revision 11 | "
                      "`gdsc=pcie0` (`Y`), `gdsc-ret=pcie0` (`N`) |",
                      "| `/sys/module/gcc_sm8550/parameters/debug_boot_state` (revision 11, read-only) | "
@@ -9382,34 +10089,41 @@ class ScriptsTest(unittest.TestCase):
                      "Revision 10 installs the same way over revision 9, which squirtle has had since 2026-11-22 20:59",
                      "the NEXT line then says that the storage came back and names the PCIe host's line",
                      "`PCIe came back (no host failure line)`",
-                     # Revision 11: what it is, the risk of its first boot,
-                     # and its runs.
-                     "**Revision 11** (written 2026-11-23, not built yet) is revision 10 plus one line of the clock "
-                     "controller's power domain table, behind a build variable of its own, "
-                     "`APPLY_SM8550_PCIE0_GDSC_OFF=1`, which needs `APPLY_SM8550_SLEEP_FIXES=1`",
-                     "**in every suspend that keeps the Wi-Fi the domain now collapses under the live PCIe host, "
-                     "and the boot's panel cycle (`ubuntu-gts9u-panel-coldboot-recover`, `pm_test=platform`, "
-                     "about 22 s into every boot) is such a suspend.**",
-                     "a boot loop that only TWRP ends",
-                     "**Revision 11: the runs** (none has run).",
-                     "0. **Choose how the first boot meets the panel cycle.**",
-                     "Masking the unit instead does not do: the floor is then never released",
+                     # Revision 11: what it is, its guard, why its first boot is
+                     # safe, and its runs.
+                     "**Revision 11** (written 2026-11-23, not built yet) is revision 10 plus `pcie_0_gdsc`, the "
+                     "PCIe host's power domain, collapsed in a system suspend in which the host has powered itself "
+                     "down and kept on while the host keeps its link (a guard), and a debug switch that lets the "
+                     "PCIe root port go to D3hot in a system suspend.",
+                     "Two build variables, which go together or not at all (each is refused without the other), "
+                     "`APPLY_SM8550_PCIE0_GDSC_OFF=1` and `APPLY_SM8550_PCIE0_GDSC_GUARD=1`",
+                     "With the guard the panel cycle keeps the domain on by construction: the root port is in D0 "
+                     "then, the host keeps its link, and the root port's switch cannot be set before the system "
+                     "is up. That has not run either",
+                     "| `/sys/module/pcie_qcom/parameters/debug_root_port_d3` (revision 11) | `N` | `root-port-d3` |",
+                     "**Revision 11: the runs** (none has run; the kernel is not built yet).",
+                     "1. **Install and check.**",
+                     "No drop-in is needed: the guard keeps `pcie_0_gdsc` on in the boot's panel cycle by "
+                     "construction",
+                     "masking the unit instead does not do (the floor is then never released)",
                      "   ExecStartPre=-/bin/sh -c 'p=/sys/module/gcc_sm8550/parameters; grep -qx \"pcie0 Y, pcie0phy "
                      "N, usb N\" $$p/debug_boot_state && echo N > $$p/debug_pcie0_off'\n"
                      "   ExecStartPost=-/bin/sh -c 'p=/sys/module/gcc_sm8550/parameters; grep -qx \"pcie0 Y, pcie0phy "
                      "N, usb N\" $$p/debug_boot_state && echo Y > $$p/debug_pcie0_off'\n",
-                     "     sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=remove mode=s2idle hold=60 "
+                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=remove mode=s2idle hold=60 "
                      "rpmh restart-ok\n",
+                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=keep hold=60 restart-ok\n",
                      "- **`rpmh`** (`ro`; revision 11's script, any kit kernel): what of Linux's own votes stands in "
                      "the way of XO shutdown, CX collapse and AOSS sleep (`cxsd`, `aosd`).",
-                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 pm_test=platform pci=keep hold=60 restart-ok\n",
-                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep hold=60 "
+                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 pm_test=platform pci=keep root-port-d3 hold=60 "
                      "restart-ok\n",
+                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 "
+                     "hold=60 rpmh restart-ok\n",
                      "Revision 11 installs the same way over revision 10, which squirtle has had since 2026-11-23 "
                      "11:37",
-                     "- **`pci=keep`** (`ro`): a sleep with the PCI devices kept on a kernel whose `pcie0` switch "
-                     "reads `Y` at the sleep",
-                     "What none of these is: a fix for normal sleep with Wi-Fi."):
+                     "- **`pci=keep`** (`ro`): the PCI devices stay, and the run watches the Wi-Fi.",
+                     "- **`root-port-d3`** (`ro`, with `pci=keep`; revision 11's kernel)",
+                     "None of these makes a normal sleep with the Wi-Fi deep"):
             with self.subTest(said):
                 self.assertIn(said, readme if "\\" not in said and "\n" not in said
                               else (KIT_SRC / "README.md").read_text())

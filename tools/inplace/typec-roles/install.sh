@@ -10,9 +10,11 @@
 # boot), since revision 10 with three upstream fixes for the SoC's sleep
 # (the PCIe PIPE clock mux, the GPU RSC's votes, the UFS lane clocks) and a
 # second UFS PHY diagnostic, and since revision 11 with pcie_0_gdsc
-# collapsed in system suspend (its debug switch on at every boot), in boot,
-# and its module tree.  The DTB and the configuration are the hang-log
-# kit's, so vendor_boot is checked but not written.
+# collapsed in system suspend when the PCIe host has powered itself down and
+# kept on while it keeps its link (the guard; its debug switch on at every
+# boot), and a debug switch that lets the PCIe root port go to D3hot (off at
+# every boot), in boot, and its module tree.  The DTB and the configuration
+# are the hang-log kit's, so vendor_boot is checked but not written.
 #
 #   sudo sh ~/typec-roles/install.sh      then reboot
 #   sudo sh ~/typec-roles/rollback.sh     back to the hang-log kit, then reboot
