@@ -4,7 +4,7 @@
 #   sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
 #        [pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
 #        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]
-#        [sensors=stop|sensors=hook] restart-ok
+#        [cxpc] [sensors=stop|sensors=hook] restart-ok
 #   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]
 #        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok
 #   sh ~/typec-roles/sleep-test.sh status
@@ -50,6 +50,10 @@
 # prints the switches as they are, and how they booted.  rpmh turns the
 # RPMh tracepoint on for the run and names, after each sleep, the sleep set
 # that the application processor's RSC slept with (XO, CX, MX, bandwidth).
+# cxpc (revision 12's kernel) has the AOP log, after each sleep, the RPMh
+# requesters that kept CX from collapsing.  sensors=hook stops the sensor
+# clients through the device package's system-sleep hook, as a systemctl
+# suspend does.
 # status (no root) prints the latest run's result from /run.
 #
 # On 2026-11-21 one deep sleep (rtcwake -m mem -s 30) did not bring the UFS
@@ -560,6 +564,21 @@
 #     clock tracepoints the XO line says there is no clock trace.  It
 #     changes no vote; a stop before any sleep turns them off again, and so
 #     does the restart that ends every run.
+#   - cxpc (ro): the AOP's own record of what keeps CX from collapsing, on a
+#     kernel with revision 12's switch
+#     (/sys/module/qcom_stats/parameters/debug_cxpc_violators,
+#     qcom-stats-cxpc-violators-diagnostic.patch): written Y right before the
+#     freeze, with the other switches (the record's word cxpc), until the
+#     restart.  Each system suspend then asks the AOP (a QMP message) to log
+#     every RPMh requester (DRV: HLOS is this kernel, AUDIO the audio DSP,
+#     DISPLAY, ...) that votes against CX power collapse while the CPUs
+#     sleep, and the resume logs the log ("cxpc violators:" kernel lines,
+#     among the cycle's kernel lines, and a summary of which requesters held
+#     CX in every line; the summary goes to pmsg too).  Before anything is
+#     frozen the run reads the log once as the AOP left it, which is the
+#     first read of that part of the AOP's message RAM on this port, and
+#     every requester's DDR vote now (qcom_stats/ddr_votes), into the record.
+#     Refused on a kernel without the switch, and with dry.
 set -u
 export LC_ALL=C
 umask 022
@@ -605,6 +624,15 @@ sw_boot_file=$sw_gcc/debug_boot_state
 # every boot.
 sw_pcie=/sys/module/pcie_qcom/parameters
 sw_names="$sw_names rpd3"
+# Revision 12's CXPC violators switch (cxpc), N at every boot: with it each
+# system suspend asks the AOP to log the RPMh requesters that keep CX from
+# collapsing, and the resume logs that log (qcom_stats' "cxpc violators:"
+# lines); its debugfs files, the log as the AOP left it and every
+# requester's DDR vote now.
+sw_stats=/sys/module/qcom_stats/parameters
+sw_names="$sw_names cxpc"
+cxpc_log=/sys/kernel/debug/qcom_stats/cxpc_violators
+cxpc_ddr=/sys/kernel/debug/qcom_stats/ddr_votes
 # The line revision 11's PCIe host logs at each resume, and the one of a
 # guard that did not hold (pcie-qcom-keep-power-domain-while-link-kept.patch).
 guard_re='[0-9a-f]+\.pcie: system sleep: '
@@ -802,7 +830,7 @@ ev_domains='^(cx|mx|mxc|mmcx|lcx|lmx|gfx|ebi|ufs_|usb|pcie|mdss|power-domain-clu
 # At most ev_klines,
 # and not the Wi-Fi's per-packet noise, the CPUs' feature lines or the
 # hung-task reports of writers waiting on the frozen disk.
-ev_kernel='PM: |psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110'
+ev_kernel='PM: |cxpc violators|psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110'
 ev_kernel_skip='msdu_done|SANITY CHECK|blocked for more than|hung_task_timeout_secs|Tainted:'
 ev_klines=150
 # How to reach TWRP from a running or looping tablet (docs/porting-log.md,
@@ -1080,6 +1108,7 @@ sw_file() { # WORD
 	usb) echo "$sw_gcc/debug_usb_off" ;;
 	cxmx) echo "$sw_rpmhpd/debug_ret_floor" ;;
 	rpd3) echo "$sw_pcie/debug_root_port_d3" ;;
+	cxpc) echo "$sw_stats/debug_cxpc_violators" ;;
 	esac
 }
 
@@ -1089,7 +1118,7 @@ sw_file() { # WORD
 # cxmx and rpd3 always.  The shell reads sysfs itself.
 sw_boot() { # WORD
 	sbv=
-	if [ "$1" != cxmx ] && [ "$1" != rpd3 ] && [ -e "$sw_boot_file" ]; then
+	if [ "$1" != cxmx ] && [ "$1" != rpd3 ] && [ "$1" != cxpc ] && [ -e "$sw_boot_file" ]; then
 		sbl=
 		read -r sbl 2>/dev/null < "$sw_boot_file" || :
 		case ", $sbl," in
@@ -2414,6 +2443,10 @@ ev_after() { # SFX K
 		say "$cyc: evidence: XO at the entry to the sleep (clock trace): $(ev_xo_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" full)"
 		evxoe=$(ev_xo_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" short)
 	fi
+	if [ "${cxpc_given:-0}" = 1 ]; then
+		evcxpc=$(awk '/cxpc violators: summary: / { sub(/.*cxpc violators: summary: /, ""); s = $0 } END { print (s == "" ? "no summary line in the kernel lines of this cycle" : s) }' "$2" 2>/dev/null)
+		say "$cyc: evidence: cxpc violators (the AOP log; each of its lines is among the kernel lines of this cycle): $evcxpc"
+	fi
 	say "$cyc: evidence: after: clocks (enable/prepare): $(ev_clk_line "$ramdir/ev-clk-$1.1" full)"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: after: genpd: $evl"; done
 	awk -v re="$ev_kernel" -v skip="$ev_kernel_skip" -v max="$ev_klines" '
@@ -2437,6 +2470,7 @@ ev_keep() { # SFX
 		# over Wi-Fi, which the sleep takes down): in pieces, at most eight.
 		ev_pmsg_pieces "$cyc: evidence: rpmh sleep set" "$evrpmhf" 8
 	fi
+	[ "${cxpc_given:-0}" = 0 ] || ev_pmsg "$cyc: evidence: cxpc: $evcxpc"
 	[ "$sleep_mode" != s2idle ] || ev_pmsg "$cyc: evidence: s2idle: $s2pmsg"
 }
 
@@ -3508,7 +3542,7 @@ fi
 # ------------------------------------------------------ before: the disk ---
 cycles=3 seconds=30 hold=300 aborts=5 release=0 confirmed=0 numbers=0 dry=0 mode= aborts_given=0
 pci_remove=0 pci_keep=0 pm_test= trace= sleep_mode= sw_set= sw_ret= gdsc_given=0 cxmx_given=0 ret_given=0 rpmh=0
-rpd3_given=0 sensors_stop=0 sensors_opt=
+rpd3_given=0 sensors_stop=0 sensors_opt= cxpc_given=0
 for a in "$@"; do
 	case $a in
 	ro|dry)
@@ -3569,6 +3603,10 @@ for a in "$@"; do
 		cxmx_given=1
 		sw_set="$sw_set cxmx" ;;
 	cxmx=*) echo "$me: cxmx=ret is the only cxmx= option, not '$a'" >&2; usage ;;
+	cxpc)
+		[ "$cxpc_given" = 0 ] || { echo "$me: one cxpc at most" >&2; usage; }
+		cxpc_given=1
+		sw_set="$sw_set cxpc" ;;
 	root-port-d3)
 		[ "$rpd3_given" = 0 ] || { echo "$me: one root-port-d3 at most" >&2; usage; }
 		rpd3_given=1
@@ -3594,6 +3632,7 @@ if [ "$dry" = 1 ]; then
 	[ -z "$pm_test" ] && [ -z "$trace" ] || { echo "$me: dry sleeps not at all: no pm_test= or trace" >&2; usage; }
 	[ "$pci_keep" = 0 ] || { echo "$me: dry sleeps not at all: pci=keep is for a sleep with the PCI devices kept" >&2; usage; }
 	[ "$rpmh" = 0 ] || { echo "$me: dry sleeps not at all: rpmh is for the RPMh commands of a sleep" >&2; usage; }
+	[ "$cxpc_given" = 0 ] || { echo "$me: dry sleeps not at all: cxpc is for the AOP's log of a sleep" >&2; usage; }
 	[ "$rpd3_given" = 0 ] || { echo "$me: dry sleeps not at all: root-port-d3 is for the sleeps of a pci=keep run" >&2; usage; }
 	[ "$sensors_stop" = 0 ] || { echo "$me: dry sleeps not at all: $sensors_opt is for the audio DSP's wakes in a sleep" >&2; usage; }
 	cycles=0
@@ -3643,12 +3682,13 @@ sw_asked=$sw_set sw_set= gdsc_word=
 for swn in $sw_names; do
 	case " $sw_asked " in *" $swn "*) ;; *) continue ;; esac
 	sw_set="$sw_set $swn"
-	case $swn in cxmx|rpd3) ;; *) gdsc_word="$gdsc_word,$swn" ;; esac
+	case $swn in cxmx|rpd3|cxpc) ;; *) gdsc_word="$gdsc_word,$swn" ;; esac
 done
 [ -z "$gdsc_word" ] || options="$options gdsc=${gdsc_word#,}"
 [ -z "$sw_ret" ] || options="$options gdsc-ret=$sw_ret"
 [ "$cxmx_given" = 0 ] || options="$options cxmx=ret"
 [ "$rpd3_given" = 0 ] || options="$options root-port-d3"
+[ "$cxpc_given" = 0 ] || options="$options cxpc"
 [ "$rpmh" = 0 ] || options="$options rpmh"
 [ "$sensors_stop" = 0 ] || options="$options $sensors_opt"
 options=${options# }
@@ -3735,8 +3775,10 @@ if [ -n "$gdsc_word" ] && [ "$pci_remove" = 0 ]; then
 fi
 for swn in $sw_set $sw_ret; do
 	swf=$(sw_file "$swn")
-	[ -e "$swf" ] && [ -w "$swf" ] ||
-		refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 to 11 have it, revision 11's alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"
+	[ -e "$swf" ] && [ -w "$swf" ] && continue
+	[ "$swn" != cxpc ] ||
+		refuse "cxpc needs the CXPC violators switch ($swf): the kernels of kit revision 12 have it (sh ~/typec-roles/verify.sh says which kernel runs)"
+	refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 to 11 have it, revision 11's alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"
 done
 # Each switch as it booted (sw_boot): N, but pcie0 Y on revision 11's
 # kernel.  One that reads otherwise was written since the boot.
@@ -4115,7 +4157,7 @@ fi
 	pci_list=$(pci_names)
 	echo "PCI: $(pci_count) devices${pci_list:+:$pci_list}; root ports:$(pci_root_ports | awk '{ printf " %s", $0 } END { if (!NR) printf " none" }')$([ "$pci_remove" = 0 ] || echo '; pci=remove: all of them go right before the freeze')"
 	echo "printk: kernel.printk ${printk_was:-n/a}, console_suspend ${suspend_was:-n/a}, ignore_loglevel $(cat "$ignore_loglevel_ctl" 2>/dev/null || echo n/a); pm_debug_messages ${debug_was:-n/a}$debug_plan, pm_print_times $(cat "$print_times_ctl" 2>/dev/null || echo n/a); pm_test [$(selected "$pm_test_ctl")], pm_test_delay ${pm_test_delay}s"
-	echo "debug $(sw_now) ($sw_gcc/debug_pcie0_off, debug_pcie0_phy_off, debug_usb_off; $sw_rpmhpd/debug_ret_floor; $sw_pcie/debug_root_port_d3)$([ -z "$sw_set" ] || echo "; this run sets$sw_set to Y right before the freeze")$([ -z "$sw_ret" ] || echo "; this run sets $sw_ret to N right before the freeze")"
+	echo "debug $(sw_now) ($sw_gcc/debug_pcie0_off, debug_pcie0_phy_off, debug_usb_off; $sw_rpmhpd/debug_ret_floor; $sw_pcie/debug_root_port_d3$([ ! -e "$sw_stats/debug_cxpc_violators" ] || echo "; $sw_stats/debug_cxpc_violators"))$([ -z "$sw_set" ] || echo "; this run sets$sw_set to Y right before the freeze")$([ -z "$sw_ret" ] || echo "; this run sets $sw_ret to N right before the freeze")"
 	[ ! -e "$sw_boot_file" ] || echo "debug switches at boot: $(cat "$sw_boot_file" 2>/dev/null) ($sw_boot_file); pcie_0_gdsc in this run's sleeps: $([ "$pcie0_off" = Y ] && echo 'OFF_ON, collapsed when the PCIe host has powered down' || echo 'RET_ON, left on')"
 	case $guard_state in
 	held) echo "PCIe power domain guard: held this boot ($guard_n sleeps logged, none with the domain off under a kept link; the first: $guard_first)" ;;
@@ -4140,6 +4182,15 @@ fi
 		[ "$pst" = closed ] || pcm="$pcm ${ps#/proc/asound/}(${pst:-?})"
 	done
 	echo "ADSP clients: $(adsp_units); PipeWire and WirePlumber processes $pw; sound streams not closed:${pcm:- none}$([ "$sensors_stop" = 0 ] || echo "; $sensors_opt: this run stops $sensor_units next$([ "$sensors_stop" != hook ] || echo " through $sensors_hook pre suspend"), until the restart")"
+	# cxpc: the AOP's log as it is (its first read, before anything is
+	# frozen: qcom-stats-cxpc-violators-diagnostic.patch), and every
+	# requester's DDR vote now (a QMP request, then a read).
+	if [ "$cxpc_given" = 1 ]; then
+		cxl=$(awk 'NR <= 6 { printf "%s%s", (NR > 1 ? "; " : ""), $0 }' "$cxpc_log" 2>/dev/null)
+		echo "cxpc: the AOP's CXPC log as it is now ($cxpc_log): ${cxl:-not readable}"
+		cxl=$(awk '!/ absent$/ { gsub(/ +/, " "); printf "%s%s", (n++ ? ", " : ""), $0 }' "$cxpc_ddr" 2>/dev/null)
+		echo "cxpc: every requester's DDR vote now ($cxpc_ddr): ${cxl:-not readable}"
+	fi
 	[ "$rpmh" = 0 ] || echo "rpmh: the tracepoint $rpmh_event (${rpmh_was:-?} now) goes on right before the freeze; command DB: $([ -r "$cmd_db" ] && echo "$cmd_db, $(grep -c '^0x' "$cmd_db" 2>/dev/null) addresses" || echo "$cmd_db not readable: the addresses stay numbers")"
 	echo "kernel command line, the ignore_unused options:$({ tr ' ' '\n' < /proc/cmdline; } 2>/dev/null | grep -E '^(clk|pd|regulator)_ignore_unused$' | sed 's/^/ /' | tr -d '\n')"
 	echo "root: $rootsrc ext4, ext4 errors_count $rooterr, state $rootstate; to freeze, the root last:$(freeze_order "$rootsrc" | awk '!seen[$1]++ { printf " %s", $2 }')"
@@ -4241,7 +4292,7 @@ sync
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for v in stamp ramdir part disk cycles seconds hold aborts dry rootsrc rootname floor armed kernel mount_cmd ufs_host \
 	pci_remove pci_keep pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note sw_set sw_ret \
-	rpmh rpmh_was clk_trace clk_was guard_state sensors_stop pwrdn_seen; do
+	rpmh rpmh_was clk_trace clk_was guard_state sensors_stop pwrdn_seen cxpc_given; do
 	eval "printf '%s=%s\n' $v \"\$(q \"\$$v\")\""
 done > "$ramdir/run.conf"
 say 'the run goes on from RAM in a session of its own: it ends with a restart even if this terminal goes away'

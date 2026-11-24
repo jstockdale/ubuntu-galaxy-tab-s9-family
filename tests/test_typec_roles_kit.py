@@ -151,6 +151,10 @@ TYPEC_PATCHES = ["tcpm-request-dfp-as-sink-before-discovery.patch", "tcpm-try-sn
 UFS_PATCHES = ["qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch",
                "qmp-ufs-pcs-state-diagnostic.patch", "qmp-ufs-pwrdn-readback-diagnostic.patch"]
 DEBUG_PATCHES = ["gcc-sm8550-gdsc-debug-switches.patch", "rpmhpd-debug-retention-floor.patch"]
+# Revision 12's debug patch in the same block of the build script: the AOP's
+# CXPC violators log (sleep-test.sh's cxpc), qcom_stats.c alone.
+CXPC_PATCH = "qcom-stats-cxpc-violators-diagnostic.patch"
+QCOM_STATS = "drivers/soc/qcom/qcom_stats"
 # Revision 11's pcie_0_gdsc, behind APPLY_SM8550_PCIE0_GDSC_OFF, and the line
 # it gives that domain, by which the build script and make-kit.sh know it.
 GDSC_PATCHES = ["gcc-sm8550-pcie0-gdsc-off-in-suspend.patch"]
@@ -236,8 +240,8 @@ PREFIXES = (
     # root-port-d3).
     "/sys/module/pcie_qcom/parameters",
     # Revision 12: the device package's sensors hook (sleep-test.sh's
-    # sensors=hook).
-    "/usr/lib/systemd/system-sleep/",
+    # sensors=hook), the CXPC violators switch (cxpc).
+    "/usr/lib/systemd/system-sleep/", "/sys/module/qcom_stats/parameters",
 )
 
 STUBS = {
@@ -3915,6 +3919,8 @@ switches() {
 	done
 	[ ! -e "$F/sys/module/pcie_qcom/parameters/debug_root_port_d3" ] ||
 		printf '%s ' "$(cat "$F/sys/module/pcie_qcom/parameters/debug_root_port_d3")"
+	[ ! -e "$F/sys/module/qcom_stats/parameters/debug_cxpc_violators" ] ||
+		printf '%s ' "$(cat "$F/sys/module/qcom_stats/parameters/debug_cxpc_violators")"
 	echo
 }
 sb_default() { cat "$T/sb-errors-$1" 2>/dev/null || echo remount-ro; }
@@ -6656,7 +6662,9 @@ exit 0
                     "pci=keep root-port-d3 gdsc-ret=pcie0", "pci=keep root-port-d3 pm_test=devices",
                     "pci=keep root-port-d3 pm_test=freezer", "dry root-port-d3", "root-port-d3=1",
                     "sensors=", "sensors=start", "sensors=stop sensors=stop", "dry sensors=stop", "sensors",
-                    "sensors=stop sensors=hook", "sensors=hook sensors=hook", "sensors=Hook"):
+                    "sensors=stop sensors=hook", "sensors=hook sensors=hook", "sensors=Hook",
+                    # Revision 12's cxpc: once, and no sleep in dry.
+                    "cxpc cxpc", "dry cxpc", "cxpc=1"):
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
@@ -6664,7 +6672,7 @@ exit 0
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok", result.stderr)
                 self.assertIn("[pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]\n"
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]\n"
-                              "       [sensors=stop|sensors=hook] restart-ok", result.stderr)
+                              "       [cxpc] [sensors=stop|sensors=hook] restart-ok", result.stderr)
                 self.assert_nothing_done()
 
     # Revision 9's debug switches (gdsc=, cxmx=ret): run-time module
@@ -7066,7 +7074,7 @@ exit 0
                 result = self.run_test("ro", *bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
                 self.assertIn("[trace|trace=live] [mode=s2idle]\n       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] "
-                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [sensors=stop|sensors=hook] restart-ok", result.stderr)
+                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [cxpc] [sensors=stop|sensors=hook] restart-ok", result.stderr)
                 self.assert_nothing_done()
                 if "pm_test=" in bad:
                     level = bad.split("pm_test=")[1].split()[0]
@@ -7784,6 +7792,71 @@ exit 0
                 self.assertEqual(self.read("hook.calls"), "")
                 self.assertEqual(self.read("frozen"), "")
 
+    def test_cxpc_has_the_aop_log_what_held_cx_in_each_sleep(self):
+        """cxpc (revision 12's kernel): Y to the CXPC violators switch right
+        before the freeze, with the other switches; the AOP's log as it is
+        and every requester's DDR vote now in the record, read before
+        anything is frozen; after each sleep the summary of the log the
+        kernel logged, among the evidence and in pmsg, and its lines among
+        the cycle's kernel lines.  Refused on a kernel without the switch,
+        and with dry."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.debug_switches()
+        switch = self.root / "sys/module/qcom_stats/parameters/debug_cxpc_violators"
+        switch.parent.mkdir(parents=True, exist_ok=True)
+        switch.write_text("N\n")
+        stats = self.root / "sys/kernel/debug/qcom_stats"
+        stats.mkdir(parents=True, exist_ok=True)
+        (stats / "cxpc_violators").write_text("no log\n")
+        (stats / "ddr_votes").write_text("TZ          absent\nHLOS        ab 0 ib 0\nAUDIO       ab 12 ib 40\n")
+        log = ("[  700.000000] PM: suspend entry (deep)\n"
+               "[  700.100000] cxpc violators: the AOP's CXPC monitor is on for this suspend\n"
+               "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+               "[  730.200000] cxpc violators: mode 0xcc (CXPC), 3 of 36 lines, every 1000 ms, time shift 0, flush 10\n"
+               "[  730.200001] cxpc violators: 0x1000: AUDIO 3, HLOS 1\n"
+               "[  730.200002] cxpc violators: 0x2000: AUDIO 3\n"
+               "[  730.200003] cxpc violators: 0x3000: CXPC enter\n"
+               "[  730.200004] cxpc violators: summary: 3 lines, 1 of them CXPC enter or exit; DRVs: HLOS 1/3, "
+               "AUDIO 2/3 (every line)\n"
+               "[  730.300000] PM: suspend exit\n")
+        self.cycle(1, log=log)
+        result = self.run_test("ro", "1", "cxpc", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(switch.read_text(), "Y")
+        self.assertEqual(self.read("switches-at-freeze"), "N N N N Y \n")
+        self.assertEqual(self.read("switches-at-sleep"), "N N N N Y \n")
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", self.out)
+        on = "switches: pcie0 N, pcie0phy N, usb N, cxmx N, cxpc Y"
+        self.assertIn(f"kernel 68d243e908c0; options: cxpc; {on}\n", self.out)
+        self.assertIn(f"progress: debug switches set: cxpc; {on}", self.progress_lines())
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertIn(f"; {self.root}/sys/module/qcom_stats/parameters/debug_cxpc_violators); this run sets cxpc to Y "
+                      "right before the freeze\n", before)
+        self.assertIn(f"cxpc: the AOP's CXPC log as it is now ({self.root}/sys/kernel/debug/qcom_stats/cxpc_violators): "
+                      "no log\n", before)
+        self.assertIn(f"cxpc: every requester's DDR vote now ({self.root}/sys/kernel/debug/qcom_stats/ddr_votes): "
+                      "HLOS ab 0 ib 0, AUDIO ab 12 ib 40\n", before)
+        summary = "3 lines, 1 of them CXPC enter or exit; DRVs: HLOS 1/3, AUDIO 2/3 (every line)"
+        self.assertIn("cycle 1/1: evidence: cxpc violators (the AOP log; each of its lines is among the kernel lines of "
+                      f"this cycle): {summary}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: kernel: [  730.200001] cxpc violators: 0x1000: AUDIO 3, HLOS 1\n", self.out)
+        self.assertIn(f"cycle 1/1: evidence: cxpc: {summary}", self.pmsg_lines())
+        # A kernel without the switch, and dry: refused, nothing done.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.debug_switches()
+        result = self.run_test("ro", "1", "cxpc", "restart-ok")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("REFUSED: cxpc needs the CXPC violators switch "
+                      f"({self.root}/sys/module/qcom_stats/parameters/debug_cxpc_violators): the kernels of kit "
+                      "revision 12 have it", self.out)
+        self.assert_nothing_done()
+        result = self.run_test("dry", "cxpc", "restart-ok")
+        self.assertEqual(result.returncode, 2, self.out)
+        self.assertIn("dry sleeps not at all: cxpc is for the AOP's log of a sleep", self.out)
+
     def test_gdsc_ret_pcie0_keeps_the_domain_in_retention_for_the_run(self):
         """gdsc-ret=pcie0 writes N to pcie0 right before the freeze, read
         back, and the record says it: pcie0 N with "at boot: pcie0 Y"."""
@@ -8360,12 +8433,17 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
         self.assertNotIn("DEVICE", block)
         self.assertIn(f"drivers/clk/qcom/gcc-sm8550.c:{self.GDSC}", block)
         self.assertIn(f"drivers/pmdomain/qcom/rpmhpd.c:{self.FLOOR}", block)
+        self.assertIn(f"{QCOM_STATS}.c:{CXPC_PATCH}", block)
         self.assertEqual(text.count(f"deep_sleep_debug_marker='{self.MARKER}'"), 1)
         for patch in (self.GDSC, self.FLOOR):
             with self.subTest(patch):
                 added = "\n".join(added_lines(patch).popitem()[1])
                 self.assertIn(self.MARKER, added)
                 self.assertNotIn("of_machine_is_compatible", added)
+        # The CXPC log's: an SM8550 at run time, both boards built alike.
+        added = "\n".join(added_lines(CXPC_PATCH).popitem()[1])
+        self.assertIn(self.MARKER, added)
+        self.assertIn('of_machine_is_compatible("qcom,sm8550")', added)
         touching = {}
         for patch in (REPO / "kernel/patches").glob("*.patch"):
             for target in re.findall(r"^\+\+\+ b/(\S+)", patch.read_text(), re.M):
@@ -8373,11 +8451,13 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
         self.assertEqual(sorted(touching[f"{GCC}.c"]), sorted(["gcc-sm8550-usb-gdscs-retention.patch", self.GDSC,
                                                               GDSC_PATCHES[0]]))
         self.assertEqual(touching[f"{RPMHPD}.c"], [self.FLOOR])
+        self.assertEqual(touching[f"{QCOM_STATS}.c"], [CXPC_PATCH])
 
     def pinned_files(self, tree, usb=True):
-        """The two files as the build has them when the block runs: the
-        pinned gcc-sm8550.c with the USB GDSC patch, the pinned rpmhpd.c."""
-        for path in (f"{GCC}.c", f"{RPMHPD}.c"):
+        """The three files as the build has them when the block runs: the
+        pinned gcc-sm8550.c with the USB GDSC patch, the pinned rpmhpd.c and
+        qcom_stats.c."""
+        for path in (f"{GCC}.c", f"{RPMHPD}.c", f"{QCOM_STATS}.c"):
             (tree / path).parent.mkdir(parents=True, exist_ok=True)
             (tree / path).write_text(subprocess.run(["git", "-C", str(kernel_source()), "show", "HEAD:" + path],
                                                     check=True, capture_output=True, text=True).stdout)
@@ -8391,7 +8471,7 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tree = pathlib.Path(tmp)
             self.pinned_files(tree)
-            files = {p: (tree / p).read_text() for p in (f"{GCC}.c", f"{RPMHPD}.c")}
+            files = {p: (tree / p).read_text() for p in (f"{GCC}.c", f"{RPMHPD}.c", f"{QCOM_STATS}.c")}
             listing = sorted(p.name for p in (tree / GCC).parent.iterdir())
             result = self.run_block(tree, "0")
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -8405,6 +8485,7 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
             # No backup next to them.
             self.assertEqual(sorted(p.name for p in (tree / GCC).parent.iterdir()), listing)
             self.assertEqual(sorted(p.name for p in (tree / RPMHPD).parent.iterdir()), ["rpmhpd.c"])
+            self.assertEqual(sorted(p.name for p in (tree / QCOM_STATS).parent.iterdir()), ["qcom_stats.c"])
             # Again: a reused tree, nothing changes.
             result = self.run_block(tree, "1")
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -9268,10 +9349,11 @@ class PcieGdscOffTest(unittest.TestCase):
             for value in ("0", "1"):
                 tree = pathlib.Path(tmp, value)
                 self.pinned_file(tree)
-                (tree / RPMHPD).parent.mkdir(parents=True)
-                (tree / f"{RPMHPD}.c").write_text(subprocess.run(
-                    ["git", "-C", str(kernel_source()), "show", f"HEAD:{RPMHPD}.c"], check=True, capture_output=True,
-                    text=True).stdout)
+                for path in (RPMHPD, QCOM_STATS):
+                    (tree / path).parent.mkdir(parents=True)
+                    (tree / f"{path}.c").write_text(subprocess.run(
+                        ["git", "-C", str(kernel_source()), "show", f"HEAD:{path}.c"], check=True,
+                        capture_output=True, text=True).stdout)
                 for again in (False, True):
                     result = self.run_block(self.block() + debug, tree, value, "1")
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -9359,7 +9441,7 @@ class PcieGuardTest(unittest.TestCase):
         rpd3 = self.block("pcie_rp_d3_patch=")
         self.assertLess(text.index("pcie0_gdsc_patch="), text.index(guard))
         self.assertLess(text.index(guard), text.index("deep_sleep_debug_marker='"))
-        self.assertLess(text.index("\tdrivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch; do\n"),
+        self.assertLess(text.index("\tdrivers/soc/qcom/qcom_stats.c:qcom-stats-cxpc-violators-diagnostic.patch; do\n"),
                         text.index(rpd3))
         self.assertIn(f"\npcie0_guard_patch={self.GUARD}\n", "\n" + guard)
         self.assertIn(f"\npcie0_guard_line='{GUARD_LINE}'\n", "\n" + guard)
@@ -10071,7 +10153,9 @@ class ScriptsTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertTrue((REPO / "kernel/patches" / name).is_file())
                 self.assertEqual(build.count(f"{target}:{name}"), 1)
-        self.assertIn("\tdrivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch; do\n", build)
+        # Continuation lines joined: revision 12's third is the loop's last.
+        self.assertIn("\tdrivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch  "
+                      "\tdrivers/soc/qcom/qcom_stats.c:qcom-stats-cxpc-violators-diagnostic.patch; do\n", build)
         # Each file a patch changes is one the kit compares with the hang-log
         # build's, and so is the PCIe PHY's, which loses the unpark patch.
         patched = re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1)

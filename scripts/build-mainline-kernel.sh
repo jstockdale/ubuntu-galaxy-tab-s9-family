@@ -34,8 +34,9 @@ enable_gunyah_cma=${ENABLE_GUNYAH_CMA:-0}
 # Diagnostic only, never in a release: see qmp-ufs-pcs-state-diagnostic.patch
 # and ufs-qcom-phy-power-count-diagnostic.patch below.
 apply_qmp_ufs_diagnostic=${APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC:-0}
-# Debug only, never in a release: see gcc-sm8550-gdsc-debug-switches.patch
-# and rpmhpd-debug-retention-floor.patch below.
+# Debug only, never in a release: see gcc-sm8550-gdsc-debug-switches.patch,
+# rpmhpd-debug-retention-floor.patch and
+# qcom-stats-cxpc-violators-diagnostic.patch below.
 apply_deep_sleep_debug=${APPLY_DEEP_SLEEP_DEBUG_SWITCHES:-0}
 # Test builds until they have run on hardware: the SM8550 sleep fixes below,
 # three upstream commits, with unpark-pcie0-pipe-mux.patch left out.
@@ -543,13 +544,19 @@ fi
 # the pcie0 one on with APPLY_SM8550_PCIE0_GDSC_OFF=1, where it can put
 # pcie_0_gdsc back in retention.  They are for test builds: set
 # APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (the SM-X710's Type-C roles kit, revision
-# 9).  The GDSC one goes on top of the USB GDSC patch just above (and of
-# revision 11's pcie_0_gdsc, one line further down then), each
-# strictly; a tree that carries either is refused for a default build, so
-# that a release built in a reused test tree cannot ship them.
+# 9).  qcom-stats-cxpc-violators-diagnostic.patch (revision 12) is a third:
+# qcom_stats.debug_cxpc_violators, N at every boot, with which each system
+# suspend asks the AOP to log the RPMh requesters that keep CX from
+# collapsing, and the resume logs that log; an SM8550 alone, and it reads
+# only, but for the AOP message that starts the log.  The GDSC one goes on
+# top of the USB GDSC patch just above (and of revision 11's pcie_0_gdsc,
+# one line further down then).  Each strictly; a tree that carries any of
+# them is refused for a default build, so that a release built in a reused
+# test tree cannot ship them.
 deep_sleep_debug_marker='SM8550 deep-sleep debug, not for release builds'
 for deep_sleep_debug in drivers/clk/qcom/gcc-sm8550.c:gcc-sm8550-gdsc-debug-switches.patch \
-	drivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch; do
+	drivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch \
+	drivers/soc/qcom/qcom_stats.c:qcom-stats-cxpc-violators-diagnostic.patch; do
 	if [ "$apply_deep_sleep_debug" = 1 ]; then
 		# The GDSC switches give the USB GDSCs back PWRSTS_RET_ON, the state
 		# of the USB GDSC patch: never without it.
