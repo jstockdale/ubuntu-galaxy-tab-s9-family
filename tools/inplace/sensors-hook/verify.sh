@@ -74,9 +74,13 @@ props=$(systemctl show -p Restart -p RestartUSec -p StartLimitBurst -p StartLimi
 inf "$props"
 case " $props" in *' NeedDaemonReload=yes '*) ck 'systemd has an older copy of the unit loaded (sudo systemctl daemon-reload)' ;; esac
 if [ "$kit_files" = 3 ]; then
+	# systemctl show prints the properties in its own order.
 	case " $props" in
-	*' Restart=on-failure '*' StartLimitBurst=3 '*) ok 'retries: on failure, three starts at most' ;;
-	*) ck 'the unit loaded is not the kit'"'"'s (Restart=on-failure, StartLimitBurst=3)' ;;
+	*' Restart=on-failure '*) case " $props" in
+		*' StartLimitBurst=3 '*) ok 'retries: on failure, three starts at most' ;;
+		*) ck 'the unit loaded is not the kit'"'"'s (StartLimitBurst=3)' ;;
+		esac ;;
+	*) ck 'the unit loaded is not the kit'"'"'s (Restart=on-failure)' ;;
 	esac
 fi
 case " $props" in *' Result=start-limit-hit '*) ck "$unit used its three starts and stays failed until the next resume or boot" ;; esac
