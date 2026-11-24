@@ -10,8 +10,8 @@ after it, the resume unit that brings both back, its failed state reset
 first.  Every call waits a bounded time, nothing fails the sleep, and the
 clients are stopped only where the resume unit can run.  Both boards, no
 board check.  The resume side is checked as text: ubuntu-gts9u-sensors-resume
-starts the file server and restarts the proxy.  Nothing on the host is
-touched.
+starts the file server and restarts the proxy, and its unit tries a failed
+recovery again, three starts at most.  Nothing on the host is touched.
 """
 import pathlib
 import shutil
@@ -180,6 +180,37 @@ class SensorsHookTest(unittest.TestCase):
         self.assertIn("systemctl start hexagonrpcd-adsp-sensorspd.service", resume)
         self.assertIn("systemctl start iio-sensor-proxy.service", resume)
         self.assertIn("systemctl reset-failed iio-sensor-proxy.service", resume)
+
+    def test_the_resume_unit_retries_a_failure_a_bounded_number_of_times(self):
+        # Restart=on-failure, three starts in a window that outlasts three
+        # whole tries (each up to the start timeout, then the pause), so that
+        # the fourth is refused whatever the tries took; a stop (the next
+        # sleep's hook) is not retried, and is not waited for long.
+        sections, section = {}, None
+        for line in RESUME_UNIT.read_text().splitlines():
+            if line.startswith("["):
+                section = sections.setdefault(line.strip("[]"), {})
+            elif "=" in line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                section.setdefault(key, []).append(value)
+        unit, service = sections["Unit"], sections["Service"]
+        self.assertEqual(service["Type"], ["oneshot"])
+        self.assertEqual(service["Restart"], ["on-failure"])
+        self.assertEqual(service["RestartSec"], ["30s"])
+        self.assertEqual(service["TimeoutStopSec"], ["5s"])
+        self.assertEqual(unit["StartLimitBurst"], ["3"])
+        self.assertEqual(unit["StartLimitIntervalSec"], ["15min"])
+        self.assertNotIn("StartLimitBurst", service)
+        tries = int(unit["StartLimitBurst"][0])
+        one = int(service["TimeoutStartSec"][0]) + 30 + int(service["ExecStartPre"][0].split()[-1])
+        self.assertGreater(15 * 60, tries * one)
+        # The hook resets the count before every restart, so each resume gets
+        # its three.
+        hook = HOOK.read_text()
+        self.assertLess(hook.index("bounded systemctl reset-failed ubuntu-gts9u-sensors-resume.service"),
+                        hook.index("bounded systemctl restart --no-block ubuntu-gts9u-sensors-resume.service"))
+        self.assertIn("SSC did not become ready; rotation stays off unless a retry of this unit",
+                      RESUME.read_text())
 
     def test_the_sleep_test_runs_this_hook_s_pre_step_and_knows_it_by_the_proxy(self):
         # sensors=hook refuses a hook that does not stop iio-sensor-proxy (the

@@ -10,13 +10,33 @@ After=hexagonrpcd-adsp-sensorspd.service
 # desktop consumer exists instead.
 After=display-manager.service
 ConditionPathExists=/usr/bin/ssccli
+# A recovery that fails is tried again (Restart= below), three starts at most
+# in a quarter of an hour: the first and two more, then the unit stays failed.
+# The boot starts it, and the system-sleep hook ubuntu-gts9u-sensors after
+# every resume, with its count reset first, so each of those gets its three.
+# Each start attaches the sensor protection domain at most twice, as one
+# resume does.  The SM-X910 has had attaches in quick succession, one of them
+# stopped half a second in, in each of two bursts of five sleeps (2026-11-07
+# and 08), and SSC came up at the first attempt after each burst, with no
+# ADSP crash in its kernel log.
+StartLimitIntervalSec=15min
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
 ExecStartPre=/bin/sleep 2
 ExecStart=/usr/libexec/ubuntu-gts9u-sensors-resume
-# SSC discovery is slow: the loop allows 45 attempts two seconds apart.
+# SSC discovery is slow: the loop allows 45 attempts two seconds apart, each
+# with up to four seconds of ssccli, so this timeout can end it first.  A
+# timeout is a failure like the others, tried again below.
 TimeoutStartSec=210
+# Not after a stop: the next sleep, a shutdown or systemctl stop end it for
+# good.
+Restart=on-failure
+RestartSec=30s
+# It holds nothing that needs a clean exit (a shell, sleep, ssccli, systemctl),
+# and the next sleep's hook waits for its stop.
+TimeoutStopSec=5s
 
 [Install]
 WantedBy=multi-user.target

@@ -56,11 +56,13 @@
 # again, waits for a real accelerometer sample and starts the proxy with a
 # fresh client: auto-rotation and auto-brightness come back with it, 14 to 15
 # s after the resume on the SM-X910 (59 resumes, 2026-11-07 to 16).  Its
-# failed state and start count are reset first: systemd refuses a unit's
-# sixth start within 10 s (its default start limit), and quick sleeps in a
-# row came close to that (five in 7 s on 2026-11-08 there); a refused start
-# would leave the sensors off until a later resume.  --no-block: the resume
-# must not wait for it.
+# failed state and start count are reset first: the unit tries a failed
+# recovery again by itself, three starts in a quarter of an hour at most (its
+# StartLimitBurst=), and each resume gets its three.  Without the reset a few
+# resumes in that time, or quick sleeps in a row (five in 7 s on 2026-11-08
+# there), would use the starts up, and the restart, refused, would leave the
+# sensors off until a later resume.  --no-block: the resume must not wait for
+# it.
 #
 # The second argument (suspend, hibernate, hybrid-sleep,
 # suspend-then-hibernate) changes nothing: whatever the sleep, the clients
