@@ -585,6 +585,13 @@
 #     frozen the run reads the log once as the AOP left it, which is the
 #     first read of that part of the AOP's message RAM on this port, and
 #     every requester's DDR vote now (qcom_stats/ddr_votes), into the record.
+#     Revision 12's first run read a region that is not a CXPC log (its
+#     header's mode 0xdb, its lines 32-bit words); revision 13's kernel
+#     decodes the lines only under a CXPC header ("summary: not a CXPC log
+#     (mode ...)" otherwise) and logs the region raw around each suspend
+#     (right before the message, right after it, after the suspend; "cxpc
+#     raw:" evidence lines, at most cxpc_raw_max), and the run reads it raw
+#     before anything is frozen too (qcom_stats/cxpc_violators_raw).
 #     Refused on a kernel without the switch, and with dry.
 set -u
 export LC_ALL=C
@@ -640,6 +647,14 @@ sw_stats=/sys/module/qcom_stats/parameters
 sw_names="$sw_names cxpc"
 cxpc_log=/sys/kernel/debug/qcom_stats/cxpc_violators
 cxpc_ddr=/sys/kernel/debug/qcom_stats/ddr_votes
+# Revision 13's: the log's region raw (16 lines of 16 words), the debugfs
+# file and the kernel's "cxpc violators: raw ..." lines of each suspend (right
+# before the message to the AOP, right after it, after the suspend), which
+# the cycle's evidence lists apart from its other kernel lines; revision 12's
+# first run read a region that is not a CXPC log
+# (qcom-stats-cxpc-violators-diagnostic.patch).
+cxpc_raw=/sys/kernel/debug/qcom_stats/cxpc_violators_raw
+cxpc_raw_max=50
 # The line revision 11's PCIe host logs at each resume, and the one of a
 # guard that did not hold (pcie-qcom-keep-power-domain-while-link-kept.patch).
 guard_re='[0-9a-f]+\.pcie: system sleep: '
@@ -836,9 +851,10 @@ ev_domains='^(cx|mx|mxc|mmcx|lcx|lmx|gfx|ebi|ufs_|usb|pcie|mdss|power-domain-clu
 # Wi-Fi's, the DSPs', the clocks', rails' and votes', warnings and errors.
 # At most ev_klines,
 # and not the Wi-Fi's per-packet noise, the CPUs' feature lines or the
-# hung-task reports of writers waiting on the frozen disk.
+# hung-task reports of writers waiting on the frozen disk, nor the CXPC
+# log's raw region (its own evidence lines; cxpc_raw).
 ev_kernel='PM: |cxpc violators|psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110'
-ev_kernel_skip='msdu_done|SANITY CHECK|blocked for more than|hung_task_timeout_secs|Tainted:'
+ev_kernel_skip='msdu_done|SANITY CHECK|blocked for more than|hung_task_timeout_secs|Tainted:|cxpc violators: raw '
 ev_klines=150
 # How to reach TWRP from a running or looping tablet (docs/porting-log.md,
 # the TWRP flash: Volume Down + Power, then at once Volume Up + Power).
@@ -2453,6 +2469,13 @@ ev_after() { # SFX K
 	if [ "${cxpc_given:-0}" = 1 ]; then
 		evcxpc=$(awk '/cxpc violators: summary: / { sub(/.*cxpc violators: summary: /, ""); s = $0 } END { print (s == "" ? "no summary line in the kernel lines of this cycle" : s) }' "$2" 2>/dev/null)
 		say "$cyc: evidence: cxpc violators (the AOP log; each of its lines is among the kernel lines of this cycle): $evcxpc"
+		# Revision 13's kernel: the log's region raw, right before the message
+		# to the AOP, right after it and after the suspend (cxpc_raw), at most
+		# cxpc_raw_max lines.
+		grep -F 'cxpc violators: raw ' "$2" 2>/dev/null |
+			awk -v max="$cxpc_raw_max" '{ sub(/.*cxpc violators: raw /, ""); if (++n <= max) print }
+				END { if (n > max) printf "(%d more raw lines left out; the kmsg file in the run directory has them)\n", n - max }' |
+			while IFS= read -r evl; do say "$cyc: evidence: cxpc raw: $evl"; done
 	fi
 	say "$cyc: evidence: after: clocks (enable/prepare): $(ev_clk_line "$ramdir/ev-clk-$1.1" full)"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: after: genpd: $evl"; done
@@ -4197,6 +4220,12 @@ fi
 		echo "cxpc: the AOP's CXPC log as it is now ($cxpc_log): ${cxl:-not readable}"
 		cxl=$(awk '!/ absent$/ { gsub(/ +/, " "); printf "%s%s", (n++ ? ", " : ""), $0 }' "$cxpc_ddr" 2>/dev/null)
 		echo "cxpc: every requester's DDR vote now ($cxpc_ddr): ${cxl:-not readable}"
+		# Revision 13's kernel: the region raw as it is now.
+		if [ -e "$cxpc_raw" ]; then
+			echo "cxpc: the region raw now ($cxpc_raw, 16 lines of 16 words):"
+			cxl=$(awk '{ print "cxpc:   " $0 }' "$cxpc_raw" 2>/dev/null)
+			echo "${cxl:-cxpc:   not readable}"
+		fi
 	fi
 	[ "$rpmh" = 0 ] || echo "rpmh: the tracepoint $rpmh_event (${rpmh_was:-?} now) goes on right before the freeze; command DB: $([ -r "$cmd_db" ] && echo "$cmd_db, $(grep -c '^0x' "$cmd_db" 2>/dev/null) addresses" || echo "$cmd_db not readable: the addresses stay numbers")"
 	echo "kernel command line, the ignore_unused options:$({ tr ' ' '\n' < /proc/cmdline; } 2>/dev/null | grep -E '^(clk|pd|regulator)_ignore_unused$' | sed 's/^/ /' | tr -d '\n')"

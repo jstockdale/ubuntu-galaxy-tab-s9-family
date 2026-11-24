@@ -7913,6 +7913,59 @@ exit 0
         self.assertEqual(result.returncode, 2, self.out)
         self.assertIn("dry sleeps not at all: cxpc is for the AOP's log of a sleep", self.out)
 
+    def test_cxpc_lists_the_raw_region_apart_and_reads_it_raw_first(self):
+        """Revision 12's first run read a region that is no CXPC log (mode
+        0xdb, its lines 32-bit words); revision 13's kernel decodes only
+        under a CXPC header, says so in its summary otherwise, and logs the
+        region raw around each suspend.  The run reads the raw file before
+        anything is frozen, and lists the kernel's raw lines as evidence of
+        their own (at most 50), not among the cycle's kernel lines."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.debug_switches()
+        switch = self.root / "sys/module/qcom_stats/parameters/debug_cxpc_violators"
+        switch.parent.mkdir(parents=True, exist_ok=True)
+        switch.write_text("N\n")
+        stats = self.root / "sys/kernel/debug/qcom_stats"
+        stats.mkdir(parents=True, exist_ok=True)
+        (stats / "cxpc_violators").write_text("no log\n")
+        (stats / "ddr_votes").write_text("HLOS        ab 0 ib 0\n")
+        words = " ".join(["00000000"] * 16)
+        (stats / "cxpc_violators_raw").write_text("".join(f"+0x{4 * i:03x}: {words}\n" for i in range(0, 256, 16)))
+        raw = "".join(f"[  730.2{i:05d}] cxpc violators: raw after the suspend +0x{4 * (i % 16) * 16:03x}: {words}\n"
+                      for i in range(60))
+        log = ("[  700.000000] PM: suspend entry (deep)\n"
+               "[  700.100000] cxpc violators: the AOP's CXPC monitor is on for this suspend\n"
+               "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+               f"[  730.100000] cxpc violators: raw before the message +0x000: {words}\n"
+               "[  730.100001] cxpc violators: raw after the message: the same as before it\n"
+               + raw +
+               "[  730.300000] cxpc violators: mode 0xdb, 27 lines at most, every 16 ms, time shift 50, flush 1: not a "
+               "CXPC log (mode 0xcc, a time shift below 32), not decoded\n"
+               "[  730.300001] cxpc violators: summary: not a CXPC log (mode 0xdb); the region raw is above\n"
+               "[  730.400000] PM: suspend exit\n")
+        self.cycle(1, log=log)
+        result = self.run_test("ro", "1", "cxpc", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertIn(f"cxpc: the region raw now ({self.root}/sys/kernel/debug/qcom_stats/cxpc_violators_raw, 16 lines of "
+                      f"16 words):\ncxpc:   +0x000: {words}\n", before)
+        self.assertIn(f"cxpc:   +0x3c0: {words}\n", before)
+        self.assertIn("cycle 1/1: evidence: cxpc violators (the AOP log; each of its lines is among the kernel lines of "
+                      "this cycle): not a CXPC log (mode 0xdb); the region raw is above\n", self.out)
+        self.assertIn(f"cycle 1/1: evidence: cxpc raw: before the message +0x000: {words}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: cxpc raw: after the message: the same as before it\n", self.out)
+        shown = [line for line in self.out.splitlines() if "cycle 1/1: evidence: cxpc raw: " in line]
+        self.assertEqual(len(shown), 51, shown[-3:])
+        self.assertTrue(shown[-1].endswith("cycle 1/1: evidence: cxpc raw: (12 more raw lines left out; the kmsg file "
+                                           "in the run directory has them)"), shown[-1])
+        self.assertNotIn("cxpc violators: raw", "".join(line for line in self.out.splitlines(True)
+                                                        if ": evidence: kernel: " in line))
+        self.assertIn("cycle 1/1: evidence: kernel: [  730.300000] cxpc violators: mode 0xdb, 27 lines at most", self.out)
+        self.assertIn("cycle 1/1: evidence: cxpc: not a CXPC log (mode 0xdb); the region raw is above", self.pmsg_lines())
+
     def test_gdsc_ret_pcie0_keeps_the_domain_in_retention_for_the_run(self):
         """gdsc-ret=pcie0 writes N to pcie0 right before the freeze, read
         back, and the record says it: pcie0 N with "at boot: pcie0 Y"."""
