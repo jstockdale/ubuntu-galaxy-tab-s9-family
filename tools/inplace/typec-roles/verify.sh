@@ -3,7 +3,8 @@
 #   sh ~/typec-roles/verify.sh                  kernel, key, switches, the root's
 #                                               ext4, UFS, PCIe, its power
 #                                               domain's guard, Wi-Fi, GPU,
-#                                               roles now
+#                                               Bluetooth and the console's
+#                                               UART, roles now
 #                                               (with sudo also the UFS host
 #                                               clocks' enable counts)
 #   sudo sh ~/typec-roles/verify.sh dock [N]    N plug-ins of a powered dock
@@ -363,7 +364,7 @@ wait_partner() { # present|absent SECONDS; absent has to hold for 3 s, a
 case ${1:-} in
 dock|record|now|swap) plug_test "$@" ;;
 '') ;;
-*) sed -n '2,20s/^# //p' "$0" >&2; exit 2 ;;
+*) sed -n '2,21s/^# //p' "$0" >&2; exit 2 ;;
 esac
 
 echo "kernel: $(uname -v)"
@@ -656,6 +657,51 @@ if [ -n "$k" ]; then
 		printf '%s\n' "$ku" | grep -E "$gpu_rsc" | tail -n 3
 	fi
 fi
+
+# Revision 13 (qcom-geni-serial-force-suspend-in-system-sleep.patch, upstream
+# d0cd9c8d0fd5 with 3098c989bd38) powers the console's UART (uart7, ttyMSM0)
+# and the Bluetooth UART (uart14) down in every system suspend and up again
+# at the resume, the boot's panel cycle first.  After this boot's first
+# suspend, on any kernel: no interrupt was disabled ("nobody cared") and no
+# HCI command timed out (the Bluetooth UART's interrupt storm, or a UART that
+# did not come back: a FAIL), and the Bluetooth controller is there (a FAIL
+# on the kit's kernel).  The console's tty must not be a wakeup source:
+# uart_suspend_port() leaves such a port running, and the force suspend then
+# powers it down all the same, as upstream's does (a FAIL on the kit's
+# kernel, a note on another).
+bt_dead='nobody cared|Disabling IRQ #|hci[0-9]+: (command 0x[0-9a-f]+ tx timeout|Opcode 0x[0-9a-f]+ failed: -110)'
+if [ -n "$k" ]; then
+	hci=
+	for h in /sys/class/bluetooth/hci*; do
+		[ -e "$h" ] || continue
+		case ${h##*/} in *:*) continue ;; esac
+		hci="$hci ${h##*/}"
+	done
+	bd=$(printf '%s\n' "$ku" | grep -E "$bt_dead")
+	if [ -n "$bd" ]; then
+		bad "an interrupt was disabled or a Bluetooth command timed out this boot ($(printf '%s\n' "$bd" | wc -l) lines):"
+		printf '%s\n' "$bd" | head -n 5
+	elif [ -z "$after" ]; then
+		note "no suspend has run yet this boot (the panel cycle runs about 22 s in): the UARTs after it were not checked; run this again later${hci:+ (Bluetooth now:$hci)}"
+	elif [ -n "$hci" ]; then
+		ok "Bluetooth after this boot's first suspend:$hci, no disabled interrupt and no HCI command timeout"
+	elif [ -n "$want" ] && [ "$id" = "$want" ]; then
+		bad 'no Bluetooth controller (/sys/class/bluetooth/hci*) after this boot'"'"'s first suspend'
+	else
+		note 'no Bluetooth controller (/sys/class/bluetooth/hci*), and no disabled interrupt or HCI command timeout this boot'
+	fi
+fi
+tw=$(cat /sys/class/tty/ttyMSM0/power/wakeup 2>/dev/null)
+case $tw in
+disabled) ok 'console ttyMSM0: wakeup disabled (its UART powers down in system suspend with the kit'"'"'s kernel)' ;;
+enabled)
+	if [ -n "$want" ] && [ "$id" = "$want" ]; then
+		bad 'console ttyMSM0: wakeup enabled: uart_suspend_port() then leaves its UART running and the kit'"'"'s kernel powers it down all the same; echo disabled | sudo tee /sys/class/tty/ttyMSM0/power/wakeup'
+	else
+		note 'console ttyMSM0: wakeup enabled (its UART stays powered through a suspend on this kernel)'
+	fi ;;
+*) note 'no ttyMSM0 wakeup setting (/sys/class/tty/ttyMSM0/power/wakeup)' ;;
+esac
 
 # Revision 10's ufs-qcom-enable-only-lane-clocks.patch: ufshcd enables the
 # UFS host's clocks once while UFS works and not while it idles, and the

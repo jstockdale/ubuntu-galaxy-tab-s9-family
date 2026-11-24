@@ -261,6 +261,9 @@ PREFIXES = (
     # Revision 12: the device package's sensors hook (sleep-test.sh's
     # sensors=hook), the CXPC violators switch (cxpc).
     "/usr/lib/systemd/system-sleep/", "/sys/module/qcom_stats/parameters",
+    # Revision 13: the Bluetooth controller and the console's tty (verify.sh,
+    # sleep-test.sh's UART evidence).
+    "/sys/class/bluetooth", "/sys/class/tty/",
 )
 
 STUBS = {
@@ -1011,8 +1014,13 @@ class FakeTablet(unittest.TestCase):
         hang-log kit's configuration and ramoops, and the switches as built:
         the driver's two, and the debug switches as revision 12's kernel
         boots with them (pcie0 on, the others off); the PCIe link up, and
-        revision 10's power-up write line before the calibration entry."""
+        revision 10's power-up write line before the calibration entry; the
+        Bluetooth controller and the console's tty with its wakeup off, as
+        squirtle has them."""
         self.running(build_id)
+        (self.root / "sys/class/bluetooth/hci0").mkdir(parents=True, exist_ok=True)
+        (self.root / "sys/class/tty/ttyMSM0/power").mkdir(parents=True, exist_ok=True)
+        (self.root / "sys/class/tty/ttyMSM0/power/wakeup").write_text("disabled\n")
         params = self.root / "sys/module/sm5714_usbpd/parameters"
         (params / "sink_host_swap").write_text("Y\n")
         (params / "try_snk_extra_wait_ms").write_text("600\n")
@@ -3230,6 +3238,67 @@ class VerifyTest(FakeTablet):
                       "rpmhpd.debug_ret_floor=N pcie_qcom.debug_root_port_d3=N (at boot: pcie0 Y, pcie0phy N, usb N)\n",
                       result.stdout)
 
+    def test_bluetooth_after_the_first_suspend_and_the_console_s_wakeup_are_checked(self):
+        """Revision 13 powers the console's UART and the Bluetooth UART down
+        in every system suspend, the boot's panel cycle first.  After this
+        boot's first suspend a disabled interrupt or an HCI command timeout
+        fails on any kernel; no controller fails on the kit's kernel and is
+        a note on another; before any suspend it is a note.  The console's
+        tty wakeup enabled fails on the kit's kernel (its port would lose its
+        clock while it runs), and is a note on another."""
+        cycle = ("kernel: PM: suspend entry (deep)\nkernel: PM: suspend debug: Waiting for 0 second(s).\n"
+                 "kernel: PM: suspend exit\n")
+        self.boot_kit()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("note no suspend has run yet this boot (the panel cycle runs about 22 s in): the UARTs after it "
+                      "were not checked; run this again later (Bluetooth now: hci0)\n", result.stdout)
+        self.assertIn("ok   console ttyMSM0: wakeup disabled (its UART powers down in system suspend with the kit's "
+                      "kernel)\n", result.stdout)
+        self.journal_add(cycle)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   Bluetooth after this boot's first suspend: hci0, no disabled interrupt and no HCI command "
+                      "timeout\n", result.stdout)
+        for line in ("kernel: irq 191: nobody cared (try booting with the \"irqpoll\" option)",
+                     "kernel: Bluetooth: hci0: command 0xfc00 tx timeout",
+                     "kernel: Bluetooth: hci0: Opcode 0x0c03 failed: -110"):
+            with self.subTest(line):
+                self.boot_kit()
+                self.journal_add(cycle + line + "\n")
+                result = self.run_script("verify.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("FAIL an interrupt was disabled or a Bluetooth command timed out this boot (1 lines):\n"
+                              f"{line}\n", result.stdout)
+        # No controller after the suspend: a FAIL on the kit's kernel, a
+        # note on another.
+        self.boot_kit()
+        self.journal_add(cycle)
+        (self.root / "sys/class/bluetooth/hci0").rmdir()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"FAIL no Bluetooth controller ({self.root}/sys/class/bluetooth/hci*) after this boot's first "
+                      "suspend\n", result.stdout)
+        self.running(HANG_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertIn(f"note no Bluetooth controller ({self.root}/sys/class/bluetooth/hci*), and no disabled interrupt or "
+                      "HCI command timeout this boot\n", result.stdout)
+        # The console's tty as a wakeup source.
+        self.boot_kit()
+        (self.root / "sys/class/tty/ttyMSM0/power/wakeup").write_text("enabled\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL console ttyMSM0: wakeup enabled: uart_suspend_port() then leaves its UART running and the "
+                      f"kit's kernel powers it down all the same; echo disabled | sudo tee "
+                      f"{self.root}/sys/class/tty/ttyMSM0/power/wakeup\n", result.stdout)
+        self.running(HANG_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertIn("note console ttyMSM0: wakeup enabled (its UART stays powered through a suspend on this "
+                      "kernel)\n", result.stdout)
+        (self.root / "sys/class/tty/ttyMSM0/power/wakeup").unlink()
+        result = self.run_script("verify.sh")
+        self.assertIn(f"note no ttyMSM0 wakeup setting ({self.root}/sys/class/tty/ttyMSM0/power/wakeup)\n", result.stdout)
+
     def test_checks_see_revision_10_s_pcie_gpu_and_power_up_lines(self):
         """Revision 10: the Wi-Fi's PCIe link has to come up at boot without
         unpark-pcie0-pipe-mux.patch, no PCIe host or PHY failure line may
@@ -4152,7 +4221,10 @@ CLK_PARENTS = {"xo_board": None, "bi_tcxo": "xo_board", "bi_tcxo_ao": "xo_board"
                "gcc_ufs_phy_ahb_clk": None, "gcc_ufs_phy_axi_clk": "gcc_gpll0",
                "gcc_ufs_phy_unipro_core_clk": "gcc_gpll0", "gcc_ufs_phy_ice_core_clk": "gcc_gpll0",
                "gcc_usb30_prim_master_clk": "gcc_gpll0",
-               "gcc_ufs_phy_phy_aux_clk": "bi_tcxo", "tcsr_ufs_clkref_en": "bi_tcxo"}
+               "gcc_ufs_phy_phy_aux_clk": "bi_tcxo", "tcsr_ufs_clkref_en": "bi_tcxo",
+               # The two UARTs' serial engine clocks (revision 12's first run:
+               # the last two holders of XO at the sleep's entry).
+               "gcc_qupv3_wrap1_s7_clk": "gcc_gpll0", "gcc_qupv3_wrap2_s6_clk": "gcc_gpll0"}
 
 
 def write_clocks(directory, **counts):
@@ -7965,6 +8037,82 @@ exit 0
                                                         if ": evidence: kernel: " in line))
         self.assertIn("cycle 1/1: evidence: kernel: [  730.300000] cxpc violators: mode 0xdb, 27 lines at most", self.out)
         self.assertIn("cycle 1/1: evidence: cxpc: not a CXPC log (mode 0xdb); the region raw is above", self.pmsg_lines())
+
+    def uarts(self, wakeup="disabled", hci=True):
+        """The two UARTs as squirtle has them (2026-11-24): both runtime
+        active, the console's tty below its serial core devices, its
+        wakeup as given, and the Bluetooth controller hci0 (and a
+        connection's hci0:2, which is not a controller)."""
+        devices = self.root / "sys/bus/platform/devices"
+        for d in ("a9c000.serial", "898000.serial"):
+            (devices / d / "power").mkdir(parents=True, exist_ok=True)
+            (devices / d / "power/runtime_status").write_text("active\n")
+        tty = devices / "a9c000.serial/a9c000.serial:0/a9c000.serial:0.0/tty/ttyMSM0/power"
+        tty.mkdir(parents=True, exist_ok=True)
+        (tty / "wakeup").write_text(wakeup + "\n")
+        if hci:
+            for h in ("hci0", "hci0:2"):
+                (self.root / "sys/class/bluetooth" / h).mkdir(parents=True, exist_ok=True)
+
+    def test_the_uarts_clocks_at_the_sleep_s_entry_and_bluetooth_after_it(self):
+        """Revision 12's first run: the console's and the Bluetooth UART's
+        serial engine clocks were XO's last holders at the sleep's entry;
+        revision 13's kernel releases them.  With rpmh and the clock
+        tracepoints a line says, for each, whether the suspend unprepared it
+        and when it was prepared again; after every sleep the UARTs' runtime
+        state, their clocks' prepare counts, the console tty's wakeup and
+        the Bluetooth controller, and the first line of the cycle that says
+        Bluetooth lost its interrupt or its controller; in pmsg too, and the
+        UARTs in the record before the first sleep."""
+        (self.root / "dev/pmsg0").write_text("")
+        (self.root / "sys/power/mem_sleep").write_text("[s2idle]\n")
+        self.s2idle_files()
+        self.rpmh_files()
+        self.clk_events()
+        write_clocks(self.root / "sys/kernel/debug/clk", bi_tcxo=(3, 3), gcc_gpll0=(2, 2),
+                     gcc_qupv3_wrap1_s7_clk=(1, 1), gcc_qupv3_wrap2_s6_clk=(1, 1))
+        self.uarts()
+        # The console's clock unprepared before the sleep (708.000000) and
+        # prepared again after it; the Bluetooth UART's held.
+        self.cycle(1, log=self.s2idle_log())
+        (self.tmp / "cycle-1/trace").write_text(
+            clk_line(703.000000, "clk_unprepare", "gcc_qupv3_wrap1_s7_clk")
+            + rpmh_line(708.000000, "sleep", "0x50000", "0x0") + rpmh_line(708.000000, "wake", "0x50000", "0x60004001")
+            + clk_line(709.000000, "clk_prepare", "gcc_qupv3_wrap1_s7_clk"))
+        result = self.run_test("ro", "1", "mode=s2idle", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        entry = ("a9c000.serial (console, gcc_qupv3_wrap1_s7_clk): unprepared in the suspend at 703.000000, prepared "
+                 "again at 709.000000; 898000.serial (Bluetooth, gcc_qupv3_wrap2_s6_clk): prepared through the sleep's "
+                 "entry")
+        self.assertIn(f"cycle 1/1: evidence: UART clocks at the entry to the sleep (clock trace): {entry}\n", self.out)
+        now = ("a9c000.serial (console): runtime active, gcc_qupv3_wrap1_s7_clk prepared 1; ttyMSM0 wakeup disabled; "
+               "898000.serial (Bluetooth): runtime active, gcc_qupv3_wrap2_s6_clk prepared 1; hci0")
+        fine = "no disabled interrupt and no HCI command timeout in the kernel lines of this cycle"
+        self.assertIn(f"cycle 1/1: evidence: after: UARTs: {now}; Bluetooth: {fine}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: UARTs at the entry: console released 703.000000 to 709.000000, Bluetooth "
+                      "held; Bluetooth: ok", self.pmsg_lines())
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn(f"UARTs: {now}\n", (logs / "before").read_text())
+        # Without rpmh, a Bluetooth command that timed out after the resume:
+        # the UARTs as they are, and that line.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        (self.root / "dev/pmsg0").write_text("")
+        self.uarts(hci=False)
+        self.cycle(1, log="[  700.000000] PM: suspend entry (deep)\n"
+                          "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+                          "[  730.100000] PM: suspend exit\n"
+                          "[  732.200000] Bluetooth: hci0: command 0xfc00 tx timeout\n")
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        now = ("a9c000.serial (console): runtime active, gcc_qupv3_wrap1_s7_clk prepared -; ttyMSM0 wakeup disabled; "
+               "898000.serial (Bluetooth): runtime active, gcc_qupv3_wrap2_s6_clk prepared -; no controller")
+        self.assertIn(f"cycle 1/1: evidence: after: UARTs: {now}; Bluetooth: Bluetooth: hci0: command 0xfc00 tx "
+                      "timeout\n", self.out)
+        self.assertIn("cycle 1/1: evidence: UARTs after: console active, Bluetooth active, no controller; Bluetooth: "
+                      "Bluetooth: hci0: command 0xfc00 tx timeout", self.pmsg_lines())
+        self.assertNotIn("UART clocks at the entry", self.out)
 
     def test_gdsc_ret_pcie0_keeps_the_domain_in_retention_for_the_run(self):
         """gdsc-ret=pcie0 writes N to pcie0 right before the freeze, read

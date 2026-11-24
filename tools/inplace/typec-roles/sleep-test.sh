@@ -564,7 +564,13 @@
 #     suspend unprepared before the sleep began, and which it left: "XO at
 #     the entry to the sleep (clock trace): ..." (ev_xo_entry), also in pmsg
 #     with the Type-C roles; and the whole flush goes to pmsg too, in eight
-#     pieces at most, for a run whose terminal went away (over Wi-Fi).
+#     pieces at most, for a run whose terminal went away (over Wi-Fi).  The
+#     same trace says, for each of the two UARTs (the console's
+#     gcc_qupv3_wrap1_s7_clk and the Bluetooth UART's gcc_qupv3_wrap2_s6_clk,
+#     uart_map), whether the suspend unprepared its clock before the sleep
+#     and when it was prepared again: "UART clocks at the entry to the sleep
+#     (clock trace): ..." (ev_uart_entry; revision 12's kernel holds both,
+#     revision 13's releases them).
 #     Refused without the RPMh tracepoint (tracefs, a
 #     kernel with CONFIG_FTRACE: the kit's kernels), with tracing off
 #     (tracing_on 0) or with a trace clock other than local; without the
@@ -822,6 +828,22 @@ ev_clk_names='bi_tcxo tcsr_ufs_pad_clkref_en gcc_ufs_phy_axi_clk gcc_ufs_phy_ahb
 # "Evidence around each cycle").  A clock prepared below it keeps it
 # prepared.
 xo_clk=bi_tcxo
+# The two geni UARTs both tablets use (sm8550.dtsi, enabled by both board
+# device trees), each "DEVICE:SE CLOCK:ROLE": uart7, the console ttyMSM0, and
+# uart14, the Bluetooth UART that hci_qca opens through serdev.  In v7.2-rc3
+# each kept its "se" clock, below XO, prepared through every system sleep
+# (revision 12's first run: the only two holders of XO at the sleep's entry):
+# the serial core's power-off at suspend, pm_runtime_put_sync(), cannot
+# runtime-suspend a device the PM core holds for the transition
+# (device_prepare()).  Revision 13's kernel force-suspends them
+# (qcom-geni-serial-force-suspend-in-system-sleep.patch, upstream
+# d0cd9c8d0fd5): the clock trace (ev_uart_entry) says whether each clock was
+# unprepared before the sleep and prepared again after it, and the cycle's
+# kernel lines whether Bluetooth answered after the resume (bt_dead_re).
+uart_map='a9c000.serial:gcc_qupv3_wrap1_s7_clk:console 898000.serial:gcc_qupv3_wrap2_s6_clk:Bluetooth'
+# A Bluetooth UART that lost its interrupt or its controller after a resume
+# (the bt-uart kit's checks, tools/inplace/bt-uart/suspend-bt.sh).
+bt_dead_re='nobody cared|Disabling IRQ #|hci[0-9]+: (command 0x[0-9a-f]+ tx timeout|Opcode 0x[0-9a-f]+ failed: -110)'
 # The interrupt lines of the DSPs' messages and signals (IPCC, glink, SMP2P,
 # the remoteprocs' q6v5 lines, the AOSS QMP mailbox, FastRPC): their counts
 # across each sleep (evidence: dsp irq).
@@ -848,12 +870,12 @@ ev_domains='^(cx|mx|mxc|mmcx|lcx|lmx|gfx|ebi|ufs_|usb|pcie|mdss|power-domain-clu
 # suspend-to-idle", "PM: Triggering wakeup from IRQ N", "PM: resume from
 # suspend-to-idle", "Timekeeping suspended for ..."), the CPUs', the
 # storage's and the diagnostic's, the USB host's, the PCIe link's and the
-# Wi-Fi's, the DSPs', the clocks', rails' and votes', warnings and errors.
-# At most ev_klines,
+# Wi-Fi's, the DSPs', Bluetooth's (a disabled interrupt, revision 13), the
+# clocks', rails' and votes', warnings and errors.  At most ev_klines,
 # and not the Wi-Fi's per-packet noise, the CPUs' feature lines or the
 # hung-task reports of writers waiting on the frozen disk, nor the CXPC
 # log's raw region (its own evidence lines; cxpc_raw).
-ev_kernel='PM: |cxpc violators|psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110'
+ev_kernel='PM: |cxpc violators|psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110|nobody cared|Disabling IRQ|Bluetooth'
 ev_kernel_skip='msdu_done|SANITY CHECK|blocked for more than|hung_task_timeout_secs|Tainted:|cxpc violators: raw '
 ev_klines=150
 # How to reach TWRP from a running or looping tablet (docs/porting-log.md,
@@ -1983,6 +2005,116 @@ ev_xo_entry() { # CLOCKS CLKT K full|short
 		}' "$1" "$2" 2>/dev/null
 }
 
+# rpmh with the clock tracepoints: each UART of uart_map at the sleep's
+# entry, from CLOCKS (ev_clk_snap right before the sleep) and CLKT (the
+# attempt's clk_prepare and clk_unprepare lines), against the sleep's
+# instant in K as ev_xo_entry has it.  One line, a part per UART: "DEVICE
+# (ROLE, CLOCK): unprepared in the suspend at T, prepared again at T'" (the
+# clock released; T' the first prepare after the sleep), "prepared through
+# the sleep's entry" (held: revision 12's kernel, or a fix that did not
+# work), "not prepared before the sleep" (the port was not in use), or "not
+# in the clock read".  With short, for pmsg: "console released T to T',
+# Bluetooth held".
+ev_uart_entry() { # CLOCKS CLKT K [short]
+	[ "${clk_trace:-0}" = 1 ] || { echo 'no clock trace (the clk_prepare and clk_unprepare tracepoints were not on)'; return 0; }
+	[ -s "$1" ] || { echo 'clock counts not readable'; return 0; }
+	evb=$(ev_sleep_bound "$3")
+	awk -v map="$uart_map" -v bound="${evb% *}" -v frozen="${evb#* }" -v short="${4:-}" '
+		'"$ev_bound_awk"'
+		BEGIN {
+			n = split(map, m, " ")
+			for (u = 1; u <= n; u++) { split(m[u], f, ":"); dev[u] = f[1]; clk[u] = f[2]; role[u] = f[3]; want[f[2]] = u }
+		}
+		FILENAME == ARGV[1] { if ($1 in want) { read[$1] = 1; on[$1] = ($3 ~ /^[0-9]+$/ && $3 + 0 > 0) } next }
+		{
+			for (i = 2; i <= NF; i++) if ($i == "clk_prepare:" || $i == "clk_unprepare:") break
+			if (i > NF) next
+			c = $(i + 1)
+			if (!(c in want)) next
+			ts = $(i - 1)
+			sub(/:$/, "", ts)
+			if (ev_after_sleep(ts)) {
+				if ($i == "clk_prepare:" && !(c in back)) back[c] = ts
+				next
+			}
+			if ($i == "clk_prepare:") on[c] = 1
+			else { on[c] = 0; off[c] = ts }
+		}
+		END {
+			if (short == "short") {
+				for (u = 1; u <= n; u++) {
+					c = clk[u]
+					printf "%s%s ", (u > 1 ? ", " : ""), role[u]
+					if (!(c in read)) printf "not read"
+					else if (on[c]) printf "held"
+					else if (c in off) printf "released %s%s", off[c], (c in back ? " to " back[c] : "")
+					else printf "not in use"
+				}
+				printf "\n"
+				exit
+			}
+			for (u = 1; u <= n; u++) {
+				c = clk[u]
+				printf "%s%s (%s, %s): ", (u > 1 ? "; " : ""), dev[u], role[u], c
+				if (!(c in read)) { printf "not in the clock read"; continue }
+				if (on[c]) printf "prepared through the sleep\047s entry"
+				else if (c in off) printf "unprepared in the suspend at %s", off[c]
+				else printf "not prepared before the sleep"
+				if (c in back) printf ", prepared again at %s", back[c]
+			}
+			printf "\n"
+		}' "$1" "$2" 2>/dev/null
+}
+
+# The UARTs of uart_map now: each one's runtime PM status, its clock's
+# prepare count, and its role's own state (the console's tty wakeup, which
+# would keep the port running through uart_suspend_port(); Bluetooth's
+# controller, hci0 or none).  One line; with short, for pmsg, "console
+# active, Bluetooth active, hci0".
+ev_uarts() { # [short]
+	evu=
+	for evm in $uart_map; do
+		evd=${evm%%:*}
+		evr=${evm##*:}
+		evc=${evm#*:}
+		evc=${evc%%:*}
+		evp=/sys/bus/platform/devices/$evd
+		if [ "${1:-}" = short ]; then
+			eve="$evr $(ev_val "$evp/power/runtime_status")"
+			if [ "$evr" = Bluetooth ]; then
+				evh=no
+				for evq in /sys/class/bluetooth/hci*; do
+					[ -e "$evq" ] || continue
+					case ${evq##*/} in *:*) continue ;; esac
+					evh=
+				done
+				[ -n "$evh" ] && eve="$eve, no controller" || eve="$eve, hci0"
+			fi
+			evu="$evu${evu:+, }$eve"
+			continue
+		fi
+		eve="$evd ($evr): runtime $(ev_val "$evp/power/runtime_status"), $evc prepared $(ev_val "$clk_dir/$evc/clk_prepare_count")"
+		case $evr in
+		console)
+			evt=
+			for evq in "$evp"/*/*/tty/*; do
+				[ -e "$evq" ] && evt="$evt ${evq##*/} wakeup $(ev_val "$evq/power/wakeup")"
+			done
+			eve="$eve;${evt:- no tty}" ;;
+		Bluetooth)
+			evh=
+			for evq in /sys/class/bluetooth/hci*; do
+				[ -e "$evq" ] || continue
+				case ${evq##*/} in *:*) continue ;; esac
+				evh="$evh ${evq##*/}"
+			done
+			eve="$eve;${evh:- no controller}" ;;
+		esac
+		evu="$evu${evu:+; }$eve"
+	done
+	echo "$evu"
+}
+
 # Each power domain with its idle states' usage and rejected counts added
 # up ("NAME USAGE REJECTED" lines; pm_genpd/NAME/idle_states,
 # idle_states_show(), drivers/pmdomain/core.c).  A usage is a power-off that
@@ -2400,10 +2532,12 @@ ev_resumed() { # SFX
 # Once the cycle's kernel lines are in K: what the sleep reached, what woke
 # or kept it, whether the PCIe link went down and came back, the Wi-Fi's
 # state, what genpd powered off, the DSPs' interrupts, what held XO, the
-# domains now, and the cycle's kernel lines (and with mode=s2idle,
-# ev_s2idle; with rpmh, the sleep set, ev_rpmh).  ev_keep then puts five
-# short lines of it in pmsg (one more with mode=s2idle, one more with
-# rpmh), for an attempt that was not given up before the sleep.
+# UARTs and Bluetooth, the domains now, and the cycle's kernel lines (and
+# with mode=s2idle, ev_s2idle; with rpmh, the sleep set, ev_rpmh, and the
+# UARTs' clocks at the sleep's entry, ev_uart_entry).  ev_keep then puts five
+# short lines of it in pmsg (one more with mode=s2idle, more with rpmh, and
+# the UARTs' with rpmh or when Bluetooth failed), for an attempt that was
+# not given up before the sleep.
 ev_after() { # SFX K
 	evdepth=$(ev_stats_delta "$ramdir/ev-stats-$1.0" "$ramdir/ev-stats-$1.1")
 	evwake=$(ev_wake_delta "$ramdir/ev-wake-$1.0" "$ramdir/ev-wake-$1.1")
@@ -2458,6 +2592,13 @@ ev_after() { # SFX K
 	say "$cyc: evidence: wifi: $evwifi"
 	say "$cyc: evidence: genpd powered off in the sleep (idle states usage of each domain): $evgpd"
 	say "$cyc: evidence: after: XO held by: $evxo1"
+	# The UARTs (uart_map) after the resume, and whether Bluetooth lost its
+	# interrupt or its controller in this cycle (bt_dead_re).
+	evbt=$(grep -E "$bt_dead_re" "$2" 2>/dev/null | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+	evbtok=0
+	[ -n "$evbt" ] || { evbt='no disabled interrupt and no HCI command timeout in the kernel lines of this cycle'; evbtok=1; }
+	say "$cyc: evidence: after: UARTs: $(ev_uarts); Bluetooth: $evbt"
+	evuart="after: $(ev_uarts short)"
 	if [ "$rpmh" = 1 ]; then
 		ev_rpmh_snap "$ramdir/ev-rpmh-$1"
 		evrpmhf=$(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" full)
@@ -2465,6 +2606,8 @@ ev_after() { # SFX K
 		evrpmh=$(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" short)
 		say "$cyc: evidence: XO at the entry to the sleep (clock trace): $(ev_xo_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" full)"
 		evxoe=$(ev_xo_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" short)
+		say "$cyc: evidence: UART clocks at the entry to the sleep (clock trace): $(ev_uart_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2")"
+		evuart="at the entry: $(ev_uart_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" short)"
 	fi
 	if [ "${cxpc_given:-0}" = 1 ]; then
 		evcxpc=$(awk '/cxpc violators: summary: / { sub(/.*cxpc violators: summary: /, ""); s = $0 } END { print (s == "" ? "no summary line in the kernel lines of this cycle" : s) }' "$2" 2>/dev/null)
@@ -2500,6 +2643,9 @@ ev_keep() { # SFX
 		# over Wi-Fi, which the sleep takes down): in pieces, at most eight.
 		ev_pmsg_pieces "$cyc: evidence: rpmh sleep set" "$evrpmhf" 8
 	fi
+	# The UARTs' line with rpmh (their clocks at the entry), or when
+	# Bluetooth failed: the ten-cycle budget of pmsg stays as it was.
+	[ "$rpmh" != 1 ] && [ "$evbtok" = 1 ] || ev_pmsg "$cyc: evidence: UARTs $evuart; Bluetooth: $([ "$evbtok" = 1 ] && echo ok || echo "$evbt")"
 	[ "${cxpc_given:-0}" = 0 ] || ev_pmsg "$cyc: evidence: cxpc: $evcxpc"
 	[ "$sleep_mode" != s2idle ] || ev_pmsg "$cyc: evidence: s2idle: $s2pmsg"
 }
@@ -4227,6 +4373,10 @@ fi
 			echo "${cxl:-cxpc:   not readable}"
 		fi
 	fi
+	# The two UARTs (uart_map): in use, their clocks prepared, the console's
+	# tty wakeup (enabled would keep its port running in a suspend), and
+	# Bluetooth's controller.
+	echo "UARTs: $(ev_uarts)"
 	[ "$rpmh" = 0 ] || echo "rpmh: the tracepoint $rpmh_event (${rpmh_was:-?} now) goes on right before the freeze; command DB: $([ -r "$cmd_db" ] && echo "$cmd_db, $(grep -c '^0x' "$cmd_db" 2>/dev/null) addresses" || echo "$cmd_db not readable: the addresses stay numbers")"
 	echo "kernel command line, the ignore_unused options:$({ tr ' ' '\n' < /proc/cmdline; } 2>/dev/null | grep -E '^(clk|pd|regulator)_ignore_unused$' | sed 's/^/ /' | tr -d '\n')"
 	echo "root: $rootsrc ext4, ext4 errors_count $rooterr, state $rootstate; to freeze, the root last:$(freeze_order "$rootsrc" | awk '!seen[$1]++ { printf " %s", $2 }')"
