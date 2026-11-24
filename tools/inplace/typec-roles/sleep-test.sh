@@ -4,7 +4,7 @@
 #   sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
 #        [pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
 #        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]
-#        [sensors=stop] restart-ok
+#        [sensors=stop|sensors=hook] restart-ok
 #   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]
 #        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok
 #   sh ~/typec-roles/sleep-test.sh status
@@ -612,6 +612,11 @@ guard_bad_re='[0-9a-f]+\.pcie: system sleep: the link was kept, but genpd powere
 guard_kept_re='[0-9a-f]+\.pcie: system sleep: the link was kept, and its power domain stayed on'
 # sensors=stop: the audio DSP's sensor clients in userspace.
 sensor_units='iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service'
+# sensors=hook: the device package's system-sleep hook, which stops them
+# before a systemctl suspend in a device package with this branch's hook (it
+# names iio-sensor-proxy.service; the earlier hook stops neither, and the
+# option is refused with it).
+sensors_hook=/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors
 # mode=s2idle's checks and evidence (reads only): each CPU's cpuidle states,
 # and the idle states of the CPU cluster's power domain (debugfs).
 cpu_devs=/sys/devices/system/cpu
@@ -3503,7 +3508,7 @@ fi
 # ------------------------------------------------------ before: the disk ---
 cycles=3 seconds=30 hold=300 aborts=5 release=0 confirmed=0 numbers=0 dry=0 mode= aborts_given=0
 pci_remove=0 pci_keep=0 pm_test= trace= sleep_mode= sw_set= sw_ret= gdsc_given=0 cxmx_given=0 ret_given=0 rpmh=0
-rpd3_given=0 sensors_stop=0
+rpd3_given=0 sensors_stop=0 sensors_opt=
 for a in "$@"; do
 	case $a in
 	ro|dry)
@@ -3568,10 +3573,12 @@ for a in "$@"; do
 		[ "$rpd3_given" = 0 ] || { echo "$me: one root-port-d3 at most" >&2; usage; }
 		rpd3_given=1
 		sw_set="$sw_set rpd3" ;;
-	sensors=stop)
-		[ "$sensors_stop" = 0 ] || { echo "$me: one sensors=stop at most" >&2; usage; }
-		sensors_stop=1 ;;
-	sensors=*) echo "$me: sensors=stop is the only sensors= option, not '$a'" >&2; usage ;;
+	sensors=stop|sensors=hook)
+		[ "$sensors_stop" = 0 ] || { echo "$me: one sensors= at most" >&2; usage; }
+		sensors_opt=$a
+		sensors_stop=1
+		[ "$a" != sensors=hook ] || sensors_stop=hook ;;
+	sensors=*) echo "$me: sensors=stop and sensors=hook are the sensors= options, not '$a'" >&2; usage ;;
 	*)
 		num "$a" || { echo "$me: unknown argument '$a'" >&2; usage; }
 		numbers=$((numbers + 1))
@@ -3588,7 +3595,7 @@ if [ "$dry" = 1 ]; then
 	[ "$pci_keep" = 0 ] || { echo "$me: dry sleeps not at all: pci=keep is for a sleep with the PCI devices kept" >&2; usage; }
 	[ "$rpmh" = 0 ] || { echo "$me: dry sleeps not at all: rpmh is for the RPMh commands of a sleep" >&2; usage; }
 	[ "$rpd3_given" = 0 ] || { echo "$me: dry sleeps not at all: root-port-d3 is for the sleeps of a pci=keep run" >&2; usage; }
-	[ "$sensors_stop" = 0 ] || { echo "$me: dry sleeps not at all: sensors=stop is for the audio DSP's wakes in a sleep" >&2; usage; }
+	[ "$sensors_stop" = 0 ] || { echo "$me: dry sleeps not at all: $sensors_opt is for the audio DSP's wakes in a sleep" >&2; usage; }
 	cycles=0
 else
 	[ "$cycles" -ge 1 ] && [ "$cycles" -le 10 ] || { echo "$me: CYCLES is 1 to 10, not $cycles" >&2; usage; }
@@ -3643,7 +3650,7 @@ done
 [ "$cxmx_given" = 0 ] || options="$options cxmx=ret"
 [ "$rpd3_given" = 0 ] || options="$options root-port-d3"
 [ "$rpmh" = 0 ] || options="$options rpmh"
-[ "$sensors_stop" = 0 ] || options="$options sensors=stop"
+[ "$sensors_stop" = 0 ] || options="$options $sensors_opt"
 options=${options# }
 options=${options:-none}
 
@@ -3801,6 +3808,12 @@ pwrdn_seen=0
 if dmesg 2>/dev/null | grep -v 'gts9u sleep-test: ' | grep -q 'power-up write: PWRDN' ||
 	journalctl -k -b --no-pager -q 2>/dev/null | grep -v 'gts9u sleep-test: ' | grep -q 'power-up write: PWRDN'; then
 	pwrdn_seen=1
+fi
+# sensors=hook: the device package's hook that stops the sensor clients
+# before a sleep, or nothing to run.
+if [ "$sensors_stop" = hook ]; then
+	[ -r "$sensors_hook" ] && grep -q 'systemctl stop iio-sensor-proxy.service' "$sensors_hook" ||
+		refuse "sensors=hook needs the device package's system-sleep hook that stops the sensor clients before a sleep ($sensors_hook, naming iio-sensor-proxy.service); this tablet's does not: sensors=stop stops them by hand"
 fi
 # rpmh: the tracepoint there and writable, and tracing on, or the trace
 # would stay empty.  The command DB names the addresses; without it they
@@ -4126,7 +4139,7 @@ fi
 		read -r pst 2>/dev/null < "$ps" || :
 		[ "$pst" = closed ] || pcm="$pcm ${ps#/proc/asound/}(${pst:-?})"
 	done
-	echo "ADSP clients: $(adsp_units); PipeWire and WirePlumber processes $pw; sound streams not closed:${pcm:- none}$([ "$sensors_stop" = 0 ] || echo "; sensors=stop: this run stops $sensor_units next, until the restart")"
+	echo "ADSP clients: $(adsp_units); PipeWire and WirePlumber processes $pw; sound streams not closed:${pcm:- none}$([ "$sensors_stop" = 0 ] || echo "; $sensors_opt: this run stops $sensor_units next$([ "$sensors_stop" != hook ] || echo " through $sensors_hook pre suspend"), until the restart")"
 	[ "$rpmh" = 0 ] || echo "rpmh: the tracepoint $rpmh_event (${rpmh_was:-?} now) goes on right before the freeze; command DB: $([ -r "$cmd_db" ] && echo "$cmd_db, $(grep -c '^0x' "$cmd_db" 2>/dev/null) addresses" || echo "$cmd_db not readable: the addresses stay numbers")"
 	echo "kernel command line, the ignore_unused options:$({ tr ' ' '\n' < /proc/cmdline; } 2>/dev/null | grep -E '^(clk|pd|regulator)_ignore_unused$' | sed 's/^/ /' | tr -d '\n')"
 	echo "root: $rootsrc ext4, ext4 errors_count $rooterr, state $rootstate; to freeze, the root last:$(freeze_order "$rootsrc" | awk '!seen[$1]++ { printf " %s", $2 }')"
@@ -4146,9 +4159,14 @@ while IFS= read -r l; do say "$l"; done < "$ramdir/before"
 # sensors=stop (the header): the audio DSP's sensor clients stopped for the
 # run, the last change before the floor's release; one still running stops
 # the run here, nothing frozen.
-if [ "$sensors_stop" = 1 ]; then
-	say "sensors=stop: systemctl stop $sensor_units (auto-rotation and auto-brightness are off until the restart)"
-	systemctl stop $sensor_units >> "$ramdir/log" 2>&1
+if [ "$sensors_stop" != 0 ]; then
+	if [ "$sensors_stop" = hook ]; then
+		say "sensors=hook: $sensors_hook pre suspend, as systemd-sleep runs it before a systemctl suspend (it stops $sensor_units; auto-rotation and auto-brightness are off until the restart, which runs no post)"
+		sh "$sensors_hook" pre suspend >> "$ramdir/log" 2>&1
+	else
+		say "sensors=stop: systemctl stop $sensor_units (auto-rotation and auto-brightness are off until the restart)"
+		systemctl stop $sensor_units >> "$ramdir/log" 2>&1
+	fi
 	sensors_rc=$?
 	sensors_now=$(adsp_units)
 	sensors_up=
@@ -4158,12 +4176,14 @@ if [ "$sensors_stop" = 1 ]; then
 		esac
 	done
 	debug_note="${debug_note:+$debug_note; }iio-sensor-proxy and hexagonrpcd-adsp-sensorspd stay stopped until the next boot (sudo reboot brings them back)"
+	sensors_by='systemctl stop'
+	[ "$sensors_stop" != hook ] || sensors_by='the hook'
 	if [ -n "$sensors_up" ]; then
 		cp "$ramdir/log" "$logs/log"
 		own
-		stop "sensors=stop: still running after systemctl stop (status $sensors_rc):$sensors_up; ADSP clients now: $sensors_now"
+		stop "$sensors_opt: still running after $sensors_by (status $sensors_rc):$sensors_up; ADSP clients now: $sensors_now"
 	fi
-	say "sensors=stop: ADSP clients now: $sensors_now (systemctl stop status $sensors_rc); ${settle}s to settle"
+	say "$sensors_opt: ADSP clients now: $sensors_now ($sensors_by status $sensors_rc); ${settle}s to settle"
 	sleep "$settle"
 fi
 

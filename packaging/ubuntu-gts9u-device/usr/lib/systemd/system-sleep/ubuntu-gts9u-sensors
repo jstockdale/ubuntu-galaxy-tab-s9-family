@@ -7,13 +7,45 @@
 # port, anonymous `systemd-run --on-active` timers fired 7 to 16 seconds late
 # and rapid lid cycles left several of them racing to restart the same FastRPC
 # protection domain, which ended in "SSC QMI Service not found".
+#
+# Before the sleep the Sensor Core's clients go, so that no sensor stream
+# runs through it.  The sensors live in the audio DSP (SSC), and the streams
+# the desktop claims through iio-sensor-proxy (orientation, ambient light)
+# stay open through a system sleep: the DSP keeps sampling them, leaving its
+# own sleep 30 to 50 times a second, and with it the DDR's low-power mode,
+# while the rest of the SoC sleeps.  On the SM-X710 (2026-11-23) a 30 s
+# suspend with them running counted about 1,500 of the DSP's wakes, and none
+# with iio-sensor-proxy and hexagonrpcd-adsp-sensorspd stopped first (the
+# Type-C roles kit's revision 10 run 6 and revision 11 run 5); with the DSP
+# quiet the DDR stayed in its low-power mode for the whole sleep.  Neither
+# keeps anything across the sleep: libssc cannot reconnect a QMI client after
+# the DSP's power collapse, so the resume restarts the proxy anyway, and a
+# systemd suspend stops the sensor protection domain's file server already
+# (its unit's Conflicts=suspend.target), though in no order with the sleep
+# itself.  Here both stop synchronously, the client first, before
+# systemd-sleep writes /sys/power/state.  Only where the resume path below
+# can bring the proxy back (ubuntu-gts9u-sensors-resume needs ssccli).
+#
+# After the sleep ubuntu-gts9u-sensors-resume attaches the protection domain
+# again, waits for a real accelerometer sample and starts the proxy with a
+# fresh client: auto-rotation and auto-brightness come back with it.
+#
+# Both boards, the SM-X910 and the SM-X710: the same DSP, sensor stack and
+# units.  tools/inplace/typec-roles/sleep-test.sh sensors=hook runs this
+# hook's pre step for a sleep that rtcwake drives itself.
+SSCCLI=/usr/bin/ssccli
 
-case "$1" in
+case "${1-}" in
 	pre)
 		systemctl stop ubuntu-gts9u-sensors-resume.service 2>/dev/null || true
+		if [ -x "$SSCCLI" ]; then
+			systemctl stop iio-sensor-proxy.service 2>/dev/null || true
+			systemctl stop hexagonrpcd-adsp-sensorspd.service 2>/dev/null || true
+		fi
 		;;
 	post)
 		systemctl restart --no-block \
 			ubuntu-gts9u-sensors-resume.service || true
 		;;
 esac
+exit 0

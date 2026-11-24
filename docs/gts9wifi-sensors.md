@@ -89,6 +89,25 @@ The sensor rails stay always-on board rails (L1B 1.8 V, L16B 3.0 V): Samsung's
 `remoteproc-adsp` node votes them as `sensor_vdd`/`sensor_vddio` for as long as
 the ADSP runs, and mainline `qcom_q6v5_pas` has no such supplies.
 
+## Across a system suspend
+
+The sensors run inside the ADSP, and the streams the desktop claims through
+`iio-sensor-proxy` (orientation, ambient light) stay open through a system
+sleep unless something closes them: the DSP keeps sampling and leaves its own
+sleep 30 to 50 times a second.  On the X710 a 30 s suspend counted about
+1,500 of the DSP's wakes with them open, and none with `iio-sensor-proxy` and
+`hexagonrpcd-adsp-sensorspd` stopped first (Type-C kit revision 10 run 6 and
+revision 11 run 5, 2026-11-23).  So the device package's system-sleep hook
+`/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors` stops both before every
+`systemctl suspend`, the proxy first, synchronously, and after the resume
+restarts `ubuntu-gts9u-sensors-resume`, which attaches the sensor protection
+domain again, waits for a real accelerometer sample and starts the proxy with
+a fresh client (it had to be restarted after a resume anyway: libssc cannot
+reconnect a QMI client after the DSP's power collapse).  Auto-rotation and
+auto-brightness come back with it.  Both boards; the proxy is stopped only
+where `ssccli`, which the resume unit needs, is installed.  The Type-C kit's
+`sleep-test.sh sensors=hook` runs the hook's pre step for its rtcwake sleeps.
+
 ## Checking it
 
 ```sh

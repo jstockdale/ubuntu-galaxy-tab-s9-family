@@ -235,6 +235,9 @@ PREFIXES = (
     # Revision 11's root port debug switch (verify.sh, sleep-test.sh's
     # root-port-d3).
     "/sys/module/pcie_qcom/parameters",
+    # Revision 12: the device package's sensors hook (sleep-test.sh's
+    # sensors=hook).
+    "/usr/lib/systemd/system-sleep/",
 )
 
 STUBS = {
@@ -6652,7 +6655,8 @@ exit 0
                     "root-port-d3", "pci=remove root-port-d3", "pci=keep root-port-d3 root-port-d3",
                     "pci=keep root-port-d3 gdsc-ret=pcie0", "pci=keep root-port-d3 pm_test=devices",
                     "pci=keep root-port-d3 pm_test=freezer", "dry root-port-d3", "root-port-d3=1",
-                    "sensors=", "sensors=start", "sensors=stop sensors=stop", "dry sensors=stop", "sensors"):
+                    "sensors=", "sensors=start", "sensors=stop sensors=stop", "dry sensors=stop", "sensors",
+                    "sensors=stop sensors=hook", "sensors=hook sensors=hook", "sensors=Hook"):
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
@@ -6660,7 +6664,7 @@ exit 0
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok", result.stderr)
                 self.assertIn("[pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]\n"
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]\n"
-                              "       [sensors=stop] restart-ok", result.stderr)
+                              "       [sensors=stop|sensors=hook] restart-ok", result.stderr)
                 self.assert_nothing_done()
 
     # Revision 9's debug switches (gdsc=, cxmx=ret): run-time module
@@ -7062,7 +7066,7 @@ exit 0
                 result = self.run_test("ro", *bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
                 self.assertIn("[trace|trace=live] [mode=s2idle]\n       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] "
-                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [sensors=stop] restart-ok", result.stderr)
+                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [sensors=stop|sensors=hook] restart-ok", result.stderr)
                 self.assert_nothing_done()
                 if "pm_test=" in bad:
                     level = bad.split("pm_test=")[1].split()[0]
@@ -7717,6 +7721,68 @@ exit 0
         self.assertEqual(self.read("frozen"), "")
         self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
         self.assertEqual(self.sysrq(), "")
+
+    def sensors_hook(self, quiesces=True):
+        """The device package's sensors hook as the stand-in root has it: one
+        that stops the Sensor Core's clients before a sleep (this branch's),
+        or the earlier one, which stops neither."""
+        hook = self.root / "usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        body = ('\t\tsystemctl stop iio-sensor-proxy.service 2>/dev/null || true\n'
+                '\t\tsystemctl stop hexagonrpcd-adsp-sensorspd.service 2>/dev/null || true\n') if quiesces else ""
+        hook.write_text('#!/bin/sh\necho "hook $*" >> "$HOME/hook.calls"\ncase "${1-}" in\n\tpre)\n'
+                        '\t\tsystemctl stop ubuntu-gts9u-sensors-resume.service 2>/dev/null || true\n'
+                        f"{body}\t\t;;\nesac\nexit 0\n")
+
+    def test_sensors_hook_runs_the_device_package_s_sleep_hook_as_a_systemd_suspend_does(self):
+        """sensors=hook: the device package's system-sleep hook's pre step
+        (pre suspend, as systemd-sleep runs it) in place of sensors=stop's
+        systemctl stop, checked the same way; no post step (the run ends with
+        a restart).  Refused, nothing done, with a hook that does not stop
+        iio-sensor-proxy, and on a dry run."""
+        for unit in ("iio-sensor-proxy", "hexagonrpcd-adsp-sensorspd"):
+            (self.tmp / f"active-{unit}.service").write_text("active\n")
+        self.sensors_hook()
+        result = self.run_test("ro", "1", "sensors=hook", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("hook.calls"), "hook pre suspend\n")
+        calls = self.read("systemctl.calls")
+        self.assertLess(calls.index("stop iio-sensor-proxy.service\n"),
+                        calls.index("stop hexagonrpcd-adsp-sensorspd.service\n"))
+        log = (self.ramdir() / "log").read_text()
+        hook = f"{self.root}/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors"
+        order = [f"sensors=hook: {hook} pre suspend, as systemd-sleep runs it before a systemctl suspend (it stops "
+                 "iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service; auto-rotation and auto-brightness "
+                 "are off until the restart, which runs no post)",
+                 "sensors=hook: ADSP clients now: iio-sensor-proxy inactive, hexagonrpcd-adsp-sensorspd inactive, "
+                 "hexagonrpcd-adsp-rootpd inactive (the hook status 0); 10s to settle",
+                 "frozen: /media/stick", "cycle 1/1: deep sleep"]
+        self.assertEqual([log.index(said) for said in order], sorted(log.index(said) for said in order))
+        self.assertIn("options: sensors=hook; switches: not offered by this kernel\n", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("; sensors=hook: this run stops iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service "
+                      f"next through {hook} pre suspend, until the restart\n", (logs / "before").read_text())
+        # The earlier hook, and a dry run: refused, nothing done.
+        for quiesces, args in ((False, ("ro", "1", "sensors=hook", "restart-ok")),
+                               (True, ("dry", "sensors=hook", "restart-ok"))):
+            with self.subTest(args=args):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.sensors_hook(quiesces)
+                hook = f"{self.root}/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors"
+                result = self.run_test(*args)
+                self.assertNotEqual(result.returncode, 0, self.out)
+                if quiesces:
+                    self.assertIn("dry sleeps not at all: sensors=hook is for the audio DSP's wakes in a sleep",
+                                  self.out)
+                else:
+                    self.assertIn("REFUSED: sensors=hook needs the device package's system-sleep hook that stops "
+                                  f"the sensor clients before a sleep ({hook}, naming iio-sensor-proxy.service); "
+                                  "this tablet's does not: sensors=stop stops them by hand", self.out)
+                    self.assert_nothing_done()
+                self.assertEqual(self.read("hook.calls"), "")
+                self.assertEqual(self.read("frozen"), "")
 
     def test_gdsc_ret_pcie0_keeps_the_domain_in_retention_for_the_run(self):
         """gdsc-ret=pcie0 writes N to pcie0 right before the freeze, read
