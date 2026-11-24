@@ -55,6 +55,11 @@ apply_va_macro_pm_clk=${APPLY_LPASS_VA_MACRO_PM_CLK:-0}
 # keeps XO voted through a system sleep (see
 # msm-dsi-phy-release-ahb-clock-in-system-sleep.patch below).
 apply_dsi_phy_ahb=${APPLY_DSI_PHY_AHB_RELEASE:-0}
+# Test builds until it has had more hardware passes: the root ports of qcom
+# PCIe hosts to D3hot in every system suspend, from the boot on (see
+# pcie-qcom-root-port-d3-in-system-suspend.patch below), with
+# APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 alone.
+apply_root_port_d3=${APPLY_SM8550_ROOT_PORT_D3:-0}
 
 validate_bool() {
 	case "$2" in
@@ -93,10 +98,19 @@ fi
 # (kit revision 11 as first prepared); the guard is for that GDSC alone.
 # Each is refused without the other, here, before the tree is touched.
 validate_bool APPLY_SM8550_PCIE0_GDSC_GUARD "$apply_pcie0_gdsc_guard"
-validate_bool APPLY_LPASS_VA_MACRO_PM_CLK "$apply_va_macro_pm_clk"
-validate_bool APPLY_DSI_PHY_AHB_RELEASE "$apply_dsi_phy_ahb"
 if [ "$apply_pcie0_gdsc_off" != "$apply_pcie0_gdsc_guard" ]; then
 	echo 'APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 go together: without the guard genpd collapses pcie_0_gdsc under a PCIe host that keeps its link (the boot'"'"'s panel cycle), and the guard is for pcie_0_gdsc PWRSTS_OFF_ON' >&2
+	exit 1
+fi
+validate_bool APPLY_LPASS_VA_MACRO_PM_CLK "$apply_va_macro_pm_clk"
+validate_bool APPLY_DSI_PHY_AHB_RELEASE "$apply_dsi_phy_ahb"
+# A PCIe host that powers itself down in a sleep with pcie_0_gdsc left on in
+# retention is the sleep that never came back (8 of 8 on kit revisions 7 to
+# 10); the root ports' D3 is what lets the host power down with the Wi-Fi
+# bound.  Refused here, before the tree is touched.
+validate_bool APPLY_SM8550_ROOT_PORT_D3 "$apply_root_port_d3"
+if [ "$apply_root_port_d3" = 1 ] && { [ "$apply_pcie0_gdsc_off" != 1 ] || [ "$apply_pcie0_gdsc_guard" != 1 ]; }; then
+	echo 'APPLY_SM8550_ROOT_PORT_D3=1 needs APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1: a PCIe host that powers itself down under pcie_0_gdsc left in retention is the sleep that never came back' >&2
 	exit 1
 fi
 
@@ -603,6 +617,35 @@ if [ "$apply_deep_sleep_debug" = 1 ] && [ "$apply_pcie0_gdsc_guard" = 1 ]; then
 	fi
 elif grep -q "$pcie_rp_d3_marker" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
 	echo "$pcie_rp_d3_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without both APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1." >&2
+	exit 1
+fi
+# pcie-qcom-root-port-d3-in-system-suspend.patch, with
+# APPLY_SM8550_ROOT_PORT_D3=1 (refused above without
+# APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1): the
+# root port switch's effect without the switch, from the boot on.  A PCI
+# fixup gives the hot-plug root port of a qcom host that pciehp does not
+# handle natively bridge_d3, so that in every system suspend, the boot's
+# panel cycle (pm_test=platform) included, the port goes to D3hot after the
+# Wi-Fi and the host powers itself down; pcie_qcom.root_port_d3=0 on the
+# command line turns it off.  It ran as the debug switch three times on the
+# SM-X710 (kit revision 11), never from the boot or on the SM-X910: test
+# builds until it has had more hardware passes.  With the guard's patch and
+# with or without the debug switch's (it goes on either), strictly; a tree
+# that carries it is refused for a build without the variable.  No board
+# gate: both tablets' PCIe hosts and root ports are the same.
+pcie_rp_d3_default_patch=pcie-qcom-root-port-d3-in-system-suspend.patch
+pcie_rp_d3_default_marker='static void qcom_pcie_fixup_root_port_d3(struct pci_dev *pdev)'
+if [ "$apply_root_port_d3" = 1 ]; then
+	if grep -qF "$pcie_rp_d3_default_marker" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$pcie_rp_d3_default_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$pcie_rp_d3_default_patch"
+	fi
+elif grep -qF "$pcie_rp_d3_default_marker" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
+	echo "$pcie_rp_d3_default_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_SM8550_ROOT_PORT_D3=1." >&2
 	exit 1
 fi
 apply_unless 'Match the SM-X910 Samsung kernel at standard mode' \

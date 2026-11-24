@@ -166,6 +166,10 @@ PCIE0_LINE = "\t.pwrsts = PWRSTS_OFF_ON, /* gcc-sm8550-pcie0-gdsc-off-in-suspend
 # script and make-kit.sh know it by.
 GUARD_FLAG_LINE = "\t\t.flags = GENPD_FLAG_ACTIVE_WAKEUP,\n"
 PCIE_PATCHES = ["pcie-qcom-keep-power-domain-while-link-kept.patch", "pcie-qcom-debug-root-port-d3.patch"]
+# The root port switch's default-on form (APPLY_SM8550_ROOT_PORT_D3=1), in no
+# kit yet.
+RPD3_DEFAULT = "pcie-qcom-root-port-d3-in-system-suspend.patch"
+RPD3_DEFAULT_MARKER = "static void qcom_pcie_fixup_root_port_d3(struct pci_dev *pdev)"
 GUARD_LINE = "qcom_pcie_mark_sleep_path(dev, pcie->link_kept);"
 RPD3_MARKER = "PCIe root port to D3 for a sleep test, not for release builds"
 # Revision 11's ufs-qcom: the UFS PHY power reference fix, which every build
@@ -9453,8 +9457,8 @@ class PcieGuardTest(unittest.TestCase):
             self.assertNotIn("gts9", block)
         touching = sorted(patch.name for patch in (REPO / "kernel/patches").glob("*.patch")
                           if re.search(rf"^\+\+\+ b/{re.escape(PCIE_QCOM)}\.c", patch.read_text(), re.M))
-        self.assertEqual(touching, sorted(PCIE_PATCHES))
-        for name in PCIE_PATCHES:
+        self.assertEqual(touching, sorted(PCIE_PATCHES + [RPD3_DEFAULT]))
+        for name in PCIE_PATCHES + [RPD3_DEFAULT]:
             with self.subTest(name):
                 patch = (REPO / "kernel/patches" / name).read_text()
                 self.assertEqual(list(diff_lines(patch)), [f"{PCIE_QCOM}.c"])
@@ -9590,6 +9594,143 @@ class PcieGuardTest(unittest.TestCase):
                       added)
         # It writes bridge_d3 and nothing else of the PCI core's.
         self.assertEqual(re.findall(r"pdev->(\w+) =", added), ["bridge_d3"])
+
+
+class RootPortD3DefaultTest(unittest.TestCase):
+    """The root port switch's default-on form in the build script, run from
+    its own text: APPLY_SM8550_ROOT_PORT_D3 (off by default, 0 or 1 only,
+    refused without APPLY_SM8550_PCIE0_GDSC_OFF=1 and
+    APPLY_SM8550_PCIE0_GDSC_GUARD=1, before the tree is touched), applied
+    strictly and once on top of the guard, with or without the debug switch,
+    refused for a build without it in a tree that carries it; and what the
+    patch changes, read from its added lines."""
+
+    BUILD = REPO / "scripts/build-mainline-kernel.sh"
+
+    def text(self):
+        return self.BUILD.read_text()
+
+    def block(self, start):
+        text = self.text()
+        at = text.index(start)
+        return text[at:text.index("\nfi\n", at) + len("\nfi\n")]
+
+    def run_block(self, block, tree, guard="1", debug="0", rpd3="0"):
+        return subprocess.run(["bash", "-c", "set -euo pipefail\nkernel_tree=$1 pat=$2 apply_pcie0_gdsc_guard=$3 "
+                               "apply_deep_sleep_debug=$4 apply_root_port_d3=$5\n" + block, "build", str(tree),
+                               str(REPO / "kernel/patches"), guard, debug, rpd3], capture_output=True, text=True)
+
+    def test_the_variable_is_off_by_default_0_or_1_and_needs_the_gdsc_and_the_guard(self):
+        text = self.text()
+        self.assertIn("\napply_root_port_d3=${APPLY_SM8550_ROOT_PORT_D3:-0}\n", text)
+        validate = re.search(r"^validate_bool\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        start = text.index('if [ "$apply_root_port_d3" = 1 ] && { [ "$apply_pcie0_gdsc_off" != 1 ] || '
+                           '[ "$apply_pcie0_gdsc_guard" != 1 ]; }; then\n')
+        needs = text[start:text.index("\nfi\n", start) + len("\nfi\n")]
+        self.assertLess(text.index('\nvalidate_bool APPLY_SM8550_ROOT_PORT_D3 "$apply_root_port_d3"\n'), start)
+        self.assertLess(start, text.index('git -C "$kernel_src" worktree add --detach "$kernel_tree" HEAD'))
+        check = ("apply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}\n"
+                 "apply_pcie0_gdsc_guard=${APPLY_SM8550_PCIE0_GDSC_GUARD:-0}\n"
+                 "apply_root_port_d3=${APPLY_SM8550_ROOT_PORT_D3:-0}\n" + validate +
+                 'validate_bool APPLY_SM8550_ROOT_PORT_D3 "$apply_root_port_d3"\n' + needs)
+        names = ("APPLY_SM8550_PCIE0_GDSC_OFF", "APPLY_SM8550_PCIE0_GDSC_GUARD", "APPLY_SM8550_ROOT_PORT_D3")
+        for off, guard, rpd3, ok in (("", "", "", True), ("1", "1", "", True), ("1", "1", "0", True),
+                                     ("1", "1", "1", True), ("", "", "1", False), ("1", "", "1", False),
+                                     ("", "1", "1", False), ("0", "0", "1", False), ("1", "1", "yes", False),
+                                     ("1", "1", "01", False)):
+            with self.subTest(off=off, guard=guard, rpd3=rpd3):
+                env = {k: v for k, v in os.environ.items() if k not in names}
+                for name, value in zip(names, (off, guard, rpd3)):
+                    if value:
+                        env[name] = value
+                result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check], capture_output=True,
+                                        text=True, env=env)
+                self.assertEqual(result.returncode == 0, ok, result.stderr)
+                if not ok and rpd3 == "1":
+                    self.assertIn("APPLY_SM8550_ROOT_PORT_D3=1 needs APPLY_SM8550_PCIE0_GDSC_OFF=1 and "
+                                  "APPLY_SM8550_PCIE0_GDSC_GUARD=1: a PCIe host that powers itself down under "
+                                  "pcie_0_gdsc left in retention is the sleep that never came back", result.stderr)
+                elif not ok:
+                    self.assertIn("APPLY_SM8550_ROOT_PORT_D3 must be 0 or 1", result.stderr)
+
+    def test_the_block_goes_after_the_debug_switch_s_on_both_boards(self):
+        text = self.text()
+        block = self.block("pcie_rp_d3_default_patch=")
+        self.assertLess(text.index("pcie_rp_d3_patch="), text.index(block))
+        self.assertIn(f"\npcie_rp_d3_default_patch={RPD3_DEFAULT}\n", "\n" + block)
+        self.assertIn(f"\npcie_rp_d3_default_marker='{RPD3_DEFAULT_MARKER}'\n", block)
+        self.assertIn('if [ "$apply_root_port_d3" = 1 ]; then\n', block)
+        self.assertNotIn("DEVICE", block)
+        self.assertNotIn("gts9", block)
+        header = (REPO / "kernel/patches" / RPD3_DEFAULT).read_text().split("\n--- a/", 1)[0]
+        self.assertTrue(header.startswith("Subject: [PATCH] PCI: qcom: "))
+        self.assertIn("NOT YET FOR RELEASE", header)
+        self.assertIn("No board check", header)
+        self.assertIn("pcie_qcom.root_port_d3=0", header)
+        # In no kit: make-kit.sh does not name it.
+        self.assertNotIn(RPD3_DEFAULT, (KIT_SRC / "make-kit.sh").read_text())
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_it_applies_once_with_or_without_the_debug_switch_and_is_refused_otherwise(self):
+        guard = PcieGuardTest("run").block("pcie0_guard_patch=")
+        debug = PcieGuardTest("run").block("pcie_rp_d3_patch=")
+        block = self.block("pcie_rp_d3_default_patch=")
+        for with_debug in ("0", "1"):
+            with self.subTest(debug=with_debug), tempfile.TemporaryDirectory() as tmp:
+                tree = pathlib.Path(tmp)
+                PcieGuardTest("run").pinned_file(tree)
+                result = self.run_block(guard + debug, tree, "1", with_debug)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                before = (tree / f"{PCIE_QCOM}.c").read_text()
+                listing = sorted(p.name for p in (tree / PCIE_QCOM).parent.iterdir())
+                # Without the variable: nothing.
+                result = self.run_block(block, tree)
+                self.assertEqual((result.returncode, (tree / f"{PCIE_QCOM}.c").read_text()), (0, before),
+                                 result.stderr)
+                result = self.run_block(guard + debug + block, tree, "1", with_debug, "1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotRegex(result.stdout, "offset|fuzz")
+                after = (tree / f"{PCIE_QCOM}.c").read_text()
+                self.assertEqual(sorted(p.name for p in (tree / PCIE_QCOM).parent.iterdir()), listing)
+                self.assertEqual(after.count(RPD3_DEFAULT_MARKER), 1)
+                self.assertEqual(after.count(RPD3_MARKER), 1 if with_debug == "1" else 0)
+                self.assertEqual([l for l in before.splitlines(True) if l not in after.splitlines(True)], [])
+                # A reused tree: nothing changes.
+                result = self.run_block(guard + debug + block, tree, "1", with_debug, "1")
+                self.assertEqual((result.returncode, (tree / f"{PCIE_QCOM}.c").read_text()), (0, after),
+                                 result.stderr)
+                # A build without it in that tree: refused, the tree as it was.
+                result = self.run_block(block, tree, "1", with_debug, "0")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"{RPD3_DEFAULT} remains in this source tree; use a fresh KERNEL_WORKTREE/"
+                              "KERNEL_BUILD_DIR for a build without APPLY_SM8550_ROOT_PORT_D3=1.", result.stderr)
+                self.assertEqual((tree / f"{PCIE_QCOM}.c").read_text(), after)
+                # The marker without the rest: refused.
+                damaged = after.replace("\tpdev->bridge_d3 = true;\n", "")
+                self.assertNotEqual(damaged, after)
+                (tree / f"{PCIE_QCOM}.c").write_text(damaged)
+                result = self.run_block(block, tree, "1", with_debug, "1")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((tree / f"{PCIE_QCOM}.c").read_text(), damaged)
+
+    def test_it_gives_bridge_d3_to_qcom_hot_plug_root_ports_without_native_pciehp_alone(self):
+        added = "\n".join(added_lines(RPD3_DEFAULT)[f"{PCIE_QCOM}.c"])
+        self.assertIn("#include <linux/pci_hotplug.h>", added)
+        self.assertIn("static bool qcom_pcie_root_port_d3 = true;\n"
+                      "module_param_named(root_port_d3, qcom_pcie_root_port_d3, bool, 0444);", added)
+        self.assertIn("\tif (!qcom_pcie_root_port_d3 || !pci_is_pcie(pdev) ||\n"
+                      "\t    pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT)\n\t\treturn;", added)
+        self.assertIn("\t    bridge->dev.parent->driver != &qcom_pcie_driver.driver)\n\t\treturn;", added)
+        self.assertIn("\tif (pdev->bridge_d3 || !pdev->is_pciehp || pciehp_is_native(pdev))\n\t\treturn;\n\n"
+                      "\tpdev->bridge_d3 = true;", added)
+        self.assertIn("DECLARE_PCI_FIXUP_CLASS_FINAL(PCI_ANY_ID, PCI_ANY_ID, PCI_CLASS_BRIDGE_PCI, 8,\n"
+                      "\t\t\t      qcom_pcie_fixup_root_port_d3);", added)
+        # It writes bridge_d3 and nothing else of the PCI core's, and no
+        # board decides.
+        self.assertEqual(re.findall(r"pdev->(\w+) =", added), ["bridge_d3"])
+        self.assertNotIn("of_machine_is_compatible", added)
+        patch = (REPO / "kernel/patches" / RPD3_DEFAULT).read_text()
+        self.assertNotIn("-", "".join(l[0] for l in diff_lines(patch)[f"{PCIE_QCOM}.c"]))
 
 
 class PipeClockGateTest(unittest.TestCase):
