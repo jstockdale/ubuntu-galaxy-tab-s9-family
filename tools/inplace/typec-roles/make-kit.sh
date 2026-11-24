@@ -19,12 +19,26 @@
 # (pcie-qcom-debug-root-port-d3.patch), and the UFS PHY power reference
 # that ufs-qcom keeps track of (ufs-qcom-track-phy-power-state-gts9u.patch,
 # which every build applies) with a diagnostic of it
-# (ufs-qcom-phy-power-count-diagnostic.patch), in boot, plus the build's
-# module tree, signed with its own key.  The configuration and the DTB do not
-# change, so vendor_boot stays the hang-log kit's.  The build for this kit
-# sets APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1,
-# APPLY_SM8550_SLEEP_FIXES=1, APPLY_SM8550_PCIE0_GDSC_OFF=1 and
-# APPLY_SM8550_PCIE0_GDSC_GUARD=1.
+# (ufs-qcom-phy-power-count-diagnostic.patch), and since revision 12 the
+# AOP's log of the RPMh requesters that keep CX from collapsing, a third
+# debug switch patch (qcom-stats-cxpc-violators-diagnostic.patch), and two
+# fixes for clocks that keep XO voted through a system sleep, the VA
+# macro's LPASS votes (lpass-va-macro-pm-clock-framework.patch, upstream
+# eb667d0fbdd3) and the DSI PHY's AHB clock
+# (msm-dsi-phy-release-ahb-clock-in-system-sleep.patch), and since
+# revision 13 the two geni UARTs' resources (the console's and the Bluetooth
+# UART's "se" clocks, XO's last holders in revision 12's first sleep)
+# released in system sleep (qcom-geni-serial-force-suspend-in-system-sleep.patch,
+# upstream d0cd9c8d0fd5 with its fix 3098c989bd38) and the CXPC log's
+# region logged raw (the third debug switch patch, which revision 13
+# changes), in boot, plus the build's module tree, signed with its own key.
+# The configuration and the DTB do not change, so vendor_boot stays the
+# hang-log kit's.  The build for this kit sets
+# APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1,
+# APPLY_SM8550_SLEEP_FIXES=1, APPLY_SM8550_PCIE0_GDSC_OFF=1,
+# APPLY_SM8550_PCIE0_GDSC_GUARD=1, APPLY_LPASS_VA_MACRO_PM_CLK=1,
+# APPLY_DSI_PHY_AHB_RELEASE=1 and APPLY_GENI_SERIAL_FORCE_SUSPEND=1 (and not
+# APPLY_SM8550_ROOT_PORT_D3).
 #
 #   bash tools/inplace/typec-roles/make-kit.sh BUILD_SCRATCH KERNEL_OUT_DIR \
 #       HANG_KERNEL_OUT_DIR HANG_KIT_DIR KIT_DIR
@@ -50,9 +64,11 @@
 # trees differ in the three Type-C files, the clock controller, the
 # dwc3-qcom glue, the UFS PHY driver, the RPMh power domain driver, the
 # PIPE clock mux, the PCIe PHY, the GMU and ufs-qcom files of revision 10
-# (ufs-qcom's changed again in revision 11), and the PCIe host driver of
-# revision 11 alone, and those are what this
-# checkout's patches, stage script and driver give (the PCIe PHY's without
+# (ufs-qcom's changed again in revision 11), the PCIe host driver of
+# revision 11, and the qcom_stats driver, the VA macro and its Kconfig, and
+# the DSI PHY's two files of revision 12, and the geni UART driver of
+# revision 13 alone, and those are what this checkout's patches, stage
+# script and driver give (the PCIe PHY's without
 # unpark-pcie0-pipe-mux.patch), the new image has the new code (the debug
 # switches' parameters among it) and the old one does not and was built
 # after the last change to those files, the compiled power domain table
@@ -62,7 +78,9 @@
 # vmlinux no longer asks which
 # board it runs on, the new vmlinux has the PIPE clock mux's gate operations
 # and not its rate operations and its PCIe PHY power-on sets no clock rate,
-# and the new boot image differs only in its kernel.  Nothing is flashed.
+# its geni UART's system sleep callbacks force-suspend and force-resume the
+# port, and the new boot image differs only in its kernel.  Nothing is
+# flashed.
 set -euo pipefail
 export LC_ALL=C
 
@@ -87,9 +105,12 @@ size=100663296
 # plus the SM8550 sleep fixes and the second UFS PHY diagnostic (10), plus
 # pcie_0_gdsc collapsed in system suspend with its guard and the root port's
 # debug switch, and ufs-qcom's UFS PHY power reference fix with its
-# diagnostic (11).  Written to the kit for people; install.sh knows a
-# revision by its boot image and kernel build ID.
-revision=11
+# diagnostic (11), plus the AOP's CXPC violators log behind a third debug
+# switch patch and the VA macro's and the DSI PHY's clocks released in
+# system sleep (12), plus the geni UARTs' resources released in system
+# sleep and the CXPC log's region logged raw (13).  Written to the kit for
+# people; install.sh knows a revision by its boot image and kernel build ID.
+revision=13
 dts=sm8550-samsung-gts9wifi
 tcpm_dir=drivers/usb/typec/tcpm
 gcc=drivers/clk/qcom/gcc-sm8550
@@ -105,6 +126,13 @@ ufs_qcom=drivers/ufs/host/ufs-qcom
 # Revision 11's PCIe host driver: the guard's half, and the root port's
 # debug switch.
 pcie_qcom=drivers/pci/controller/dwc/pcie-qcom
+# Revision 12's: the qcom_stats driver (the CXPC log's debug switch), the VA
+# macro and its Kconfig entry, and the DSI PHY's driver and header.
+qcom_stats=drivers/soc/qcom/qcom_stats
+va_macro=sound/soc/codecs/lpass-va-macro
+dsi_phy=drivers/gpu/drm/msm/dsi/phy/dsi_phy
+# Revision 13's: the geni UART driver (the console and the Bluetooth UART).
+geni=drivers/tty/serial/qcom_geni_serial
 # The USB-C dock changes, each applied to the hang-log tree's file as it is.
 typec_patches=(tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
 	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch
@@ -133,8 +161,10 @@ pcie_lines=('qcom_pcie_mark_sleep_path(dev, pcie->link_kept);'
 	'PCIe root port to D3 for a sleep test, not for release builds')
 # Revision 9's debug switches, with APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1: the
 # GDSC one on top of the USB power domain patch (and of revision 11's), the
-# RPMh one on its own.
-debug_patches=(gcc-sm8550-gdsc-debug-switches.patch rpmhpd-debug-retention-floor.patch)
+# RPMh one on its own; and revision 12's third, the AOP's CXPC log, in
+# qcom_stats.
+debug_patches=(gcc-sm8550-gdsc-debug-switches.patch rpmhpd-debug-retention-floor.patch
+	qcom-stats-cxpc-violators-diagnostic.patch)
 # Revision 10's SM8550 sleep fixes, with APPLY_SM8550_SLEEP_FIXES=1: three
 # upstream commits, one file each (ufs-qcom's two), and the PCIe PHY without
 # unpark-pcie0-pipe-mux.patch, which the hang-log tree carries.
@@ -147,11 +177,23 @@ unpark=unpark-pcie0-pipe-mux.patch
 # with APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1; both go in under the lane clock
 # fix above.
 ufs_qcom_patches=(ufs-qcom-track-phy-power-state-gts9u.patch ufs-qcom-phy-power-count-diagnostic.patch)
+# Revision 12's two clocks that kept XO voted through a system sleep, each
+# behind a variable of its own (APPLY_LPASS_VA_MACRO_PM_CLK=1,
+# APPLY_DSI_PHY_AHB_RELEASE=1), strictly: the VA macro's LPASS votes
+# (upstream eb667d0fbdd3, its driver and Kconfig entry) and the DSI PHY's
+# AHB clock (its driver and header, on top of the port's DSI PHY patches).
+# Then revision 13's, the two UARTs' clocks (APPLY_GENI_SERIAL_FORCE_SUSPEND=1,
+# upstream d0cd9c8d0fd5 and 3098c989bd38, the geni UART driver, on top of
+# the SM-X710's Bluetooth UART interrupt patch, another function).
+xo_patches=(lpass-va-macro-pm-clock-framework.patch msm-dsi-phy-release-ahb-clock-in-system-sleep.patch
+	qcom-geni-serial-force-suspend-in-system-sleep.patch)
+xo_files=("$va_macro.c sound/soc/codecs/Kconfig" "$dsi_phy.c $dsi_phy.h" "$geni.c")
 patches=("${typec_patches[@]}" "${gdsc_patches[@]}" "${debug_patches[@]}" "${fix_patches[@]}" "${ufs_patches[@]}"
-	"${pcie_patches[@]}" "${ufs_qcom_patches[@]}")
+	"${pcie_patches[@]}" "${ufs_qcom_patches[@]}" "${xo_patches[@]}")
 # The files those patches change, and the PCIe PHY's.
 patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c" "$rpmhpd.c"
-	"$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c")
+	"$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c"
+	"$qcom_stats.c" "$va_macro.c" sound/soc/codecs/Kconfig "$dsi_phy.c" "$dsi_phy.h" "$geni.c")
 
 # The base on the tablet: the hang-log kit, which a first install saves and
 # rollback.sh puts back.
@@ -187,7 +229,18 @@ hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
 # driver), and two of its diagnostic's: the label of its line at each
 # power-up sequence, and the end of that line, the setup_clocks repeats.
 # Its pcie_0_gdsc's power states and genpd flags are two bytes of a table:
-# the power domain check below is for them.
+# the power domain check below is for them.  Then revision 12: the CXPC
+# log's switch, as the kernel keeps it, and the line each suspend with it
+# logs; the VA macro's message for a runtime PM put that failed when its
+# fsgen clock is disabled (upstream's, in no other driver; the one of the
+# enable path's unwind is no use here, the compiler drops that branch
+# because va_macro_mclk_enable() cannot fail); and the DSI PHY's message
+# for an AHB clock it could not prepare.  Then revision 13: the CXPC log's
+# raw line (the format of qcom_stats_vx_dump(), which every report calls on
+# its main path, before any branch on what the region holds) and the name
+# of its raw debugfs file (qcom_stats_vx_init(), next to the decoded one's).
+# The UART patch adds no string at all; the disassembly check below (5d) is
+# for it.
 new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
 	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
 	'Swap is still queued, left pending' 'Partner swapped first, queued DR_SWAP_SEND dropped'
@@ -202,14 +255,19 @@ new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait
 	'system sleep: the link was kept, and its power domain stayed on'
 	'system sleep: the link was kept, but genpd powered its power domain off'
 	pcie_qcom.debug_root_port_d3
-	'Failed to power on PHY: %pe' 'power-up sequence entry' 'setup_clocks repeats: power-on')
+	'Failed to power on PHY: %pe' 'power-up sequence entry' 'setup_clocks repeats: power-on'
+	qcom_stats.debug_cxpc_violators "the AOP's CXPC monitor is on for this suspend"
+	'runtime PM put failed in fsgen disable' 'Unable to prepare iface clk'
+	'cxpc violators: raw %s +0x%03x: ' cxpc_violators_raw)
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
 	"$tcpm_dir/sm5714_usbpd.o:$tcpm_dir/sm5714_usbpd.c"
 	"$tcpm_dir/sm5714_usbpd.o:include/linux/usb/tcpm.h" "$dwc3.o:$dwc3.c" "$qmp.o:$qmp.c"
 	"$rpmhpd.o:$rpmhpd.c" "$phymux.o:$phymux.c" "$qmp_pcie.o:$qmp_pcie.c" "$gmu.o:$gmu.c"
-	"$ufs_qcom.o:$ufs_qcom.c" "$ufs_qcom.o:$ufs_qcom.h" "$pcie_qcom.o:$pcie_qcom.c")
+	"$ufs_qcom.o:$ufs_qcom.c" "$ufs_qcom.o:$ufs_qcom.h" "$pcie_qcom.o:$pcie_qcom.c"
+	"$qcom_stats.o:$qcom_stats.c" "$va_macro.o:$va_macro.c" "$dsi_phy.o:$dsi_phy.c" "$dsi_phy.o:$dsi_phy.h"
+	"$geni.o:$geni.c")
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 die() { echo "$*" >&2; exit 1; }
@@ -219,7 +277,9 @@ for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$build/.config" "$build/certs/signing_key.x509" "$build/vmlinux" \
 	"$build/$gcc.o" "$build/$tcpm_dir/tcpm.o" "$build/$tcpm_dir/sm5714_usbpd.o" "$build/$dwc3.o" \
 	"$build/$qmp.o" "$build/$rpmhpd.o" "$build/$phymux.o" "$build/$qmp_pcie.o" "$build/$gmu.o" \
-	"$build/$ufs_qcom.o" "$build/$pcie_qcom.o" "$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
+	"$build/$ufs_qcom.o" "$build/$pcie_qcom.o" "$build/$qcom_stats.o" "$build/$va_macro.o" "$build/$dsi_phy.o" \
+	"$build/$geni.o" \
+	"$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
 	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}" \
 	"$repo/kernel/patches/$unpark" "$repo/scripts/stage-ufs-resume-experiment.sh"; do
 	[ -f "$f" ] || die "missing: $f"
@@ -371,10 +431,10 @@ for ((i = ${#ufs_patches[@]} - 1; i >= 0; i--)); do
 done
 ! grep -q 'SM-X910 experiment: assert PCS reset before calibration tables' "$tree/$qmp.c" ||
 	die "the build tree's $qmp.c still carries the SM-X910-only PCS reset"
-# Revision 9's debug switches: each patch whole in the build tree's file (it
-# comes out again with no fuzz), the GDSC one over the USB power domain
-# patch, which the check above found under it.
-debug_files=("$gcc.c" "$rpmhpd.c")
+# Revision 9's debug switches and revision 12's third: each patch whole in
+# the build tree's file (it comes out again with no fuzz), the GDSC one over
+# the USB power domain patch, which the check above found under it.
+debug_files=("$gcc.c" "$rpmhpd.c" "$qcom_stats.c")
 for i in "${!debug_patches[@]}"; do
 	f=${debug_files[$i]}
 	mkdir -p "$tmp/debug/${f%/*}"
@@ -407,6 +467,18 @@ for ((i = ${#ufs_qcom_patches[@]} - 1; i >= 0; i--)); do
 done
 ! grep -q 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' "$tree/$qmp_pcie.c" ||
 	die "the build tree's $qmp_pcie.c carries $unpark, which revision 10 leaves out"
+# Revision 12's two XO fixes and revision 13's UART one: each whole in the
+# build tree's files (each comes out again with no fuzz from its own
+# copies; the UART's over the SM-X710's interrupt patch, a few lines up).
+for i in "${!xo_patches[@]}"; do
+	for f in ${xo_files[$i]}; do
+		mkdir -p "$tmp/xo$i/${f%/*}"
+		cp "$tree/$f" "$tmp/xo$i/$f"
+	done
+	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/xo$i" -p1 \
+		< "$repo/kernel/patches/${xo_patches[$i]}" ||
+		die "the build tree's ${xo_files[$i]} do not carry ${xo_patches[$i]} whole"
+done
 source_check='marker lines only (HANG_SCRATCH not set)'
 if [ -n "${HANG_SCRATCH:-}" ]; then
 	hang_tree=$HANG_SCRATCH/linux-src-gts9wifi
@@ -423,8 +495,18 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 	! grep -q 'no hcd and no root hub' "$hang_tree/$dwc3.c" &&
 		! grep -q 'Retention across system suspend, as on sm8650' "$hang_tree/$gcc.c" ||
 		die 'the hang-log tree carries the dwc3-qcom guard or the USB power domain patch already'
-	! grep -q 'SM8550 deep-sleep debug, not for release builds' "$hang_tree/$gcc.c" "$hang_tree/$rpmhpd.c" ||
+	! grep -q 'SM8550 deep-sleep debug, not for release builds' "$hang_tree/$gcc.c" "$hang_tree/$rpmhpd.c" \
+		"$hang_tree/$qcom_stats.c" ||
 		die 'the hang-log tree carries the deep-sleep debug switches already'
+	# Revision 12's two XO fixes and revision 13's UART one: the hang-log
+	# build had none of them (it did have the SM-X710's Bluetooth UART
+	# interrupt patch, as every SM-X710 build does).
+	! grep -qF 'ret = pm_clk_suspend(dev);' "$hang_tree/$va_macro.c" &&
+		! grep -qF 'static int dsi_phy_suspend_late(struct device *dev)' "$hang_tree/$dsi_phy.c" ||
+		die "the hang-log tree carries revision 12's VA macro or DSI PHY change already"
+	! grep -qF 'return pm_runtime_force_suspend(dev);' "$hang_tree/$geni.c" &&
+		grep -qF 'Serve the interrupt even once uart_suspend_port()' "$hang_tree/$geni.c" ||
+		die "the hang-log tree's $geni.c carries revision 13's UART change already, or not the Bluetooth UART interrupt patch"
 	! grep -qF -- "$pcie0_line" "$hang_tree/$gcc.c" &&
 		[ "$(gdsc_pwrsts "$hang_tree/$gcc.c" pcie_0_gdsc)" = 'PWRSTS_RET_ON,' ] ||
 		die "the hang-log tree's pcie_0_gdsc is not upstream's PWRSTS_RET_ON"
@@ -473,6 +555,15 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
 		< "$repo/kernel/patches/$unpark" ||
 		die "$unpark does not come out of the hang-log tree's $qmp_pcie.c whole"
+	# Revision 12's two XO fixes and revision 13's UART one, strictly, as
+	# the build applies them (the DSI PHY's on top of the port's DSI PHY
+	# patches, the UART's on top of the Bluetooth UART interrupt patch,
+	# both of which the hang-log tree carries as the build tree does).
+	for p in "${xo_patches[@]}"; do
+		patch -s --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
+			< "$repo/kernel/patches/$p" ||
+			die "$p does not apply to the hang-log tree"
+	done
 	# Revision 11's ufs-qcom patches, strictly: here on top of the lane clock
 	# fix, where the build has them under it; the two files come out the same.
 	for p in "${ufs_qcom_patches[@]}"; do
@@ -529,23 +620,29 @@ $gmu.c
 $ufs_qcom.c
 $ufs_qcom.h
 $pcie_qcom.c
+$qcom_stats.c
+$va_macro.c
+sound/soc/codecs/Kconfig
+$dsi_phy.c
+$dsi_phy.h
+$geni.c
 $tcpm_dir/sm5714_usbpd.c
 $tcpm_dir/tcpm.c
 include/linux/usb/tcpm.h
 EOF
 	cmp -s "$tmp/trees.changed" "$tmp/trees.want" || {
-		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c, ufs-qcom.h and pcie-qcom.c:' >&2
+		echo 'the kernel source trees differ in more than the three Type-C files, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c, ufs-qcom.h, pcie-qcom.c, qcom_stats.c, lpass-va-macro.c, sound/soc/codecs/Kconfig, dsi_phy.c, dsi_phy.h and qcom_geni_serial.c:' >&2
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $hang_tree: thirteen files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, gcc-sm8550.c by revision 11's pcie_0_gdsc, gcc-sm8550.c and rpmhpd.c by its two debug switch patches, clk-regmap-phy-mux.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h by its three sleep fixes, ufs-qcom.c and ufs-qcom.h by revision 11's PHY power reference fix and its diagnostic, phy-qcom-qmp-pcie.c by $unpark left out, phy-qcom-qmp-ufs.c by its stage script and the two UFS PHY diagnostics, pcie-qcom.c by revision 11's guard and the root port's debug switch"
-	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c, ufs-qcom.h and pcie-qcom.c differ from the hang-log tree, by exactly this checkout'"'"'s changes'
+	source_check="compared with $hang_tree: nineteen files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, gcc-sm8550.c by revision 11's pcie_0_gdsc, gcc-sm8550.c, rpmhpd.c and qcom_stats.c by its three debug switch patches, clk-regmap-phy-mux.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h by its three sleep fixes, ufs-qcom.c and ufs-qcom.h by revision 11's PHY power reference fix and its diagnostic, phy-qcom-qmp-pcie.c by $unpark left out, phy-qcom-qmp-ufs.c by its stage script and the two UFS PHY diagnostics, pcie-qcom.c by revision 11's guard and the root port's debug switch, lpass-va-macro.c and sound/soc/codecs/Kconfig by upstream eb667d0fbdd3, dsi_phy.c and dsi_phy.h by the DSI PHY's AHB clock release, qcom_geni_serial.c by upstream d0cd9c8d0fd5 and 3098c989bd38"
+	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c, ufs-qcom.h, pcie-qcom.c, qcom_stats.c, lpass-va-macro.c, sound/soc/codecs/Kconfig, dsi_phy.c, dsi_phy.h and qcom_geni_serial.c differ from the hang-log tree, by exactly this checkout'"'"'s changes'
 	if [ -n "$backups" ]; then
 		source_check="$source_check; passed over, a copy of the hang-log tree's file that patch(1) kept:$backups"
 		echo "sources: passed over$backups, the hang-log tree's file as patch(1) kept it"
 	fi
 else
-	echo 'sources: the twenty patches and this checkout'"'"'s driver are in the build tree, and unpark-pcie0-pipe-mux.patch is not (HANG_SCRATCH not set: no tree comparison)'
+	echo 'sources: the twenty-four patches and this checkout'"'"'s driver are in the build tree, and unpark-pcie0-pipe-mux.patch is not (HANG_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.
@@ -729,6 +826,39 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 fi
 echo "PCIe PIPE clock: $pcie_check"
 
+# 5d. Revision 13's UART change (upstream d0cd9c8d0fd5 and 3098c989bd38),
+# which adds no string: in the vmlinux the image was made from (5b) the geni
+# UART's system suspend callback, qcom_geni_serial_suspend(), calls
+# pm_runtime_force_suspend() after uart_suspend_port(), and its resume
+# callback, qcom_geni_serial_resume(), pm_runtime_force_resume() as well as
+# uart_resume_port().  Both callbacks are in the driver's dev_pm_ops, so the
+# compiler emits each as a function of its own under its name, and the two
+# calls are on their main paths, behind a test of console_suspend_enabled, a
+# variable it cannot know (a call or a tail branch counts; uart_suspend_port()
+# and uart_resume_port() show the functions were found).  With HANG_SCRATCH
+# the hang-log build's callbacks must call neither of the two.
+branches_of() { # VMLINUX FUNCTION: what FUNCTION calls or branches to by name, one per line
+	llvm-objdump -d --no-show-raw-insn --disassemble-symbols="$2" "$1" |
+		sed -n 's/.*[[:space:]]bl\{0,1\}[[:space:]].*<\([A-Za-z0-9_.]*\)>$/\1/p' | sort -u
+}
+branches_of "$build/vmlinux" qcom_geni_serial_suspend > "$tmp/geni.suspend.calls"
+branches_of "$build/vmlinux" qcom_geni_serial_resume > "$tmp/geni.resume.calls"
+grep -qx uart_suspend_port "$tmp/geni.suspend.calls" && grep -qx pm_runtime_force_suspend "$tmp/geni.suspend.calls" ||
+	die "qcom_geni_serial_suspend() in $build/vmlinux does not call both uart_suspend_port() and pm_runtime_force_suspend(): ${xo_patches[2]} is not in it"
+grep -qx uart_resume_port "$tmp/geni.resume.calls" && grep -qx pm_runtime_force_resume "$tmp/geni.resume.calls" ||
+	die "qcom_geni_serial_resume() in $build/vmlinux does not call both uart_resume_port() and pm_runtime_force_resume(): ${xo_patches[2]} is not in it"
+geni_check="qcom_geni_serial_suspend() and qcom_geni_serial_resume() in vmlinux (build ID ${new_id:0:12}) call pm_runtime_force_suspend() and pm_runtime_force_resume()"
+if [ -n "${HANG_SCRATCH:-}" ]; then
+	branches_of "$HANG_SCRATCH/linux-gts9wifi/vmlinux" qcom_geni_serial_suspend > "$tmp/geni.suspend.hang.calls"
+	branches_of "$HANG_SCRATCH/linux-gts9wifi/vmlinux" qcom_geni_serial_resume > "$tmp/geni.resume.hang.calls"
+	grep -qx uart_suspend_port "$tmp/geni.suspend.hang.calls" && grep -qx uart_resume_port "$tmp/geni.resume.hang.calls" &&
+		! grep -qx pm_runtime_force_suspend "$tmp/geni.suspend.hang.calls" &&
+		! grep -qx pm_runtime_force_resume "$tmp/geni.resume.hang.calls" ||
+		die "self-test failed: the hang-log build's geni UART callbacks are not found, or force-suspend and force-resume the port already"
+	geni_check="$geni_check; the hang-log build's call neither"
+fi
+echo "geni UARTs: $geni_check"
+
 # 6. The module key and the modules.  The serial is what modinfo reports as
 # sig_key; the subject key ID is what the kernel logs and the registry files
 # it under.  Only the public certificate is read here.
@@ -761,28 +891,32 @@ done < <(list "$modules")
 echo "modules: $n, the hang-log build's list, all signed with key ${key_id:0:12} (archived)"
 
 # 6b. Revision 9's debug switches as the kernel knows them, with revision
-# 11's debug_boot_state and the root port's switch: built in, so each
-# parameter's description is in the module tree's modules.builtin.modinfo
-# under its object's name, where the hang-log build's has none; and the
-# build's vmlinux, the image's by its build ID (5b), has their handlers (its
-# symbols as 5c listed them), and the guard's genpd notifier, whose address
-# its probe hands genpd (the guard's other two functions are inlined).
+# 11's debug_boot_state and the root port's switch and revision 12's CXPC
+# log switch: built in, so each parameter's description is in the module
+# tree's modules.builtin.modinfo under its object's name, where the hang-log
+# build's has none; and the build's vmlinux, the image's by its build ID
+# (5b), has their handlers (its symbols as 5c listed them), the guard's
+# genpd notifier, whose address its probe hands genpd (the guard's other two
+# functions are inlined), the CXPC log's PM notifier, the DSI PHY's system
+# sleep callbacks of revision 12 (in its dev_pm_ops), and the show function
+# of revision 13's raw CXPC file (single_open() is handed its address).
 # Their names are in the image (4).
 tr '\0' '\n' < "$modules/modules.builtin.modinfo" > "$tmp/builtin.modinfo"
 tr '\0' '\n' < "$hang_modules/modules.builtin.modinfo" > "$tmp/builtin.hang.modinfo"
 for parm in gcc_sm8550.parm=debug_pcie0_off: gcc_sm8550.parm=debug_pcie0_phy_off: \
 	gcc_sm8550.parm=debug_usb_off: rpmhpd.parm=debug_ret_floor: gcc_sm8550.parm=debug_boot_state: \
-	pcie_qcom.parm=debug_root_port_d3:; do
+	pcie_qcom.parm=debug_root_port_d3: qcom_stats.parm=debug_cxpc_violators:; do
 	grep -q "^$parm" "$tmp/builtin.modinfo" ||
 		die "the module tree's modules.builtin.modinfo has no $parm"
 	! grep -q "^$parm" "$tmp/builtin.hang.modinfo" ||
 		die "self-test failed: the hang-log build's modules.builtin.modinfo has $parm too"
 done
 for f in gcc_sm8550_debug_set gcc_sm8550_debug_get gcc_sm8550_debug_boot_get rpmhpd_debug_ret_floor_set \
-	qcom_pcie_debug_rp_d3_set qcom_pcie_pd_notify; do
+	qcom_pcie_debug_rp_d3_set qcom_pcie_pd_notify qcom_stats_vx_set qcom_stats_vx_pm_notify \
+	dsi_phy_suspend_late dsi_phy_resume_early qcom_stats_vx_raw_show; do
 	grep -q " [tT] $f\$" "$tmp/vmlinux.nm" || die "no $f in $build/vmlinux"
 done
-switch_check="the six parameters' names in the image and their descriptions in modules.builtin.modinfo, none in the hang-log build's; the set and get handlers and the guard's genpd notifier in vmlinux (build ID ${new_id:0:12})"
+switch_check="the seven parameters' names in the image and their descriptions in modules.builtin.modinfo, none in the hang-log build's; the set and get handlers, the guard's genpd notifier, the CXPC log's PM notifier, the DSI PHY's system sleep callbacks and the raw CXPC file's show function in vmlinux (build ID ${new_id:0:12})"
 echo "debug switches: $switch_check"
 
 # 7. The kit's boot image, and what changed in it.
@@ -829,6 +963,12 @@ printf '%s\n' "$revision" > "$kit/REVISION"
 	echo "pcie_0_gdsc guard: GENPD_FLAG_ACTIVE_WAKEUP (kernel/patches/${gdsc_patches[0]}) and the PCIe host on the awake path while it keeps its link (kernel/patches/${pcie_patches[0]}, APPLY_SM8550_PCIE0_GDSC_GUARD=1)"
 	echo "root port debug switch: pcie_qcom.debug_root_port_d3, N at boot (kernel/patches/${pcie_patches[1]}, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 with APPLY_SM8550_PCIE0_GDSC_GUARD=1)"
 	echo "UFS PHY power reference: kept track of by ufs-qcom (kernel/patches/${ufs_qcom_patches[0]}, every build), its counts logged (kernel/patches/${ufs_qcom_patches[1]}, APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1)"
+	echo "CXPC violators log: qcom_stats.debug_cxpc_violators, N at boot, its region logged raw around each suspend and decoded only under a CXPC header (kernel/patches/${debug_patches[2]}, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1)"
+	echo "VA macro: its LPASS votes released when idle (kernel/patches/${xo_patches[0]}, APPLY_LPASS_VA_MACRO_PM_CLK=1)"
+	echo "DSI PHY: its AHB clock unprepared in system sleep (kernel/patches/${xo_patches[1]}, APPLY_DSI_PHY_AHB_RELEASE=1)"
+	echo "geni UARTs: the console's and the Bluetooth UART's resources off in system sleep (kernel/patches/${xo_patches[2]}, upstream d0cd9c8d0fd5 and 3098c989bd38, APPLY_GENI_SERIAL_FORCE_SUSPEND=1)"
+	echo "geni UART callbacks: $geni_check"
+	echo "left out: kernel/patches/pcie-qcom-root-port-d3-in-system-suspend.patch (APPLY_SM8550_ROOT_PORT_D3 not set)"
 } > "$kit/SOURCE"
 install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/sleep-test.sh" \
 	"$here/ufs-phy-power-check.sh" "$here/README.md" "$kit/"

@@ -34,8 +34,9 @@ enable_gunyah_cma=${ENABLE_GUNYAH_CMA:-0}
 # Diagnostic only, never in a release: see qmp-ufs-pcs-state-diagnostic.patch
 # and ufs-qcom-phy-power-count-diagnostic.patch below.
 apply_qmp_ufs_diagnostic=${APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC:-0}
-# Debug only, never in a release: see gcc-sm8550-gdsc-debug-switches.patch
-# and rpmhpd-debug-retention-floor.patch below.
+# Debug only, never in a release: see gcc-sm8550-gdsc-debug-switches.patch,
+# rpmhpd-debug-retention-floor.patch and
+# qcom-stats-cxpc-violators-diagnostic.patch below.
 apply_deep_sleep_debug=${APPLY_DEEP_SLEEP_DEBUG_SWITCHES:-0}
 # Test builds until they have run on hardware: the SM8550 sleep fixes below,
 # three upstream commits, with unpark-pcie0-pipe-mux.patch left out.
@@ -46,6 +47,24 @@ apply_sm8550_sleep_fixes=${APPLY_SM8550_SLEEP_FIXES:-0}
 # together or not at all.
 apply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}
 apply_pcie0_gdsc_guard=${APPLY_SM8550_PCIE0_GDSC_GUARD:-0}
+# Test builds until it has run on hardware: the VA macro's LPASS votes,
+# which keep the audio DSP's LPASS powered through a system sleep (see
+# lpass-va-macro-pm-clock-framework.patch below).
+apply_va_macro_pm_clk=${APPLY_LPASS_VA_MACRO_PM_CLK:-0}
+# Test builds until it has run on hardware: the DSI PHY's AHB clock, which
+# keeps XO voted through a system sleep (see
+# msm-dsi-phy-release-ahb-clock-in-system-sleep.patch below).
+apply_dsi_phy_ahb=${APPLY_DSI_PHY_AHB_RELEASE:-0}
+# Test builds until it has run on hardware: the geni UARTs' resources, which
+# a port in use (the console, the Bluetooth UART) kept through a system
+# sleep, its "se" clock keeping XO voted (see
+# qcom-geni-serial-force-suspend-in-system-sleep.patch below).
+apply_geni_force_suspend=${APPLY_GENI_SERIAL_FORCE_SUSPEND:-0}
+# Test builds until it has had more hardware passes: the root ports of qcom
+# PCIe hosts to D3hot in every system suspend, from the boot on (see
+# pcie-qcom-root-port-d3-in-system-suspend.patch below), with
+# APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 alone.
+apply_root_port_d3=${APPLY_SM8550_ROOT_PORT_D3:-0}
 
 validate_bool() {
 	case "$2" in
@@ -86,6 +105,18 @@ fi
 validate_bool APPLY_SM8550_PCIE0_GDSC_GUARD "$apply_pcie0_gdsc_guard"
 if [ "$apply_pcie0_gdsc_off" != "$apply_pcie0_gdsc_guard" ]; then
 	echo 'APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 go together: without the guard genpd collapses pcie_0_gdsc under a PCIe host that keeps its link (the boot'"'"'s panel cycle), and the guard is for pcie_0_gdsc PWRSTS_OFF_ON' >&2
+	exit 1
+fi
+validate_bool APPLY_LPASS_VA_MACRO_PM_CLK "$apply_va_macro_pm_clk"
+validate_bool APPLY_DSI_PHY_AHB_RELEASE "$apply_dsi_phy_ahb"
+validate_bool APPLY_GENI_SERIAL_FORCE_SUSPEND "$apply_geni_force_suspend"
+# A PCIe host that powers itself down in a sleep with pcie_0_gdsc left on in
+# retention is the sleep that never came back (8 of 8 on kit revisions 7 to
+# 10); the root ports' D3 is what lets the host power down with the Wi-Fi
+# bound.  Refused here, before the tree is touched.
+validate_bool APPLY_SM8550_ROOT_PORT_D3 "$apply_root_port_d3"
+if [ "$apply_root_port_d3" = 1 ] && { [ "$apply_pcie0_gdsc_off" != 1 ] || [ "$apply_pcie0_gdsc_guard" != 1 ]; }; then
+	echo 'APPLY_SM8550_ROOT_PORT_D3=1 needs APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1: a PCIe host that powers itself down under pcie_0_gdsc left in retention is the sleep that never came back' >&2
 	exit 1
 fi
 
@@ -457,9 +488,10 @@ apply_unless 'Retention across system suspend, as on sm8650' \
 # a system suspend, and GENPD_FLAG_ACTIVE_WAKEUP, so that genpd leaves it on
 # for a device of it on the awake path, which the guard's other half below
 # makes of a PCIe host that keeps its link.  On the SM-X710 a sleep with the
-# PCIe host powered down (its root port removed) and the interconnect floor
-# released returned only with that GDSC collapsed (kit revisions 9 and 10:
-# 7 of 7 with it, 0 of 8 without).  Upstream keeps it in retention
+# PCIe host powered down (its root port removed, or in D3hot through kit
+# revision 11's switch) and the interconnect floor released returned only
+# with that GDSC collapsed (kit revisions 9 to 11: 12 of 12 with it, 0 of 8
+# without).  Upstream keeps it in retention
 # (967e011013ed) because a host that keeps its link through the suspend
 # loses its controller when the GDSC collapses, and on this port every
 # suspend that keeps the Wi-Fi, the boot's panel cycle included, keeps the
@@ -528,13 +560,19 @@ fi
 # the pcie0 one on with APPLY_SM8550_PCIE0_GDSC_OFF=1, where it can put
 # pcie_0_gdsc back in retention.  They are for test builds: set
 # APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (the SM-X710's Type-C roles kit, revision
-# 9).  The GDSC one goes on top of the USB GDSC patch just above (and of
-# revision 11's pcie_0_gdsc, one line further down then), each
-# strictly; a tree that carries either is refused for a default build, so
-# that a release built in a reused test tree cannot ship them.
+# 9).  qcom-stats-cxpc-violators-diagnostic.patch (revision 12) is a third:
+# qcom_stats.debug_cxpc_violators, N at every boot, with which each system
+# suspend asks the AOP to log the RPMh requesters that keep CX from
+# collapsing, and the resume logs that log; an SM8550 alone, and it reads
+# only, but for the AOP message that starts the log.  The GDSC one goes on
+# top of the USB GDSC patch just above (and of revision 11's pcie_0_gdsc,
+# one line further down then).  Each strictly; a tree that carries any of
+# them is refused for a default build, so that a release built in a reused
+# test tree cannot ship them.
 deep_sleep_debug_marker='SM8550 deep-sleep debug, not for release builds'
 for deep_sleep_debug in drivers/clk/qcom/gcc-sm8550.c:gcc-sm8550-gdsc-debug-switches.patch \
-	drivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch; do
+	drivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch \
+	drivers/soc/qcom/qcom_stats.c:qcom-stats-cxpc-violators-diagnostic.patch; do
 	if [ "$apply_deep_sleep_debug" = 1 ]; then
 		# The GDSC switches give the USB GDSCs back PWRSTS_RET_ON, the state
 		# of the USB GDSC patch: never without it.
@@ -583,6 +621,35 @@ elif grep -q "$pcie_rp_d3_marker" "$kernel_tree/drivers/pci/controller/dwc/pcie-
 	echo "$pcie_rp_d3_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without both APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1." >&2
 	exit 1
 fi
+# pcie-qcom-root-port-d3-in-system-suspend.patch, with
+# APPLY_SM8550_ROOT_PORT_D3=1 (refused above without
+# APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1): the
+# root port switch's effect without the switch, from the boot on.  A PCI
+# fixup gives the hot-plug root port of a qcom host that pciehp does not
+# handle natively bridge_d3, so that in every system suspend, the boot's
+# panel cycle (pm_test=platform) included, the port goes to D3hot after the
+# Wi-Fi and the host powers itself down; pcie_qcom.root_port_d3=0 on the
+# command line turns it off.  It ran as the debug switch three times on the
+# SM-X710 (kit revision 11), never from the boot or on the SM-X910: test
+# builds until it has had more hardware passes.  With the guard's patch and
+# with or without the debug switch's (it goes on either), strictly; a tree
+# that carries it is refused for a build without the variable.  No board
+# gate: both tablets' PCIe hosts and root ports are the same.
+pcie_rp_d3_default_patch=pcie-qcom-root-port-d3-in-system-suspend.patch
+pcie_rp_d3_default_marker='static void qcom_pcie_fixup_root_port_d3(struct pci_dev *pdev)'
+if [ "$apply_root_port_d3" = 1 ]; then
+	if grep -qF "$pcie_rp_d3_default_marker" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$pcie_rp_d3_default_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$pcie_rp_d3_default_patch"
+	fi
+elif grep -qF "$pcie_rp_d3_default_marker" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
+	echo "$pcie_rp_d3_default_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_SM8550_ROOT_PORT_D3=1." >&2
+	exit 1
+fi
 # A failed xhci-plat probe leaves dwc->xhci without drvdata, and the glue's
 # suspend in host role then reads the port speeds through a NULL hcd (an
 # oops on the SM-X710, 2026-11-21).  The guard lets the suspend complete;
@@ -607,8 +674,62 @@ if [ "$DEVICE" = gts9wifi ]; then
 		drivers/tty/serial/qcom_geni_serial.c \
 		qcom-geni-serial-serve-irq-while-suspending.patch
 fi
+# qcom-geni-serial-force-suspend-in-system-sleep.patch, upstream d0cd9c8d0fd5
+# (v7.3-rc1) with its fix 3098c989bd38 (v7.3-rc6) folded in, with
+# APPLY_GENI_SERIAL_FORCE_SUSPEND=1: in v7.2-rc3 a geni UART in use keeps its
+# "se" clock, its QUP bandwidth and its CX vote through a system sleep, as
+# the serial core's power-off (pm_runtime_put_sync()) cannot runtime suspend
+# a device the PM core holds for the whole transition, and on the SM8550
+# those clocks sit on the XO that is voted in the sleep set.  Both tablets'
+# console (uart7) and Bluetooth UART (uart14) are such ports: kit revision
+# 12's clock trace found them the only clocks still holding XO at the entry
+# to the sleep.  The patch force-suspends the port at the end of its suspend
+# callback and force-resumes it first in its resume callback.  Every system
+# sleep runs it, the boot's panel cycle (pm_test) too: test builds until it
+# has run on hardware.  No board gate: both tablets have the same two UARTs.
+# Strictly, with or without the patch above (another function), and refused
+# for a build without it in a tree that carries it.
+geni_fs_patch=qcom-geni-serial-force-suspend-in-system-sleep.patch
+geni_fs_marker='return pm_runtime_force_suspend(dev);'
+if [ "$apply_geni_force_suspend" = 1 ]; then
+	if grep -qF "$geni_fs_marker" "$kernel_tree/drivers/tty/serial/qcom_geni_serial.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$geni_fs_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$geni_fs_patch"
+	fi
+elif grep -qF "$geni_fs_marker" "$kernel_tree/drivers/tty/serial/qcom_geni_serial.c"; then
+	echo "$geni_fs_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_GENI_SERIAL_FORCE_SUSPEND=1." >&2
+	exit 1
+fi
 apply_unless 'sc8280xp_snd_startup' \
 	sound/soc/qcom/sc8280xp.c set-mi2s-codec-dai-format.patch
+# lpass-va-macro-pm-clock-framework.patch, upstream eb667d0fbdd3 (v7.3-rc1),
+# with APPLY_LPASS_VA_MACRO_PM_CLK=1: the VA macro, the one LPASS macro both
+# tablets bind, takes its LPASS_HW_MACRO and LPASS_HW_DCODEC votes (q6prm
+# clocks that ask the audio DSP to keep the LPASS core hardware on) at
+# probe and keeps them for the life of the driver in v7.2-rc3; with the
+# PM clock framework they go at its runtime suspend, 100 ms after its last
+# use.  It changes the VA macro's runtime behaviour, not only its system
+# sleep: test builds until it has run on hardware.  No board gate.
+# Strictly, and refused for a build without it in a tree that carries it.
+va_macro_patch=lpass-va-macro-pm-clock-framework.patch
+va_macro_marker='ret = pm_clk_suspend(dev);'
+if [ "$apply_va_macro_pm_clk" = 1 ]; then
+	if grep -qF "$va_macro_marker" "$kernel_tree/sound/soc/codecs/lpass-va-macro.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$va_macro_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$va_macro_patch"
+	fi
+elif grep -qF "$va_macro_marker" "$kernel_tree/sound/soc/codecs/lpass-va-macro.c"; then
+	echo "$va_macro_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_LPASS_VA_MACRO_PM_CLK=1." >&2
+	exit 1
+fi
 apply_unless 'ret != -ENODEV && ret != -EPROBE_DEFER' \
 	drivers/gpu/drm/msm/dp/dp_display.c \
 	msm-dp-allow-unresolved-usbc-bridge.patch
@@ -646,6 +767,33 @@ apply_unless 'mdss_handoff_gdsc_cycle' \
 	drivers/gpu/drm/msm/msm_mdss.c msm-mdss-handoff-gdsc-cycle.patch
 apply_unless 'boot_display_cycle' \
 	drivers/gpu/drm/msm/msm_kms.c msm-kms-boot-display-cycle.patch
+# msm-dsi-phy-release-ahb-clock-in-system-sleep.patch, posted upstream and
+# reviewed (2026-10/11), not merged yet, with APPLY_DSI_PHY_AHB_RELEASE=1:
+# the DSI PHY's pm_clk keeps its AHB clock, DISP_CC_MDSS_AHB_CLK, prepared
+# from its probe on, and on the SM8550 that clock's source sits on the XO
+# that is voted in the sleep set, so XO stayed voted through every system
+# sleep with the display off.  The patch unprepares it in suspend_late and
+# prepares it again in resume_early; at run time the clock is handled as
+# before.  It goes on top of the three DSI PHY patches above
+# (msm-dsi-handoff-regdump.patch's context is in it), strictly, and is
+# refused for a build without it in a tree that carries it.  The boot's
+# panel cycle (pm_test=platform) runs it too: test builds until it has run
+# on hardware.  No board gate: both tablets' DSI PHYs are the same.
+dsi_ahb_patch=msm-dsi-phy-release-ahb-clock-in-system-sleep.patch
+dsi_ahb_marker='static int dsi_phy_suspend_late(struct device *dev)'
+if [ "$apply_dsi_phy_ahb" = 1 ]; then
+	if grep -qF "$dsi_ahb_marker" "$kernel_tree/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$dsi_ahb_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$dsi_ahb_patch"
+	fi
+elif grep -qF "$dsi_ahb_marker" "$kernel_tree/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c"; then
+	echo "$dsi_ahb_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_DSI_PHY_AHB_RELEASE=1." >&2
+	exit 1
+fi
 # Bring-up switch: msm.cached_coherent=0 withholds cached-coherent GEM
 # buffers from Mesa (the X710 shows a 96-px lattice of unwritten/stale
 # pixels in GPU-rendered content).  Inert without the parameter.

@@ -13,8 +13,13 @@
 # collapsed in system suspend when the PCIe host has powered itself down and
 # kept on while it keeps its link (the guard; its debug switch on at every
 # boot), and a debug switch that lets the PCIe root port go to D3hot (off at
-# every boot), in boot, and its module tree.  The DTB and the configuration
-# are the hang-log kit's, so vendor_boot is checked but not written.
+# every boot), and since revision 12 with the AOP's log of what keeps CX from
+# collapsing (a debug switch, off at every boot) and the VA macro's and the
+# DSI PHY's clocks released in system sleep, and since revision 13 with the
+# console's and the Bluetooth UART's resources released in system sleep (and
+# the AOP log's region logged raw), in boot, and its module tree.
+# The DTB and the configuration are the hang-log kit's, so vendor_boot is
+# checked but not written.
 #
 #   sudo sh ~/typec-roles/install.sh      then reboot
 #   sudo sh ~/typec-roles/rollback.sh     back to the hang-log kit, then reboot
@@ -67,7 +72,7 @@
 # already (reboot soon), and the hang-log kernel with this kit's module tree
 # loads none of the tree's modules (v4l2loopback, netfilter, netconsole and
 # the secure processor's), while Wi-Fi, USB networking and Bluetooth
-# are built in.  Revisions 1 to 11 all have one key: the kernel of one takes
+# are built in.  Revisions 1 to 12 all have one key: the kernel of one takes
 # the signature of another's modules, but a module whose BTF does not match
 # the running kernel's is refused all the same (CONFIG_DEBUG_INFO_BTF_MODULES
 # without CONFIG_MODULE_ALLOW_BTF_MISMATCH), and revisions whose kernels

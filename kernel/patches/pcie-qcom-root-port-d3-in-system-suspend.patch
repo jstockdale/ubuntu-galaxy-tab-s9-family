@@ -1,0 +1,163 @@
+Subject: [PATCH] PCI: qcom: let the root ports go to D3hot in system suspend without native pciehp
+
+NOT YET FOR RELEASE: the default-on form of kit revision 11's debug switch
+(pcie-qcom-debug-root-port-d3.patch, sleep-test.sh's root-port-d3).  It
+has run as that switch three times on the SM-X710 (2026-11-23, revision
+11's runs 3 to 5: once at pm_test=platform, twice in a real
+suspend-to-idle), and never at boot, in the boot's panel cycle, on the
+SM-X910 (whose Wi-Fi is another chip, on ath12k) or in a real deep sleep;
+it needs more hardware passes before it ships.
+scripts/build-mainline-kernel.sh applies this only with
+APPLY_SM8550_ROOT_PORT_D3=1, which needs APPLY_SM8550_PCIE0_GDSC_OFF=1 and
+APPLY_SM8550_PCIE0_GDSC_GUARD=1 (a host that powers down under
+pcie_0_gdsc kept in retention is the sleep that never came back, 8 times of
+8 on kit revisions 7 to 10), and refuses any other build in a tree that
+carries it.  No board check.
+
+Why.  A qcom PCIe host powers itself down in a system suspend only when
+every function on its bus is in D3hot, its root port included
+(pci_host_common_d3cold_possible(), from dw_pcie_suspend_noirq()), and the
+PCI core puts the root port in D3hot only with bridge_d3
+(pci_power_manageable(), from pci_pm_suspend_noirq()).  The qcom root
+ports are hot-plug capable again since 33a76fc3c3e6 (v7.1), and
+pci_bridge_d3_possible() refuses D3 to a hot-plug port that pciehp does
+not handle natively before anything else: without CONFIG_HOTPLUG_PCI_PCIE
+(this port's configuration, and arm64's defconfig) pciehp_is_native() is
+false, so with the Wi-Fi bound the root port stays in D0 and the host keeps
+its link, clocks, PHY and votes through every suspend.  On the SM-X710
+such a sleep kept pcie_0_gdsc and CX on (revision 11's run 2, a deep
+sleep with the PCI devices kept: pcie_0_gdsc +0 and cx +0 in genpd's
+power-offs, ddr +0), where one with the PCI devices removed collapsed both
+(run 1, suspend-to-idle: pcie_0_gdsc +1, cx +1, ddr +1275); with the debug
+switch the host powered down with the Wi-Fi bound and the sleep went as
+the removed port's (runs 4 and 5, suspend-to-idle: pcie_0_gdsc +1, cx +1,
+ddr +1261 and +1, the Wi-Fi back with one firmware load).
+
+What upstream intends.  Root ports go to D3 on non-x86 (a5fb3ff63287 for
+ports that are not hot-plug capable), and since d4c79b63d82d (v7.3,
+Manivannan Sadhasivam, the qcom PCIe maintainer) hot-plug capable ones as
+well, but only with native pciehp: upstream's route is
+CONFIG_HOTPLUG_PCI_PCIE=y, with 65ccb2203ef8 (v7.3) clearing Attention
+Button Present for pciehp.  (On v7.2-rc3 a hot-plug port with native
+pciehp is refused too, for being one, unless pcie_port_pm=force:
+pci_bridge_d3_possible() before d4c79b63d82d.)  This port's kits cannot
+change the kernel configuration (make-kit.sh requires the hang-log kit's),
+and pciehp would bind to the port and act on its link-down and link-up
+events at every suspend, which has not run here.  So this gives the root
+port of a qcom host bridge_d3 where it is a hot-plug port without native
+pciehp, the D3 that the PCI core of v7.3 gives the same port with native
+pciehp, which is what the debug switch did by hand: the community SM8550
+kernels get the same with CONFIG_HOTPLUG_PCI_PCIE=y and pcie_port_pm=force
+(ROCKNIX).
+
+What changes, at every system suspend from the boot on, the boot's panel
+cycle (pm_test=platform, about 22 s in) included: the root port goes to
+D3hot after the Wi-Fi does; the host sends PME_Turn_Off, waits for L2/L3
+Ready at most 10 ms (the WCN6855, reset by ath11k's suspend, never acks:
+"Timeout waiting for L2 entry! LTSSM: 0x12", non-fatal since eed390775470),
+powers the Wi-Fi off through pwrctrl and itself down; the guard marks it
+out-of-band and genpd collapses pcie_0_gdsc; the resume sets the host up,
+trains the link (0.27 s in revision 11's runs; the link wait gives up after
+about 3.7 s on the SM-X710, pcie-dwc-link-wait-longer-gts9wifi.patch, and
+0.9 s on the SM-X910) and restores the root port's and the Wi-Fi's
+configuration, and the Wi-Fi driver loads its firmware as it does after
+every suspend already (ath11k on the SM-X710).
+Risks: a link that does not train at the resume loses the Wi-Fi until the
+next boot, at every boot if it is the panel cycle's; a bus error at the
+host's first access after the collapse would restart the tablet.  The
+PCI core does not manage this port's bridge_d3 (pci_bridge_d3_update()
+returns for a port pci_bridge_d3_possible() refuses), so a function's
+D3cold veto (no_d3cold, d3cold_allowed 0 in sysfs) is not consulted for
+it, and pcie_port_pm=off does not reach it; the in-tree ath11k and ath12k
+set no such veto, and no PCI quirk does.
+verify.sh's guard check expects the panel cycle to keep the link and would
+note this boot's "the host powered down" line instead: to be adapted when
+this ships.  pcie_qcom.root_port_d3=0 on the command line turns it off.
+On a build with the debug switches too (APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1)
+the root port's debug switch still reads N at boot although the ports go
+to D3hot from the boot on: its N takes it away until the restart, its Y
+gives it back, and sleep-test.sh's root-port-d3 adds nothing there.
+
+---
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -36,6 +36,7 @@
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ #include <linux/units.h>
++#include <linux/pci_hotplug.h>
+ 
+ #include "../../pci.h"
+ #include "../pci-host-common.h"
+@@ -2407,6 +2408,71 @@ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QC
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1000, qcom_fixup_class);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1001, qcom_fixup_class);
+ 
++/*
++ * Root ports to D3hot in system suspend, so that a host powers itself down
++ * with its endpoint bound (pcie-qcom-root-port-d3-in-system-suspend.patch,
++ * APPLY_SM8550_ROOT_PORT_D3=1; test builds until it has run on hardware).
++ *
++ * A host powers itself down in a system suspend only when every function
++ * on its bus is in D3hot, its root port included
++ * (pci_host_common_d3cold_possible(), from dw_pcie_suspend_noirq()), and the
++ * PCI core puts a root port in D3hot only with bridge_d3
++ * (pci_power_manageable(), from pci_pm_suspend_noirq()).  The qcom root
++ * ports are hot-plug capable (33a76fc3c3e6, v7.1), and
++ * pci_bridge_d3_possible() refuses D3 to a hot-plug port that pciehp does
++ * not handle natively: a kernel without CONFIG_HOTPLUG_PCI_PCIE (which this
++ * port's configuration leaves out) never gives them bridge_d3, so with the
++ * Wi-Fi bound the host kept its link, its clocks and its votes in every
++ * system suspend.  Upstream wants such root ports in D3 on non-x86
++ * (a5fb3ff63287, d4c79b63d82d in v7.3), through native pciehp.  This gives
++ * a qcom host's hot-plug root port without native pciehp bridge_d3, the D3
++ * that v7.3's PCI core gives it with native pciehp, as the PCI core
++ * enumerates it (and enumerates it again after a rescan):
++ * from the first suspend on the port goes to D3hot after its functions, the
++ * host sends PME_Turn_Off and powers down, and its resume sets it up again,
++ * trains the link and restores the functions' configuration
++ * (pci_pm_resume_noirq()).  It is the effect of the debug switch of
++ * pcie-qcom-debug-root-port-d3.patch (kit revision 11) from the boot, the
++ * boot's panel cycle (pm_test=platform) included.  bridge_d3 is recomputed
++ * only for a port the PCI core can put in D3 itself (pci_bridge_d3_update()),
++ * so it stays; the portdrv enables runtime PM only for a port
++ * pci_bridge_d3_possible() allows, so this adds no runtime D3.
++ * Nor is a function's D3cold veto consulted for the port then, nor
++ * pcie_port_pm=off: pcie_qcom.root_port_d3=0 on the command line leaves the
++ * ports as the PCI core has them; the debug switch's N takes it away at run
++ * time.  Without CONFIG_ACPI pciehp_is_native() is true and this does
++ * nothing (this port's configuration has CONFIG_ACPI).
++ */
++static bool qcom_pcie_root_port_d3 = true;
++module_param_named(root_port_d3, qcom_pcie_root_port_d3, bool, 0444);
++MODULE_PARM_DESC(root_port_d3,
++		 "Let the hot-plug root ports of qcom PCIe hosts without native pciehp go to D3hot in system suspend (default: Y)");
++
++static struct platform_driver qcom_pcie_driver;
++
++static void qcom_pcie_fixup_root_port_d3(struct pci_dev *pdev)
++{
++	struct pci_host_bridge *bridge;
++
++	if (!qcom_pcie_root_port_d3 || !pci_is_pcie(pdev) ||
++	    pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT)
++		return;
++
++	bridge = pci_find_host_bridge(pdev->bus);
++	if (!bridge || !bridge->dev.parent ||
++	    bridge->dev.parent->driver != &qcom_pcie_driver.driver)
++		return;
++
++	/* A hot-plug port without native pciehp: else the PCI core decides. */
++	if (pdev->bridge_d3 || !pdev->is_pciehp || pciehp_is_native(pdev))
++		return;
++
++	pdev->bridge_d3 = true;
++	pci_info(pdev, "goes to D3hot in system suspend (a hot-plug port without native pciehp; pcie_qcom.root_port_d3)\n");
++}
++DECLARE_PCI_FIXUP_CLASS_FINAL(PCI_ANY_ID, PCI_ANY_ID, PCI_CLASS_BRIDGE_PCI, 8,
++			      qcom_pcie_fixup_root_port_d3);
++
+ static const struct dev_pm_ops qcom_pcie_pm_ops = {
+ 	NOIRQ_SYSTEM_SLEEP_PM_OPS(qcom_pcie_suspend_noirq, qcom_pcie_resume_noirq)
+ };

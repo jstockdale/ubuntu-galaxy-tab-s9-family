@@ -151,6 +151,21 @@ TYPEC_PATCHES = ["tcpm-request-dfp-as-sink-before-discovery.patch", "tcpm-try-sn
 UFS_PATCHES = ["qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch",
                "qmp-ufs-pcs-state-diagnostic.patch", "qmp-ufs-pwrdn-readback-diagnostic.patch"]
 DEBUG_PATCHES = ["gcc-sm8550-gdsc-debug-switches.patch", "rpmhpd-debug-retention-floor.patch"]
+# Revision 12's debug patch in the same block of the build script: the AOP's
+# CXPC violators log (sleep-test.sh's cxpc), qcom_stats.c alone.
+CXPC_PATCH = "qcom-stats-cxpc-violators-diagnostic.patch"
+QCOM_STATS = "drivers/soc/qcom/qcom_stats"
+# Its switch (sleep-test.sh's cxpc), N at every boot of revision 12's kernel.
+CXPC_SWITCH = "qcom_stats/parameters/debug_cxpc_violators"
+# Revision 12's two fixes for clocks that kept XO voted through a sleep
+# (APPLY_LPASS_VA_MACRO_PM_CLK=1, APPLY_DSI_PHY_AHB_RELEASE=1), and the
+# sources they change.
+XO_PATCHES = ["lpass-va-macro-pm-clock-framework.patch", "msm-dsi-phy-release-ahb-clock-in-system-sleep.patch",
+              # Revision 13's: the two UARTs' clocks (APPLY_GENI_SERIAL_FORCE_SUSPEND=1).
+              "qcom-geni-serial-force-suspend-in-system-sleep.patch"]
+VA_MACRO = "sound/soc/codecs/lpass-va-macro"
+DSI_PHY = "drivers/gpu/drm/msm/dsi/phy/dsi_phy"
+GENI_SERIAL = "drivers/tty/serial/qcom_geni_serial"
 # Revision 11's pcie_0_gdsc, behind APPLY_SM8550_PCIE0_GDSC_OFF, and the line
 # it gives that domain, by which the build script and make-kit.sh know it.
 GDSC_PATCHES = ["gcc-sm8550-pcie0-gdsc-off-in-suspend.patch"]
@@ -162,6 +177,10 @@ PCIE0_LINE = "\t.pwrsts = PWRSTS_OFF_ON, /* gcc-sm8550-pcie0-gdsc-off-in-suspend
 # script and make-kit.sh know it by.
 GUARD_FLAG_LINE = "\t\t.flags = GENPD_FLAG_ACTIVE_WAKEUP,\n"
 PCIE_PATCHES = ["pcie-qcom-keep-power-domain-while-link-kept.patch", "pcie-qcom-debug-root-port-d3.patch"]
+# The root port switch's default-on form (APPLY_SM8550_ROOT_PORT_D3=1), in no
+# kit yet.
+RPD3_DEFAULT = "pcie-qcom-root-port-d3-in-system-suspend.patch"
+RPD3_DEFAULT_MARKER = "static void qcom_pcie_fixup_root_port_d3(struct pci_dev *pdev)"
 GUARD_LINE = "qcom_pcie_mark_sleep_path(dev, pcie->link_kept);"
 RPD3_MARKER = "PCIe root port to D3 for a sleep test, not for release builds"
 # Revision 11's ufs-qcom: the UFS PHY power reference fix, which every build
@@ -201,10 +220,18 @@ GUARD_DOWN = "qcom-pcie 1c00000.pcie: system sleep: the host powered down, and g
 
 
 def kit_patches(text):
-    """make-kit.sh's seven lists of patches, as it names them."""
+    """make-kit.sh's eight lists of patches, as it names them."""
     return [re.search(rf"^{name}=\((.*?)\)$", text, re.M | re.S).group(1).split()
             for name in ("typec_patches", "gdsc_patches", "debug_patches", "fix_patches", "ufs_patches",
-                         "pcie_patches", "ufs_qcom_patches")]
+                         "pcie_patches", "ufs_qcom_patches", "xo_patches")]
+
+
+def xo_files_of(text):
+    """make-kit.sh's files of each of revision 12's two XO fixes and
+    revision 13's UART one."""
+    names = {"va_macro": VA_MACRO, "dsi_phy": DSI_PHY, "geni": GENI_SERIAL}
+    words = shlex.split(re.search(r"^xo_files=\((.*?)\)$", text, re.M).group(1))
+    return [[re.sub(r"\$(\w+)", lambda m: names[m.group(1)], f) for f in word.split()] for word in words]
 
 PREFIXES = (
     "/dev/disk/by-partlabel/", "/usr/lib/modules/", "/var/backups", "/var/log/", "/run/",
@@ -235,6 +262,12 @@ PREFIXES = (
     # Revision 11's root port debug switch (verify.sh, sleep-test.sh's
     # root-port-d3).
     "/sys/module/pcie_qcom/parameters",
+    # Revision 12: the device package's sensors hook (sleep-test.sh's
+    # sensors=hook), the CXPC violators switch (cxpc).
+    "/usr/lib/systemd/system-sleep/", "/sys/module/qcom_stats/parameters",
+    # Revision 13: the Bluetooth controller and the console's tty (verify.sh,
+    # sleep-test.sh's UART evidence).
+    "/sys/class/bluetooth", "/sys/class/tty/",
 )
 
 STUBS = {
@@ -749,7 +782,7 @@ class FakeTablet(unittest.TestCase):
         (self.kit / "BUILD_ID").write_text(NEW_BUILD_ID + "\n")
         (self.kit / "KEY_ID").write_text(KEY_ID + "\n")
         (self.kit / "SIGNER").write_text(SIGNER + "\n")
-        (self.kit / "REVISION").write_text("11\n")
+        (self.kit / "REVISION").write_text("12\n")
         for name in ("install.sh", "rollback.sh", "verify.sh", "sleep-test.sh", "ufs-phy-power-check.sh",
                      "README.md"):
             (self.kit / name).write_bytes((KIT_SRC / name).read_bytes())
@@ -933,10 +966,11 @@ class FakeTablet(unittest.TestCase):
         VALUES says otherwise (by word: pcie0="Y"); a value of None leaves
         that switch out.  BOOT is revision 11's debug_boot_state (R11_BOOT
         on its kernel), and None leaves it out, as the kernels of revisions
-        9 and 10 have it.  rpd3, revision 11's root port switch, is left out
-        unless VALUES gives it."""
-        for word, path in SWITCHES + (("rpd3", RPD3_SWITCH),):
-            value = values.get(word, None if word == "rpd3" else "N")
+        9 and 10 have it.  rpd3, revision 11's root port switch, and cxpc,
+        revision 12's CXPC log switch, are left out unless VALUES gives
+        them."""
+        for word, path in SWITCHES + (("rpd3", RPD3_SWITCH), ("cxpc", CXPC_SWITCH)):
+            value = values.get(word, None if word in ("rpd3", "cxpc") else "N")
             f = self.root / "sys/module" / path
             if value is None:
                 f.unlink(missing_ok=True)
@@ -955,6 +989,11 @@ class FakeTablet(unittest.TestCase):
         pcie0 Y (pcie_0_gdsc OFF_ON), the others N, the root port's N, and
         debug_boot_state."""
         self.debug_switches(boot=R11_BOOT, **{"pcie0": "Y", "rpd3": "N", **values})
+
+    def r12_switches(self, **values):
+        """The debug switches as revision 12's kernel boots with them:
+        revision 11's and the CXPC log's, N."""
+        self.r11_switches(**{"cxpc": "N", **values})
 
     def r7_kit(self):
         """The kit directory as revision 7's packed kit, with stand-ins for
@@ -977,14 +1016,19 @@ class FakeTablet(unittest.TestCase):
     def boot_kit_kernel(self, build_id):
         """A boot of the kernel BUILD_ID with the kit's module key, the
         hang-log kit's configuration and ramoops, and the switches as built:
-        the driver's two, and the debug switches as revision 11's kernel
+        the driver's two, and the debug switches as revision 12's kernel
         boots with them (pcie0 on, the others off); the PCIe link up, and
-        revision 10's power-up write line before the calibration entry."""
+        revision 10's power-up write line before the calibration entry; the
+        Bluetooth controller and the console's tty with its wakeup off, as
+        squirtle has them."""
         self.running(build_id)
+        (self.root / "sys/class/bluetooth/hci0").mkdir(parents=True, exist_ok=True)
+        (self.root / "sys/class/tty/ttyMSM0/power").mkdir(parents=True, exist_ok=True)
+        (self.root / "sys/class/tty/ttyMSM0/power/wakeup").write_text("disabled\n")
         params = self.root / "sys/module/sm5714_usbpd/parameters"
         (params / "sink_host_swap").write_text("Y\n")
         (params / "try_snk_extra_wait_ms").write_text("600\n")
-        self.r11_switches()
+        self.r12_switches()
         (self.root / "journal").write_text(
             f"kernel: Loaded X.509 cert 'Build time autogenerated kernel key: {KEY_ID}'\n"
             "kernel: ramoops: using 0x200000@0x880900000, ecc: 96\n"
@@ -1511,7 +1555,7 @@ class UpgradeTest(UpgradeHelpers, FakeTablet):
         (self.kit / "boot.img").write_bytes(self.new_boot)
         (self.kit / f"modules-{RELEASE}.tar").write_bytes(modules_tar("new"))
         (self.kit / "BUILD_ID").write_text(NEW_BUILD_ID + "\n")
-        (self.kit / "REVISION").write_text("11\n")
+        (self.kit / "REVISION").write_text("12\n")
         for name, data in scripts.items():
             (self.kit / name).write_bytes(data)
         self.seal()
@@ -2060,7 +2104,7 @@ class UpgradeTest(UpgradeHelpers, FakeTablet):
         self.boot_kit_kernel(NEWER_BUILD_ID)
         result = self.run_script("verify.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"ok   running the kit's kernel (build ID {NEWER_BUILD_ID[:12]}, revision 11)",
+        self.assertIn(f"ok   running the kit's kernel (build ID {NEWER_BUILD_ID[:12]}, revision 12)",
                       result.stdout)
         self.assertIn("all checks passed", result.stdout)
 
@@ -3032,6 +3076,29 @@ class VerifyTest(FakeTablet):
                 self.assertIn(said, result.stdout)
                 self.assertNotIn("guard did not hold", result.stdout)
 
+    def test_a_ufs_failure_shows_revision_11_s_ufs_qcom_lines_with_it(self):
+        """verify.sh takes the same diagnostic lines as sleep-test.sh: with a
+        failure its listing has revision 11's ufs-qcom lines too, the counts
+        at a power-up sequence's entry, a failed sequence and a setup_clocks
+        repeat; without a failure they are not listed."""
+        diag = {name: re.search(r"^ufs_diag='([^']*)'$", (KIT_SRC / name).read_text(), re.M).group(1)
+                for name in ("verify.sh", "sleep-test.sh")}
+        self.assertEqual(diag["verify.sh"], diag["sleep-test.sh"])
+        self.boot_kit()
+        self.journal_add("kernel: PM: suspend entry (deep)\nkernel: " + UFS_REPEAT + "\nkernel: "
+                         + UFS_COUNTS.format(count=2) + "\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(UFS_REPEAT, result.stdout)
+        self.journal_add(UFS_PWRUP + "\n" + "\n".join(UFS_TIMEOUT) + "\nkernel: " + UFS_COUNTS_FAILED + "\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL the UFS PHY or host failed to come up this boot (4 lines; ", result.stdout)
+        listing = result.stdout[result.stdout.index("FAIL the UFS PHY or host failed"):]
+        for line in (UFS_REPEAT, UFS_COUNTS.format(count=2), UFS_COUNTS_FAILED):
+            with self.subTest(line):
+                self.assertIn("kernel: " + line + "\n", listing)
+
     def test_checks_see_the_ufs_phy_through_the_diagnostic_s_lines(self):
         """Revision 8: the PCS reset logs nothing; on the kit's kernel the
         diagnostic logs each calibration of the UFS PHY.  A calibration that
@@ -3101,14 +3168,14 @@ class VerifyTest(FakeTablet):
         self.assertNotIn("gts9u sleep-test", result.stdout)
 
     def test_checks_see_the_debug_switches_as_the_kit_s_kernel_boots_them(self):
-        """Revisions 9 to 11: on the kit's kernel each of the four debug
-        switches is there and reads as revision 11's kernel boots it, pcie0
-        Y (pcie_0_gdsc OFF_ON) and the others N, and debug_boot_state says
-        so; a switch that reads otherwise, or one missing, fails.  On
-        another kernel they are a note: listed if it has them, said to be
-        absent if not."""
+        """Revisions 9 to 12: on the kit's kernel each of the debug switches
+        is there and reads as revision 12's kernel boots it, pcie0 Y
+        (pcie_0_gdsc OFF_ON) and the others N, the CXPC log's among them,
+        and debug_boot_state says so; a switch that reads otherwise, or one
+        missing, fails.  On another kernel they are a note: listed if it has
+        them, said to be absent if not."""
         names = ("gcc_sm8550.debug_pcie0_phy_off", "gcc_sm8550.debug_usb_off", "rpmhpd.debug_ret_floor",
-                 "pcie_qcom.debug_root_port_d3")
+                 "pcie_qcom.debug_root_port_d3", "qcom_stats.debug_cxpc_violators")
         self.boot_kit()
         result = self.run_script("verify.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -3128,6 +3195,12 @@ class VerifyTest(FakeTablet):
                                 "kernel starts every boot with it off, and only a sleep test sets it, until its "
                                 "restart\n"),
                 ({"rpd3": None}, "FAIL debug switch pcie_qcom.debug_root_port_d3 is missing, expected N (off)"),
+                # Revision 12's CXPC log switch: set by hand, or revision
+                # 11's kernel under revision 12's BUILD_ID.
+                ({"cxpc": "Y"}, "FAIL debug switch qcom_stats.debug_cxpc_violators is Y, expected N (off): the "
+                                "kit's kernel starts every boot with it off, and only a sleep test sets it, until "
+                                "its restart\n"),
+                ({"cxpc": None}, "FAIL debug switch qcom_stats.debug_cxpc_violators is missing, expected N (off)"),
                 # gdsc-ret=pcie0 by hand, or a kernel without the new default.
                 ({"pcie0": "N"}, "FAIL debug switch gcc_sm8550.debug_pcie0_off is N, expected Y: the kit's kernel "
                                  "starts every boot with pcie_0_gdsc OFF_ON, and only a sleep test (gdsc-ret=pcie0) "
@@ -3139,8 +3212,8 @@ class VerifyTest(FakeTablet):
                                                          "usb N, expected 'pcie0 Y, pcie0phy N, usb N'")):
             with self.subTest(line):
                 self.boot_kit()
-                self.r11_switches(**values) if "boot" not in values else self.debug_switches(
-                    pcie0="Y", rpd3="N", **values)
+                self.r12_switches(**values) if "boot" not in values else self.debug_switches(
+                    pcie0="Y", rpd3="N", cxpc="N", **values)
                 result = self.run_script("verify.sh")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(line, result.stdout)
@@ -3152,7 +3225,8 @@ class VerifyTest(FakeTablet):
         self.debug_switches(pcie0=None, pcie0phy=None, usb=None, cxmx=None)
         result = self.run_script("verify.sh")
         self.assertIn("note the running kernel is not the kit's and offers no debug switches (the kernels of "
-                      "revisions 9 to 11 have them, the root port's from revision 11)\n", result.stdout)
+                      "revisions 9 to 12 have them, the root port's from revision 11, the CXPC log's from revision "
+                      "12)\n", result.stdout)
         self.assertNotIn("debug switch gcc_sm8550", result.stdout)
         self.debug_switches(usb="Y")
         result = self.run_script("verify.sh")
@@ -3167,6 +3241,67 @@ class VerifyTest(FakeTablet):
                       "gcc_sm8550.debug_pcie0_off=Y gcc_sm8550.debug_pcie0_phy_off=N gcc_sm8550.debug_usb_off=N "
                       "rpmhpd.debug_ret_floor=N pcie_qcom.debug_root_port_d3=N (at boot: pcie0 Y, pcie0phy N, usb N)\n",
                       result.stdout)
+
+    def test_bluetooth_after_the_first_suspend_and_the_console_s_wakeup_are_checked(self):
+        """Revision 13 powers the console's UART and the Bluetooth UART down
+        in every system suspend, the boot's panel cycle first.  After this
+        boot's first suspend a disabled interrupt or an HCI command timeout
+        fails on any kernel; no controller fails on the kit's kernel and is
+        a note on another; before any suspend it is a note.  The console's
+        tty wakeup enabled fails on the kit's kernel (its port would lose its
+        clock while it runs), and is a note on another."""
+        cycle = ("kernel: PM: suspend entry (deep)\nkernel: PM: suspend debug: Waiting for 0 second(s).\n"
+                 "kernel: PM: suspend exit\n")
+        self.boot_kit()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("note no suspend has run yet this boot (the panel cycle runs about 22 s in): the UARTs after it "
+                      "were not checked; run this again later (Bluetooth now: hci0)\n", result.stdout)
+        self.assertIn("ok   console ttyMSM0: wakeup disabled (its UART powers down in system suspend with the kit's "
+                      "kernel)\n", result.stdout)
+        self.journal_add(cycle)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   Bluetooth after this boot's first suspend: hci0, no disabled interrupt and no HCI command "
+                      "timeout\n", result.stdout)
+        for line in ("kernel: irq 191: nobody cared (try booting with the \"irqpoll\" option)",
+                     "kernel: Bluetooth: hci0: command 0xfc00 tx timeout",
+                     "kernel: Bluetooth: hci0: Opcode 0x0c03 failed: -110"):
+            with self.subTest(line):
+                self.boot_kit()
+                self.journal_add(cycle + line + "\n")
+                result = self.run_script("verify.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("FAIL an interrupt was disabled or a Bluetooth command timed out this boot (1 lines):\n"
+                              f"{line}\n", result.stdout)
+        # No controller after the suspend: a FAIL on the kit's kernel, a
+        # note on another.
+        self.boot_kit()
+        self.journal_add(cycle)
+        (self.root / "sys/class/bluetooth/hci0").rmdir()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"FAIL no Bluetooth controller ({self.root}/sys/class/bluetooth/hci*) after this boot's first "
+                      "suspend\n", result.stdout)
+        self.running(HANG_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertIn(f"note no Bluetooth controller ({self.root}/sys/class/bluetooth/hci*), and no disabled interrupt or "
+                      "HCI command timeout this boot\n", result.stdout)
+        # The console's tty as a wakeup source.
+        self.boot_kit()
+        (self.root / "sys/class/tty/ttyMSM0/power/wakeup").write_text("enabled\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL console ttyMSM0: wakeup enabled: uart_suspend_port() then leaves its UART running and the "
+                      f"kit's kernel powers it down all the same; echo disabled | sudo tee "
+                      f"{self.root}/sys/class/tty/ttyMSM0/power/wakeup\n", result.stdout)
+        self.running(HANG_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertIn("note console ttyMSM0: wakeup enabled (its UART stays powered through a suspend on this "
+                      "kernel)\n", result.stdout)
+        (self.root / "sys/class/tty/ttyMSM0/power/wakeup").unlink()
+        result = self.run_script("verify.sh")
+        self.assertIn(f"note no ttyMSM0 wakeup setting ({self.root}/sys/class/tty/ttyMSM0/power/wakeup)\n", result.stdout)
 
     def test_checks_see_revision_10_s_pcie_gpu_and_power_up_lines(self):
         """Revision 10: the Wi-Fi's PCIe link has to come up at boot without
@@ -3912,6 +4047,8 @@ switches() {
 	done
 	[ ! -e "$F/sys/module/pcie_qcom/parameters/debug_root_port_d3" ] ||
 		printf '%s ' "$(cat "$F/sys/module/pcie_qcom/parameters/debug_root_port_d3")"
+	[ ! -e "$F/sys/module/qcom_stats/parameters/debug_cxpc_violators" ] ||
+		printf '%s ' "$(cat "$F/sys/module/qcom_stats/parameters/debug_cxpc_violators")"
 	echo
 }
 sb_default() { cat "$T/sb-errors-$1" 2>/dev/null || echo remount-ro; }
@@ -4088,7 +4225,10 @@ CLK_PARENTS = {"xo_board": None, "bi_tcxo": "xo_board", "bi_tcxo_ao": "xo_board"
                "gcc_ufs_phy_ahb_clk": None, "gcc_ufs_phy_axi_clk": "gcc_gpll0",
                "gcc_ufs_phy_unipro_core_clk": "gcc_gpll0", "gcc_ufs_phy_ice_core_clk": "gcc_gpll0",
                "gcc_usb30_prim_master_clk": "gcc_gpll0",
-               "gcc_ufs_phy_phy_aux_clk": "bi_tcxo", "tcsr_ufs_clkref_en": "bi_tcxo"}
+               "gcc_ufs_phy_phy_aux_clk": "bi_tcxo", "tcsr_ufs_clkref_en": "bi_tcxo",
+               # The two UARTs' serial engine clocks (revision 12's first run:
+               # the last two holders of XO at the sleep's entry).
+               "gcc_qupv3_wrap1_s7_clk": "gcc_gpll0", "gcc_qupv3_wrap2_s6_clk": "gcc_gpll0"}
 
 
 def write_clocks(directory, **counts):
@@ -4126,6 +4266,12 @@ def rpmh_line(ts, state, addr, data):
     drivers/soc/qcom/trace-rpmh.h)."""
     return (f"          <idle>-0       [000] d..2. {ts:12.6f}: rpmh_send_msg: apps_rsc: tcs(m): 2 [{state}] "
             f"cmd(n): 0 msgid: 0x10108 addr: {addr} data: {data} complete: 0\n")
+
+
+def clk_line(ts, event, name):
+    """A line of the trace for a clock's prepare or unprepare (clk_prepare,
+    clk_unprepare, include/trace/events/clk.h)."""
+    return f"     kworker/0:1-12      [000] ...1. {ts:12.6f}: {event}: {name}\n"
 
 
 # The command DB as its debugfs file dumps it (made-up addresses).
@@ -6646,7 +6792,10 @@ exit 0
                     "root-port-d3", "pci=remove root-port-d3", "pci=keep root-port-d3 root-port-d3",
                     "pci=keep root-port-d3 gdsc-ret=pcie0", "pci=keep root-port-d3 pm_test=devices",
                     "pci=keep root-port-d3 pm_test=freezer", "dry root-port-d3", "root-port-d3=1",
-                    "sensors=", "sensors=start", "sensors=stop sensors=stop", "dry sensors=stop", "sensors"):
+                    "sensors=", "sensors=start", "sensors=stop sensors=stop", "dry sensors=stop", "sensors",
+                    "sensors=stop sensors=hook", "sensors=hook sensors=hook", "sensors=Hook",
+                    # Revision 12's cxpc: once, and no sleep in dry.
+                    "cxpc cxpc", "dry cxpc", "cxpc=1"):
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
@@ -6654,7 +6803,7 @@ exit 0
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok", result.stderr)
                 self.assertIn("[pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]\n"
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]\n"
-                              "       [sensors=stop] restart-ok", result.stderr)
+                              "       [cxpc] [sensors=stop|sensors=hook] restart-ok", result.stderr)
                 self.assert_nothing_done()
 
     # Revision 9's debug switches (gdsc=, cxmx=ret): run-time module
@@ -6760,7 +6909,7 @@ exit 0
             (("gdsc=usb", "cxmx=ret"), {}, "gdsc=usb needs pci=remove"),
             (("pci=remove", "gdsc=pcie0"), {"pcie0": None, "pcie0phy": None, "usb": None, "cxmx": None},
              f"this kernel does not offer the debug switch pcie0 ({gcc}/debug_pcie0_off): the kernels of kit "
-             "revisions 9 to 11 have it"),
+             "revisions 9 to 12 have it"),
             (("pci=remove", "gdsc=pcie0", "cxmx=ret"), {"cxmx": None},
              "this kernel does not offer the debug switch cxmx (ROOT/sys/module/rpmhpd/parameters/debug_ret_floor)"),
             (("pci=remove",), {"pcie0": "Y"},
@@ -7056,7 +7205,7 @@ exit 0
                 result = self.run_test("ro", *bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
                 self.assertIn("[trace|trace=live] [mode=s2idle]\n       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] "
-                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [sensors=stop] restart-ok", result.stderr)
+                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [cxpc] [sensors=stop|sensors=hook] restart-ok", result.stderr)
                 self.assert_nothing_done()
                 if "pm_test=" in bad:
                     level = bad.split("pm_test=")[1].split()[0]
@@ -7632,8 +7781,9 @@ exit 0
         puts it back to N."""
         for name, switches, lines, refused in (
                 ("no switch", {"rpd3": None}, (GUARD_KEPT,),
-                 "this kernel does not offer the debug switch rpd3 ({switch}): the kernels of kit revisions 9 to 11 "
-                 "have it, revision 11's alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"),
+                 "this kernel does not offer the debug switch rpd3 ({switch}): the kernels of kit revisions 9 to 12 "
+                 "have it, those of revisions 11 and 12 alone the root port's (sh ~/typec-roles/verify.sh says which "
+                 "kernel runs)"),
                 ("no guard", {}, (), 'root-port-d3 needs a guard that held this boot (a sleep that logged "the link '
                                     'was kept, and its power domain stayed on", none that logged it off): guard none'),
                 ("a guard that failed", {}, (GUARD_KEPT, GUARD_BAD),
@@ -7711,6 +7861,262 @@ exit 0
         self.assertEqual(self.read("frozen"), "")
         self.assertEqual(self.read("rtcwake.calls").count("-m mem"), 0)
         self.assertEqual(self.sysrq(), "")
+
+    def sensors_hook(self, quiesces=True):
+        """The device package's sensors hook as the stand-in root has it: one
+        that stops the Sensor Core's clients before a sleep (this branch's),
+        or the earlier one, which stops neither."""
+        hook = self.root / "usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        body = ('\t\tsystemctl stop iio-sensor-proxy.service 2>/dev/null || true\n'
+                '\t\tsystemctl stop hexagonrpcd-adsp-sensorspd.service 2>/dev/null || true\n') if quiesces else ""
+        hook.write_text('#!/bin/sh\necho "hook $*" >> "$HOME/hook.calls"\ncase "${1-}" in\n\tpre)\n'
+                        '\t\tsystemctl stop ubuntu-gts9u-sensors-resume.service 2>/dev/null || true\n'
+                        f"{body}\t\t;;\nesac\nexit 0\n")
+
+    def test_sensors_hook_runs_the_device_package_s_sleep_hook_as_a_systemd_suspend_does(self):
+        """sensors=hook: the device package's system-sleep hook's pre step
+        (pre suspend, as systemd-sleep runs it) in place of sensors=stop's
+        systemctl stop, checked the same way; no post step (the run ends with
+        a restart).  Refused, nothing done, with a hook that does not stop
+        iio-sensor-proxy, and on a dry run."""
+        for unit in ("iio-sensor-proxy", "hexagonrpcd-adsp-sensorspd"):
+            (self.tmp / f"active-{unit}.service").write_text("active\n")
+        self.sensors_hook()
+        result = self.run_test("ro", "1", "sensors=hook", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.read("hook.calls"), "hook pre suspend\n")
+        calls = self.read("systemctl.calls")
+        self.assertLess(calls.index("stop iio-sensor-proxy.service\n"),
+                        calls.index("stop hexagonrpcd-adsp-sensorspd.service\n"))
+        log = (self.ramdir() / "log").read_text()
+        hook = f"{self.root}/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors"
+        order = [f"sensors=hook: {hook} pre suspend, as systemd-sleep runs it before a systemctl suspend (it stops "
+                 "iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service; auto-rotation and auto-brightness "
+                 "are off until the restart, which runs no post)",
+                 "sensors=hook: ADSP clients now: iio-sensor-proxy inactive, hexagonrpcd-adsp-sensorspd inactive, "
+                 "hexagonrpcd-adsp-rootpd inactive (the hook status 0); 10s to settle",
+                 "frozen: /media/stick", "cycle 1/1: deep sleep"]
+        self.assertEqual([log.index(said) for said in order], sorted(log.index(said) for said in order))
+        self.assertIn("options: sensors=hook; switches: not offered by this kernel\n", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("; sensors=hook: this run stops iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service "
+                      f"next through {hook} pre suspend, until the restart\n", (logs / "before").read_text())
+        # The earlier hook, and a dry run: refused, nothing done.
+        for quiesces, args in ((False, ("ro", "1", "sensors=hook", "restart-ok")),
+                               (True, ("dry", "sensors=hook", "restart-ok"))):
+            with self.subTest(args=args):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                self.sensors_hook(quiesces)
+                hook = f"{self.root}/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors"
+                result = self.run_test(*args)
+                self.assertNotEqual(result.returncode, 0, self.out)
+                if quiesces:
+                    self.assertIn("dry sleeps not at all: sensors=hook is for the audio DSP's wakes in a sleep",
+                                  self.out)
+                else:
+                    self.assertIn("REFUSED: sensors=hook needs the device package's system-sleep hook that stops "
+                                  f"the sensor clients before a sleep ({hook}, naming iio-sensor-proxy.service); "
+                                  "this tablet's does not: sensors=stop stops them by hand", self.out)
+                    self.assert_nothing_done()
+                self.assertEqual(self.read("hook.calls"), "")
+                self.assertEqual(self.read("frozen"), "")
+
+    def test_cxpc_has_the_aop_log_what_held_cx_in_each_sleep(self):
+        """cxpc (revision 12's kernel): Y to the CXPC violators switch right
+        before the freeze, with the other switches; the AOP's log as it is
+        and every requester's DDR vote now in the record, read before
+        anything is frozen; after each sleep the summary of the log the
+        kernel logged, among the evidence and in pmsg, and its lines among
+        the cycle's kernel lines.  Refused on a kernel without the switch,
+        and with dry."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.debug_switches()
+        switch = self.root / "sys/module/qcom_stats/parameters/debug_cxpc_violators"
+        switch.parent.mkdir(parents=True, exist_ok=True)
+        switch.write_text("N\n")
+        stats = self.root / "sys/kernel/debug/qcom_stats"
+        stats.mkdir(parents=True, exist_ok=True)
+        (stats / "cxpc_violators").write_text("no log\n")
+        (stats / "ddr_votes").write_text("TZ          absent\nHLOS        ab 0 ib 0\nAUDIO       ab 12 ib 40\n")
+        log = ("[  700.000000] PM: suspend entry (deep)\n"
+               "[  700.100000] cxpc violators: the AOP's CXPC monitor is on for this suspend\n"
+               "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+               "[  730.200000] cxpc violators: mode 0xcc (CXPC), 3 of 36 lines, every 1000 ms, time shift 0, flush 10\n"
+               "[  730.200001] cxpc violators: 0x1000: AUDIO 3, HLOS 1\n"
+               "[  730.200002] cxpc violators: 0x2000: AUDIO 3\n"
+               "[  730.200003] cxpc violators: 0x3000: CXPC enter\n"
+               "[  730.200004] cxpc violators: summary: 3 lines, 1 of them CXPC enter or exit; DRVs: HLOS 1/3, "
+               "AUDIO 2/3 (every line)\n"
+               "[  730.300000] PM: suspend exit\n")
+        self.cycle(1, log=log)
+        result = self.run_test("ro", "1", "cxpc", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(switch.read_text(), "Y")
+        self.assertEqual(self.read("switches-at-freeze"), "N N N N Y \n")
+        self.assertEqual(self.read("switches-at-sleep"), "N N N N Y \n")
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", self.out)
+        on = "switches: pcie0 N, pcie0phy N, usb N, cxmx N, cxpc Y"
+        self.assertIn(f"kernel 68d243e908c0; options: cxpc; {on}\n", self.out)
+        self.assertIn(f"progress: debug switches set: cxpc; {on}", self.progress_lines())
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertIn(f"; {self.root}/sys/module/qcom_stats/parameters/debug_cxpc_violators); this run sets cxpc to Y "
+                      "right before the freeze\n", before)
+        self.assertIn(f"cxpc: the AOP's CXPC log as it is now ({self.root}/sys/kernel/debug/qcom_stats/cxpc_violators): "
+                      "no log\n", before)
+        self.assertIn(f"cxpc: every requester's DDR vote now ({self.root}/sys/kernel/debug/qcom_stats/ddr_votes): "
+                      "HLOS ab 0 ib 0, AUDIO ab 12 ib 40\n", before)
+        summary = "3 lines, 1 of them CXPC enter or exit; DRVs: HLOS 1/3, AUDIO 2/3 (every line)"
+        self.assertIn("cycle 1/1: evidence: cxpc violators (the AOP log; each of its lines is among the kernel lines of "
+                      f"this cycle): {summary}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: kernel: [  730.200001] cxpc violators: 0x1000: AUDIO 3, HLOS 1\n", self.out)
+        self.assertIn(f"cycle 1/1: evidence: cxpc: {summary}", self.pmsg_lines())
+        # A kernel without the switch, and dry: refused, nothing done.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.debug_switches()
+        result = self.run_test("ro", "1", "cxpc", "restart-ok")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("REFUSED: cxpc needs the CXPC violators switch "
+                      f"({self.root}/sys/module/qcom_stats/parameters/debug_cxpc_violators): the kernels of kit "
+                      "revision 12 have it", self.out)
+        self.assert_nothing_done()
+        result = self.run_test("dry", "cxpc", "restart-ok")
+        self.assertEqual(result.returncode, 2, self.out)
+        self.assertIn("dry sleeps not at all: cxpc is for the AOP's log of a sleep", self.out)
+
+    def test_cxpc_lists_the_raw_region_apart_and_reads_it_raw_first(self):
+        """Revision 12's first run read a region that is no CXPC log (mode
+        0xdb, its lines 32-bit words); revision 13's kernel decodes only
+        under a CXPC header, says so in its summary otherwise, and logs the
+        region raw around each suspend.  The run reads the raw file before
+        anything is frozen, and lists the kernel's raw lines as evidence of
+        their own (at most 50), not among the cycle's kernel lines."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.debug_switches()
+        switch = self.root / "sys/module/qcom_stats/parameters/debug_cxpc_violators"
+        switch.parent.mkdir(parents=True, exist_ok=True)
+        switch.write_text("N\n")
+        stats = self.root / "sys/kernel/debug/qcom_stats"
+        stats.mkdir(parents=True, exist_ok=True)
+        (stats / "cxpc_violators").write_text("no log\n")
+        (stats / "ddr_votes").write_text("HLOS        ab 0 ib 0\n")
+        words = " ".join(["00000000"] * 16)
+        (stats / "cxpc_violators_raw").write_text("".join(f"+0x{4 * i:03x}: {words}\n" for i in range(0, 256, 16)))
+        raw = "".join(f"[  730.2{i:05d}] cxpc violators: raw after the suspend +0x{4 * (i % 16) * 16:03x}: {words}\n"
+                      for i in range(60))
+        log = ("[  700.000000] PM: suspend entry (deep)\n"
+               "[  700.100000] cxpc violators: the AOP's CXPC monitor is on for this suspend\n"
+               "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+               f"[  730.100000] cxpc violators: raw before the message +0x000: {words}\n"
+               "[  730.100001] cxpc violators: raw after the message: the same as before it\n"
+               + raw +
+               "[  730.300000] cxpc violators: mode 0xdb, 27 lines at most, every 16 ms, time shift 50, flush 1: not a "
+               "CXPC log (mode 0xcc, a time shift below 32), not decoded\n"
+               "[  730.300001] cxpc violators: summary: not a CXPC log (mode 0xdb); the region raw is above\n"
+               "[  730.400000] PM: suspend exit\n")
+        self.cycle(1, log=log)
+        result = self.run_test("ro", "1", "cxpc", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertIn(f"cxpc: the region raw now ({self.root}/sys/kernel/debug/qcom_stats/cxpc_violators_raw, 16 lines of "
+                      f"16 words):\ncxpc:   +0x000: {words}\n", before)
+        self.assertIn(f"cxpc:   +0x3c0: {words}\n", before)
+        self.assertIn("cycle 1/1: evidence: cxpc violators (the AOP log; each of its lines is among the kernel lines of "
+                      "this cycle): not a CXPC log (mode 0xdb); the region raw is above\n", self.out)
+        self.assertIn(f"cycle 1/1: evidence: cxpc raw: before the message +0x000: {words}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: cxpc raw: after the message: the same as before it\n", self.out)
+        shown = [line for line in self.out.splitlines() if "cycle 1/1: evidence: cxpc raw: " in line]
+        self.assertEqual(len(shown), 51, shown[-3:])
+        self.assertTrue(shown[-1].endswith("cycle 1/1: evidence: cxpc raw: (12 more raw lines left out; the kmsg file "
+                                           "in the run directory has them)"), shown[-1])
+        self.assertNotIn("cxpc violators: raw", "".join(line for line in self.out.splitlines(True)
+                                                        if ": evidence: kernel: " in line))
+        self.assertIn("cycle 1/1: evidence: kernel: [  730.300000] cxpc violators: mode 0xdb, 27 lines at most", self.out)
+        self.assertIn("cycle 1/1: evidence: cxpc: not a CXPC log (mode 0xdb); the region raw is above", self.pmsg_lines())
+
+    def uarts(self, wakeup="disabled", hci=True):
+        """The two UARTs as squirtle has them (2026-11-24): both runtime
+        active, the console's tty below its serial core devices, its
+        wakeup as given, and the Bluetooth controller hci0 (and a
+        connection's hci0:2, which is not a controller)."""
+        devices = self.root / "sys/bus/platform/devices"
+        for d in ("a9c000.serial", "898000.serial"):
+            (devices / d / "power").mkdir(parents=True, exist_ok=True)
+            (devices / d / "power/runtime_status").write_text("active\n")
+        tty = devices / "a9c000.serial/a9c000.serial:0/a9c000.serial:0.0/tty/ttyMSM0/power"
+        tty.mkdir(parents=True, exist_ok=True)
+        (tty / "wakeup").write_text(wakeup + "\n")
+        if hci:
+            for h in ("hci0", "hci0:2"):
+                (self.root / "sys/class/bluetooth" / h).mkdir(parents=True, exist_ok=True)
+
+    def test_the_uarts_clocks_at_the_sleep_s_entry_and_bluetooth_after_it(self):
+        """Revision 12's first run: the console's and the Bluetooth UART's
+        serial engine clocks were XO's last holders at the sleep's entry;
+        revision 13's kernel releases them.  With rpmh and the clock
+        tracepoints a line says, for each, whether the suspend unprepared it
+        and when it was prepared again; after every sleep the UARTs' runtime
+        state, their clocks' prepare counts, the console tty's wakeup and
+        the Bluetooth controller, and the first line of the cycle that says
+        Bluetooth lost its interrupt or its controller; in pmsg too, and the
+        UARTs in the record before the first sleep."""
+        (self.root / "dev/pmsg0").write_text("")
+        (self.root / "sys/power/mem_sleep").write_text("[s2idle]\n")
+        self.s2idle_files()
+        self.rpmh_files()
+        self.clk_events()
+        write_clocks(self.root / "sys/kernel/debug/clk", bi_tcxo=(3, 3), gcc_gpll0=(2, 2),
+                     gcc_qupv3_wrap1_s7_clk=(1, 1), gcc_qupv3_wrap2_s6_clk=(1, 1))
+        self.uarts()
+        # The console's clock unprepared before the sleep (708.000000) and
+        # prepared again after it; the Bluetooth UART's held.
+        self.cycle(1, log=self.s2idle_log())
+        (self.tmp / "cycle-1/trace").write_text(
+            clk_line(703.000000, "clk_unprepare", "gcc_qupv3_wrap1_s7_clk")
+            + rpmh_line(708.000000, "sleep", "0x50000", "0x0") + rpmh_line(708.000000, "wake", "0x50000", "0x60004001")
+            + clk_line(709.000000, "clk_prepare", "gcc_qupv3_wrap1_s7_clk"))
+        result = self.run_test("ro", "1", "mode=s2idle", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        entry = ("a9c000.serial (console, gcc_qupv3_wrap1_s7_clk): unprepared in the suspend at 703.000000, prepared "
+                 "again at 709.000000; 898000.serial (Bluetooth, gcc_qupv3_wrap2_s6_clk): prepared through the sleep's "
+                 "entry")
+        self.assertIn(f"cycle 1/1: evidence: UART clocks at the entry to the sleep (clock trace): {entry}\n", self.out)
+        now = ("a9c000.serial (console): runtime active, gcc_qupv3_wrap1_s7_clk prepared 1; ttyMSM0 wakeup disabled; "
+               "898000.serial (Bluetooth): runtime active, gcc_qupv3_wrap2_s6_clk prepared 1; hci0")
+        fine = "no disabled interrupt and no HCI command timeout in the kernel lines of this cycle"
+        self.assertIn(f"cycle 1/1: evidence: after: UARTs: {now}; Bluetooth: {fine}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: UARTs at the entry: console released 703.000000 to 709.000000, Bluetooth "
+                      "held; Bluetooth: ok", self.pmsg_lines())
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn(f"UARTs: {now}\n", (logs / "before").read_text())
+        # Without rpmh, a Bluetooth command that timed out after the resume:
+        # the UARTs as they are, and that line.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        (self.root / "dev/pmsg0").write_text("")
+        self.uarts(hci=False)
+        self.cycle(1, log="[  700.000000] PM: suspend entry (deep)\n"
+                          "[  730.000000] Timekeeping suspended for 30.002 seconds\n"
+                          "[  730.100000] PM: suspend exit\n"
+                          "[  732.200000] Bluetooth: hci0: command 0xfc00 tx timeout\n")
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        now = ("a9c000.serial (console): runtime active, gcc_qupv3_wrap1_s7_clk prepared -; ttyMSM0 wakeup disabled; "
+               "898000.serial (Bluetooth): runtime active, gcc_qupv3_wrap2_s6_clk prepared -; no controller")
+        self.assertIn(f"cycle 1/1: evidence: after: UARTs: {now}; Bluetooth: Bluetooth: hci0: command 0xfc00 tx "
+                      "timeout\n", self.out)
+        self.assertIn("cycle 1/1: evidence: UARTs after: console active, Bluetooth active, no controller; Bluetooth: "
+                      "Bluetooth: hci0: command 0xfc00 tx timeout", self.pmsg_lines())
+        self.assertNotIn("UART clocks at the entry", self.out)
 
     def test_gdsc_ret_pcie0_keeps_the_domain_in_retention_for_the_run(self):
         """gdsc-ret=pcie0 writes N to pcie0 right before the freeze, read
@@ -7864,6 +8270,106 @@ exit 0
         self.assertIn("options: rpmh;", self.out)
         self.assertEqual((self.root / "sys/kernel/tracing/events/rpmh/rpmh_send_msg/enable").read_text(), "1")
 
+    def clk_events(self):
+        """The clock framework's prepare and unprepare tracepoints, off."""
+        for ev in ("clk_prepare", "clk_unprepare"):
+            d = self.root / "sys/kernel/tracing/events/clk" / ev
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "enable").write_text("0\n")
+
+    def test_rpmh_names_a_suspend_to_idle_flush_at_the_sleep_s_entry_and_what_holds_xo_there(self):
+        """A suspend-to-idle flushes the sets after the last CPU stopped
+        sched_clock: at the time of the "Timekeeping suspended" line, which
+        the trace prints up to 1 us later than the kernel log.  That flush
+        is the sleep's ("the sleep's entry"), where revision 11's script
+        said "no flush" (2026-11-23).  With the clock tracepoints the XO line
+        names what the suspend left prepared below XO (a prepare before the
+        sleep, none after it, counts), the whole flush goes to pmsg in
+        pieces, and the clock tracepoints are on until the restart."""
+        (self.root / "dev/pmsg0").write_text("")
+        (self.root / "sys/power/mem_sleep").write_text("[s2idle]\n")
+        self.s2idle_files()
+        self.rpmh_files()
+        self.clk_events()
+        write_clocks(self.root / "sys/kernel/debug/clk", bi_tcxo=(3, 3), gcc_gpll0=(2, 2),
+                     gcc_ufs_phy_ice_core_clk=(1, 1), gcc_usb30_prim_master_clk=(1, 1))
+        # Cycle 1: USB's clock unprepared before the sleep, the ICE clock
+        # not; the flush at the sleep's instant (708.000000 in the kernel
+        # log: s2idle_log's Timekeeping line), one command 1 us later as the
+        # trace rounds it, and one 2 us later, after the sleep.
+        self.cycle(1, log=self.s2idle_log())
+        (self.tmp / "cycle-1/trace").write_text(
+            clk_line(703.000000, "clk_unprepare", "gcc_usb30_prim_master_clk")
+            + rpmh_line(704.000000, "active", "0x30030", "0x3")
+            + rpmh_line(708.000000, "sleep", "0x50000", "0x0") + rpmh_line(708.000000, "wake", "0x50000", "0x60004001")
+            + rpmh_line(708.000001, "sleep", "0x30000", "0x0") + rpmh_line(708.000001, "wake", "0x30000", "0x2")
+            + rpmh_line(708.000002, "sleep", "0x30010", "0x0")
+            + clk_line(709.000000, "clk_prepare", "gcc_usb30_prim_master_clk"))
+        result = self.run_test("ro", "1", "mode=s2idle", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("rpmh: the clk_prepare and clk_unprepare tracepoints are on until the restart too (XO at each "
+                      "sleep's entry)\n", self.out)
+        flush = ("the last of 1 flushes before the sleep at 708.000000 (at 708.000000, the sleep's entry, 4 commands), "
+                 "sleep/wake: MC0 0x0/0x60004001, cx.lvl 0x0/0x2; left out, so held at their vote through the sleep: "
+                 "xo.lvl (active 0x3), mx.lvl; active votes before the sleep 1, commands after it 1")
+        self.assertIn(f"cycle 1/1: evidence: rpmh sleep set: {flush}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: XO at the entry to the sleep (clock trace): XO still voted at the entry "
+                      "to the sleep, held by: gcc_ufs_phy_ice_core_clk; unprepared in the suspend before the sleep: "
+                      "gcc_usb30_prim_master_clk (1 prepares and unprepares traced before the sleep)\n", self.out)
+        pmsg = [line for line in self.pmsg_lines() if ": evidence: " in line]
+        self.assertIn("cycle 1/1: evidence: rpmh: flush 1 of 1 at 708.000000, the sleep's entry, sleep/wake: cx.lvl "
+                      "0x0/0x2; held: xo.lvl (active 0x3), mx.lvl", pmsg)
+        entry = [line for line in pmsg if ": evidence: XO at entry: " in line]
+        self.assertEqual(len(entry), 1, pmsg)
+        self.assertTrue(entry[0].startswith("cycle 1/1: evidence: XO at entry: XO held by gcc_ufs_phy_ice_core_clk; "
+                                            "data="), entry)
+        pieces = [line for line in pmsg if ": evidence: rpmh sleep set (" in line]
+        self.assertEqual(len(pieces), 2, pieces)
+        self.assertEqual("".join(line.split("): ", 1)[1] for line in pieces), flush)
+        self.assertTrue(pieces[0].startswith("cycle 1/1: evidence: rpmh sleep set (1/2): "), pieces)
+        self.assertTrue(all(len(line) <= 300 for line in pieces), pieces)
+        for ev in ("clk_prepare", "clk_unprepare"):
+            self.assertEqual((self.root / "sys/kernel/tracing/events/clk" / ev / "enable").read_text(), "1")
+
+    def test_xo_at_the_sleep_s_entry_is_free_when_the_suspend_unprepared_xo_itself(self):
+        """XO's own unprepare before the sleep: no clock of Linux votes it in
+        the sleep set.  A deep sleep flushes before sched_clock stops, so its
+        flush is before the Timekeeping line's time, as before.  Without the
+        clock tracepoints the XO line says so and the run goes on."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.rpmh_files()
+        self.clk_events()
+        write_clocks(self.root / "sys/kernel/debug/clk", bi_tcxo=(1, 1), gcc_gpll0=(1, 1),
+                     gcc_usb30_prim_master_clk=(1, 1))
+        self.cycle(1)
+        (self.tmp / "cycle-1/trace").write_text(
+            clk_line(701.000000, "clk_unprepare", "gcc_usb30_prim_master_clk")
+            + clk_line(701.000001, "clk_unprepare", "gcc_gpll0") + clk_line(701.000002, "clk_unprepare", "bi_tcxo")
+            + rpmh_line(729.999000, "sleep", "0x30030", "0x0") + rpmh_line(729.999001, "wake", "0x30030", "0x3"))
+        result = self.run_test("ro", "1", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("cycle 1/1: evidence: rpmh sleep set: the last of 1 flushes before the sleep at 730.000000 (at "
+                      "729.999000, 2 commands), sleep/wake: xo.lvl 0x0/0x3; left out, so held at their vote through the "
+                      "sleep: cx.lvl, mx.lvl; active votes before the sleep 0, commands after it 0\n", self.out)
+        self.assertIn("cycle 1/1: evidence: XO at the entry to the sleep (clock trace): XO free at the entry to the "
+                      "sleep: bi_tcxo unprepared at 701.000002, so no clock of Linux votes XO in the sleep set (3 prepares "
+                      "and unprepares traced before the sleep)\n", self.out)
+        entry = [line for line in self.pmsg_lines() if ": evidence: XO at entry: " in line]
+        self.assertEqual(len(entry), 1)
+        self.assertTrue(entry[0].startswith("cycle 1/1: evidence: XO at entry: XO free; data="), entry)
+        # A kernel without the clock tracepoints: said, and the run goes on.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.rpmh_files()
+        self.cycle(1)
+        result = self.run_test("ro", "1", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1 cycles", self.out)
+        self.assertIn("rpmh: no clk_prepare and clk_unprepare tracepoints to turn on", self.out)
+        self.assertIn("cycle 1/1: evidence: XO at the entry to the sleep (clock trace): no clock trace (the "
+                      "clk_prepare and clk_unprepare tracepoints were not on)\n", self.out)
+
     def test_rpmh_is_refused_without_the_tracepoint_tracing_or_the_kernel_log_s_clock_and_a_stop_turns_it_off(self):
         tr = "sys/kernel/tracing"
         cases = (
@@ -7889,11 +8395,14 @@ exit 0
         FakeTablet.setUp(self)
         SleepTestTest.setUp(self)
         self.rpmh_files()
+        self.clk_events()
         (self.tmp / "freeze-fails").write_text("/media/stick\n")
         result = self.run_test("ro", "1", "rpmh", "restart-ok", "hold=0")
         self.assertEqual(result.returncode, 1, self.out)
         self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep", self.out)
         self.assertEqual((self.root / tr / "events/rpmh/rpmh_send_msg/enable").read_text(), "0")
+        for ev in ("clk_prepare", "clk_unprepare"):
+            self.assertEqual((self.root / tr / "events/clk" / ev / "enable").read_text(), "0")
         self.assertEqual(self.sysrq(), "")
 
     def test_revision_11_s_evidence_names_xo_s_holders_genpd_s_power_offs_and_the_dsps_interrupts(self):
@@ -8185,12 +8694,17 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
         self.assertNotIn("DEVICE", block)
         self.assertIn(f"drivers/clk/qcom/gcc-sm8550.c:{self.GDSC}", block)
         self.assertIn(f"drivers/pmdomain/qcom/rpmhpd.c:{self.FLOOR}", block)
+        self.assertIn(f"{QCOM_STATS}.c:{CXPC_PATCH}", block)
         self.assertEqual(text.count(f"deep_sleep_debug_marker='{self.MARKER}'"), 1)
         for patch in (self.GDSC, self.FLOOR):
             with self.subTest(patch):
                 added = "\n".join(added_lines(patch).popitem()[1])
                 self.assertIn(self.MARKER, added)
                 self.assertNotIn("of_machine_is_compatible", added)
+        # The CXPC log's: an SM8550 at run time, both boards built alike.
+        added = "\n".join(added_lines(CXPC_PATCH).popitem()[1])
+        self.assertIn(self.MARKER, added)
+        self.assertIn('of_machine_is_compatible("qcom,sm8550")', added)
         touching = {}
         for patch in (REPO / "kernel/patches").glob("*.patch"):
             for target in re.findall(r"^\+\+\+ b/(\S+)", patch.read_text(), re.M):
@@ -8198,11 +8712,13 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
         self.assertEqual(sorted(touching[f"{GCC}.c"]), sorted(["gcc-sm8550-usb-gdscs-retention.patch", self.GDSC,
                                                               GDSC_PATCHES[0]]))
         self.assertEqual(touching[f"{RPMHPD}.c"], [self.FLOOR])
+        self.assertEqual(touching[f"{QCOM_STATS}.c"], [CXPC_PATCH])
 
     def pinned_files(self, tree, usb=True):
-        """The two files as the build has them when the block runs: the
-        pinned gcc-sm8550.c with the USB GDSC patch, the pinned rpmhpd.c."""
-        for path in (f"{GCC}.c", f"{RPMHPD}.c"):
+        """The three files as the build has them when the block runs: the
+        pinned gcc-sm8550.c with the USB GDSC patch, the pinned rpmhpd.c and
+        qcom_stats.c."""
+        for path in (f"{GCC}.c", f"{RPMHPD}.c", f"{QCOM_STATS}.c"):
             (tree / path).parent.mkdir(parents=True, exist_ok=True)
             (tree / path).write_text(subprocess.run(["git", "-C", str(kernel_source()), "show", "HEAD:" + path],
                                                     check=True, capture_output=True, text=True).stdout)
@@ -8216,7 +8732,7 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tree = pathlib.Path(tmp)
             self.pinned_files(tree)
-            files = {p: (tree / p).read_text() for p in (f"{GCC}.c", f"{RPMHPD}.c")}
+            files = {p: (tree / p).read_text() for p in (f"{GCC}.c", f"{RPMHPD}.c", f"{QCOM_STATS}.c")}
             listing = sorted(p.name for p in (tree / GCC).parent.iterdir())
             result = self.run_block(tree, "0")
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -8230,6 +8746,7 @@ class DeepSleepDebugSwitchTest(unittest.TestCase):
             # No backup next to them.
             self.assertEqual(sorted(p.name for p in (tree / GCC).parent.iterdir()), listing)
             self.assertEqual(sorted(p.name for p in (tree / RPMHPD).parent.iterdir()), ["rpmhpd.c"])
+            self.assertEqual(sorted(p.name for p in (tree / QCOM_STATS).parent.iterdir()), ["qcom_stats.c"])
             # Again: a reused tree, nothing changes.
             result = self.run_block(tree, "1")
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -9093,10 +9610,11 @@ class PcieGdscOffTest(unittest.TestCase):
             for value in ("0", "1"):
                 tree = pathlib.Path(tmp, value)
                 self.pinned_file(tree)
-                (tree / RPMHPD).parent.mkdir(parents=True)
-                (tree / f"{RPMHPD}.c").write_text(subprocess.run(
-                    ["git", "-C", str(kernel_source()), "show", f"HEAD:{RPMHPD}.c"], check=True, capture_output=True,
-                    text=True).stdout)
+                for path in (RPMHPD, QCOM_STATS):
+                    (tree / path).parent.mkdir(parents=True)
+                    (tree / f"{path}.c").write_text(subprocess.run(
+                        ["git", "-C", str(kernel_source()), "show", f"HEAD:{path}.c"], check=True,
+                        capture_output=True, text=True).stdout)
                 for again in (False, True):
                     result = self.run_block(self.block() + debug, tree, value, "1")
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -9184,7 +9702,7 @@ class PcieGuardTest(unittest.TestCase):
         rpd3 = self.block("pcie_rp_d3_patch=")
         self.assertLess(text.index("pcie0_gdsc_patch="), text.index(guard))
         self.assertLess(text.index(guard), text.index("deep_sleep_debug_marker='"))
-        self.assertLess(text.index("\tdrivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch; do\n"),
+        self.assertLess(text.index("\tdrivers/soc/qcom/qcom_stats.c:qcom-stats-cxpc-violators-diagnostic.patch; do\n"),
                         text.index(rpd3))
         self.assertIn(f"\npcie0_guard_patch={self.GUARD}\n", "\n" + guard)
         self.assertIn(f"\npcie0_guard_line='{GUARD_LINE}'\n", "\n" + guard)
@@ -9196,8 +9714,8 @@ class PcieGuardTest(unittest.TestCase):
             self.assertNotIn("gts9", block)
         touching = sorted(patch.name for patch in (REPO / "kernel/patches").glob("*.patch")
                           if re.search(rf"^\+\+\+ b/{re.escape(PCIE_QCOM)}\.c", patch.read_text(), re.M))
-        self.assertEqual(touching, sorted(PCIE_PATCHES))
-        for name in PCIE_PATCHES:
+        self.assertEqual(touching, sorted(PCIE_PATCHES + [RPD3_DEFAULT]))
+        for name in PCIE_PATCHES + [RPD3_DEFAULT]:
             with self.subTest(name):
                 patch = (REPO / "kernel/patches" / name).read_text()
                 self.assertEqual(list(diff_lines(patch)), [f"{PCIE_QCOM}.c"])
@@ -9333,6 +9851,147 @@ class PcieGuardTest(unittest.TestCase):
                       added)
         # It writes bridge_d3 and nothing else of the PCI core's.
         self.assertEqual(re.findall(r"pdev->(\w+) =", added), ["bridge_d3"])
+
+
+class RootPortD3DefaultTest(unittest.TestCase):
+    """The root port switch's default-on form in the build script, run from
+    its own text: APPLY_SM8550_ROOT_PORT_D3 (off by default, 0 or 1 only,
+    refused without APPLY_SM8550_PCIE0_GDSC_OFF=1 and
+    APPLY_SM8550_PCIE0_GDSC_GUARD=1, before the tree is touched), applied
+    strictly and once on top of the guard, with or without the debug switch,
+    refused for a build without it in a tree that carries it; and what the
+    patch changes, read from its added lines."""
+
+    BUILD = REPO / "scripts/build-mainline-kernel.sh"
+
+    def text(self):
+        return self.BUILD.read_text()
+
+    def block(self, start):
+        text = self.text()
+        at = text.index(start)
+        return text[at:text.index("\nfi\n", at) + len("\nfi\n")]
+
+    def run_block(self, block, tree, guard="1", debug="0", rpd3="0"):
+        return subprocess.run(["bash", "-c", "set -euo pipefail\nkernel_tree=$1 pat=$2 apply_pcie0_gdsc_guard=$3 "
+                               "apply_deep_sleep_debug=$4 apply_root_port_d3=$5\n" + block, "build", str(tree),
+                               str(REPO / "kernel/patches"), guard, debug, rpd3], capture_output=True, text=True)
+
+    def test_the_variable_is_off_by_default_0_or_1_and_needs_the_gdsc_and_the_guard(self):
+        text = self.text()
+        self.assertIn("\napply_root_port_d3=${APPLY_SM8550_ROOT_PORT_D3:-0}\n", text)
+        validate = re.search(r"^validate_bool\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        start = text.index('if [ "$apply_root_port_d3" = 1 ] && { [ "$apply_pcie0_gdsc_off" != 1 ] || '
+                           '[ "$apply_pcie0_gdsc_guard" != 1 ]; }; then\n')
+        needs = text[start:text.index("\nfi\n", start) + len("\nfi\n")]
+        self.assertLess(text.index('\nvalidate_bool APPLY_SM8550_ROOT_PORT_D3 "$apply_root_port_d3"\n'), start)
+        self.assertLess(start, text.index('git -C "$kernel_src" worktree add --detach "$kernel_tree" HEAD'))
+        check = ("apply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}\n"
+                 "apply_pcie0_gdsc_guard=${APPLY_SM8550_PCIE0_GDSC_GUARD:-0}\n"
+                 "apply_root_port_d3=${APPLY_SM8550_ROOT_PORT_D3:-0}\n" + validate +
+                 'validate_bool APPLY_SM8550_ROOT_PORT_D3 "$apply_root_port_d3"\n' + needs)
+        names = ("APPLY_SM8550_PCIE0_GDSC_OFF", "APPLY_SM8550_PCIE0_GDSC_GUARD", "APPLY_SM8550_ROOT_PORT_D3")
+        for off, guard, rpd3, ok in (("", "", "", True), ("1", "1", "", True), ("1", "1", "0", True),
+                                     ("1", "1", "1", True), ("", "", "1", False), ("1", "", "1", False),
+                                     ("", "1", "1", False), ("0", "0", "1", False), ("1", "1", "yes", False),
+                                     ("1", "1", "01", False)):
+            with self.subTest(off=off, guard=guard, rpd3=rpd3):
+                env = {k: v for k, v in os.environ.items() if k not in names}
+                for name, value in zip(names, (off, guard, rpd3)):
+                    if value:
+                        env[name] = value
+                result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check], capture_output=True,
+                                        text=True, env=env)
+                self.assertEqual(result.returncode == 0, ok, result.stderr)
+                if not ok and rpd3 == "1":
+                    self.assertIn("APPLY_SM8550_ROOT_PORT_D3=1 needs APPLY_SM8550_PCIE0_GDSC_OFF=1 and "
+                                  "APPLY_SM8550_PCIE0_GDSC_GUARD=1: a PCIe host that powers itself down under "
+                                  "pcie_0_gdsc left in retention is the sleep that never came back", result.stderr)
+                elif not ok:
+                    self.assertIn("APPLY_SM8550_ROOT_PORT_D3 must be 0 or 1", result.stderr)
+
+    def test_the_block_goes_after_the_debug_switch_s_on_both_boards(self):
+        text = self.text()
+        block = self.block("pcie_rp_d3_default_patch=")
+        self.assertLess(text.index("pcie_rp_d3_patch="), text.index(block))
+        self.assertIn(f"\npcie_rp_d3_default_patch={RPD3_DEFAULT}\n", "\n" + block)
+        self.assertIn(f"\npcie_rp_d3_default_marker='{RPD3_DEFAULT_MARKER}'\n", block)
+        self.assertIn('if [ "$apply_root_port_d3" = 1 ]; then\n', block)
+        self.assertNotIn("DEVICE", block)
+        self.assertNotIn("gts9", block)
+        header = (REPO / "kernel/patches" / RPD3_DEFAULT).read_text().split("\n--- a/", 1)[0]
+        self.assertTrue(header.startswith("Subject: [PATCH] PCI: qcom: "))
+        self.assertIn("NOT YET FOR RELEASE", header)
+        self.assertIn("No board check", header)
+        self.assertIn("pcie_qcom.root_port_d3=0", header)
+        # In no kit: make-kit.sh's lists do not have it, and its SOURCE names
+        # it left out.
+        kit = (KIT_SRC / "make-kit.sh").read_text()
+        self.assertNotIn(RPD3_DEFAULT, sum(kit_patches(kit), []))
+        self.assertEqual(kit.count(RPD3_DEFAULT), 1)
+        self.assertIn(f'echo "left out: kernel/patches/{RPD3_DEFAULT} (APPLY_SM8550_ROOT_PORT_D3 not set)"', kit)
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_it_applies_once_with_or_without_the_debug_switch_and_is_refused_otherwise(self):
+        guard = PcieGuardTest("run").block("pcie0_guard_patch=")
+        debug = PcieGuardTest("run").block("pcie_rp_d3_patch=")
+        block = self.block("pcie_rp_d3_default_patch=")
+        for with_debug in ("0", "1"):
+            with self.subTest(debug=with_debug), tempfile.TemporaryDirectory() as tmp:
+                tree = pathlib.Path(tmp)
+                PcieGuardTest("run").pinned_file(tree)
+                result = self.run_block(guard + debug, tree, "1", with_debug)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                before = (tree / f"{PCIE_QCOM}.c").read_text()
+                listing = sorted(p.name for p in (tree / PCIE_QCOM).parent.iterdir())
+                # Without the variable: nothing.
+                result = self.run_block(block, tree)
+                self.assertEqual((result.returncode, (tree / f"{PCIE_QCOM}.c").read_text()), (0, before),
+                                 result.stderr)
+                result = self.run_block(guard + debug + block, tree, "1", with_debug, "1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotRegex(result.stdout, "offset|fuzz")
+                after = (tree / f"{PCIE_QCOM}.c").read_text()
+                self.assertEqual(sorted(p.name for p in (tree / PCIE_QCOM).parent.iterdir()), listing)
+                self.assertEqual(after.count(RPD3_DEFAULT_MARKER), 1)
+                self.assertEqual(after.count(RPD3_MARKER), 1 if with_debug == "1" else 0)
+                self.assertEqual([l for l in before.splitlines(True) if l not in after.splitlines(True)], [])
+                # A reused tree: nothing changes.
+                result = self.run_block(guard + debug + block, tree, "1", with_debug, "1")
+                self.assertEqual((result.returncode, (tree / f"{PCIE_QCOM}.c").read_text()), (0, after),
+                                 result.stderr)
+                # A build without it in that tree: refused, the tree as it was.
+                result = self.run_block(block, tree, "1", with_debug, "0")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"{RPD3_DEFAULT} remains in this source tree; use a fresh KERNEL_WORKTREE/"
+                              "KERNEL_BUILD_DIR for a build without APPLY_SM8550_ROOT_PORT_D3=1.", result.stderr)
+                self.assertEqual((tree / f"{PCIE_QCOM}.c").read_text(), after)
+                # The marker without the rest: refused.
+                damaged = after.replace("\tpdev->bridge_d3 = true;\n", "")
+                self.assertNotEqual(damaged, after)
+                (tree / f"{PCIE_QCOM}.c").write_text(damaged)
+                result = self.run_block(block, tree, "1", with_debug, "1")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((tree / f"{PCIE_QCOM}.c").read_text(), damaged)
+
+    def test_it_gives_bridge_d3_to_qcom_hot_plug_root_ports_without_native_pciehp_alone(self):
+        added = "\n".join(added_lines(RPD3_DEFAULT)[f"{PCIE_QCOM}.c"])
+        self.assertIn("#include <linux/pci_hotplug.h>", added)
+        self.assertIn("static bool qcom_pcie_root_port_d3 = true;\n"
+                      "module_param_named(root_port_d3, qcom_pcie_root_port_d3, bool, 0444);", added)
+        self.assertIn("\tif (!qcom_pcie_root_port_d3 || !pci_is_pcie(pdev) ||\n"
+                      "\t    pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT)\n\t\treturn;", added)
+        self.assertIn("\t    bridge->dev.parent->driver != &qcom_pcie_driver.driver)\n\t\treturn;", added)
+        self.assertIn("\tif (pdev->bridge_d3 || !pdev->is_pciehp || pciehp_is_native(pdev))\n\t\treturn;\n\n"
+                      "\tpdev->bridge_d3 = true;", added)
+        self.assertIn("DECLARE_PCI_FIXUP_CLASS_FINAL(PCI_ANY_ID, PCI_ANY_ID, PCI_CLASS_BRIDGE_PCI, 8,\n"
+                      "\t\t\t      qcom_pcie_fixup_root_port_d3);", added)
+        # It writes bridge_d3 and nothing else of the PCI core's, and no
+        # board decides.
+        self.assertEqual(re.findall(r"pdev->(\w+) =", added), ["bridge_d3"])
+        self.assertNotIn("of_machine_is_compatible", added)
+        patch = (REPO / "kernel/patches" / RPD3_DEFAULT).read_text()
+        self.assertNotIn("-", "".join(l[0] for l in diff_lines(patch)[f"{PCIE_QCOM}.c"]))
 
 
 class PipeClockGateTest(unittest.TestCase):
@@ -9715,7 +10374,44 @@ class ScriptsTest(unittest.TestCase):
                                    "system sleep: the link was kept, but genpd powered its power domain off",
                                    "pcie_qcom.debug_root_port_d3",
                                    "Failed to power on PHY: %pe", "power-up sequence entry",
-                                   "setup_clocks repeats: power-on"])
+                                   "setup_clocks repeats: power-on",
+                                   "qcom_stats.debug_cxpc_violators",
+                                   "the AOP's CXPC monitor is on for this suspend",
+                                   "runtime PM put failed in fsgen disable", "Unable to prepare iface clk",
+                                   "cxpc violators: raw %s +0x%03x: ", "cxpc_violators_raw"])
+        # Revision 13's two, the CXPC log's: the format of its raw lines (in
+        # the function every report calls first) and its raw file's name,
+        # each the CXPC patch's alone.  The UART patch adds no string (the
+        # disassembly check is for it).
+        cxpc_added = added_lines(CXPC_PATCH)[f"{QCOM_STATS}.c"]
+        self.assertEqual(len([a for a in cxpc_added if f'pr_info("{strings[32]}%08x ' in a]), 1)
+        self.assertEqual(len([a for a in cxpc_added if f'debugfs_create_file("{strings[33]}", 0400, ' in a]), 1)
+        for line in strings[32:34]:
+            with self.subTest(line):
+                self.assertEqual([p.name for p in (REPO / "kernel/patches").glob("*.patch") if line in p.read_text()],
+                                 [CXPC_PATCH])
+        self.assertFalse([a for a in added_lines(XO_PATCHES[2])[f"{GENI_SERIAL}.c"] if '"' in a])
+        # Revision 12's four: the CXPC log's switch as the kernel keeps it
+        # (a module_param_cb() of its patch alone) and the line each suspend
+        # with it logs; the VA macro's and the DSI PHY's error messages.
+        # Each a string of its patch's code and of no other patch, and in no
+        # driver of this checkout.
+        module, name = strings[28].split(".")
+        self.assertEqual(module, pathlib.Path(QCOM_STATS).stem)
+        self.assertEqual(len([a for a in added_lines(CXPC_PATCH)[f"{QCOM_STATS}.c"]
+                              if a.startswith(f"module_param_cb({name}, ")]), 1)
+        self.assertEqual([other.name for other in (REPO / "kernel/patches").glob("*.patch") if name in other.read_text()],
+                         [CXPC_PATCH])
+        for line, patch, target, form in (
+                (strings[29], CXPC_PATCH, f"{QCOM_STATS}.c", f'pr_info("cxpc violators: {strings[29]}\\n");'),
+                (strings[30], XO_PATCHES[0], f"{VA_MACRO}.c", f'"{strings[30]}: %d\\n",'),
+                (strings[31], XO_PATCHES[1], f"{DSI_PHY}.c", f'"{strings[31]}\\n");')):
+            with self.subTest(line):
+                self.assertEqual(len([added for added in added_lines(patch)[target] if form in added]), 1, form)
+                self.assertEqual([p.name for p in (REPO / "kernel/patches").glob("*.patch") if line in p.read_text()],
+                                 [patch])
+                self.assertFalse([p.name for p in (REPO / "kernel/drivers").rglob("*") if p.is_file()
+                                  and line in p.read_text(errors="replace")])
         # Revision 11's ufs-qcom: the fix's message for a PHY power-on that
         # failed (a format string of its code), and two of the diagnostic's,
         # its entry line's label and its counts' format; each in no other
@@ -9827,13 +10523,31 @@ class ScriptsTest(unittest.TestCase):
 
     def test_the_kit_s_patches_are_patches_the_build_applies(self):
         text = (KIT_SRC / "make-kit.sh").read_text()
-        typec, gdsc, debug, fix, ufs, pcie, ufs_qcom = kit_patches(text)
-        self.assertEqual((typec, gdsc, debug, fix, ufs, pcie, ufs_qcom),
-                         (TYPEC_PATCHES, GDSC_PATCHES, DEBUG_PATCHES, FIX_PATCHES, UFS_PATCHES, PCIE_PATCHES,
-                          UFS_QCOM_PATCHES))
+        typec, gdsc, debug, fix, ufs, pcie, ufs_qcom, xo = kit_patches(text)
+        self.assertEqual((typec, gdsc, debug, fix, ufs, pcie, ufs_qcom, xo),
+                         (TYPEC_PATCHES, GDSC_PATCHES, DEBUG_PATCHES + [CXPC_PATCH], FIX_PATCHES, UFS_PATCHES,
+                          PCIE_PATCHES, UFS_QCOM_PATCHES, XO_PATCHES))
         self.assertIn('\npatches=("${typec_patches[@]}" "${gdsc_patches[@]}" "${debug_patches[@]}" '
-                      '"${fix_patches[@]}" "${ufs_patches[@]}"\n\t"${pcie_patches[@]}" "${ufs_qcom_patches[@]}")\n',
-                      text)
+                      '"${fix_patches[@]}" "${ufs_patches[@]}"\n\t"${pcie_patches[@]}" "${ufs_qcom_patches[@]}" '
+                      '"${xo_patches[@]}")\n', text)
+        # Revision 12's two, each behind its variable and known by its line,
+        # the way the build script applies them; the root port's default-on
+        # patch is in no kit.
+        self.assertEqual(xo_files_of(text), [[f"{VA_MACRO}.c", "sound/soc/codecs/Kconfig"],
+                                             [f"{DSI_PHY}.c", f"{DSI_PHY}.h"], [f"{GENI_SERIAL}.c"]])
+        for name, files in zip(xo, xo_files_of(text)):
+            with self.subTest(name):
+                self.assertEqual(sorted(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / name).read_text(),
+                                                   re.M)), sorted(files))
+        build_text = (REPO / "scripts/build-mainline-kernel.sh").read_text()
+        self.assertIn(f"\nva_macro_patch={xo[0]}\n", build_text)
+        self.assertIn(f"\ndsi_ahb_patch={xo[1]}\n", build_text)
+        self.assertEqual(build_text.count('< "$pat/$va_macro_patch"'), 2)
+        self.assertEqual(build_text.count('< "$pat/$dsi_ahb_patch"'), 2)
+        self.assertIn(f"\ngeni_fs_patch={xo[2]}\n", build_text)
+        self.assertEqual(build_text.count('< "$pat/$geni_fs_patch"'), 2)
+        self.assertNotIn("APPLY_SM8550_ROOT_PORT_D3=1", text)
+        self.assertIn("left out: kernel/patches/pcie-qcom-root-port-d3-in-system-suspend.patch", text)
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text().replace("\\\n", " ")
         for name in typec:
             with self.subTest(name):
@@ -9896,33 +10610,38 @@ class ScriptsTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertTrue((REPO / "kernel/patches" / name).is_file())
                 self.assertEqual(build.count(f"{target}:{name}"), 1)
-        self.assertIn("\tdrivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch; do\n", build)
+        # Continuation lines joined: revision 12's third is the loop's last.
+        self.assertIn("\tdrivers/pmdomain/qcom/rpmhpd.c:rpmhpd-debug-retention-floor.patch  "
+                      "\tdrivers/soc/qcom/qcom_stats.c:qcom-stats-cxpc-violators-diagnostic.patch; do\n", build)
         # Each file a patch changes is one the kit compares with the hang-log
         # build's, and so is the PCIe PHY's, which loses the unpark patch.
         patched = re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1)
         changed = set()
-        for name in typec + gdsc + debug + fix + ufs + ufs_qcom:
+        for name in typec + gdsc + debug + fix + ufs + ufs_qcom + xo:
             changed.update(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / name).read_text(),
                                       re.M))
         self.assertEqual(changed, {f"{TCPM_DIR}/tcpm.c", "include/linux/usb/tcpm.h", f"{GCC}.c",
                                    f"{DWC3}.c", f"{QMP}.c", f"{RPMHPD}.c", f"{PHYMUX}.c", f"{GMU}.c",
-                                   f"{UFS_QCOM}.c", f"{UFS_QCOM}.h"})
+                                   f"{UFS_QCOM}.c", f"{UFS_QCOM}.h", f"{QCOM_STATS}.c", f"{VA_MACRO}.c",
+                                   "sound/soc/codecs/Kconfig", f"{DSI_PHY}.c", f"{DSI_PHY}.h", f"{GENI_SERIAL}.c"})
         self.assertEqual(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / UNPARK).read_text(), re.M),
                          [f"{QMP_PCIE}.c"])
         self.assertEqual(" ".join(patched.split()),
                          '"$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c" '
-                         '"$rpmhpd.c" "$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c"')
+                         '"$rpmhpd.c" "$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c" '
+                         '"$qcom_stats.c" "$va_macro.c" sound/soc/codecs/Kconfig "$dsi_phy.c" "$dsi_phy.h" "$geni.c"')
         self.assertIn("\ntcpm_dir=drivers/usb/typec/tcpm\n", text)
         self.assertIn("\ngcc=drivers/clk/qcom/gcc-sm8550\n", text)
         self.assertIn("\ndwc3=drivers/usb/dwc3/dwc3-qcom\n", text)
         self.assertIn(f"\nqmp={QMP}\n", text)
         self.assertIn(f"\nrpmhpd={RPMHPD}\n", text)
         for name, value in (("phymux", PHYMUX), ("qmp_pcie", QMP_PCIE), ("gmu", GMU), ("ufs_qcom", UFS_QCOM),
-                            ("pcie_qcom", PCIE_QCOM)):
+                            ("pcie_qcom", PCIE_QCOM), ("qcom_stats", QCOM_STATS), ("va_macro", VA_MACRO),
+                            ("dsi_phy", DSI_PHY), ("geni", GENI_SERIAL)):
             self.assertIn(f"\n{name}={value}\n", text)
         self.assertIn(f"\nunpark={UNPARK}\n", text)
         self.assertIn('fix_files=("$phymux.c" "$gmu.c" "$ufs_qcom.c")\n', text)
-        self.assertIn("\nrevision=11\n", text)
+        self.assertIn("\nrevision=13\n", text)
         # The build tree has to carry each fix whole and not the unpark
         # patch; the hang-log tree none of the fixes and the unpark patch.
         self.assertIn('die "the build tree\'s $f does not carry ${fix_patches[$i]} whole"', text)
@@ -9932,16 +10651,27 @@ class ScriptsTest(unittest.TestCase):
         # The build tree has to carry both whole, and the hang-log tree
         # neither; with the switches off the RPMh tables are the hang-log
         # build's; the module tree and vmlinux show the switches.
-        self.assertIn('debug_files=("$gcc.c" "$rpmhpd.c")\n', text)
+        self.assertIn('debug_files=("$gcc.c" "$rpmhpd.c" "$qcom_stats.c")\n', text)
         self.assertIn('die "the build tree\'s $f does not carry ${debug_patches[$i]} whole"', text)
         self.assertIn("die 'the hang-log tree carries the deep-sleep debug switches already'", text)
         self.assertIn('cmp -s "$tmp/rpmhpd.hang.data" "$tmp/rpmhpd.new.data" ||', text)
         for parm in ("gcc_sm8550.parm=debug_pcie0_off:", "gcc_sm8550.parm=debug_pcie0_phy_off:",
                      "gcc_sm8550.parm=debug_usb_off:", "rpmhpd.parm=debug_ret_floor:",
-                     "gcc_sm8550.parm=debug_boot_state:", "pcie_qcom.parm=debug_root_port_d3:"):
+                     "gcc_sm8550.parm=debug_boot_state:", "pcie_qcom.parm=debug_root_port_d3:",
+                     "qcom_stats.parm=debug_cxpc_violators:"):
             self.assertIn(parm, text)
         self.assertIn("for f in gcc_sm8550_debug_set gcc_sm8550_debug_get gcc_sm8550_debug_boot_get "
-                      "rpmhpd_debug_ret_floor_set \\\n\tqcom_pcie_debug_rp_d3_set qcom_pcie_pd_notify; do", text)
+                      "rpmhpd_debug_ret_floor_set \\\n\tqcom_pcie_debug_rp_d3_set qcom_pcie_pd_notify "
+                      "qcom_stats_vx_set qcom_stats_vx_pm_notify \\\n\tdsi_phy_suspend_late dsi_phy_resume_early "
+                      "qcom_stats_vx_raw_show; do", text)
+        # Revision 12's four: the CXPC log's set handler and PM notifier,
+        # the DSI PHY's system sleep callbacks, each its patch's.
+        for f, patch, target in (("qcom_stats_vx_set", CXPC_PATCH, f"{QCOM_STATS}.c"),
+                                 ("qcom_stats_vx_pm_notify", CXPC_PATCH, f"{QCOM_STATS}.c"),
+                                 ("dsi_phy_suspend_late", XO_PATCHES[1], f"{DSI_PHY}.c"),
+                                 ("dsi_phy_resume_early", XO_PATCHES[1], f"{DSI_PHY}.c"),
+                                 ("qcom_stats_vx_raw_show", CXPC_PATCH, f"{QCOM_STATS}.c")):
+            self.assertTrue([a for a in added_lines(patch)[target] if a.startswith(f"static int {f}(")], f)
         # Each of those functions is the debug patch's, and revision 11's
         # two the PCIe host patches': the root port switch's handler and the
         # guard record's notifier.
@@ -9956,6 +10686,51 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn('die "the build tree\'s $gcc.c does not carry ${gdsc_patches[$i]} whole"', text)
         self.assertIn('die "the hang-log tree\'s pcie_0_gdsc is not upstream\'s PWRSTS_RET_ON"', text)
         self.assertIn('for p in "${gdsc_patches[@]}" "${debug_patches[@]}" "${pcie_patches[@]}"; do', text)
+        # Revision 12's two XO fixes whole in the build tree, in neither of
+        # the hang-log tree's files, and replayed on them.
+        self.assertIn('die "the build tree\'s ${xo_files[$i]} do not carry ${xo_patches[$i]} whole"', text)
+        self.assertIn('die "the hang-log tree carries revision 12\'s VA macro or DSI PHY change already"', text)
+        self.assertIn('\tfor p in "${xo_patches[@]}"; do\n', text)
+        # Revision 13's UART one the same way, the hang-log tree with the
+        # SM-X710's interrupt patch and without it; and its disassembly check
+        # (it adds no string): both callbacks, named in the driver's
+        # dev_pm_ops, call the force functions, the hang-log build's neither.
+        self.assertIn('die "the hang-log tree\'s $geni.c carries revision 13\'s UART change already, or not the '
+                      'Bluetooth UART interrupt patch"', text)
+        self.assertIn("grep -qF 'Serve the interrupt even once uart_suspend_port()' \"$hang_tree/$geni.c\"", text)
+        self.assertIn('branches_of "$build/vmlinux" qcom_geni_serial_suspend > "$tmp/geni.suspend.calls"', text)
+        self.assertIn('grep -qx uart_suspend_port "$tmp/geni.suspend.calls" && grep -qx pm_runtime_force_suspend '
+                      '"$tmp/geni.suspend.calls" ||', text)
+        self.assertIn('grep -qx uart_resume_port "$tmp/geni.resume.calls" && grep -qx pm_runtime_force_resume '
+                      '"$tmp/geni.resume.calls" ||', text)
+        self.assertIn('\t\t! grep -qx pm_runtime_force_suspend "$tmp/geni.suspend.hang.calls" &&\n', text)
+        geni = added_lines(XO_PATCHES[2])[f"{GENI_SERIAL}.c"]
+        self.assertIn("\treturn pm_runtime_force_suspend(dev);", geni)
+        self.assertIn("\t\tret = pm_runtime_force_resume(dev);", geni)
+        self.assertIn('echo "geni UART callbacks: $geni_check"', text)
+
+    def test_the_disassembly_check_finds_calls_and_tail_branches_by_name(self):
+        """branches_of() keeps what a function calls (bl) or branches to
+        (b, a tail call) by name, not its branches within itself (b.ne to
+        FUNCTION+0x54) nor indirect ones."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        fn = re.search(r"^branches_of\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        listing = ("ffff800080d39a7c <qcom_geni_serial_suspend>:\n"
+                   "ffff800080d39ab8:      \tb.ne\t0xffff800080d39ad0 <qcom_geni_serial_suspend+0x54>\n"
+                   "ffff800080d39ac4:      \tbl\t0xffff800080c26e78 <geni_icc_set_tag>\n"
+                   "ffff800080d39ad8:      \tbl\t0xffff800080cf1b98 <uart_suspend_port>\n"
+                   "ffff800080d39b00:      \tblr\tx8\n"
+                   "ffff800080d39b04:      \tb\t0xffff800080d10000 <pm_runtime_force_suspend>\n"
+                   "ffff800080d39b08:      \tret\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = pathlib.Path(tmp) / "llvm-objdump"
+            tool.write_text("#!/bin/sh\ncat <<'EOF'\n" + listing + "EOF\n")
+            tool.chmod(0o755)
+            result = subprocess.run(["bash", "-c", fn + 'branches_of vmlinux qcom_geni_serial_suspend'],
+                                    capture_output=True, text=True,
+                                    env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["geni_icc_set_tag", "pm_runtime_force_suspend", "uart_suspend_port"])
 
     def test_every_changed_source_is_required_dated_and_compared(self):
         """The kit's changes to the kernel tree are the patched files and the
@@ -9966,7 +10741,8 @@ class ScriptsTest(unittest.TestCase):
         for revision 10's GMU fix."""
         text = (KIT_SRC / "make-kit.sh").read_text()
         names = {"tcpm_dir": TCPM_DIR, "gcc": GCC, "dwc3": DWC3, "qmp": QMP, "rpmhpd": RPMHPD,
-                 "phymux": PHYMUX, "qmp_pcie": QMP_PCIE, "gmu": GMU, "ufs_qcom": UFS_QCOM, "pcie_qcom": PCIE_QCOM}
+                 "phymux": PHYMUX, "qmp_pcie": QMP_PCIE, "gmu": GMU, "ufs_qcom": UFS_QCOM, "pcie_qcom": PCIE_QCOM,
+                 "qcom_stats": QCOM_STATS, "va_macro": VA_MACRO, "dsi_phy": DSI_PHY, "geni": GENI_SERIAL}
 
         def expand(word):
             return re.sub(r"\$\{?(\w+)\}?", lambda match: names[match.group(1)], word)
@@ -9992,13 +10768,21 @@ class ScriptsTest(unittest.TestCase):
                     self.assertIn(f'"$build/{obj}"', required)
         self.assertIn("grep -q 'no hcd and no root hub' \"$tree/$dwc3.c\" ||\n"
                       "\tdie 'the build tree does not carry the dwc3-qcom guard'", text)
-        # ufs-qcom.h is dated against ufs-qcom.o, which includes it.
+        # ufs-qcom.h is dated against ufs-qcom.o, which includes it, and
+        # dsi_phy.h against dsi_phy.o (revision 12); the VA macro's Kconfig
+        # entry has no object, and is compared with the hang-log tree's.
         self.assertIn(f"{UFS_QCOM}.o:{UFS_QCOM}.h", objects)
+        self.assertIn(f"{DSI_PHY}.o:{DSI_PHY}.h", objects)
+        self.assertIn("sound/soc/codecs/Kconfig", patched)
         # The guard's proof stays its marker and the date of its object; the
-        # one disassembler is calls_of(), for the UFS PHY's calibration
-        # (revision 8) and the PCIe PHY's power-on (revision 10).
-        self.assertEqual(text.count("llvm-objdump -d"), 1)
-        self.assertIn('llvm-objdump -d --no-show-raw-insn --disassemble-symbols="$2" "$1"', text)
+        # disassemblers are calls_of(), for the UFS PHY's calibration
+        # (revision 8) and the PCIe PHY's power-on (revision 10), and
+        # branches_of(), for the geni UART's callbacks (revision 13).
+        self.assertEqual(text.count("llvm-objdump -d"), 2)
+        self.assertEqual(text.count('llvm-objdump -d --no-show-raw-insn --disassemble-symbols="$2" "$1"'), 2)
+        self.assertEqual(re.findall(r'branches_of "\$build/vmlinux" (\w+)', text),
+                         ["qcom_geni_serial_suspend", "qcom_geni_serial_resume"])
+        self.assertIn(f"{GENI_SERIAL}.o:{GENI_SERIAL}.c", objects)
         self.assertEqual(re.findall(r'calls_of "\$build/vmlinux" (\w+)', text),
                          ["qmp_ufs_phy_calibrate", "qmp_pcie_enable"])
 
@@ -10341,6 +11125,10 @@ class ScriptsTest(unittest.TestCase):
                  f"tree/{GMU}.c": 100, f"build/{GMU}.o": 200,
                  f"tree/{UFS_QCOM}.c": 100, f"tree/{UFS_QCOM}.h": 100, f"build/{UFS_QCOM}.o": 200,
                  f"tree/{PCIE_QCOM}.c": 100, f"build/{PCIE_QCOM}.o": 200,
+                 f"tree/{QCOM_STATS}.c": 100, f"build/{QCOM_STATS}.o": 200,
+                 f"tree/{VA_MACRO}.c": 100, f"build/{VA_MACRO}.o": 200,
+                 f"tree/{DSI_PHY}.c": 100, f"tree/{DSI_PHY}.h": 100, f"build/{DSI_PHY}.o": 200,
+                 f"tree/{GENI_SERIAL}.c": 100, f"build/{GENI_SERIAL}.o": 200,
                  f"build/{TCPM_DIR}/sm5714_usbpd.o": 200, "build/vmlinux": 300,
                  "build/arch/arm64/boot/Image.gz": 400, "out/Image.gz": 400}
         files.update(ages)
@@ -10356,6 +11144,7 @@ class ScriptsTest(unittest.TestCase):
                  'die() { echo "$*" >&2; exit 1; }\ntree=$1/tree build=$1/build out=$1/out\n'
                  f'tcpm_dir={TCPM_DIR}\ngcc={GCC}\ndwc3={DWC3}\nqmp={QMP}\nrpmhpd={RPMHPD}\n'
                  f'phymux={PHYMUX}\nqmp_pcie={QMP_PCIE}\ngmu={GMU}\nufs_qcom={UFS_QCOM}\npcie_qcom={PCIE_QCOM}\n'
+                 f'qcom_stats={QCOM_STATS}\nva_macro={VA_MACRO}\ndsi_phy={DSI_PHY}\ngeni={GENI_SERIAL}\n'
                  + objects.group(0) + "\n"
                  + gate.group(0),
                  "gate", tmp], capture_output=True, text=True)
@@ -10393,6 +11182,16 @@ class ScriptsTest(unittest.TestCase):
             # Revision 11: the PCIe host driver, its guard and root port switch.
             "pcie-qcom.c changed since": ({f"tree/{PCIE_QCOM}.c": 250}, stale % (PCIE_QCOM, PCIE_QCOM + ".c")),
             "no pcie-qcom object": ({f"build/{PCIE_QCOM}.o": None}, stale % (PCIE_QCOM, PCIE_QCOM + ".c")),
+            # Revision 12: qcom_stats (the CXPC log), the VA macro, the DSI
+            # PHY with its header.
+            "qcom_stats.c changed since": ({f"tree/{QCOM_STATS}.c": 250},
+                                           stale % (QCOM_STATS, QCOM_STATS + ".c")),
+            "no lpass-va-macro object": ({f"build/{VA_MACRO}.o": None}, stale % (VA_MACRO, VA_MACRO + ".c")),
+            "dsi_phy.h changed since": ({f"tree/{DSI_PHY}.h": 250}, stale % (DSI_PHY, DSI_PHY + ".h")),
+            # Revision 13: the geni UART driver.
+            "qcom_geni_serial.c changed since": ({f"tree/{GENI_SERIAL}.c": 250},
+                                                 stale % (GENI_SERIAL, GENI_SERIAL + ".c")),
+            "no qcom_geni_serial object": ({f"build/{GENI_SERIAL}.o": None}, stale % (GENI_SERIAL, GENI_SERIAL + ".c")),
             # The driver includes the header too.
             "the driver's object alone is old": (
                 {f"build/{driver}.o": 50, f"tree/{driver}.c": 40}, stale % (driver, header)),
@@ -10446,7 +11245,7 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         kit = sum(kit_patches(text), [])
         self.assertEqual(sorted(set(re.findall(r"`kernel/patches/([^`]+)`", readme))), sorted(kit))
-        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (20, 5))
+        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (24, 5))
         self.assertIn("and the UFS PHY's two (revision 8): nine patches, five of them to TCPM. Revision 9 adds the "
                       "two debug patches above: eleven patches. Revision 10 adds the three upstream fixes and the "
                       "second UFS PHY diagnostic, fifteen patches, and leaves out `unpark-pcie0-pipe-mux.patch`, "
@@ -10482,7 +11281,8 @@ class ScriptsTest(unittest.TestCase):
                      "**Four debug switches** (revision 9), each read as its power domains are, at every boot "
                      "as the kernel's table has them: off, but `debug_pcie0_off` on from revision 11; since "
                      "revision 11 a fifth that says how they booted, and a sixth, the root port's, off at every "
-                     "boot.",
+                     "boot; since revision 12 a seventh, the AOP's CXPC log's, off at every boot.",
+                     "| `/sys/module/qcom_stats/parameters/debug_cxpc_violators` (revision 12) | `N` | `cxpc` |",
                      "| `/sys/module/gcc_sm8550/parameters/debug_pcie0_off` | `N`; `Y` on revision 11 | "
                      "`gdsc=pcie0` (`Y`), `gdsc-ret=pcie0` (`N`) |",
                      "| `/sys/module/gcc_sm8550/parameters/debug_boot_state` (revision 11, read-only) | "
@@ -10491,7 +11291,7 @@ class ScriptsTest(unittest.TestCase):
                      "APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 "
                      "APPLY_SM8550_SLEEP_FIXES=1 \\",
                      "**`gdsc=LIST`**, **`gdsc-ret=pcie0`** and **`cxmx=ret`** (`ro` and `dry`; the kernels of "
-                     "revisions 9 to 11)",
+                     "revisions 9 to 12)",
                      "**Revision 9: the runs** (2026-11-22 and 23, squirtle;",
                      "each with `ro 1 30 release-floor pci=remove mode=s2idle trace=live hold=60 restart-ok`:",
                      "2. `gdsc=pcie0`;\n3. `gdsc=pcie0,usb`;\n4. `gdsc=pcie0,usb,pcie0phy`;\n"
@@ -10508,7 +11308,8 @@ class ScriptsTest(unittest.TestCase):
                      "`PCIe came back (no host failure line)`",
                      # Revision 11: what it is, its guard, why its first boot is
                      # safe, and its runs.
-                     "**Revision 11** (written 2026-11-23, not built yet) is revision 10 plus `pcie_0_gdsc`, the "
+                     "**Revision 11** (built 2026-11-23, kernel build ID df3a9340c136, on squirtle from 23:06 that "
+                     "day; five runs, below, \"Revision 11: results\") is revision 10 plus `pcie_0_gdsc`, the "
                      "PCIe host's power domain, collapsed in a system suspend in which the host has powered itself "
                      "down and kept on while the host keeps its link (a guard), and a debug switch that lets the "
                      "PCIe root port go to D3hot in a system suspend.",
@@ -10516,9 +11317,18 @@ class ScriptsTest(unittest.TestCase):
                      "`APPLY_SM8550_PCIE0_GDSC_OFF=1` and `APPLY_SM8550_PCIE0_GDSC_GUARD=1`",
                      "With the guard the panel cycle keeps the domain on by construction: the root port is in D0 "
                      "then, the host keeps its link, and the root port's switch cannot be set before the system "
-                     "is up. That has not run either",
+                     "is up. On squirtle's first boot of revision 11 (2026-11-23 23:06) the panel cycle logged `the "
+                     "link was kept, and its power domain stayed on`",
                      "| `/sys/module/pcie_qcom/parameters/debug_root_port_d3` (revision 11) | `N` | `root-port-d3` |",
-                     "**Revision 11: the runs** (none has run; the kernel is not built yet).",
+                     "**Revision 11: the runs** (written before the kernel was built; what ran is below, "
+                     "\"Revision 11: results\").",
+                     # What ran: the five runs, from their logs.
+                     "**Revision 11: results** (2026-11-23, squirtle, steps 2 to 6 above, one 30 s cycle each,",
+                     "no run logged a `setup_clocks repeated` line: the power reference fix held in all five.",
+                     "The `rpmh sleep set: no flush before the sleep` lines of runs 1, 4 and 5 were the test's "
+                     "mistake, not the kernel's",
+                     "on revision 11, with this patch, 3 times of 3 with the host powered down, once with the root "
+                     "port removed and twice with it in D3hot",
                      "1. **Install and check.**",
                      "No drop-in is needed: the guard keeps `pcie_0_gdsc` on in the boot's panel cycle by "
                      "construction",
@@ -10530,7 +11340,8 @@ class ScriptsTest(unittest.TestCase):
                      "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=remove mode=s2idle hold=60 "
                      "rpmh restart-ok\n",
                      "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=keep hold=60 restart-ok\n",
-                     "- **`rpmh`** (`ro`; revision 11's script, any kit kernel): what of Linux's own votes stands in "
+                     "- **`rpmh`** (`ro`; revision 11's script and later, any kit kernel): what of Linux's own votes "
+                     "stands in "
                      "the way of XO shutdown, CX collapse and AOSS sleep (`cxsd`, `aosd`).",
                      "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 pm_test=platform pci=keep root-port-d3 hold=60 "
                      "restart-ok\n",
@@ -10540,7 +11351,61 @@ class ScriptsTest(unittest.TestCase):
                      "11:37",
                      "- **`pci=keep`** (`ro`): the PCI devices stay, and the run watches the Wi-Fi.",
                      "- **`root-port-d3`** (`ro`, with `pci=keep`; revision 11's kernel)",
-                     "None of these makes a normal sleep with the Wi-Fi deep"):
+                     "None of these makes a normal sleep with the Wi-Fi deep",
+                     # Revision 12: what it is, what it changes outside a
+                     # sleep and in the panel cycle, what it leaves out, how
+                     # it is built and installed, and its runs.
+                     "**Revision 12** (built 2026-11-24 from 0d3ed8a, kernel build ID 530d06f4c804, on squirtle "
+                     "from 08:45 that day; its first run below, \"Revision 12: results\") is revision 11 plus three "
+                     "kernel patches",
+                     "**This changes the VA macro outside system sleep too**",
+                     "**Every system suspend runs it, the boot's panel cycle included**",
+                     "Not in revision 12: `pcie-qcom-root-port-d3-in-system-suspend.patch` "
+                     "(`APPLY_SM8550_ROOT_PORT_D3=1`)",
+                     "Revision 12 adds `kernel/patches/qcom-stats-cxpc-violators-diagnostic.patch`, "
+                     "`kernel/patches/lpass-va-macro-pm-clock-framework.patch` and "
+                     "`kernel/patches/msm-dsi-phy-release-ahb-clock-in-system-sleep.patch`: twenty-three patches, "
+                     "eighteen files",
+                     "APPLY_LPASS_VA_MACRO_PM_CLK=1 APPLY_DSI_PHY_AHB_RELEASE=1 APPLY_GENI_SERIAL_FORCE_SUSPEND=1 \\",
+                     "Revision 12 installs the same way over revision 11, which squirtle has run since 2026-11-23 "
+                     "23:06, and over every earlier revision.",
+                     "From revision 12, the way back to revision 11 in one step",
+                     "**Revision 12: the runs** (written before the kernel was built; steps 1 and 2 have run, "
+                     "below, \"Revision 12: results\", steps 3 and 4 have not).",
+                     # What ran on revision 12, from its logs, and the
+                     # microphone as the owner reported it.
+                     "**Revision 12: results** (2026-11-24, squirtle;",
+                     "`verify.sh`: 27 `ok`, no `FAIL`",
+                     "The microphone: sound capture works in use (it picks up the voice); the level meter in "
+                     "Settings was not confirmed.",
+                     "not the kernel's or revision 12's.",
+                     "`XO still voted at the entry to the sleep, held by: gcc_qupv3_wrap1_s7_clk, "
+                     "gcc_qupv3_wrap2_s6_clk`",
+                     # Revision 13: what it is, what it changes, how it is
+                     # built and installed, the way back, and its runs.
+                     "**Revision 13** (written 2026-11-24, not built yet) is revision 12 plus one upstream fix and a "
+                     "change to the CXPC log's diagnostic",
+                     "upstream d0cd9c8d0fd5 (v7.3-rc1) with its fix 3098c989bd38 (v7.3-rc6) folded in, with "
+                     "`APPLY_GENI_SERIAL_FORCE_SUSPEND=1`.",
+                     "**Every system suspend runs it, the boot's panel cycle included**, on both UARTs.",
+                     "`qcom_stats/cxpc_violators_raw`. What the region holds, and whether the message changes it, is "
+                     "what the next run settles.",
+                     "Revision 13 adds `kernel/patches/qcom-geni-serial-force-suspend-in-system-sleep.patch` and "
+                     "changes the CXPC log's patch: twenty-four patches, nineteen files",
+                     "Revision 13 is to be built the same way, in `build-r13`, its `certs` given that key from "
+                     "`build-r12`, with `APPLY_GENI_SERIAL_FORCE_SUSPEND=1` added.",
+                     "Revision 13 installs the same way over revision 12, which squirtle has run since 2026-11-24 "
+                     "08:45, over revision 11, and over every earlier revision",
+                     "From revision 13, the way back to revision 12 in one step, the same way: "
+                     "`~/ubuntu-gts9u/backups/typec-roles-kit-r12/boot.img` (sha256 "
+                     "`9bca1427d84dc351ec0b050ae52fc43bf874af279f19e7386edcfb5688c572ec`)",
+                     "**Revision 13: the runs** (written before the kernel was built).",
+                     "   sudo sh ~/bt-uart/suspend-bt.sh platform 20\n",
+                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 "
+                     "rpmh cxpc sensors=stop hold=60 restart-ok\n",
+                     "- **`cxpc`** (`ro`; revision 12's kernel)",
+                     "- **`sensors=hook`** (`ro`; revision 12's script)",
+                     "revision 12's script names that flush `at T, the sleep's entry`"):
             with self.subTest(said):
                 self.assertIn(said, readme if "\\" not in said and "\n" not in said
                               else (KIT_SRC / "README.md").read_text())
@@ -10562,7 +11427,10 @@ class ScriptsTest(unittest.TestCase):
                       "this kit changes nothing there", "New in this revision are",
                       "**On the SM-X710 the previous revision of the kit is installed",
                       "not done yet: `verify.sh dock` and `swap` on a kit kernel",
-                      "The data role fault has not been seen on it", "Not on the SM-X710 for now"):
+                      "The data role fault has not been seen on it", "Not on the SM-X710 for now",
+                      # Revision 12 was built, installed and run (2026-11-24).
+                      "**Revision 12** (written 2026-11-24, not built yet)",
+                      "(none has run; the kernel is not built yet)"):
             self.assertNotIn(stale, readme)
         # What the SM-X710 showed.
         self.assertIn("That is the SM-X910's fault, seen once here: the reason revision 7 carries the "

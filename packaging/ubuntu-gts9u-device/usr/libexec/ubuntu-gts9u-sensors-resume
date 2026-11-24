@@ -23,8 +23,10 @@ log() { echo "ubuntu-gts9u-sensors-resume: $*" >&2; }
 # coming up.  At that point sensorspd may have started only milliseconds ago.
 # Restarting it unconditionally races the first protection-domain attach and
 # can leave the ADSP handover IRQ firing continuously.  Keep an already active
-# daemon; a normal system suspend stops it through Conflicts=suspend.target,
-# so the inactive case below still performs the required fresh attachment.
+# daemon; every system sleep stops it (the system-sleep hook
+# ubuntu-gts9u-sensors, and on a systemctl suspend its unit's
+# Conflicts=suspend.target as well), so the inactive case below still performs
+# the required fresh attachment.
 started_sensorspd=0
 if ! systemctl is-active --quiet hexagonrpcd-adsp-sensorspd.service; then
 	systemctl start hexagonrpcd-adsp-sensorspd.service || true
@@ -114,5 +116,5 @@ while [ "$attempt" -lt 45 ]; do
 	sleep 2
 done
 
-log 'SSC did not become ready; rotation will not work this boot'
+log 'SSC did not become ready; rotation stays off unless a retry of this unit (three starts at most), the next resume or the next boot brings it'
 exit 1

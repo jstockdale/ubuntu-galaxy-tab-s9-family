@@ -42,10 +42,12 @@ its power-off branch) and the interconnect floor released did not return
 with this GDSC in retention: 0 of 8 (six on Type-C kit revision 7's kernel,
 one on revision 9's, one on revision 10's), the SoC dropping PS_HOLD 43 to
 44 s after the RTC alarm; the same sleep with the floor held came back.
-With the GDSC collapsed it returned 7 of 7 (four on revision 9, three on
-revision 10, through the run-time switch of
-gcc-sm8550-gdsc-debug-switches.patch), and with revision 10's PIPE clock
-revert the PCIe host came back as well.  Two SM8550 community kernels with
+With the GDSC collapsed it returned 12 of 12: four on revision 9 and five
+on revision 10, through the run-time switch of
+gcc-sm8550-gdsc-debug-switches.patch, and three on revision 11 with this
+patch (one with the root port removed, two with it in D3hot through
+pcie-qcom-debug-root-port-d3.patch, the Wi-Fi bound); with revision 10's
+PIPE clock revert the PCIe host came back as well.  Two SM8550 community kernels with
 the same symptom made the domain PWRSTS_OFF_ON (ROCKNIX PR 3636,
 retroforge patch 0143).
 

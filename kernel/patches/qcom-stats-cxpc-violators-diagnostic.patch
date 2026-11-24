@@ -1,0 +1,565 @@
+Subject: [DEBUG, test builds only] soc: qcom: stats: log the AOP's CXPC violators after a system suspend (SM8550)
+
+Not for release builds.  scripts/build-mainline-kernel.sh applies this only
+with APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and refuses a default build in a source
+tree that carries it.  No board check: an SM8550 (both tablets).
+
+One switch, N at every boot, that root writes at run time:
+
+  /sys/module/qcom_stats/parameters/debug_cxpc_violators
+
+and two read-only debugfs files, qcom_stats/cxpc_violators and
+qcom_stats/ddr_votes.
+
+qcom_stats counts the SoC's AOSS sleeps, CX collapses and DDR low-power
+entries (aosd, cxsd, ddr) but cannot say what held them off, and the
+application processor's own sleep set (sleep-test.sh rpmh) is one RPMh
+requester (DRV) of about twenty.  The AOP keeps a log of the DRVs that
+voted against CX power collapse while the APPS slept, when it is asked
+with a QMP message before the suspend; Samsung's kernel for this SoC and
+firmware reads it (drivers/soc/qcom/sys_pm_vx.c, compatible
+"qcom,sys-pm-kalama": the message "{class: lpm_mon, type: cxpc, dur: 1000,
+flush: 10, ts_adj: 1}" from its suspend callback, the log at
+sys-pm-vx@c320000, 0x400 bytes, in its DTB, a header and lines of a time
+word and a byte per DRV, an all-zero line where CX collapsed; the DRV
+names below are its drv_names_kalama[]).  The kit does not change the DTB,
+which has no node for the log, so the region is the SoC's address and is
+mapped on an SM8550 alone, with the AOSS QMP that qcom_stats already uses
+for the DDR stats.
+
+With Y each system suspend sends the message from a PM_SUSPEND_PREPARE
+notifier (process context, before the freeze), and the PM_POST_SUSPEND
+notifier logs the log, at info level:
+
+  cxpc violators: the AOP's CXPC monitor is on for this suspend
+  cxpc violators: mode 0xcc (CXPC), N of M lines, every 1000 ms, ...
+  cxpc violators: TIME: AUDIO 3, HLOS 1      (a line with DRVs in it)
+  cxpc violators: TIME: CXPC enter            (an all-zero line)
+  cxpc violators: summary: N lines, K of them CXPC enter or exit; DRVs: AUDIO 30/30 (every line), ...
+
+What a DRV's value means beyond "this requester voted against CXPC" is
+the AOP's and is not documented: the values are logged as they are.
+qcom_stats/cxpc_violators shows the log as the AOP last left it, any time.
+qcom_stats/ddr_votes asks the AOP for every DRV's DDR vote now
+("{class: ddr, res: drvs_ddr_votes}", as soc_sleep_stats.c's
+ddr_stats_get_ss_vote_info() does for kalama's 20 DRVs: they follow the
+DDR stats' entries in the stats region qcom_stats maps) and shows ab and
+ib; it is the awake state, for a DDR held at a frequency that no Linux
+vote explains (the 547 MHz with the audio DSP stopped, revisions 9 and
+10), and the order of its DRVs is taken to be the log's.
+
+Before the switch is written nothing of this runs: the notifier returns
+at once, the region is mapped and not read, and the debugfs files read
+nothing until they are read.  Refused before SYSTEM_RUNNING (-EPERM), so
+the kernel command line cannot set it; -ENODEV without the region or the
+QMP.  Reading the region is the first access to that part of the AOP's
+message RAM on this port (Samsung's HLOS, under the same hypervisor, reads
+it): sleep-test.sh reads the debugfs file once right before it freezes
+anything, so that a bus error, if the region were not mapped for this VM,
+would come there and not in a sleep.
+
+Kit revision 13: the first read (kit revision 12, SM-X710, 2026-11-24, one
+suspend-to-idle of 30 s) gave a header that is no CXPC log's: mode 0xdb
+(Samsung's decoder knows 0xaa AOSS, 0xcc CXPC, 0xdd DDR), "every 16 ms",
+time shift 50 and flush 1 for the message's cxpc, 1000 ms and 10; and 26
+lines whose "DRVs" were byte 0 of each of their six words in every line
+(TZ, SECPROC, GPU, TME_HW, WLAN BB, DDR AUX) with small values and zero
+bytes around them: 32-bit words, not a byte per DRV.  The layout read is
+Samsung's (sys_pm_vx.c read_vx_data(): the type and size in the first word,
+duration, shift and flush in the second, then per line a time word and a
+byte per DRV in words), so the content, not the decode, is other than
+expected; what it is and whether the message changed it cannot be told
+from the decoded lines (zero bytes are not printed, and a shift of 50 on a
+32-bit word is undefined: the times printed are the low 14 bits shifted by
+18).  So the lines are decoded only under a CXPC header (mode 0xcc, a time
+shift below 32), and the region is logged raw, 16 kernel lines of 16 words
+("cxpc violators: raw ..."), right before the message, right after the AOP
+took it (when it differs) and after the suspend (when it differs); a header
+that is not a CXPC log's gives "cxpc violators: summary: not a CXPC log
+(mode ...)".  qcom_stats/cxpc_violators_raw (0400) shows the region raw at
+any time; sleep-test.sh cxpc reads it before it freezes anything.  Each
+word is read with readl_relaxed() (the message RAM takes 32-bit reads).
+
+---
+--- a/drivers/soc/qcom/qcom_stats.c
++++ b/drivers/soc/qcom/qcom_stats.c
+@@ -12,6 +12,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/seq_file.h>
++#include <linux/suspend.h>
+ 
+ #include <linux/soc/qcom/qcom_aoss.h>
+ #include <linux/soc/qcom/smem.h>
+@@ -300,6 +301,454 @@ static void qcom_create_subsystem_stat_f
+ 				    &qcom_subsystem_sleep_stats_fops);
+ }
+ 
++/*
++ * SM8550 deep-sleep debug, not for release builds: the AOP's log of what
++ * keeps the SoC out of CX power collapse, which
++ * scripts/build-mainline-kernel.sh adds only with
++ * APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (qcom-stats-cxpc-violators-diagnostic.patch).
++ *
++ * qcom_stats counts the SoC's sleeps (aosd, cxsd, ddr) but cannot say what
++ * held them off.  The AOP can: asked with a QMP message, it keeps a log in
++ * its message RAM of each RPMh DRV (requester) that voted against CX power
++ * collapse while the application processor slept, a line every so often
++ * with a byte per DRV, an all-zero line when CX did collapse.  Samsung's
++ * kernel reads it on the same SoC and firmware (drivers/soc/qcom/
++ * sys_pm_vx.c, "qcom,sys-pm-kalama": the message
++ * "{class: lpm_mon, type: cxpc, dur: 1000, flush: 10, ts_adj: 1}" before a
++ * suspend, the log at sys-pm-vx@c320000, 0x400 bytes, in its DTB, read
++ * after it, with the kalama DRV names below).  This kernel's DTB has no node
++ * for it and the kit does not change the DTB, so the region is the SoC's
++ * address, for an SM8550 alone.
++ *
++ * One switch, which root writes at run time and nothing else changes:
++ * /sys/module/qcom_stats/parameters/debug_cxpc_violators, N at every boot,
++ * refused before SYSTEM_RUNNING (the kernel command line cannot set it),
++ * -ENODEV off an SM8550 or without the AOSS QMP.  With Y each system
++ * suspend sends the message from its PM_SUSPEND_PREPARE notifier, and its
++ * PM_POST_SUSPEND notifier logs the log: "qcom_stats: cxpc violators:" lines,
++ * the header, then each line with a DRV in it by name and value, the CXPC
++ * lines ("CXPC enter" or "CXPC exit"), and a summary of which DRVs were in
++ * every line.  What a DRV's value means beyond "this requester held CX" is
++ * the AOP's and not documented; the values are logged as they are.  The
++ * read-only debugfs file qcom_stats/cxpc_violators (0400) shows the log as
++ * the AOP last left it, any time, and qcom_stats/ddr_votes (0400) asks the
++ * AOP for each DRV's DDR vote now ("{class: ddr, res: drvs_ddr_votes}",
++ * soc_sleep_stats.c's ddr_stats_get_ss_vote_info(), 20 DRVs on kalama,
++ * after the DDR stats' entries) and shows them, ab and ib, by the same
++ * names (the AOP's order of that list is taken to be the log's).  Nothing
++ * of this runs or reads until the switch is written or a file is read.
++ *
++ * Kit revision 12's first run read a region whose header is not a CXPC
++ * log's (mode 0xdb, "every 16 ms", time shift 50, flush 1, for the message's
++ * cxpc, 1000 ms and 10) and whose lines are 32-bit words, not a byte per
++ * DRV.  So the lines are decoded only under a CXPC header (mode 0xcc, a
++ * time shift below 32), and the region is logged raw, 0x400 bytes as 16
++ * lines of 16 words each, "cxpc violators: raw ..." in the kernel log: as
++ * it was right before the message, right after the AOP took it (when it
++ * differs) and after the suspend (when it differs), so that one run tells
++ * what the AOP writes there and when.  The read-only debugfs file
++ * qcom_stats/cxpc_violators_raw (0400) shows the region raw the same way.
++ * The message RAM takes 32-bit reads alone: each word is read with
++ * readl_relaxed().
++ */
++#define QCOM_STATS_VX_BASE_SM8550	0x0c320000
++#define QCOM_STATS_VX_SIZE		0x400
++#define QCOM_STATS_VX_CXPC		0xcc
++#define QCOM_STATS_VX_MAX_LINES		64
++#define QCOM_STATS_VX_WORDS		(QCOM_STATS_VX_SIZE / 4)
++#define QCOM_STATS_VX_ROW		16
++#define QCOM_STATS_DDR_VOTE_DRVS	20
++#define QCOM_STATS_DRV_ABSENT		0xdeaddead
++#define QCOM_STATS_DRV_INVALID		0xffffdead
++
++static const char * const qcom_stats_vx_drvs[] = {
++	"TZ", "HYP", "HLOS", "L3", "SECPROC", "AUDIO", "AOP", "DEBUG",
++	"GPU", "DISPLAY", "COMPUTE_DSP", "TME_SW", "TME_HW", "MDM SW",
++	"MDM HW", "WLAN RF", "WLAN BB", "CAM_IFE0", "CAM_IFE1", "CAM_IFE2",
++	"DDR AUX", "ARC CPRF",
++};
++
++#define QCOM_STATS_VX_NDRV	ARRAY_SIZE(qcom_stats_vx_drvs)
++/* A line: its time word, then a byte per DRV in words. */
++#define QCOM_STATS_VX_LINE	(4 + 4 * DIV_ROUND_UP(QCOM_STATS_VX_NDRV, 4))
++
++static void __iomem *qcom_stats_vx_base;
++static void __iomem *qcom_stats_ddr_base;
++static bool qcom_stats_vx_on;
++static bool qcom_stats_vx_armed;
++/* The region right before the message and right after the AOP took it. */
++static u32 qcom_stats_vx_snap[2][QCOM_STATS_VX_WORDS];
++static bool qcom_stats_vx_snapped[2];
++
++struct qcom_stats_vx_log {
++	u8 type, logsize, ts_shift, flush;
++	u16 dur_ms;
++	unsigned int lines;
++	u32 ts[QCOM_STATS_VX_MAX_LINES];
++	u8 drv[QCOM_STATS_VX_MAX_LINES][QCOM_STATS_VX_NDRV];
++};
++
++static int qcom_stats_vx_read(struct qcom_stats_vx_log *log)
++{
++	unsigned int max, i, j;
++	u32 w0, w1, v = 0;
++	void __iomem *p;
++
++	w0 = readl_relaxed(qcom_stats_vx_base);
++	w1 = readl_relaxed(qcom_stats_vx_base + 4);
++	if (!w0 || !w1)
++		return -ENOENT;
++
++	log->type = w0 & 0xff;
++	log->logsize = (w0 >> 8) & 0xff;
++	log->dur_ms = w1 & 0xffff;
++	log->ts_shift = (w1 >> 16) & 0xff;
++	log->flush = w1 >> 24;
++	log->lines = 0;
++	/* Not the answer to the message: the lines are not decoded. */
++	if (log->type != QCOM_STATS_VX_CXPC || log->ts_shift >= 32)
++		return -EPROTO;
++
++	max = min3((unsigned int)log->logsize, (unsigned int)QCOM_STATS_VX_MAX_LINES,
++		   (unsigned int)((QCOM_STATS_VX_SIZE - 8) / QCOM_STATS_VX_LINE));
++	for (i = 0; i < max; i++) {
++		p = qcom_stats_vx_base + 8 + i * QCOM_STATS_VX_LINE;
++		log->ts[i] = readl_relaxed(p);
++		if (!log->ts[i])
++			break;
++		for (j = 0; j < QCOM_STATS_VX_NDRV; j++) {
++			if (!(j % 4))
++				v = readl_relaxed(p + 4 + j);
++			log->drv[i][j] = (v >> (8 * (j % 4))) & 0xff;
++		}
++	}
++	log->lines = i;
++
++	return 0;
++}
++
++static void qcom_stats_vx_copy(u32 *w)
++{
++	unsigned int i;
++
++	for (i = 0; i < QCOM_STATS_VX_WORDS; i++)
++		w[i] = readl_relaxed(qcom_stats_vx_base + 4 * i);
++}
++
++/* The region raw, 16 kernel lines of 16 words, with when it was read. */
++static void qcom_stats_vx_dump(const char *when, const u32 *w)
++{
++	unsigned int i;
++
++	for (i = 0; i < QCOM_STATS_VX_WORDS; i += QCOM_STATS_VX_ROW)
++		pr_info("cxpc violators: raw %s +0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			when, 4 * i, w[i], w[i + 1], w[i + 2], w[i + 3], w[i + 4], w[i + 5], w[i + 6],
++			w[i + 7], w[i + 8], w[i + 9], w[i + 10], w[i + 11], w[i + 12], w[i + 13],
++			w[i + 14], w[i + 15]);
++}
++
++static bool qcom_stats_vx_line_empty(const struct qcom_stats_vx_log *log, unsigned int i)
++{
++	unsigned int j;
++
++	for (j = 0; j < QCOM_STATS_VX_NDRV; j++)
++		if (log->drv[i][j])
++			return false;
++	return true;
++}
++
++/* One line of the log as text: the DRVs in it, or CXPC entered/left. */
++static void qcom_stats_vx_line(const struct qcom_stats_vx_log *log, unsigned int i,
++			       bool *in_cxpc, char *buf, size_t len)
++{
++	unsigned int j;
++	size_t n = 0;
++
++	if (qcom_stats_vx_line_empty(log, i)) {
++		scnprintf(buf, len, "CXPC %s", *in_cxpc ? "exit" : "enter");
++		*in_cxpc = !*in_cxpc;
++		return;
++	}
++	buf[0] = '\0';
++	for (j = 0; j < QCOM_STATS_VX_NDRV; j++)
++		if (log->drv[i][j])
++			n += scnprintf(buf + n, len - n, "%s%s %u", n ? ", " : "",
++				       qcom_stats_vx_drvs[j], log->drv[i][j]);
++}
++
++static void qcom_stats_vx_report(void)
++{
++	struct qcom_stats_vx_log *log;
++	unsigned int i, j, held, some;
++	bool in_cxpc = false;
++	char *buf, *all;
++	size_t na = 0;
++	u32 *now;
++	int ret;
++
++	log = kzalloc(sizeof(*log), GFP_KERNEL);
++	buf = kzalloc(256, GFP_KERNEL);
++	all = kzalloc(256, GFP_KERNEL);
++	now = kcalloc(QCOM_STATS_VX_WORDS, sizeof(*now), GFP_KERNEL);
++	if (!log || !buf || !all || !now)
++		goto out;
++
++	/*
++	 * The region raw: before the message, after it and now, each one
++	 * that differs from the one before it in full.
++	 */
++	qcom_stats_vx_copy(now);
++	if (qcom_stats_vx_snapped[0])
++		qcom_stats_vx_dump("before the message", qcom_stats_vx_snap[0]);
++	if (qcom_stats_vx_snapped[1]) {
++		if (qcom_stats_vx_snapped[0] &&
++		    !memcmp(qcom_stats_vx_snap[1], qcom_stats_vx_snap[0], QCOM_STATS_VX_SIZE))
++			pr_info("cxpc violators: raw after the message: the same as before it\n");
++		else
++			qcom_stats_vx_dump("after the message", qcom_stats_vx_snap[1]);
++	}
++	if (qcom_stats_vx_snapped[1] && !memcmp(now, qcom_stats_vx_snap[1], QCOM_STATS_VX_SIZE))
++		pr_info("cxpc violators: raw after the suspend: the same as after the message\n");
++	else
++		qcom_stats_vx_dump("after the suspend", now);
++
++	ret = qcom_stats_vx_read(log);
++	if (ret == -EPROTO) {
++		pr_info("cxpc violators: mode %#x, %u lines at most, every %u ms, time shift %u, flush %u: not a CXPC log (mode 0xcc, a time shift below 32), not decoded\n",
++			log->type, log->logsize, log->dur_ms, log->ts_shift, log->flush);
++		pr_info("cxpc violators: summary: not a CXPC log (mode %#x); the region raw is above\n",
++			log->type);
++		goto out;
++	}
++	if (ret) {
++		pr_info("cxpc violators: no log in the AOP's message RAM after this suspend\n");
++		goto out;
++	}
++	pr_info("cxpc violators: mode %#x%s, %u of %u lines, every %u ms, time shift %u, flush %u\n",
++		log->type, log->type == QCOM_STATS_VX_CXPC ? " (CXPC)" : "", log->lines,
++		log->logsize, log->dur_ms, log->ts_shift, log->flush);
++	for (i = 0; i < log->lines; i++) {
++		qcom_stats_vx_line(log, i, &in_cxpc, buf, 256);
++		pr_info("cxpc violators: %#x: %s\n", log->ts[i] << log->ts_shift, buf);
++	}
++	/* Which DRVs were in every line with a DRV in it, and which in some. */
++	for (j = 0, some = 0; j < QCOM_STATS_VX_NDRV; j++) {
++		for (i = 0, held = 0; i < log->lines; i++)
++			held += !!log->drv[i][j];
++		if (!held)
++			continue;
++		some++;
++		for (i = 0; i < log->lines; i++)
++			if (!log->drv[i][j] && !qcom_stats_vx_line_empty(log, i))
++				break;
++		na += scnprintf(all + na, 256 - na, "%s%s %u/%u%s", na ? ", " : "",
++				qcom_stats_vx_drvs[j], held, log->lines,
++				i == log->lines ? " (every line)" : "");
++	}
++	for (i = 0, held = 0; i < log->lines; i++)
++		held += qcom_stats_vx_line_empty(log, i);
++	pr_info("cxpc violators: summary: %u lines, %u of them CXPC enter or exit; DRVs: %s\n",
++		log->lines, held, some ? all : "none");
++out:
++	kfree(now);
++	kfree(all);
++	kfree(buf);
++	kfree(log);
++}
++
++static int qcom_stats_vx_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	int ret;
++
++	switch (action) {
++	case PM_SUSPEND_PREPARE:
++		qcom_stats_vx_armed = false;
++		qcom_stats_vx_snapped[0] = qcom_stats_vx_snapped[1] = false;
++		if (!READ_ONCE(qcom_stats_vx_on))
++			break;
++		qcom_stats_vx_copy(qcom_stats_vx_snap[0]);
++		qcom_stats_vx_snapped[0] = true;
++		ret = qmp_send(qcom_stats_qmp, "{class: lpm_mon, type: cxpc, dur: 1000, flush: 10, ts_adj: 1}");
++		if (ret) {
++			pr_warn("cxpc violators: the AOP did not take the monitor message: %d\n", ret);
++			break;
++		}
++		qcom_stats_vx_copy(qcom_stats_vx_snap[1]);
++		qcom_stats_vx_snapped[1] = true;
++		qcom_stats_vx_armed = true;
++		pr_info("cxpc violators: the AOP's CXPC monitor is on for this suspend\n");
++		break;
++	case PM_POST_SUSPEND:
++		if (qcom_stats_vx_armed)
++			qcom_stats_vx_report();
++		qcom_stats_vx_armed = false;
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block qcom_stats_vx_nb = {
++	.notifier_call = qcom_stats_vx_pm_notify,
++};
++
++static int qcom_stats_vx_set(const char *val, const struct kernel_param *kp)
++{
++	bool on;
++	int ret;
++
++	/* Run time only: see above. */
++	if (system_state != SYSTEM_RUNNING)
++		return -EPERM;
++
++	ret = kstrtobool(val, &on);
++	if (ret)
++		return ret;
++
++	if (on && (!qcom_stats_vx_base || !qcom_stats_qmp))
++		return -ENODEV;
++
++	WRITE_ONCE(*(bool *)kp->arg, on);
++	return 0;
++}
++
++static const struct kernel_param_ops qcom_stats_vx_ops = {
++	.set = qcom_stats_vx_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(debug_cxpc_violators, &qcom_stats_vx_ops, &qcom_stats_vx_on, 0644);
++MODULE_PARM_DESC(debug_cxpc_violators,
++		 "debug: Y: log the AOP's CXPC violators after each system suspend (SM8550, run time only)");
++
++static int qcom_stats_vx_show(struct seq_file *s, void *unused)
++{
++	struct qcom_stats_vx_log *log;
++	bool in_cxpc = false;
++	unsigned int i;
++	char *buf;
++	int ret;
++
++	log = kzalloc(sizeof(*log), GFP_KERNEL);
++	buf = kzalloc(256, GFP_KERNEL);
++	ret = -ENOMEM;
++	if (!log || !buf)
++		goto out;
++
++	ret = qcom_stats_vx_read(log);
++	if (ret == -EPROTO) {
++		seq_printf(s, "Mode: %#x, not a CXPC log (mode 0xcc, a time shift below 32): not decoded (cxpc_violators_raw has the region)\nDuration (ms): %u\nTime Shift: %u\nFlush Threshold: %u\nMax Log Entries: %u\n",
++			   log->type, log->dur_ms, log->ts_shift, log->flush, log->logsize);
++		ret = 0;
++		goto out;
++	}
++	if (ret) {
++		seq_puts(s, "no log\n");
++		ret = 0;
++		goto out;
++	}
++	seq_printf(s, "Mode: %#x%s\nDuration (ms): %u\nTime Shift: %u\nFlush Threshold: %u\nMax Log Entries: %u\n",
++		   log->type, log->type == QCOM_STATS_VX_CXPC ? " (CXPC)" : "", log->dur_ms,
++		   log->ts_shift, log->flush, log->logsize);
++	for (i = 0; i < log->lines; i++) {
++		qcom_stats_vx_line(log, i, &in_cxpc, buf, 256);
++		seq_printf(s, "%#x: %s\n", log->ts[i] << log->ts_shift, buf);
++	}
++	ret = 0;
++out:
++	kfree(buf);
++	kfree(log);
++	return ret;
++}
++
++DEFINE_SHOW_ATTRIBUTE(qcom_stats_vx);
++
++/* The region raw, as the kernel log has it: 16 lines of 16 words. */
++static int qcom_stats_vx_raw_show(struct seq_file *s, void *unused)
++{
++	unsigned int i, j;
++	u32 *w;
++
++	w = kcalloc(QCOM_STATS_VX_WORDS, sizeof(*w), GFP_KERNEL);
++	if (!w)
++		return -ENOMEM;
++	qcom_stats_vx_copy(w);
++	for (i = 0; i < QCOM_STATS_VX_WORDS; i += QCOM_STATS_VX_ROW) {
++		seq_printf(s, "+0x%03x:", 4 * i);
++		for (j = 0; j < QCOM_STATS_VX_ROW; j++)
++			seq_printf(s, " %08x", w[i + j]);
++		seq_putc(s, '\n');
++	}
++	kfree(w);
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(qcom_stats_vx_raw);
++
++static int qcom_stats_ddr_votes_show(struct seq_file *s, void *unused)
++{
++	void __iomem *reg;
++	unsigned int i;
++	u32 n, v;
++	int ret;
++
++	/* After the magic, the entry count and the DDR stats' entries. */
++	n = readl_relaxed(qcom_stats_ddr_base + DDR_STATS_NUM_MODES_ADDR);
++	if (n > DDR_STATS_MAX_NUM_MODES)
++		return -EINVAL;
++
++	ret = qmp_send(qcom_stats_qmp, "{class: ddr, res: drvs_ddr_votes}");
++	if (ret)
++		return ret;
++
++	reg = qcom_stats_ddr_base + DDR_STATS_ENTRY_START_ADDR + n * sizeof(struct ddr_stats_entry);
++	for (i = 0; i < QCOM_STATS_DDR_VOTE_DRVS; i++) {
++		v = readl_relaxed(reg + 4 * i);
++		seq_printf(s, "%-11s ", qcom_stats_vx_drvs[i]);
++		if (v == QCOM_STATS_DRV_ABSENT)
++			seq_puts(s, "absent\n");
++		else if (v == QCOM_STATS_DRV_INVALID)
++			seq_puts(s, "invalid\n");
++		else
++			seq_printf(s, "ab %u ib %u\n", (v >> 14) & 0x3fff, v & 0x3fff);
++	}
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(qcom_stats_ddr_votes);
++
++static void qcom_stats_vx_init(struct device *dev, struct dentry *root, void __iomem *reg,
++			       const struct stats_config *config)
++{
++	if (!qcom_stats_qmp || !of_machine_is_compatible("qcom,sm8550"))
++		return;
++
++	qcom_stats_vx_base = devm_ioremap(dev, QCOM_STATS_VX_BASE_SM8550, QCOM_STATS_VX_SIZE);
++	if (!qcom_stats_vx_base)
++		return;
++	if (register_pm_notifier(&qcom_stats_vx_nb)) {
++		qcom_stats_vx_base = NULL;
++		return;
++	}
++	debugfs_create_file("cxpc_violators", 0400, root, NULL, &qcom_stats_vx_fops);
++	debugfs_create_file("cxpc_violators_raw", 0400, root, NULL, &qcom_stats_vx_raw_fops);
++
++	/*
++	 * The votes follow the DDR stats' entries in the stats region (0x400
++	 * bytes): there is room for them at the largest entry count.
++	 */
++	BUILD_BUG_ON(0xb8 + DDR_STATS_ENTRY_START_ADDR +
++		     DDR_STATS_MAX_NUM_MODES * sizeof(struct ddr_stats_entry) +
++		     4 * QCOM_STATS_DDR_VOTE_DRVS > 0x400);
++	if (config->ddr_stats_offset == 0xb8 &&
++	    readl_relaxed(reg + config->ddr_stats_offset + DDR_STATS_MAGIC_KEY_ADDR) == DDR_STATS_MAGIC_KEY) {
++		qcom_stats_ddr_base = reg + config->ddr_stats_offset;
++		debugfs_create_file("ddr_votes", 0400, root, NULL, &qcom_stats_ddr_votes_fops);
++	}
++}
++
+ static int qcom_stats_probe(struct platform_device *pdev)
+ {
+ 	void __iomem *reg;
+@@ -344,6 +793,7 @@ static int qcom_stats_probe(struct platf
+ 	qcom_create_subsystem_stat_files(root, config);
+ 	qcom_create_soc_sleep_stat_files(root, reg, d, config);
+ 	qcom_create_ddr_stat_files(root, reg, config);
++	qcom_stats_vx_init(&pdev->dev, root, reg, config);
+ 
+ 	platform_set_drvdata(pdev, root);
+ 
+@@ -356,6 +806,8 @@ static void qcom_stats_remove(struct pla
+ {
+ 	struct dentry *root = platform_get_drvdata(pdev);
+ 
++	if (qcom_stats_vx_base)
++		unregister_pm_notifier(&qcom_stats_vx_nb);
+ 	debugfs_remove_recursive(root);
+ }
+ 

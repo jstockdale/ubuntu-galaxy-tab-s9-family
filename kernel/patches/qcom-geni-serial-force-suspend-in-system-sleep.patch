@@ -1,0 +1,154 @@
+From d0cd9c8d0fd59bc7d140f3d60cf02e1d80376dab Mon Sep 17 00:00:00 2001
+From: Praveen Talari <praveen.talari@oss.qualcomm.com>
+Date: Thu, 2 Jul 2026 17:11:50 +0530
+Subject: [PATCH] serial: qcom-geni: add force suspend/resume to system sleep callbacks
+
+commit d0cd9c8d0fd59bc7d140f3d60cf02e1d80376dab upstream (v7.3-rc1), with
+its fix 3098c989bd38edff871d798acd7f1d1b269f7edd upstream (v7.3-rc6,
+"serial: qcom-geni: Fix unbalanced runtime PM resume for no_console_suspend",
+Abel Vesa) folded in.
+
+During system sleep the hardware resources (clocks, interconnect) are
+not gated because the runtime-suspend callback is never invoked from
+the system sleep path.  This prevents the platform from reaching its
+lowest idle state.
+
+The system sleep callbacks qcom_geni_serial_suspend() and
+qcom_geni_serial_resume() rely solely on uart_suspend_port() /
+uart_resume_port() to manage power.  uart_suspend_port() drives the
+UART PM state machine to UART_PM_STATE_OFF, which in turn calls
+pm_runtime_put_sync() and eventually the runtime-suspend callback.
+However, if the runtime-PM usage count is still elevated at the time
+of system sleep (e.g. the port is held active by an open file
+descriptor), the runtime-suspend callback is never invoked and the
+hardware resources (clocks, interconnect) remain enabled across
+suspend, preventing the platform from reaching its lowest idle state.
+
+Fix this by calling pm_runtime_force_suspend() at the end of
+qcom_geni_serial_suspend() so that the runtime-suspend callback is
+always executed regardless of the usage count, and by calling
+pm_runtime_force_resume() at the start of qcom_geni_serial_resume()
+to restore those resources before uart_resume_port() re-opens the
+port.
+
+Signed-off-by: Praveen Talari <praveen.talari@oss.qualcomm.com>
+Link: https://patch.msgid.link/20260702-add_force_suspend_resume_to_system_sleep_callbacks-v2-1-b79e254a7015@oss.qualcomm.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+The folded fix (3098c989bd38):
+
+    When no_console_suspend is set for the serial console, the system
+    suspend callback skips pm_runtime_force_suspend() to keep the console
+    active. The resume callback still unconditionally calls
+    pm_runtime_force_resume(), which triggers an "Unbalanced
+    pm_runtime_enable!" warning.
+
+    Only force resume when the suspend callback force suspended the device.
+
+    Fixes: d0cd9c8d0fd5 ("serial: qcom-geni: add force suspend/resume to system sleep callbacks")
+    Signed-off-by: Abel Vesa <abel.vesa@oss.qualcomm.com>
+    Reviewed-by: Praveen Talari <praveen.talari@oss.qualcomm.com>
+    Tested-by: David Heidelberg <david@ixit.cz> # OnePlus 6T (sdm845)
+    Link: https://patch.msgid.link/20260828-serial-qcom-geni-fix-unbalanced-rpm-resume-v1-1-af3e5aef17a6@oss.qualcomm.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Port notes (this port's, not upstream's).  Both hunks are upstream's code
+as it is in v7.3 and v7.4-rc4; only the line numbers are v7.2-rc3's.
+
+Why: in kit revision 12's first sleep (SM-X710, 2026-11-24) the clock trace
+found XO still voted at the entry to the sleep, held by two clocks alone:
+gcc_qupv3_wrap1_s7_clk, uart7's (serial@a9c000, the console ttyMSM0), and
+gcc_qupv3_wrap2_s6_clk, uart14's (serial@898000, the Bluetooth UART that
+hci_qca opens through serdev).  In v7.2-rc3 both ports hold one runtime PM
+reference while their serial core power state is UART_PM_STATE_ON: the
+console's from uart_configure_port(), which leaves a console port on, the
+Bluetooth UART's from uart_port_startup() at serdev's open.  In system
+suspend uart_suspend_port() turns the state OFF, and qcom_geni_serial_pm()
+drops that reference with pm_runtime_put_sync(); but device_prepare() holds
+a reference of its own through the whole transition
+(drivers/base/power/main.c, pm_runtime_get_noresume()), so the count does
+not reach 0, the runtime suspend callback never runs, and
+geni_se_resources_off() never unprepares the "se" clock.  Each port also
+kept its QUP core bandwidth vote and its CX performance vote.
+
+This tree keeps the uart_ops .pm callback (upstream removed it later, in
+aee1f94dab13, v7.3-rc1, and fixed what that broke in 2de1066dc859 and
+e95442c31ae6; none of the three is taken): uart_resume_port()'s
+uart_change_pm(UART_PM_STATE_ON) is what powers the console port up again
+when pm_runtime_force_suspend() found it not in use and left it suspended,
+which is what e95442c31ae6 has to add without the callback.
+
+Ordering with qcom-geni-serial-serve-irq-while-suspending.patch (SM-X710
+builds; the interrupt handler, another function): uart_suspend_port() calls
+shutdown(), whose disable_irq() waits for a running handler, before
+uart_change_pm() and the force suspend turn the resources off; at the
+resume they are on again before startup() enables the interrupt.  hci_qca
+queues and does not send while it is suspending (QCA_SUSPENDING, from its
+own suspend, which runs before the UART's, until its resume, after it), and
+every console is marked suspended before the devices' suspend and until
+after their resume (console_suspend_all(), console_resume_all()), so
+nothing writes to an unclocked engine (console_suspend Y on both tablets).
+
+Wakeup: uart_suspend_port() returns early, the port left running, for a tty
+whose power/wakeup is enabled, and upstream's force suspend still powers it
+down.  No wake source of this port uses that: ttyMSM0's power/wakeup reads
+disabled (squirtle, 2026-11-24), neither platform device is wakeup capable
+(no dedicated wake interrupt in the device tree), and the Bluetooth UART has
+no tty device (serdev) and hci_qca installs no wakeup hook for it.  The
+kit's verify.sh warns if ttyMSM0's wakeup is ever enabled.
+
+Applied by scripts/build-mainline-kernel.sh with
+APPLY_GENI_SERIAL_FORCE_SUSPEND=1, strictly, and refused for a build
+without it in a tree that carries it.  It changes every system sleep on
+both tablets, the boot's panel cycle (pm_test) included: test builds until
+it has run on hardware.  No board gate: both tablets have the same two
+UARTs (uart7 the console, uart14 the Bluetooth UART: WCN6855 on the
+SM-X710, WCN7850 on the SM-X910).
+---
+ drivers/tty/serial/qcom_geni_serial.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -1974,6 +1974,7 @@ static int qcom_geni_serial_suspend(stru
+ 	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
+ 	struct uart_port *uport = &port->uport;
+ 	struct qcom_geni_private_data *private_data = uport->private_data;
++	int ret;
+ 
+ 	/*
+ 	 * This is done so we can hit the lowest possible state in suspend
+@@ -1983,7 +1984,19 @@ static int qcom_geni_serial_suspend(stru
+ 		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ACTIVE_ONLY);
+ 		geni_icc_set_bw(&port->se);
+ 	}
+-	return uart_suspend_port(private_data->drv, uport);
++
++	ret = uart_suspend_port(private_data->drv, uport);
++	if (ret)
++		return ret;
++
++	/*
++	 * When no_console_suspend is set the console must remain active
++	 * across system sleep, so skip the force suspend path.
++	 */
++	if (!console_suspend_enabled && uart_console(uport))
++		return 0;
++
++	return pm_runtime_force_suspend(dev);
+ }
+ 
+ static int qcom_geni_serial_resume(struct device *dev)
+@@ -1993,6 +2006,12 @@ static int qcom_geni_serial_resume(struc
+ 	struct uart_port *uport = &port->uport;
+ 	struct qcom_geni_private_data *private_data = uport->private_data;
+ 
++	if (console_suspend_enabled || !uart_console(uport)) {
++		ret = pm_runtime_force_resume(dev);
++		if (ret)
++			return ret;
++	}
++
+ 	ret = uart_resume_port(private_data->drv, uport);
+ 	if (uart_console(uport)) {
+ 		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ALWAYS);

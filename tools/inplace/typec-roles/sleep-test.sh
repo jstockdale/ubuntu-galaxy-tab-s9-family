@@ -4,7 +4,7 @@
 #   sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
 #        [pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
 #        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]
-#        [sensors=stop] restart-ok
+#        [cxpc] [sensors=stop|sensors=hook] restart-ok
 #   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]
 #        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok
 #   sh ~/typec-roles/sleep-test.sh status
@@ -43,13 +43,17 @@
 # suspend and resume (console_suspend N), at a cost: read the risks below
 # first.  gdsc=LIST (pcie0, pcie0phy and usb, comma-separated; with
 # pci=remove only), gdsc-ret=pcie0 and cxmx=ret set the kernel's debug
-# switches (the kernels of revisions 9 to 11) right before the freeze, until
+# switches (the kernels of revisions 9 to 12) right before the freeze, until
 # the restart: the PCIe and USB GDSCs collapse in the sleep instead of
 # staying on, pcie_0_gdsc stays on (in retention) where revision 11 lets it
 # collapse, and the CX and MX votes stay at RETENTION or above.  Every run
 # prints the switches as they are, and how they booted.  rpmh turns the
 # RPMh tracepoint on for the run and names, after each sleep, the sleep set
 # that the application processor's RSC slept with (XO, CX, MX, bandwidth).
+# cxpc (revision 12's kernel) has the AOP log, after each sleep, the RPMh
+# requesters that kept CX from collapsing.  sensors=hook stops the sensor
+# clients through the device package's system-sleep hook, as a systemctl
+# suspend does.
 # status (no root) prints the latest run's result from /run.
 #
 # On 2026-11-21 one deep sleep (rtcwake -m mem -s 30) did not bring the UFS
@@ -408,7 +412,7 @@
 #     past which the run ends with NO-SLEEP (s2idle).  A cycle in which no
 #     CPU entered its s2idle state and no such wakeup explains it FAILs.
 #   - gdsc=LIST, gdsc-ret=pcie0 and cxmx=ret (ro and dry; the kernels of
-#     revisions 9 to 11): the kernel's debug switches, run-time module
+#     revisions 9 to 12): the kernel's debug switches, run-time module
 #     parameters that nothing but root's write changes
 #     (gcc-sm8550-gdsc-debug-switches.patch, rpmhpd-debug-retention-floor.patch):
 #       pcie0     gcc_sm8550 debug_pcie0_off: pcie_0_gdsc OFF_ON (Y), not RET_ON (N)
@@ -518,6 +522,13 @@
 #     it), so start it by hand only knowing that.  Auto-rotation and
 #     auto-brightness are off until then.  The options name it in every
 #     RESULT line.
+#   - sensors=hook (ro): the same stop the way a systemctl suspend makes it,
+#     through the device package's system-sleep hook ($sensors_hook pre
+#     suspend), which stops the sensors' resume unit, then iio-sensor-proxy
+#     and hexagonrpcd-adsp-sensorspd, each before the next; the same checks
+#     after it.  Refused where the hook does not stop iio-sensor-proxy (a
+#     device package before that hook): sensors=stop then.  Nothing runs
+#     its post; the restart brings them back.
 #   - rpmh (ro): what of Linux's own votes stands in the way of XO shutdown,
 #     CX collapse and AOSS sleep (cxsd, aosd), from the commands that
 #     rpmh-rsc writes to the application processor's RSC (the tracepoint
@@ -529,7 +540,8 @@
 #     through the sleep.  The run turns the tracepoint on right before the
 #     freeze (events/rpmh/rpmh_send_msg/enable in tracefs) and reads the
 #     command DB once (debugfs cmd-db, the names of the RPMh addresses);
-#     right before each sleep it empties the trace buffer, and after it
+#     right before each sleep (before its clock read) it empties the trace
+#     buffer, and after it
 #     names the last flush before the sleep (by the kernel's
 #     "Timekeeping suspended" line, the trace's clock being the kernel
 #     log's): each address in it with its sleep and wake values, and which
@@ -538,10 +550,55 @@
 #     xo.lvl, cx.lvl and mx.lvl are levels, 0 is off; a BCM's value with
 #     bit 29 (0x20000000) set is a bandwidth vote.  "no flush" means no vote
 #     changed between the emptying and the sleep: the RSC slept with an
-#     earlier flush's sets.  Refused without the tracepoint (tracefs, a
+#     earlier flush's sets.  A suspend-to-idle flushes at the sleep's own
+#     instant, the time of the "Timekeeping suspended" line, which the
+#     trace prints up to 1 us later (sched_clock stands still from the last
+#     CPU's tick_freeze() on, ev_rpmh): such a flush is named "at ..., the
+#     sleep's entry".  Up to revision 11 the script counted those commands
+#     as after the sleep, and every suspend-to-idle said "no flush" (the
+#     sets were flushed: the cluster's S1 power-off, which flushes, counted
+#     +1 with no rejection).  With the kernel's clk_prepare and
+#     clk_unprepare tracepoints (events/clk/, on with rpmh until the
+#     restart) the trace also tells which of the clocks that keep XO voted
+#     in the sleep set (the "XO held by" read right before the sleep) the
+#     suspend unprepared before the sleep began, and which it left: "XO at
+#     the entry to the sleep (clock trace): ..." (ev_xo_entry), also in pmsg
+#     with the Type-C roles; and the whole flush goes to pmsg too, in eight
+#     pieces at most, for a run whose terminal went away (over Wi-Fi).  The
+#     same trace says, for each of the two UARTs (the console's
+#     gcc_qupv3_wrap1_s7_clk and the Bluetooth UART's gcc_qupv3_wrap2_s6_clk,
+#     uart_map), whether the suspend unprepared its clock before the sleep
+#     and when it was prepared again: "UART clocks at the entry to the sleep
+#     (clock trace): ..." (ev_uart_entry; revision 12's kernel holds both,
+#     revision 13's releases them).
+#     Refused without the RPMh tracepoint (tracefs, a
 #     kernel with CONFIG_FTRACE: the kit's kernels), with tracing off
-#     (tracing_on 0) or with a trace clock other than local.  It changes no vote; a stop before any sleep turns it
-#     off again, and so does the restart that ends every run.
+#     (tracing_on 0) or with a trace clock other than local; without the
+#     clock tracepoints the XO line says there is no clock trace.  It
+#     changes no vote; a stop before any sleep turns them off again, and so
+#     does the restart that ends every run.
+#   - cxpc (ro): the AOP's own record of what keeps CX from collapsing, on a
+#     kernel with revision 12's switch
+#     (/sys/module/qcom_stats/parameters/debug_cxpc_violators,
+#     qcom-stats-cxpc-violators-diagnostic.patch): written Y right before the
+#     freeze, with the other switches (the record's word cxpc), until the
+#     restart.  Each system suspend then asks the AOP (a QMP message) to log
+#     every RPMh requester (DRV: HLOS is this kernel, AUDIO the audio DSP,
+#     DISPLAY, ...) that votes against CX power collapse while the CPUs
+#     sleep, and the resume logs the log ("cxpc violators:" kernel lines,
+#     among the cycle's kernel lines, and a summary of which requesters held
+#     CX in every line; the summary goes to pmsg too).  Before anything is
+#     frozen the run reads the log once as the AOP left it, which is the
+#     first read of that part of the AOP's message RAM on this port, and
+#     every requester's DDR vote now (qcom_stats/ddr_votes), into the record.
+#     Revision 12's first run read a region that is not a CXPC log (its
+#     header's mode 0xdb, its lines 32-bit words); revision 13's kernel
+#     decodes the lines only under a CXPC header ("summary: not a CXPC log
+#     (mode ...)" otherwise) and logs the region raw around each suspend
+#     (right before the message, right after it, after the suspend; "cxpc
+#     raw:" evidence lines, at most cxpc_raw_max), and the run reads it raw
+#     before anything is frozen too (qcom_stats/cxpc_violators_raw).
+#     Refused on a kernel without the switch, and with dry.
 set -u
 export LC_ALL=C
 umask 022
@@ -587,6 +644,23 @@ sw_boot_file=$sw_gcc/debug_boot_state
 # every boot.
 sw_pcie=/sys/module/pcie_qcom/parameters
 sw_names="$sw_names rpd3"
+# Revision 12's CXPC violators switch (cxpc), N at every boot: with it each
+# system suspend asks the AOP to log the RPMh requesters that keep CX from
+# collapsing, and the resume logs that log (qcom_stats' "cxpc violators:"
+# lines); its debugfs files, the log as the AOP left it and every
+# requester's DDR vote now.
+sw_stats=/sys/module/qcom_stats/parameters
+sw_names="$sw_names cxpc"
+cxpc_log=/sys/kernel/debug/qcom_stats/cxpc_violators
+cxpc_ddr=/sys/kernel/debug/qcom_stats/ddr_votes
+# Revision 13's: the log's region raw (16 lines of 16 words), the debugfs
+# file and the kernel's "cxpc violators: raw ..." lines of each suspend (right
+# before the message to the AOP, right after it, after the suspend), which
+# the cycle's evidence lists apart from its other kernel lines; revision 12's
+# first run read a region that is not a CXPC log
+# (qcom-stats-cxpc-violators-diagnostic.patch).
+cxpc_raw=/sys/kernel/debug/qcom_stats/cxpc_violators_raw
+cxpc_raw_max=50
 # The line revision 11's PCIe host logs at each resume, and the one of a
 # guard that did not hold (pcie-qcom-keep-power-domain-while-link-kept.patch).
 guard_re='[0-9a-f]+\.pcie: system sleep: '
@@ -594,6 +668,11 @@ guard_bad_re='[0-9a-f]+\.pcie: system sleep: the link was kept, but genpd powere
 guard_kept_re='[0-9a-f]+\.pcie: system sleep: the link was kept, and its power domain stayed on'
 # sensors=stop: the audio DSP's sensor clients in userspace.
 sensor_units='iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service'
+# sensors=hook: the device package's system-sleep hook, which stops them
+# before a systemctl suspend in a device package with this branch's hook (it
+# names iio-sensor-proxy.service; the earlier hook stops neither, and the
+# option is refused with it).
+sensors_hook=/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors
 # mode=s2idle's checks and evidence (reads only): each CPU's cpuidle states,
 # and the idle states of the CPU cluster's power domain (debugfs).
 cpu_devs=/sys/devices/system/cpu
@@ -749,6 +828,22 @@ ev_clk_names='bi_tcxo tcsr_ufs_pad_clkref_en gcc_ufs_phy_axi_clk gcc_ufs_phy_ahb
 # "Evidence around each cycle").  A clock prepared below it keeps it
 # prepared.
 xo_clk=bi_tcxo
+# The two geni UARTs both tablets use (sm8550.dtsi, enabled by both board
+# device trees), each "DEVICE:SE CLOCK:ROLE": uart7, the console ttyMSM0, and
+# uart14, the Bluetooth UART that hci_qca opens through serdev.  In v7.2-rc3
+# each kept its "se" clock, below XO, prepared through every system sleep
+# (revision 12's first run: the only two holders of XO at the sleep's entry):
+# the serial core's power-off at suspend, pm_runtime_put_sync(), cannot
+# runtime-suspend a device the PM core holds for the transition
+# (device_prepare()).  Revision 13's kernel force-suspends them
+# (qcom-geni-serial-force-suspend-in-system-sleep.patch, upstream
+# d0cd9c8d0fd5): the clock trace (ev_uart_entry) says whether each clock was
+# unprepared before the sleep and prepared again after it, and the cycle's
+# kernel lines whether Bluetooth answered after the resume (bt_dead_re).
+uart_map='a9c000.serial:gcc_qupv3_wrap1_s7_clk:console 898000.serial:gcc_qupv3_wrap2_s6_clk:Bluetooth'
+# A Bluetooth UART that lost its interrupt or its controller after a resume
+# (the bt-uart kit's checks, tools/inplace/bt-uart/suspend-bt.sh).
+bt_dead_re='nobody cared|Disabling IRQ #|hci[0-9]+: (command 0x[0-9a-f]+ tx timeout|Opcode 0x[0-9a-f]+ failed: -110)'
 # The interrupt lines of the DSPs' messages and signals (IPCC, glink, SMP2P,
 # the remoteprocs' q6v5 lines, the AOSS QMP mailbox, FastRPC): their counts
 # across each sleep (evidence: dsp irq).
@@ -757,6 +852,11 @@ ev_irq_dsp='ipcc|glink|smp2p|q6v5|wdog|fatal|ready|handover|stop-ack|qmp|aoss|fa
 # in tracefs, and the command DB that names their addresses.
 trace_dir=/sys/kernel/tracing
 rpmh_event=$trace_dir/events/rpmh/rpmh_send_msg/enable
+# With rpmh also the clock framework's prepare and unprepare tracepoints
+# (trace_clk_prepare() and trace_clk_unprepare() in drivers/clk/clk.c: a
+# clock's 0 -> 1 and 1 -> 0, its parents' with it), when the kernel has
+# them: which clocks below XO the suspend left prepared (ev_xo_entry).
+clk_events="$trace_dir/events/clk/clk_prepare/enable $trace_dir/events/clk/clk_unprepare/enable"
 cmd_db=/sys/kernel/debug/cmd-db
 ufs_ctl=/sys/bus/platform/devices/1d84000.ufshc
 usb_ctl=/sys/bus/platform/devices/a600000.usb
@@ -770,12 +870,13 @@ ev_domains='^(cx|mx|mxc|mmcx|lcx|lmx|gfx|ebi|ufs_|usb|pcie|mdss|power-domain-clu
 # suspend-to-idle", "PM: Triggering wakeup from IRQ N", "PM: resume from
 # suspend-to-idle", "Timekeeping suspended for ..."), the CPUs', the
 # storage's and the diagnostic's, the USB host's, the PCIe link's and the
-# Wi-Fi's, the DSPs', the clocks', rails' and votes', warnings and errors.
-# At most ev_klines,
+# Wi-Fi's, the DSPs', Bluetooth's (a disabled interrupt, revision 13), the
+# clocks', rails' and votes', warnings and errors.  At most ev_klines,
 # and not the Wi-Fi's per-packet noise, the CPUs' feature lines or the
-# hung-task reports of writers waiting on the frozen disk.
-ev_kernel='PM: |psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110'
-ev_kernel_skip='msdu_done|SANITY CHECK|blocked for more than|hung_task_timeout_secs|Tainted:'
+# hung-task reports of writers waiting on the frozen disk, nor the CXPC
+# log's raw region (its own evidence lines; cxpc_raw).
+ev_kernel='PM: |cxpc violators|psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110|nobody cared|Disabling IRQ|Bluetooth'
+ev_kernel_skip='msdu_done|SANITY CHECK|blocked for more than|hung_task_timeout_secs|Tainted:|cxpc violators: raw '
 ev_klines=150
 # How to reach TWRP from a running or looping tablet (docs/porting-log.md,
 # the TWRP flash: Volume Down + Power, then at once Volume Up + Power).
@@ -1052,6 +1153,7 @@ sw_file() { # WORD
 	usb) echo "$sw_gcc/debug_usb_off" ;;
 	cxmx) echo "$sw_rpmhpd/debug_ret_floor" ;;
 	rpd3) echo "$sw_pcie/debug_root_port_d3" ;;
+	cxpc) echo "$sw_stats/debug_cxpc_violators" ;;
 	esac
 }
 
@@ -1061,7 +1163,7 @@ sw_file() { # WORD
 # cxmx and rpd3 always.  The shell reads sysfs itself.
 sw_boot() { # WORD
 	sbv=
-	if [ "$1" != cxmx ] && [ "$1" != rpd3 ] && [ -e "$sw_boot_file" ]; then
+	if [ "$1" != cxmx ] && [ "$1" != rpd3 ] && [ "$1" != cxpc ] && [ -e "$sw_boot_file" ]; then
 		sbl=
 		read -r sbl 2>/dev/null < "$sw_boot_file" || :
 		case ", $sbl," in
@@ -1335,15 +1437,14 @@ sw_next() {
 # that nothing the run ends with, a stop or the restart, finds one set.
 # $knobs_why says what did not take (pm_test= then does not sleep; a trace
 # knob that did not take is said and the sleep goes on), $knobs_now what is
-# in force.  With rpmh the trace buffer is emptied here too, so that what
-# is in it after the sleep is this attempt's.
+# in force.  With rpmh the trace buffer was emptied right before the
+# attempt's clock read (the cycle's loop, before ev_before), so that what is
+# in it after the sleep is this attempt's, and its clock prepares and
+# unprepares follow that read.
 knobs_on() {
 	knobs_why= knobs_now=
 	knobs_set=1
-	if [ "$rpmh" = 1 ]; then
-		: 2>/dev/null > "$trace_dir/trace"
-		knobs_now='rpmh trace emptied'
-	fi
+	[ "$rpmh" = 0 ] || knobs_now='rpmh trace emptied'
 	if [ -n "$pm_test" ]; then
 		printf '%s' "$pm_test" 2>/dev/null > "$pm_test_ctl"
 		if [ "$(selected "$pm_test_ctl")" = "$pm_test" ]; then
@@ -1403,6 +1504,15 @@ sw_on() {
 rpmh_off() {
 	[ "${rpmh_set:-0}" = 1 ] || return 0
 	printf '%s' "${rpmh_was:-0}" 2>/dev/null > "$rpmh_event"
+	# The clock tracepoints too, each as it was ($clk_was, in $clk_events'
+	# order).
+	if [ "${clk_trace:-0}" = 1 ]; then
+		set -- $clk_was
+		for evf in $clk_events; do
+			printf '%s' "${1:-0}" 2>/dev/null > "$evf"
+			[ $# = 0 ] || shift
+		done
+	fi
 	rpmh_set=0
 }
 
@@ -1817,6 +1927,194 @@ ev_xo_holders() { # FILE
 		}' "$1" 2>/dev/null
 }
 
+# rpmh with the clock tracepoints (clk_trace): what of XO's prepared clocks
+# the suspend left prepared when the sleep began.  CLOCKS is the ev_clk_snap
+# copy right before the sleep (the trace was emptied right before it), CLKT
+# the trace's clk_prepare and clk_unprepare lines of the attempt
+# (ev_rpmh_snap), K the cycle's kernel lines: each clock prepared in CLOCKS
+# is taken as prepared unless a clk_unprepare up to the sleep's entry
+# (ev_sleep_bound) took it to 0, one that was not unless a clk_prepare made
+# it 1 (the framework traces a clock's prepare and unprepare only on its 0
+# -> 1 and 1 -> 0, its parents' with it, clk_core_prepare() and
+# clk_core_unprepare()), and the parents are CLOCKS's.  One line: XO free
+# (bi_tcxo unprepared: no clock of Linux votes XO in the sleep set, xo.lvl
+# 0 in every set, clk_rpmh_unprepare()), or the clocks that still hold it,
+# as ev_xo_holders names them (those prepared in the suspend marked), then
+# what the suspend unprepared of the holders before it.  With short, for
+# pmsg, the holders alone.  A prepare count above 1 is not seen moving, nor
+# XO's own consumers (a PHY's reference clock) until XO's count reaches 0.
+ev_xo_entry() { # CLOCKS CLKT K full|short
+	[ "${clk_trace:-0}" = 1 ] || { echo 'no clock trace (the clk_prepare and clk_unprepare tracepoints were not on)'; return 0; }
+	[ -s "$1" ] || { echo 'clock counts not readable'; return 0; }
+	evb=$(ev_sleep_bound "$3")
+	awk -v xo="$xo_clk" -v bound="${evb% *}" -v frozen="${evb#* }" -v short="$4" '
+		'"$ev_bound_awk"'
+		function below(c,   x, d) {
+			x = pa[c]
+			for (d = 0; d < 64 && x != "-" && x != "" && x != xo; d++) x = (x in pa) ? pa[x] : ""
+			return x == xo
+		}
+		function sorted(a, n,   i, j, v) {
+			for (i = 2; i <= n; i++) {
+				v = a[i]
+				for (j = i - 1; j >= 1 && a[j] > v; j--) a[j + 1] = a[j]
+				a[j + 1] = v
+			}
+		}
+		FILENAME == ARGV[1] { on[$1] = ($3 ~ /^[0-9]+$/ && $3 + 0 > 0); was[$1] = on[$1]; pa[$1] = $4; next }
+		{
+			for (i = 2; i <= NF; i++) if ($i == "clk_prepare:" || $i == "clk_unprepare:") break
+			if (i > NF) next
+			ts = $(i - 1)
+			sub(/:$/, "", ts)
+			if (ev_after_sleep(ts)) next
+			c = $(i + 1)
+			if ($i == "clk_prepare:") on[c] = 1
+			else {
+				on[c] = 0
+				if (c == xo) xo_off = ts
+			}
+			seen++
+		}
+		END {
+			if (!(xo in on)) { print "XO not in the clock read"; exit }
+			if (!on[xo]) {
+				if (short == "short") print "XO free"
+				else printf "XO free at the entry to the sleep: %s unprepared%s, so no clock of Linux votes XO in the sleep set (%d prepares and unprepares traced before the sleep)\n", xo, (xo_off != "" ? " at " xo_off : ""), seen
+				exit
+			}
+			for (c in on) if (c != xo && on[c] && below(c)) held[c] = 1
+			for (c in held) if (pa[c] in held) inner[pa[c]] = 1
+			n = 0
+			for (c in held) if (!(c in inner)) leaf[++n] = c
+			sorted(leaf, n)
+			s = ""
+			for (i = 1; i <= n; i++) s = s (i > 1 ? ", " : "") leaf[i] (was[leaf[i]] ? "" : " (prepared in the suspend)")
+			if (s == "") s = xo " itself (one of its own consumers: a PHY\047s or a DSP\047s reference clock)"
+			if (short == "short") { print "XO held by " s; exit }
+			# The holders before the sleep (ev_xo_holders leaves) that it
+			# unprepared.
+			for (c in was) if (was[c] && c != xo && below(c)) wheld[c] = 1
+			for (c in wheld) if (pa[c] in wheld) winner[pa[c]] = 1
+			m = 0
+			for (c in wheld) if (!(c in winner) && !on[c]) gone[++m] = c
+			sorted(gone, m)
+			g = ""
+			for (i = 1; i <= m; i++) g = g (i > 1 ? ", " : "") gone[i]
+			printf "XO still voted at the entry to the sleep, held by: %s; unprepared in the suspend before the sleep: %s (%d prepares and unprepares traced before the sleep)\n", s, (g == "" ? "none" : g), seen
+		}' "$1" "$2" 2>/dev/null
+}
+
+# rpmh with the clock tracepoints: each UART of uart_map at the sleep's
+# entry, from CLOCKS (ev_clk_snap right before the sleep) and CLKT (the
+# attempt's clk_prepare and clk_unprepare lines), against the sleep's
+# instant in K as ev_xo_entry has it.  One line, a part per UART: "DEVICE
+# (ROLE, CLOCK): unprepared in the suspend at T, prepared again at T'" (the
+# clock released; T' the first prepare after the sleep), "prepared through
+# the sleep's entry" (held: revision 12's kernel, or a fix that did not
+# work), "not prepared before the sleep" (the port was not in use), or "not
+# in the clock read".  With short, for pmsg: "console released T to T',
+# Bluetooth held".
+ev_uart_entry() { # CLOCKS CLKT K [short]
+	[ "${clk_trace:-0}" = 1 ] || { echo 'no clock trace (the clk_prepare and clk_unprepare tracepoints were not on)'; return 0; }
+	[ -s "$1" ] || { echo 'clock counts not readable'; return 0; }
+	evb=$(ev_sleep_bound "$3")
+	awk -v map="$uart_map" -v bound="${evb% *}" -v frozen="${evb#* }" -v short="${4:-}" '
+		'"$ev_bound_awk"'
+		BEGIN {
+			n = split(map, m, " ")
+			for (u = 1; u <= n; u++) { split(m[u], f, ":"); dev[u] = f[1]; clk[u] = f[2]; role[u] = f[3]; want[f[2]] = u }
+		}
+		FILENAME == ARGV[1] { if ($1 in want) { read[$1] = 1; on[$1] = ($3 ~ /^[0-9]+$/ && $3 + 0 > 0) } next }
+		{
+			for (i = 2; i <= NF; i++) if ($i == "clk_prepare:" || $i == "clk_unprepare:") break
+			if (i > NF) next
+			c = $(i + 1)
+			if (!(c in want)) next
+			ts = $(i - 1)
+			sub(/:$/, "", ts)
+			if (ev_after_sleep(ts)) {
+				if ($i == "clk_prepare:" && !(c in back)) back[c] = ts
+				next
+			}
+			if ($i == "clk_prepare:") on[c] = 1
+			else { on[c] = 0; off[c] = ts }
+		}
+		END {
+			if (short == "short") {
+				for (u = 1; u <= n; u++) {
+					c = clk[u]
+					printf "%s%s ", (u > 1 ? ", " : ""), role[u]
+					if (!(c in read)) printf "not read"
+					else if (on[c]) printf "held"
+					else if (c in off) printf "released %s%s", off[c], (c in back ? " to " back[c] : "")
+					else printf "not in use"
+				}
+				printf "\n"
+				exit
+			}
+			for (u = 1; u <= n; u++) {
+				c = clk[u]
+				printf "%s%s (%s, %s): ", (u > 1 ? "; " : ""), dev[u], role[u], c
+				if (!(c in read)) { printf "not in the clock read"; continue }
+				if (on[c]) printf "prepared through the sleep\047s entry"
+				else if (c in off) printf "unprepared in the suspend at %s", off[c]
+				else printf "not prepared before the sleep"
+				if (c in back) printf ", prepared again at %s", back[c]
+			}
+			printf "\n"
+		}' "$1" "$2" 2>/dev/null
+}
+
+# The UARTs of uart_map now: each one's runtime PM status, its clock's
+# prepare count, and its role's own state (the console's tty wakeup, which
+# would keep the port running through uart_suspend_port(); Bluetooth's
+# controller, hci0 or none).  One line; with short, for pmsg, "console
+# active, Bluetooth active, hci0".
+ev_uarts() { # [short]
+	evu=
+	for evm in $uart_map; do
+		evd=${evm%%:*}
+		evr=${evm##*:}
+		evc=${evm#*:}
+		evc=${evc%%:*}
+		evp=/sys/bus/platform/devices/$evd
+		if [ "${1:-}" = short ]; then
+			eve="$evr $(ev_val "$evp/power/runtime_status")"
+			if [ "$evr" = Bluetooth ]; then
+				evh=no
+				for evq in /sys/class/bluetooth/hci*; do
+					[ -e "$evq" ] || continue
+					case ${evq##*/} in *:*) continue ;; esac
+					evh=
+				done
+				[ -n "$evh" ] && eve="$eve, no controller" || eve="$eve, hci0"
+			fi
+			evu="$evu${evu:+, }$eve"
+			continue
+		fi
+		eve="$evd ($evr): runtime $(ev_val "$evp/power/runtime_status"), $evc prepared $(ev_val "$clk_dir/$evc/clk_prepare_count")"
+		case $evr in
+		console)
+			evt=
+			for evq in "$evp"/*/*/tty/*; do
+				[ -e "$evq" ] && evt="$evt ${evq##*/} wakeup $(ev_val "$evq/power/wakeup")"
+			done
+			eve="$eve;${evt:- no tty}" ;;
+		Bluetooth)
+			evh=
+			for evq in /sys/class/bluetooth/hci*; do
+				[ -e "$evq" ] || continue
+				case ${evq##*/} in *:*) continue ;; esac
+				evh="$evh ${evq##*/}"
+			done
+			eve="$eve;${evh:- no controller}" ;;
+		esac
+		evu="$evu${evu:+; }$eve"
+	done
+	echo "$evu"
+}
+
 # Each power domain with its idle states' usage and rejected counts added
 # up ("NAME USAGE REJECTED" lines; pm_genpd/NAME/idle_states,
 # idle_states_show(), drivers/pmdomain/core.c).  A usage is a power-off that
@@ -1878,29 +2176,70 @@ ev_pci_state() {
 	fi
 }
 
-# rpmh: the trace's lines of rpmh-rsc's commands copied to OUT, in one read
-# (reading the trace pauses tracing while the file is open).
+# rpmh: the trace's lines of rpmh-rsc's commands, and those of the clock
+# framework's prepares and unprepares (when the run turned those
+# tracepoints on: clk_trace), copied to OUT in one read (reading the trace
+# pauses tracing while the file is open).  ev_rpmh and ev_xo_entry each take
+# their own lines of it.
 ev_rpmh_snap() { # OUT
-	awk '/ rpmh_send_msg: /' "$trace_dir/trace" 2>/dev/null > "$1"
+	awk '/ rpmh_send_msg: | clk_(un)?prepare: /' "$trace_dir/trace" 2>/dev/null > "$1"
 }
+
+# The sleep's time in the cycle's kernel lines K, as ev_rpmh and ev_xo_entry
+# take it: "TIME tk" from the first "Timekeeping suspended for" line (the
+# sleep's own instant, see ev_rpmh), else "TIME exit" from "PM: suspend
+# exit", else nothing.
+ev_sleep_bound() { # K
+	awk '/Timekeeping suspended for / && s == "" { s = $0; k = "tk" } /PM: suspend exit/ && x == "" { x = $0 }
+		END { if (s == "") { s = x; k = "exit" } if (match(s, /^\[ *[0-9]+\.[0-9]+\]/)) { s = substr(s, RSTART + 1, RLENGTH - 2); gsub(/ /, "", s); print s, k } }' "$1" 2>/dev/null
+}
+
+# awk functions for a trace line's time TS against the sleep's: after it,
+# or at its entry (the frozen instant, up to 1 us after a "Timekeeping
+# suspended" line's time; ev_rpmh).  For awk programs given bound= and
+# frozen= (ev_sleep_bound's two words).
+ev_bound_awk='
+		function ev_after_sleep(ts) {
+			if (bound == "") return 0
+			if (frozen == "tk") return ts + 0 > bound + 0.0000015
+			return ts + 0 >= bound + 0
+		}
+		function ev_at_entry(ts) {
+			return bound != "" && frozen == "tk" && ts + 0 >= bound - 0.0000005 && ts + 0 <= bound + 0.0000015
+		}'
 
 # rpmh: the last flush of the sleep and wake sets before the sleep, from
 # TRACE (the rpmh_send_msg lines of this attempt) and the cycle's kernel
 # lines K: the sleep is where "Timekeeping suspended" is in K (the trace's
 # clock is the kernel log's, and it stands still in the sleep), else "PM:
 # suspend exit"; a sleep or wake command more than 1 ms after the one before
-# it starts another flush.  One line: the flush's commands, "NAME
-# SLEEP/WAKE" each (the address when the command DB does not name it; a
-# VRM's register as NAME+4 and so on), then which of xo.lvl, cx.lvl and
-# mx.lvl it left out (sleep = wake: held at that vote through the sleep),
-# each with the last active vote before the sleep, if the trace has one.
-# With short, the levels and the BCMs with a vote in the sleep set alone,
-# for pmsg.
+# it starts another flush.  The time of the "Timekeeping suspended" line is
+# the sleep's own instant: the last CPU stops sched_clock, the clock of the
+# kernel log and of the trace, before anything sleeps (tick_freeze(),
+# kernel/time/tick-common.c), and the line is printed at the resume before
+# it runs again (timekeeping_resume(), then sched_clock_resume(), in
+# tick_unfreeze() and in the syscore resume of a deep sleep).  A
+# suspend-to-idle flushes the sets after that, when the last CPU takes the
+# cluster's power domain down from its idle state
+# (psci_enter_s2idle_domain_idle_state() -> dev_pm_genpd_suspend() ->
+# the RSC's GENPD_NOTIFY_PRE_OFF, rpmh_rsc_pd_callback() -> rpmh_flush()):
+# its commands carry that same instant, which the trace prints rounded to
+# the microsecond and the kernel log cut to it, so up to 1 us after the
+# line's time.  Such a flush is the sleep's, "at the sleep's entry"; a deep
+# sleep flushes before (the PSCI syscore hook, whose suspend runs before
+# sched_clock's).  Revision 11's script counted a command at the line's own
+# time as after the sleep, and every suspend-to-idle with rpmh (revision 10's
+# runs 5 and 6, revision 11's 1, 4 and 5) said "no flush" for it.  One line:
+# the flush's commands, "NAME SLEEP/WAKE" each (the address when the command
+# DB does not name it; a VRM's register as NAME+4 and so on), then which of
+# xo.lvl, cx.lvl and mx.lvl it left out (sleep = wake: held at that vote
+# through the sleep), each with the last active vote before the sleep, if
+# the trace has one.  With short, the levels and the BCMs with a vote in the
+# sleep set alone, for pmsg.
 ev_rpmh() { # TRACE K full|short
-	[ -s "$1" ] || { echo 'no RPMh command in the trace'; return 0; }
-	evb=$(awk '/Timekeeping suspended for / { s = $0; exit } /PM: suspend exit/ && x == "" { x = $0 }
-		END { if (s == "") s = x; if (match(s, /^\[ *[0-9]+\.[0-9]+\]/)) { s = substr(s, RSTART + 1, RLENGTH - 2); gsub(/ /, "", s); print s } }' "$2" 2>/dev/null)
-	awk -v bound="$evb" -v short="$3" -v keys='xo.lvl cx.lvl mx.lvl' '
+	grep -q ' rpmh_send_msg: ' "$1" 2>/dev/null || { echo 'no RPMh command in the trace'; return 0; }
+	evb=$(ev_sleep_bound "$2")
+	awk -v bound="${evb% *}" -v frozen="${evb#* }" -v short="$3" -v keys='xo.lvl cx.lvl mx.lvl' '
 		function hex(s,   i, c, v) {
 			s = tolower(s)
 			sub(/^0x/, "", s)
@@ -1920,6 +2259,7 @@ ev_rpmh() { # TRACE K full|short
 			}
 			return a
 		}
+		'"$ev_bound_awk"'
 		FILENAME == ARGV[1] {
 			if ($1 ~ /^0x[0-9a-fA-F]+:$/ && NF >= 2) { a = $1; sub(/:$/, "", a); nm[sprintf("%x", hex(a))] = $2; named[$2] = 1; nnamed++ }
 			next
@@ -1929,7 +2269,7 @@ ev_rpmh() { # TRACE K full|short
 			if (i > NF || i < 2) next
 			ts = $(i - 1)
 			sub(/:$/, "", ts)
-			if (bound != "" && ts + 0 >= bound + 0) { after++; next }
+			if (ev_after_sleep(ts)) { after++; next }
 			st = ""
 			if (match($0, /\[(sleep|wake|active)\]/)) st = substr($0, RSTART + 1, RLENGTH - 2)
 			ad = da = ""
@@ -1965,10 +2305,11 @@ ev_rpmh() { # TRACE K full|short
 				h = h (h == "" ? "" : ", ") kk[k] ((kk[k] in act) ? " (active " act[kk[k]] ")" : "")
 			}
 			if (!nnamed) h = "not known (no command DB)"
+			e = ev_at_entry(ft[nf]) ? ", the sleep\047s entry" : ""
 			if (short == "short")
-				printf "flush %d of %d at %s, sleep/wake: %s; held: %s\n", nf, nf, ft[nf], (s == "" ? "none" : s), (h == "" ? "none" : h)
+				printf "flush %d of %d at %s%s, sleep/wake: %s; held: %s\n", nf, nf, ft[nf], e, (s == "" ? "none" : s), (h == "" ? "none" : h)
 			else
-				printf "the last of %d flushes %s (at %s, %d commands), sleep/wake: %s; left out, so held at their vote through the sleep: %s; active votes before the sleep %d, commands after it %d\n", nf, b, ft[nf], cnt[nf], (s == "" ? "none" : s), (h == "" ? "none" : h), nact, after
+				printf "the last of %d flushes %s (at %s%s, %d commands), sleep/wake: %s; left out, so held at their vote through the sleep: %s; active votes before the sleep %d, commands after it %d\n", nf, b, ft[nf], e, cnt[nf], (s == "" ? "none" : s), (h == "" ? "none" : h), nact, after
 		}' "$ramdir/cmd-db" "$1" 2>/dev/null
 }
 
@@ -2191,10 +2532,12 @@ ev_resumed() { # SFX
 # Once the cycle's kernel lines are in K: what the sleep reached, what woke
 # or kept it, whether the PCIe link went down and came back, the Wi-Fi's
 # state, what genpd powered off, the DSPs' interrupts, what held XO, the
-# domains now, and the cycle's kernel lines (and with mode=s2idle,
-# ev_s2idle; with rpmh, the sleep set, ev_rpmh).  ev_keep then puts five
-# short lines of it in pmsg (one more with mode=s2idle, one more with
-# rpmh), for an attempt that was not given up before the sleep.
+# UARTs and Bluetooth, the domains now, and the cycle's kernel lines (and
+# with mode=s2idle, ev_s2idle; with rpmh, the sleep set, ev_rpmh, and the
+# UARTs' clocks at the sleep's entry, ev_uart_entry).  ev_keep then puts five
+# short lines of it in pmsg (one more with mode=s2idle, more with rpmh, and
+# the UARTs' with rpmh or when Bluetooth failed), for an attempt that was
+# not given up before the sleep.
 ev_after() { # SFX K
 	evdepth=$(ev_stats_delta "$ramdir/ev-stats-$1.0" "$ramdir/ev-stats-$1.1")
 	evwake=$(ev_wake_delta "$ramdir/ev-wake-$1.0" "$ramdir/ev-wake-$1.1")
@@ -2249,10 +2592,33 @@ ev_after() { # SFX K
 	say "$cyc: evidence: wifi: $evwifi"
 	say "$cyc: evidence: genpd powered off in the sleep (idle states usage of each domain): $evgpd"
 	say "$cyc: evidence: after: XO held by: $evxo1"
+	# The UARTs (uart_map) after the resume, and whether Bluetooth lost its
+	# interrupt or its controller in this cycle (bt_dead_re).
+	evbt=$(grep -E "$bt_dead_re" "$2" 2>/dev/null | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+	evbtok=0
+	[ -n "$evbt" ] || { evbt='no disabled interrupt and no HCI command timeout in the kernel lines of this cycle'; evbtok=1; }
+	say "$cyc: evidence: after: UARTs: $(ev_uarts); Bluetooth: $evbt"
+	evuart="after: $(ev_uarts short)"
 	if [ "$rpmh" = 1 ]; then
 		ev_rpmh_snap "$ramdir/ev-rpmh-$1"
-		say "$cyc: evidence: rpmh sleep set: $(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" full)"
+		evrpmhf=$(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" full)
+		say "$cyc: evidence: rpmh sleep set: $evrpmhf"
 		evrpmh=$(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" short)
+		say "$cyc: evidence: XO at the entry to the sleep (clock trace): $(ev_xo_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" full)"
+		evxoe=$(ev_xo_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" short)
+		say "$cyc: evidence: UART clocks at the entry to the sleep (clock trace): $(ev_uart_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2")"
+		evuart="at the entry: $(ev_uart_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" short)"
+	fi
+	if [ "${cxpc_given:-0}" = 1 ]; then
+		evcxpc=$(awk '/cxpc violators: summary: / { sub(/.*cxpc violators: summary: /, ""); s = $0 } END { print (s == "" ? "no summary line in the kernel lines of this cycle" : s) }' "$2" 2>/dev/null)
+		say "$cyc: evidence: cxpc violators (the AOP log; each of its lines is among the kernel lines of this cycle): $evcxpc"
+		# Revision 13's kernel: the log's region raw, right before the message
+		# to the AOP, right after it and after the suspend (cxpc_raw), at most
+		# cxpc_raw_max lines.
+		grep -F 'cxpc violators: raw ' "$2" 2>/dev/null |
+			awk -v max="$cxpc_raw_max" '{ sub(/.*cxpc violators: raw /, ""); if (++n <= max) print }
+				END { if (n > max) printf "(%d more raw lines left out; the kmsg file in the run directory has them)\n", n - max }' |
+			while IFS= read -r evl; do say "$cyc: evidence: cxpc raw: $evl"; done
 	fi
 	say "$cyc: evidence: after: clocks (enable/prepare): $(ev_clk_line "$ramdir/ev-clk-$1.1" full)"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: after: genpd: $evl"; done
@@ -2270,8 +2636,34 @@ ev_keep() { # SFX
 	ev_pmsg "$cyc: evidence: clocks before: $evclk0; after: $evclk1"
 	ev_pmsg "$cyc: evidence: wifi: $evwifi; genpd off: $(ev_genpd_offs_delta "$ramdir/ev-gpd-$1.0" "$ramdir/ev-gpd-$1.1" short); dsp irq $evdsp"
 	ev_pmsg "$cyc: evidence: XO held by: $evxo1"
-	[ "$rpmh" = 0 ] || ev_pmsg "$cyc: evidence: rpmh: $evrpmh"
+	if [ "$rpmh" = 1 ]; then
+		ev_pmsg "$cyc: evidence: rpmh: $evrpmh"
+		ev_pmsg "$cyc: evidence: XO at entry: $evxoe; $(roles)"
+		# The whole flush as well, for a run whose terminal went away (one
+		# over Wi-Fi, which the sleep takes down): in pieces, at most eight.
+		ev_pmsg_pieces "$cyc: evidence: rpmh sleep set" "$evrpmhf" 8
+	fi
+	# The UARTs' line with rpmh (their clocks at the entry), or when
+	# Bluetooth failed: the ten-cycle budget of pmsg stays as it was.
+	[ "$rpmh" != 1 ] && [ "$evbtok" = 1 ] || ev_pmsg "$cyc: evidence: UARTs $evuart; Bluetooth: $([ "$evbtok" = 1 ] && echo ok || echo "$evbt")"
+	[ "${cxpc_given:-0}" = 0 ] || ev_pmsg "$cyc: evidence: cxpc: $evcxpc"
 	[ "$sleep_mode" != s2idle ] || ev_pmsg "$cyc: evidence: s2idle: $s2pmsg"
+}
+
+# TEXT to pmsg in pieces of 240 characters, "PREFIX (I/N): ...", at most MAX
+# of them, the last saying how much was left out.
+ev_pmsg_pieces() { # PREFIX TEXT MAX
+	[ -e /dev/pmsg0 ] || return 0
+	printf '%s\n' "$2" | awk -v p="$1" -v max="$3" '
+		{ t = t $0 }
+		END {
+			n = int((length(t) + 239) / 240)
+			for (i = 1; i <= n && i <= max; i++) {
+				s = substr(t, (i - 1) * 240 + 1, 240)
+				if (i == max && n > max) s = substr(s, 1, 200) " (" length(t) - (max - 1) * 240 - 200 " more on the terminal)"
+				printf "%s (%d/%d): %s\n", p, i, n, s
+			}
+		}' 2>/dev/null | while IFS= read -r evl; do ev_pmsg "$evl"; done
 }
 
 # The failure lines of a kernel log excerpt: the UFS ones, the block layer's
@@ -2939,6 +3331,21 @@ run_from_ram() { # CONFIG
 		evn=$(grep -c '^0x' "$ramdir/cmd-db")
 		say "rpmh: the tracepoint rpmh_send_msg is on until the restart; the command DB names ${evn:-0} RPMh addresses"
 		progress "rpmh: tracepoint on, ${evn:-0} addresses named"
+		# The clock tracepoints with it; one that does not take is said, and
+		# the run goes on without the clock trace.
+		if [ "${clk_trace:-0}" = 1 ]; then
+			for evf in $clk_events; do
+				printf 1 2>/dev/null > "$evf"
+				[ "$(ev_val "$evf")" = 1 ] || clk_trace=0
+			done
+			if [ "$clk_trace" = 1 ]; then
+				say "rpmh: the clk_prepare and clk_unprepare tracepoints are on until the restart too (XO at each sleep's entry)"
+			else
+				say "rpmh: a clock tracepoint did not go on ($clk_events): no clock trace, the XO line says so"
+			fi
+		else
+			say "rpmh: no clk_prepare and clk_unprepare tracepoints to turn on ($clk_events): no clock trace"
+		fi
 	fi
 	# Nothing recorded or given up since the checks before the run (minutes
 	# ago with release-floor's settling): an error saved by now would be in
@@ -3052,6 +3459,10 @@ run_from_ram() { # CONFIG
 			verdict "SLEEP-TEST RESULT: ABORTED$mword at $cyc, before its sleep ($why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 			finish healthy
 		fi
+		# rpmh: the trace emptied right before the attempt's clock read, so
+		# that it holds what follows that read (ev_xo_entry) and the
+		# attempt's RPMh commands (ev_rpmh).
+		[ "$rpmh" = 0 ] || : 2>/dev/null > "$trace_dir/trace"
 		ev_before "$sfx"
 		ok0=$(stat_of success) fail0=$(stat_of fail)
 		a0=$(count_of aosd) x0=$(count_of cxsd) d0=$(count_of ddr)
@@ -3307,7 +3718,7 @@ fi
 # ------------------------------------------------------ before: the disk ---
 cycles=3 seconds=30 hold=300 aborts=5 release=0 confirmed=0 numbers=0 dry=0 mode= aborts_given=0
 pci_remove=0 pci_keep=0 pm_test= trace= sleep_mode= sw_set= sw_ret= gdsc_given=0 cxmx_given=0 ret_given=0 rpmh=0
-rpd3_given=0 sensors_stop=0
+rpd3_given=0 sensors_stop=0 sensors_opt= cxpc_given=0
 for a in "$@"; do
 	case $a in
 	ro|dry)
@@ -3368,14 +3779,20 @@ for a in "$@"; do
 		cxmx_given=1
 		sw_set="$sw_set cxmx" ;;
 	cxmx=*) echo "$me: cxmx=ret is the only cxmx= option, not '$a'" >&2; usage ;;
+	cxpc)
+		[ "$cxpc_given" = 0 ] || { echo "$me: one cxpc at most" >&2; usage; }
+		cxpc_given=1
+		sw_set="$sw_set cxpc" ;;
 	root-port-d3)
 		[ "$rpd3_given" = 0 ] || { echo "$me: one root-port-d3 at most" >&2; usage; }
 		rpd3_given=1
 		sw_set="$sw_set rpd3" ;;
-	sensors=stop)
-		[ "$sensors_stop" = 0 ] || { echo "$me: one sensors=stop at most" >&2; usage; }
-		sensors_stop=1 ;;
-	sensors=*) echo "$me: sensors=stop is the only sensors= option, not '$a'" >&2; usage ;;
+	sensors=stop|sensors=hook)
+		[ "$sensors_stop" = 0 ] || { echo "$me: one sensors= at most" >&2; usage; }
+		sensors_opt=$a
+		sensors_stop=1
+		[ "$a" != sensors=hook ] || sensors_stop=hook ;;
+	sensors=*) echo "$me: sensors=stop and sensors=hook are the sensors= options, not '$a'" >&2; usage ;;
 	*)
 		num "$a" || { echo "$me: unknown argument '$a'" >&2; usage; }
 		numbers=$((numbers + 1))
@@ -3391,8 +3808,9 @@ if [ "$dry" = 1 ]; then
 	[ -z "$pm_test" ] && [ -z "$trace" ] || { echo "$me: dry sleeps not at all: no pm_test= or trace" >&2; usage; }
 	[ "$pci_keep" = 0 ] || { echo "$me: dry sleeps not at all: pci=keep is for a sleep with the PCI devices kept" >&2; usage; }
 	[ "$rpmh" = 0 ] || { echo "$me: dry sleeps not at all: rpmh is for the RPMh commands of a sleep" >&2; usage; }
+	[ "$cxpc_given" = 0 ] || { echo "$me: dry sleeps not at all: cxpc is for the AOP's log of a sleep" >&2; usage; }
 	[ "$rpd3_given" = 0 ] || { echo "$me: dry sleeps not at all: root-port-d3 is for the sleeps of a pci=keep run" >&2; usage; }
-	[ "$sensors_stop" = 0 ] || { echo "$me: dry sleeps not at all: sensors=stop is for the audio DSP's wakes in a sleep" >&2; usage; }
+	[ "$sensors_stop" = 0 ] || { echo "$me: dry sleeps not at all: $sensors_opt is for the audio DSP's wakes in a sleep" >&2; usage; }
 	cycles=0
 else
 	[ "$cycles" -ge 1 ] && [ "$cycles" -le 10 ] || { echo "$me: CYCLES is 1 to 10, not $cycles" >&2; usage; }
@@ -3440,14 +3858,15 @@ sw_asked=$sw_set sw_set= gdsc_word=
 for swn in $sw_names; do
 	case " $sw_asked " in *" $swn "*) ;; *) continue ;; esac
 	sw_set="$sw_set $swn"
-	case $swn in cxmx|rpd3) ;; *) gdsc_word="$gdsc_word,$swn" ;; esac
+	case $swn in cxmx|rpd3|cxpc) ;; *) gdsc_word="$gdsc_word,$swn" ;; esac
 done
 [ -z "$gdsc_word" ] || options="$options gdsc=${gdsc_word#,}"
 [ -z "$sw_ret" ] || options="$options gdsc-ret=$sw_ret"
 [ "$cxmx_given" = 0 ] || options="$options cxmx=ret"
 [ "$rpd3_given" = 0 ] || options="$options root-port-d3"
+[ "$cxpc_given" = 0 ] || options="$options cxpc"
 [ "$rpmh" = 0 ] || options="$options rpmh"
-[ "$sensors_stop" = 0 ] || options="$options sensors=stop"
+[ "$sensors_stop" = 0 ] || options="$options $sensors_opt"
 options=${options# }
 options=${options:-none}
 
@@ -3532,8 +3951,10 @@ if [ -n "$gdsc_word" ] && [ "$pci_remove" = 0 ]; then
 fi
 for swn in $sw_set $sw_ret; do
 	swf=$(sw_file "$swn")
-	[ -e "$swf" ] && [ -w "$swf" ] ||
-		refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 to 11 have it, revision 11's alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"
+	[ -e "$swf" ] && [ -w "$swf" ] && continue
+	[ "$swn" != cxpc ] ||
+		refuse "cxpc needs the CXPC violators switch ($swf): the kernels of kit revision 12 have it (sh ~/typec-roles/verify.sh says which kernel runs)"
+	refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 to 12 have it, those of revisions 11 and 12 alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"
 done
 # Each switch as it booted (sw_boot): N, but pcie0 Y on revision 11's
 # kernel.  One that reads otherwise was written since the boot.
@@ -3606,10 +4027,16 @@ if dmesg 2>/dev/null | grep -v 'gts9u sleep-test: ' | grep -q 'power-up write: P
 	journalctl -k -b --no-pager -q 2>/dev/null | grep -v 'gts9u sleep-test: ' | grep -q 'power-up write: PWRDN'; then
 	pwrdn_seen=1
 fi
+# sensors=hook: the device package's hook that stops the sensor clients
+# before a sleep, or nothing to run.
+if [ "$sensors_stop" = hook ]; then
+	[ -r "$sensors_hook" ] && grep -q 'systemctl stop iio-sensor-proxy.service' "$sensors_hook" ||
+		refuse "sensors=hook needs the device package's system-sleep hook that stops the sensor clients before a sleep ($sensors_hook, naming iio-sensor-proxy.service); this tablet's does not: sensors=stop stops them by hand"
+fi
 # rpmh: the tracepoint there and writable, and tracing on, or the trace
 # would stay empty.  The command DB names the addresses; without it they
 # stay numbers (the header says so).
-rpmh_was=
+rpmh_was= clk_trace=0 clk_was=
 if [ "$rpmh" = 1 ]; then
 	[ -e "$rpmh_event" ] && [ -w "$rpmh_event" ] ||
 		refuse "rpmh needs the RPMh tracepoint ($rpmh_event): tracefs, and a kernel with CONFIG_FTRACE (the kit's kernels have both)"
@@ -3623,6 +4050,17 @@ if [ "$rpmh" = 1 ]; then
 	[ "$tclk" = local ] ||
 		refuse "rpmh: the trace clock is ${tclk:-unknown} ($trace_dir/trace_clock), not local, the kernel log's: echo local | sudo tee $trace_dir/trace_clock, or run without rpmh"
 	rpmh_was=$(cat "$rpmh_event" 2>/dev/null)
+	# The clock tracepoints, when the kernel has both writable (no refusal
+	# without them: the XO line then says there is no clock trace).
+	clk_trace=1 clk_was=
+	for evf in $clk_events; do
+		if [ -e "$evf" ] && [ -w "$evf" ]; then
+			clk_was="$clk_was $(cat "$evf" 2>/dev/null)"
+		else
+			clk_trace=0
+		fi
+	done
+	clk_was=${clk_was# }
 fi
 # The first resume with a filesystem frozen from userspace logs one kernel
 # warning (fs/super.c:1919, may_unfreeze: the suspend's own thaw finds no
@@ -3895,7 +4333,7 @@ fi
 	pci_list=$(pci_names)
 	echo "PCI: $(pci_count) devices${pci_list:+:$pci_list}; root ports:$(pci_root_ports | awk '{ printf " %s", $0 } END { if (!NR) printf " none" }')$([ "$pci_remove" = 0 ] || echo '; pci=remove: all of them go right before the freeze')"
 	echo "printk: kernel.printk ${printk_was:-n/a}, console_suspend ${suspend_was:-n/a}, ignore_loglevel $(cat "$ignore_loglevel_ctl" 2>/dev/null || echo n/a); pm_debug_messages ${debug_was:-n/a}$debug_plan, pm_print_times $(cat "$print_times_ctl" 2>/dev/null || echo n/a); pm_test [$(selected "$pm_test_ctl")], pm_test_delay ${pm_test_delay}s"
-	echo "debug $(sw_now) ($sw_gcc/debug_pcie0_off, debug_pcie0_phy_off, debug_usb_off; $sw_rpmhpd/debug_ret_floor; $sw_pcie/debug_root_port_d3)$([ -z "$sw_set" ] || echo "; this run sets$sw_set to Y right before the freeze")$([ -z "$sw_ret" ] || echo "; this run sets $sw_ret to N right before the freeze")"
+	echo "debug $(sw_now) ($sw_gcc/debug_pcie0_off, debug_pcie0_phy_off, debug_usb_off; $sw_rpmhpd/debug_ret_floor; $sw_pcie/debug_root_port_d3$([ ! -e "$sw_stats/debug_cxpc_violators" ] || echo "; $sw_stats/debug_cxpc_violators"))$([ -z "$sw_set" ] || echo "; this run sets$sw_set to Y right before the freeze")$([ -z "$sw_ret" ] || echo "; this run sets $sw_ret to N right before the freeze")"
 	[ ! -e "$sw_boot_file" ] || echo "debug switches at boot: $(cat "$sw_boot_file" 2>/dev/null) ($sw_boot_file); pcie_0_gdsc in this run's sleeps: $([ "$pcie0_off" = Y ] && echo 'OFF_ON, collapsed when the PCIe host has powered down' || echo 'RET_ON, left on')"
 	case $guard_state in
 	held) echo "PCIe power domain guard: held this boot ($guard_n sleeps logged, none with the domain off under a kept link; the first: $guard_first)" ;;
@@ -3919,7 +4357,26 @@ fi
 		read -r pst 2>/dev/null < "$ps" || :
 		[ "$pst" = closed ] || pcm="$pcm ${ps#/proc/asound/}(${pst:-?})"
 	done
-	echo "ADSP clients: $(adsp_units); PipeWire and WirePlumber processes $pw; sound streams not closed:${pcm:- none}$([ "$sensors_stop" = 0 ] || echo "; sensors=stop: this run stops $sensor_units next, until the restart")"
+	echo "ADSP clients: $(adsp_units); PipeWire and WirePlumber processes $pw; sound streams not closed:${pcm:- none}$([ "$sensors_stop" = 0 ] || echo "; $sensors_opt: this run stops $sensor_units next$([ "$sensors_stop" != hook ] || echo " through $sensors_hook pre suspend"), until the restart")"
+	# cxpc: the AOP's log as it is (its first read, before anything is
+	# frozen: qcom-stats-cxpc-violators-diagnostic.patch), and every
+	# requester's DDR vote now (a QMP request, then a read).
+	if [ "$cxpc_given" = 1 ]; then
+		cxl=$(awk 'NR <= 6 { printf "%s%s", (NR > 1 ? "; " : ""), $0 }' "$cxpc_log" 2>/dev/null)
+		echo "cxpc: the AOP's CXPC log as it is now ($cxpc_log): ${cxl:-not readable}"
+		cxl=$(awk '!/ absent$/ { gsub(/ +/, " "); printf "%s%s", (n++ ? ", " : ""), $0 }' "$cxpc_ddr" 2>/dev/null)
+		echo "cxpc: every requester's DDR vote now ($cxpc_ddr): ${cxl:-not readable}"
+		# Revision 13's kernel: the region raw as it is now.
+		if [ -e "$cxpc_raw" ]; then
+			echo "cxpc: the region raw now ($cxpc_raw, 16 lines of 16 words):"
+			cxl=$(awk '{ print "cxpc:   " $0 }' "$cxpc_raw" 2>/dev/null)
+			echo "${cxl:-cxpc:   not readable}"
+		fi
+	fi
+	# The two UARTs (uart_map): in use, their clocks prepared, the console's
+	# tty wakeup (enabled would keep its port running in a suspend), and
+	# Bluetooth's controller.
+	echo "UARTs: $(ev_uarts)"
 	[ "$rpmh" = 0 ] || echo "rpmh: the tracepoint $rpmh_event (${rpmh_was:-?} now) goes on right before the freeze; command DB: $([ -r "$cmd_db" ] && echo "$cmd_db, $(grep -c '^0x' "$cmd_db" 2>/dev/null) addresses" || echo "$cmd_db not readable: the addresses stay numbers")"
 	echo "kernel command line, the ignore_unused options:$({ tr ' ' '\n' < /proc/cmdline; } 2>/dev/null | grep -E '^(clk|pd|regulator)_ignore_unused$' | sed 's/^/ /' | tr -d '\n')"
 	echo "root: $rootsrc ext4, ext4 errors_count $rooterr, state $rootstate; to freeze, the root last:$(freeze_order "$rootsrc" | awk '!seen[$1]++ { printf " %s", $2 }')"
@@ -3939,9 +4396,14 @@ while IFS= read -r l; do say "$l"; done < "$ramdir/before"
 # sensors=stop (the header): the audio DSP's sensor clients stopped for the
 # run, the last change before the floor's release; one still running stops
 # the run here, nothing frozen.
-if [ "$sensors_stop" = 1 ]; then
-	say "sensors=stop: systemctl stop $sensor_units (auto-rotation and auto-brightness are off until the restart)"
-	systemctl stop $sensor_units >> "$ramdir/log" 2>&1
+if [ "$sensors_stop" != 0 ]; then
+	if [ "$sensors_stop" = hook ]; then
+		say "sensors=hook: $sensors_hook pre suspend, as systemd-sleep runs it before a systemctl suspend (it stops $sensor_units; auto-rotation and auto-brightness are off until the restart, which runs no post)"
+		sh "$sensors_hook" pre suspend >> "$ramdir/log" 2>&1
+	else
+		say "sensors=stop: systemctl stop $sensor_units (auto-rotation and auto-brightness are off until the restart)"
+		systemctl stop $sensor_units >> "$ramdir/log" 2>&1
+	fi
 	sensors_rc=$?
 	sensors_now=$(adsp_units)
 	sensors_up=
@@ -3951,12 +4413,14 @@ if [ "$sensors_stop" = 1 ]; then
 		esac
 	done
 	debug_note="${debug_note:+$debug_note; }iio-sensor-proxy and hexagonrpcd-adsp-sensorspd stay stopped until the next boot (sudo reboot brings them back)"
+	sensors_by='systemctl stop'
+	[ "$sensors_stop" != hook ] || sensors_by='the hook'
 	if [ -n "$sensors_up" ]; then
 		cp "$ramdir/log" "$logs/log"
 		own
-		stop "sensors=stop: still running after systemctl stop (status $sensors_rc):$sensors_up; ADSP clients now: $sensors_now"
+		stop "$sensors_opt: still running after $sensors_by (status $sensors_rc):$sensors_up; ADSP clients now: $sensors_now"
 	fi
-	say "sensors=stop: ADSP clients now: $sensors_now (systemctl stop status $sensors_rc); ${settle}s to settle"
+	say "$sensors_opt: ADSP clients now: $sensors_now ($sensors_by status $sensors_rc); ${settle}s to settle"
 	sleep "$settle"
 fi
 
@@ -4014,7 +4478,7 @@ sync
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for v in stamp ramdir part disk cycles seconds hold aborts dry rootsrc rootname floor armed kernel mount_cmd ufs_host \
 	pci_remove pci_keep pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note sw_set sw_ret \
-	rpmh rpmh_was guard_state sensors_stop pwrdn_seen; do
+	rpmh rpmh_was clk_trace clk_was guard_state sensors_stop pwrdn_seen cxpc_given; do
 	eval "printf '%s=%s\n' $v \"\$(q \"\$$v\")\""
 done > "$ramdir/run.conf"
 say 'the run goes on from RAM in a session of its own: it ends with a restart even if this terminal goes away'
