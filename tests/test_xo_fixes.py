@@ -2,7 +2,9 @@
 
 scripts/build-mainline-kernel.sh applies each behind a variable of its own:
 lpass-va-macro-pm-clock-framework.patch (upstream eb667d0fbdd3, v7.3-rc1)
-with APPLY_LPASS_VA_MACRO_PM_CLK=1.  The build script's block runs from its
+with APPLY_LPASS_VA_MACRO_PM_CLK=1, and
+msm-dsi-phy-release-ahb-clock-in-system-sleep.patch (posted and reviewed
+upstream, not merged) with APPLY_DSI_PHY_AHB_RELEASE=1.  The build script's block runs from its
 own text on files taken from the pinned kernel checkout (only read, with
 git show): off by default, 0 or 1 only, the patch applied strictly and
 once, a tree that carries it refused for a build without the variable, a
@@ -23,6 +25,8 @@ PATCHES = REPO / "kernel/patches"
 VA = "sound/soc/codecs/lpass-va-macro.c"
 KCONFIG = "sound/soc/codecs/Kconfig"
 VA_PATCH = "lpass-va-macro-pm-clock-framework.patch"
+DSI_PHY = "drivers/gpu/drm/msm/dsi/phy/dsi_phy"
+DSI_PATCH = "msm-dsi-phy-release-ahb-clock-in-system-sleep.patch"
 
 
 def kernel_source():
@@ -53,7 +57,8 @@ def validate(text):
 
 
 class VariableTest(unittest.TestCase):
-    CASES = (("APPLY_LPASS_VA_MACRO_PM_CLK", "apply_va_macro_pm_clk"),)
+    CASES = (("APPLY_LPASS_VA_MACRO_PM_CLK", "apply_va_macro_pm_clk"),
+             ("APPLY_DSI_PHY_AHB_RELEASE", "apply_dsi_phy_ahb"))
 
     def test_each_variable_is_off_by_default_and_0_or_1(self):
         text = BUILD.read_text()
@@ -74,7 +79,8 @@ class VariableTest(unittest.TestCase):
                         self.assertIn(f"{env} must be 0 or 1", result.stderr)
 
     def test_no_board_gate(self):
-        for start in ("# lpass-va-macro-pm-clock-framework.patch, upstream eb667d0fbdd3",):
+        for start in ("# lpass-va-macro-pm-clock-framework.patch, upstream eb667d0fbdd3",
+                      "# msm-dsi-phy-release-ahb-clock-in-system-sleep.patch, posted upstream"):
             with self.subTest(start):
                 self.assertNotIn("DEVICE", block(start))
 
@@ -155,6 +161,89 @@ class VaMacroTest(unittest.TestCase):
             result = self.run_block(tree, "1")
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((tree / VA).read_text(), damaged)
+
+
+class DsiPhyAhbTest(unittest.TestCase):
+    START = "# msm-dsi-phy-release-ahb-clock-in-system-sleep.patch, posted upstream"
+    PATCH = DSI_PATCH
+
+    def run_block(self, tree, value):
+        return subprocess.run(["bash", "-c", "set -euo pipefail\nkernel_tree=$1 pat=$2 apply_dsi_phy_ahb=$3\n"
+                               + block(self.START), "build", str(tree), str(PATCHES), value],
+                              capture_output=True, text=True)
+
+    def test_the_patch_is_the_posted_one_on_the_phy_s_two_files_and_says_so(self):
+        text = (PATCHES / self.PATCH).read_text()
+        self.assertIn("Subject: [PATCH] drm/msm/dsi: fix AHB clock staying enabled across suspend", text)
+        self.assertIn("Link: https://lore.kernel.org/all/20261006-dsi-ahb-clk-suspend-fix-v1-1-67da848e1b0a@oss.qualcomm.com/",
+                      text)
+        self.assertIn("Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>", text)
+        self.assertEqual(sorted(targets(self.PATCH)), sorted([DSI_PHY + ".c", DSI_PHY + ".h"]))
+        diff = text[text.index("\n--- a/"):]
+        added = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+        removed = [l for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")]
+        # The posting: 127 lines in, 9 out.
+        self.assertEqual((len(added), len(removed)), (127, 9))
+        self.assertIn("+\tLATE_SYSTEM_SLEEP_PM_OPS(dsi_phy_suspend_late, dsi_phy_resume_early)", added)
+        self.assertIn("+\tdev_pm_set_driver_flags(dev, DPM_FLAG_NO_DIRECT_COMPLETE);", added)
+        self.assertIn("-\tret = pm_clk_add(dev, \"iface\");", removed)
+        self.assertIn("APPLY_DSI_PHY_AHB_RELEASE=1", text)
+
+    def test_it_goes_on_top_of_the_other_patch_of_its_file(self):
+        """msm-dsi-handoff-regdump.patch is the only other patch of
+        dsi_phy.c (none touches dsi_phy.h), and the build applies it first."""
+        others = sorted(p.name for p in PATCHES.glob("*.patch")
+                        if p.name != self.PATCH and {DSI_PHY + ".c", DSI_PHY + ".h"} & set(targets(p.name)))
+        self.assertEqual(others, ["msm-dsi-handoff-regdump.patch"])
+        text = BUILD.read_text()
+        self.assertLess(text.index("drivers/gpu/drm/msm/dsi/dsi_manager.c msm-dsi-handoff-regdump.patch"),
+                        text.index(block(self.START)))
+
+    def tree(self, tmp):
+        """The PHY's files as the build has them when the block runs: the
+        pinned ones with msm-dsi-handoff-regdump.patch."""
+        tree = pathlib.Path(tmp)
+        for path in (DSI_PHY + ".c", DSI_PHY + ".h", "drivers/gpu/drm/msm/dsi/dsi.h",
+                     "drivers/gpu/drm/msm/dsi/dsi_host.c", "drivers/gpu/drm/msm/dsi/dsi_manager.c"):
+            (tree / path).parent.mkdir(parents=True, exist_ok=True)
+            (tree / path).write_text(pinned(path))
+        subprocess.run(["patch", "-s", "-d", str(tree), "-p1", "--no-backup-if-mismatch"],
+                       input=(PATCHES / "msm-dsi-handoff-regdump.patch").read_text(), check=True, text=True)
+        return tree
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_variable_applies_it_once_and_a_build_without_it_refuses_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = self.tree(tmp)
+            names = (DSI_PHY + ".c", DSI_PHY + ".h")
+            files = {p: (tree / p).read_text() for p in names}
+            listing = sorted(p.name for p in (tree / DSI_PHY).parent.iterdir())
+            result = self.run_block(tree, "0")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual({p: (tree / p).read_text() for p in names}, files)
+            result = self.run_block(tree, "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("fuzz", result.stdout)
+            patched = {p: (tree / p).read_text() for p in names}
+            self.assertEqual(patched[DSI_PHY + ".c"].count("static int dsi_phy_suspend_late(struct device *dev)"), 1)
+            self.assertNotIn("pm_clk_add", patched[DSI_PHY + ".c"])
+            self.assertIn("\tbool ahb_clk_prepared;\n", patched[DSI_PHY + ".h"])
+            # The port's regdump stays as it was.
+            self.assertIn("msm_dsi_phy_regdump(phy, \"probe\");", patched[DSI_PHY + ".c"])
+            self.assertEqual(sorted(p.name for p in (tree / DSI_PHY).parent.iterdir()), listing)
+            result = self.run_block(tree, "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual({p: (tree / p).read_text() for p in names}, patched)
+            result = self.run_block(tree, "0")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(f"{self.PATCH} remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR "
+                          "for a build without APPLY_DSI_PHY_AHB_RELEASE=1.", result.stderr)
+            self.assertEqual({p: (tree / p).read_text() for p in names}, patched)
+            damaged = patched[DSI_PHY + ".h"].replace("\tbool ahb_clk_enabled;\n", "")
+            (tree / (DSI_PHY + ".h")).write_text(damaged)
+            result = self.run_block(tree, "1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((tree / (DSI_PHY + ".h")).read_text(), damaged)
 
 
 if __name__ == "__main__":

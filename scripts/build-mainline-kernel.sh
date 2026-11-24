@@ -50,6 +50,10 @@ apply_pcie0_gdsc_guard=${APPLY_SM8550_PCIE0_GDSC_GUARD:-0}
 # which keep the audio DSP's LPASS powered through a system sleep (see
 # lpass-va-macro-pm-clock-framework.patch below).
 apply_va_macro_pm_clk=${APPLY_LPASS_VA_MACRO_PM_CLK:-0}
+# Test builds until it has run on hardware: the DSI PHY's AHB clock, which
+# keeps XO voted through a system sleep (see
+# msm-dsi-phy-release-ahb-clock-in-system-sleep.patch below).
+apply_dsi_phy_ahb=${APPLY_DSI_PHY_AHB_RELEASE:-0}
 
 validate_bool() {
 	case "$2" in
@@ -89,6 +93,7 @@ fi
 # Each is refused without the other, here, before the tree is touched.
 validate_bool APPLY_SM8550_PCIE0_GDSC_GUARD "$apply_pcie0_gdsc_guard"
 validate_bool APPLY_LPASS_VA_MACRO_PM_CLK "$apply_va_macro_pm_clk"
+validate_bool APPLY_DSI_PHY_AHB_RELEASE "$apply_dsi_phy_ahb"
 if [ "$apply_pcie0_gdsc_off" != "$apply_pcie0_gdsc_guard" ]; then
 	echo 'APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 go together: without the guard genpd collapses pcie_0_gdsc under a PCIe host that keeps its link (the boot'"'"'s panel cycle), and the guard is for pcie_0_gdsc PWRSTS_OFF_ON' >&2
 	exit 1
@@ -673,6 +678,33 @@ apply_unless 'mdss_handoff_gdsc_cycle' \
 	drivers/gpu/drm/msm/msm_mdss.c msm-mdss-handoff-gdsc-cycle.patch
 apply_unless 'boot_display_cycle' \
 	drivers/gpu/drm/msm/msm_kms.c msm-kms-boot-display-cycle.patch
+# msm-dsi-phy-release-ahb-clock-in-system-sleep.patch, posted upstream and
+# reviewed (2026-10/11), not merged yet, with APPLY_DSI_PHY_AHB_RELEASE=1:
+# the DSI PHY's pm_clk keeps its AHB clock, DISP_CC_MDSS_AHB_CLK, prepared
+# from its probe on, and on the SM8550 that clock's source sits on the XO
+# that is voted in the sleep set, so XO stayed voted through every system
+# sleep with the display off.  The patch unprepares it in suspend_late and
+# prepares it again in resume_early; at run time the clock is handled as
+# before.  It goes on top of the three DSI PHY patches above
+# (msm-dsi-handoff-regdump.patch's context is in it), strictly, and is
+# refused for a build without it in a tree that carries it.  The boot's
+# panel cycle (pm_test=platform) runs it too: test builds until it has run
+# on hardware.  No board gate: both tablets' DSI PHYs are the same.
+dsi_ahb_patch=msm-dsi-phy-release-ahb-clock-in-system-sleep.patch
+dsi_ahb_marker='static int dsi_phy_suspend_late(struct device *dev)'
+if [ "$apply_dsi_phy_ahb" = 1 ]; then
+	if grep -qF "$dsi_ahb_marker" "$kernel_tree/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$dsi_ahb_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$dsi_ahb_patch"
+	fi
+elif grep -qF "$dsi_ahb_marker" "$kernel_tree/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c"; then
+	echo "$dsi_ahb_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_DSI_PHY_AHB_RELEASE=1." >&2
+	exit 1
+fi
 # Bring-up switch: msm.cached_coherent=0 withholds cached-coherent GEM
 # buffers from Mesa (the X710 shows a 96-px lattice of unwritten/stale
 # pixels in GPU-rendered content).  Inert without the parameter.
