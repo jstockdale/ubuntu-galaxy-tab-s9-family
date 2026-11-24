@@ -32,7 +32,7 @@ fingerprint_sensor=${FINGERPRINT_EL721:-$enable_fingerprint}
 qtee_admin_null_credentials=${QCOMTEE_ADMIN_NULL_CREDENTIALS:-0}
 enable_gunyah_cma=${ENABLE_GUNYAH_CMA:-0}
 # Diagnostic only, never in a release: see qmp-ufs-pcs-state-diagnostic.patch
-# below.
+# and ufs-qcom-phy-power-count-diagnostic.patch below.
 apply_qmp_ufs_diagnostic=${APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC:-0}
 # Debug only, never in a release: see gcc-sm8550-gdsc-debug-switches.patch
 # and rpmhpd-debug-retention-floor.patch below.
@@ -40,6 +40,12 @@ apply_deep_sleep_debug=${APPLY_DEEP_SLEEP_DEBUG_SWITCHES:-0}
 # Test builds until they have run on hardware: the SM8550 sleep fixes below,
 # three upstream commits, with unpark-pcie0-pipe-mux.patch left out.
 apply_sm8550_sleep_fixes=${APPLY_SM8550_SLEEP_FIXES:-0}
+# Test builds only: pcie_0_gdsc collapsed in system suspend, see
+# gcc-sm8550-pcie0-gdsc-off-in-suspend.patch below, and its guard, which
+# keeps the domain on while the PCIe host keeps its link: the two go
+# together or not at all.
+apply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}
+apply_pcie0_gdsc_guard=${APPLY_SM8550_PCIE0_GDSC_GUARD:-0}
 
 validate_bool() {
 	case "$2" in
@@ -62,6 +68,24 @@ validate_bool APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC "$apply_qmp_ufs_diagnostic"
 # place looks like.  Refused here, before the tree is touched.
 if [ "$apply_qmp_ufs_diagnostic" = 1 ] && [ "${UFS_PCS_RESET_EXPERIMENTAL:-1}" != 1 ]; then
 	echo 'APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 needs the PCS reset (UFS_PCS_RESET_EXPERIMENTAL=1)' >&2
+	exit 1
+fi
+validate_bool APPLY_SM8550_PCIE0_GDSC_OFF "$apply_pcie0_gdsc_off"
+# A collapsed pcie_0_gdsc did not report power-up again at the resume while
+# the PCIe PIPE clock mux stayed on the clock of a PHY that was off (kit
+# revision 9): the GDSC change needs the mux revert of the sleep fixes.
+# Refused here, before the tree is touched.
+if [ "$apply_pcie0_gdsc_off" = 1 ] && [ "$apply_sm8550_sleep_fixes" != 1 ]; then
+	echo 'APPLY_SM8550_PCIE0_GDSC_OFF=1 needs APPLY_SM8550_SLEEP_FIXES=1: without the PIPE clock revert pcie_0_gdsc does not power up again at the resume' >&2
+	exit 1
+fi
+# Without the guard genpd collapses pcie_0_gdsc under a PCIe host that keeps
+# its link, the boot's pm_test=platform panel cycle among such suspends
+# (kit revision 11 as first prepared); the guard is for that GDSC alone.
+# Each is refused without the other, here, before the tree is touched.
+validate_bool APPLY_SM8550_PCIE0_GDSC_GUARD "$apply_pcie0_gdsc_guard"
+if [ "$apply_pcie0_gdsc_off" != "$apply_pcie0_gdsc_guard" ]; then
+	echo 'APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 go together: without the guard genpd collapses pcie_0_gdsc under a PCIe host that keeps its link (the boot'"'"'s panel cycle), and the guard is for pcie_0_gdsc PWRSTS_OFF_ON' >&2
 	exit 1
 fi
 
@@ -339,6 +363,41 @@ apply_unless '!of_machine_is_compatible("samsung,gts9wifi")' \
 # being tried with it, together with its UFS PCS reset (2026-11-08).
 apply_unless 'it runs HS-G5' \
 	drivers/ufs/host/ufs-qcom.c ufs-qcom-hs-g5-at-300mhz-sm8550.patch
+# ufs-qcom powers the UFS PHY with the host clocks, and ufshcd calls that
+# hook again for clocks that are on (a gate work that gave up on a command
+# being dispatched, then an ungate): each such call left the PHY a power
+# reference nothing dropped, and the next resume timed out every PHY
+# calibration (2026-11-23, Type-C kit revision 10, run 5).  Both tablets,
+# every build.  Its line numbers are those of files that carry
+# ufs-qcom-enable-only-lane-clocks.patch, which goes on top of it here (with
+# APPLY_SM8550_SLEEP_FIXES=1, below): its hunks go in 31 lines up in
+# ufs-qcom.c and one line up in ufs-qcom.h, with no fuzz, and patch(1) keeps
+# the two files as they were as ufs-qcom.c.orig and ufs-qcom.h.orig.
+apply_unless 'Power the PHY off if this host holds its power, so that the power-on' \
+	drivers/ufs/host/ufs-qcom.c ufs-qcom-track-phy-power-state-gts9u.patch
+# ufs-qcom-phy-power-count-diagnostic.patch is deliberately NOT applied by
+# default, like qmp-ufs-pcs-state-diagnostic.patch above: at every power-up
+# sequence of the UFS PHY it logs the PHY's power and init counts and whether
+# the host holds its power reference, and each setup_clocks call that finds
+# that reference already as it asks.  It only reads.  Test builds only, with
+# APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 (the SM-X710's Type-C roles kit,
+# revision 11), on top of the patch above; strictly, and refused for any
+# other build in a tree that carries it.
+ufs_qcom_source=$kernel_tree/drivers/ufs/host/ufs-qcom.c
+ufs_qcom_count_marker='static void ufs_qcom_dbg_phy_counts('
+if [ "$apply_qmp_ufs_diagnostic" = 1 ]; then
+	if grep -qF "$ufs_qcom_count_marker" "$ufs_qcom_source"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/ufs-qcom-phy-power-count-diagnostic.patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/ufs-qcom-phy-power-count-diagnostic.patch"
+	fi
+elif grep -qF "$ufs_qcom_count_marker" "$ufs_qcom_source"; then
+	echo 'The ufs-qcom PHY count diagnostic remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a default build.' >&2
+	exit 1
+fi
 apply_unless 'Users may open the misc device as soon as it is registered' \
 	drivers/misc/fastrpc.c fastrpc-publish-after-session-init.patch
 apply_unless 'qcom,early-tx-intent' \
@@ -393,14 +452,84 @@ fi
 # applied here yet.
 apply_unless 'Retention across system suspend, as on sm8650' \
 	drivers/clk/qcom/gcc-sm8550.c gcc-sm8550-usb-gdscs-retention.patch
+# gcc-sm8550-pcie0-gdsc-off-in-suspend.patch is deliberately NOT applied by
+# default.  It gives pcie_0_gdsc PWRSTS_OFF_ON, so that genpd collapses it in
+# a system suspend, and GENPD_FLAG_ACTIVE_WAKEUP, so that genpd leaves it on
+# for a device of it on the awake path, which the guard's other half below
+# makes of a PCIe host that keeps its link.  On the SM-X710 a sleep with the
+# PCIe host powered down (its root port removed) and the interconnect floor
+# released returned only with that GDSC collapsed (kit revisions 9 and 10:
+# 7 of 7 with it, 0 of 8 without).  Upstream keeps it in retention
+# (967e011013ed) because a host that keeps its link through the suspend
+# loses its controller when the GDSC collapses, and on this port every
+# suspend that keeps the Wi-Fi, the boot's panel cycle included, keeps the
+# link.  So test builds only: set
+# APPLY_SM8550_PCIE0_GDSC_OFF=1 (the SM-X710's Type-C roles kit, revision
+# 11), which needs APPLY_SM8550_SLEEP_FIXES=1 and the guard below,
+# APPLY_SM8550_PCIE0_GDSC_GUARD=1 (both checked at the top).  No board gate.
+# Strictly, on top of the USB GDSC patch just above and under the debug
+# switches below; the patch adds one line, so the debug switches go in one
+# line further down with it than without it.  A tree that carries it is
+# refused for a build without the variable, so that a release built in a
+# reused test tree cannot ship it.  It is known by the line it changes.
+pcie0_gdsc_patch=gcc-sm8550-pcie0-gdsc-off-in-suspend.patch
+pcie0_gdsc_line="PWRSTS_OFF_ON, /* $pcie0_gdsc_patch */"
+if [ "$apply_pcie0_gdsc_off" = 1 ]; then
+	if grep -qF -- "$pcie0_gdsc_line" "$kernel_tree/drivers/clk/qcom/gcc-sm8550.c"; then
+		# Reject a partly applied copy, and the patch's first form (revision
+		# 11 as first prepared), which changed the .pwrsts line alone.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$pcie0_gdsc_patch" || {
+			echo "$pcie0_gdsc_patch is in this source tree only in part (or in its first form, without the genpd flag); use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR." >&2
+			exit 1
+		}
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$pcie0_gdsc_patch"
+	fi
+elif grep -qF -- "$pcie0_gdsc_line" "$kernel_tree/drivers/clk/qcom/gcc-sm8550.c"; then
+	echo "$pcie0_gdsc_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_SM8550_PCIE0_GDSC_OFF=1." >&2
+	exit 1
+fi
+# The guard's other half, with APPLY_SM8550_PCIE0_GDSC_GUARD=1 (which goes
+# together with APPLY_SM8550_PCIE0_GDSC_OFF=1, checked at the top):
+# pcie-qcom-keep-power-domain-while-link-kept.patch puts the PCIe host on the
+# awake path in a suspend that keeps its link and marks it out-of-band in one
+# that powered it down, which genpd reads for a domain with
+# GENPD_FLAG_ACTIVE_WAKEUP (pcie_0_gdsc, the patch just above): the domain
+# collapses only when the host has powered itself down, and stays on while
+# the host keeps its link (every suspend with the Wi-Fi bound, the boot's
+# panel cycle among them), which is why upstream keeps the PCIe GDSCs in
+# retention (967e011013ed).  It also logs at each resume what genpd did with the
+# domain, for verify.sh and sleep-test.sh.  No board gate.  Strictly; a tree
+# that carries it is refused for a build without the variable.  It is known
+# by a line it adds.
+pcie0_guard_patch=pcie-qcom-keep-power-domain-while-link-kept.patch
+pcie0_guard_line='qcom_pcie_mark_sleep_path(dev, pcie->link_kept);'
+if [ "$apply_pcie0_gdsc_guard" = 1 ]; then
+	if grep -qF -- "$pcie0_guard_line" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
+		# Reject a partly applied copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$pcie0_guard_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$pcie0_guard_patch"
+	fi
+elif grep -qF -- "$pcie0_guard_line" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
+	echo "$pcie0_guard_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_SM8550_PCIE0_GDSC_GUARD=1." >&2
+	exit 1
+fi
 # gcc-sm8550-gdsc-debug-switches.patch and rpmhpd-debug-retention-floor.patch
 # are deliberately NOT applied by default, like the UFS PHY diagnostic above.
-# They add run-time switches, all off at every boot and set by root through
-# /sys/module, for telling apart the causes of the SM-X710's deep-sleep wake
-# hang: the PCIe and USB GDSCs collapsed instead of left on, and a RETENTION
-# floor for the CX and MX votes.  They are for test builds: set
+# They add run-time switches, set by root through /sys/module, for telling
+# apart the causes of the SM-X710's deep-sleep wake hang: the PCIe and USB
+# GDSCs collapsed instead of left on, and a RETENTION floor for the CX and MX
+# votes.  Every boot starts with each as the build's table has it: off, but
+# the pcie0 one on with APPLY_SM8550_PCIE0_GDSC_OFF=1, where it can put
+# pcie_0_gdsc back in retention.  They are for test builds: set
 # APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (the SM-X710's Type-C roles kit, revision
-# 9).  The GDSC one goes on top of the USB GDSC patch just above, each
+# 9).  The GDSC one goes on top of the USB GDSC patch just above (and of
+# revision 11's pcie_0_gdsc, one line further down then), each
 # strictly; a tree that carries either is refused for a default build, so
 # that a release built in a reused test tree cannot ship them.
 deep_sleep_debug_marker='SM8550 deep-sleep debug, not for release builds'
@@ -429,6 +558,31 @@ for deep_sleep_debug in drivers/clk/qcom/gcc-sm8550.c:gcc-sm8550-gdsc-debug-swit
 		exit 1
 	fi
 done
+# pcie-qcom-debug-root-port-d3.patch goes on top of the guard's
+# pcie-qcom-keep-power-domain-while-link-kept.patch, only with both
+# APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 (the
+# SM-X710's Type-C roles kit, revision 11): a run-time switch,
+# pcie_qcom.debug_root_port_d3, N at every boot, that lets the root ports of
+# qcom PCIe hosts go to D3hot in system suspend, so that the host powers
+# itself down with the Wi-Fi bound, as it does with its root port removed.
+# The guard is what lets pcie_0_gdsc collapse then; without it the host
+# would power down under a GDSC left on, the sleep that never came back.
+# Strictly, and refused for any other build in a tree that carries it.
+pcie_rp_d3_patch=pcie-qcom-debug-root-port-d3.patch
+pcie_rp_d3_marker='PCIe root port to D3 for a sleep test, not for release builds'
+if [ "$apply_deep_sleep_debug" = 1 ] && [ "$apply_pcie0_gdsc_guard" = 1 ]; then
+	if grep -q "$pcie_rp_d3_marker" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$pcie_rp_d3_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$pcie_rp_d3_patch"
+	fi
+elif grep -q "$pcie_rp_d3_marker" "$kernel_tree/drivers/pci/controller/dwc/pcie-qcom.c"; then
+	echo "$pcie_rp_d3_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without both APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1." >&2
+	exit 1
+fi
 # A failed xhci-plat probe leaves dwc->xhci without drvdata, and the glue's
 # suspend in host role then reads the port speeds through a NULL hcd (an
 # oops on the SM-X710, 2026-11-21).  The guard lets the suspend complete;
@@ -535,8 +689,9 @@ apply_unless 'qcom_overlay_all' \
 #     ufs-qcom turns its three lane clocks on and off once, where it turned
 #     every clock of the UFS host on again at each runtime resume, which
 #     kept them, and XO under them, on through every sleep; on top of
-#     ufs-qcom-hs-g5-at-300mhz-sm8550.patch on the SM-X710, on the pinned
-#     file on the SM-X910.
+#     ufs-qcom-track-phy-power-state-gts9u.patch (and its diagnostic) and
+#     of ufs-qcom-hs-g5-at-300mhz-sm8550.patch, on both boards; its hunks
+#     go in with no offset.
 # Each strictly; a tree that carries any of them is refused for a build
 # without the variable, so that a release built in a reused test tree
 # cannot ship them.  Upstream code has no marker of this port's: each is

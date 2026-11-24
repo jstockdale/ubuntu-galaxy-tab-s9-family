@@ -1,0 +1,85 @@
+Subject: [TEST builds only] clk: qcom: gcc-sm8550: let pcie_0_gdsc collapse in system suspend, but not under a host that keeps its link
+
+Test builds only.  scripts/build-mainline-kernel.sh applies this only with
+APPLY_SM8550_PCIE0_GDSC_OFF=1, after gcc-sm8550-usb-gdscs-retention.patch,
+refuses it without APPLY_SM8550_SLEEP_FIXES=1 and without the guard's other
+half, APPLY_SM8550_PCIE0_GDSC_GUARD=1 (below), and refuses a build without
+the variable in a source tree that carries it.  No board check: both
+tablets' builds get it when the variable is set.
+
+Two lines of pcie_0_gdsc's entry, in one hunk:
+  - .pwrsts goes from PWRSTS_RET_ON to PWRSTS_OFF_ON.  gdsc_disable() then
+    drops the application processor's vote for it (it is VOTABLE, and probe
+    clears GDSC_SLEEP_ENA_VOTE) when genpd powers it off at the end of a
+    suspend's noirq phase, instead of leaving it on in hardware until CX
+    collapses;
+  - its genpd gets GENPD_FLAG_ACTIVE_WAKEUP: genpd then does not power it
+    off at all for a device of it that is on the awake path at the end of
+    its noirq suspend, and does not power it on again at the resume, since
+    it never went off (genpd_finish_suspend() and genpd_finish_resume(),
+    drivers/pmdomain/core.c, the flag's only readers; gdsc_init() and
+    pm_genpd_init() add to pd.flags and keep what is there).  The domain's
+    one device is the PCIe host 1c00000.pcie, which
+    pcie-qcom-keep-power-domain-while-link-kept.patch, the guard's other
+    half, puts on the awake path when it keeps its link through the
+    suspend, and marks out-of-band when it powered itself down (genpd then
+    powers the domain off whatever the endpoints' wakeup settings put on
+    the awake path).
+So the domain collapses in a suspend in which the PCIe host has powered
+itself down, and stays on in one in which the host keeps its link.  Nothing
+else changes: pcie_0_phy_gdsc, the PCIe1 domains and the USB domains keep
+their states.  The file gets one line more, so the debug switches go in one
+line further down with this patch than without it.  The compiled .data of
+gcc-sm8550.o differs from the build without this patch in two bytes,
+pcie_0_gdsc's .pwrsts (6 to 5) and its pd.flags (0 to 8).  Both are in the
+table, which keeps clang's order of the GDSC objects in .data: the same
+flag set from the probe or from the init function moved pcie_0_gdsc there
+(tried on a scratch build).
+
+Why the collapse.  On the SM-X710 (gts9wifi) a sleep with the PCIe host
+powered down (its root port removed, so that dw_pcie_suspend_noirq() takes
+its power-off branch) and the interconnect floor released did not return
+with this GDSC in retention: 0 of 8 (six on Type-C kit revision 7's kernel,
+one on revision 9's, one on revision 10's), the SoC dropping PS_HOLD 43 to
+44 s after the RTC alarm; the same sleep with the floor held came back.
+With the GDSC collapsed it returned 7 of 7 (four on revision 9, three on
+revision 10, through the run-time switch of
+gcc-sm8550-gdsc-debug-switches.patch), and with revision 10's PIPE clock
+revert the PCIe host came back as well.  Two SM8550 community kernels with
+the same symptom made the domain PWRSTS_OFF_ON (ROCKNIX PR 3636,
+retroforge patch 0143).
+
+Why not under a host that keeps its link (upstream's reason for
+PWRSTS_RET_ON, 967e011013ed, "clk: qcom: gcc-sm8550: Do not turn off PCIe
+GDSCs during gdsc_disable()", v6.14): a PCIe controller that keeps its link
+through a system suspend (qcom_pcie_suspend_noirq() with the link kept, the
+PCI devices still bound) loses its registers when its GDSC collapses, and
+its resume breaks.  That is the case on this port in every suspend in which
+the Wi-Fi stays: the root port cannot go to D3, so dw_pcie_suspend_noirq()
+keeps the link.  The boot's pm_test=platform panel cycle is such a suspend.
+Without the guard (kit revision 11 as first prepared) genpd collapsed the
+domain in it.
+
+The cost of the guard: while the link is kept the domain stays on, and with
+it its parent's vote: CX's genpd stays on (the domain's subdomain count),
+and rpmhpd votes CX at its enable level (retention) or above in every set
+(rpmhpd_power_on(), rpmhpd_set_performance_state()), where genpd could
+otherwise vote it 0 under a live controller.  A live host has no use for a
+collapsed CX.
+
+It needs the PIPE clock revert (clk-qcom-regmap-phy-mux-revert-rework.patch,
+APPLY_SM8550_SLEEP_FIXES=1): without it the GDSC did not report power-up at
+the resume ("pcie_0_gdsc status stuck at 'off'", revision 9).
+
+--- a/drivers/clk/qcom/gcc-sm8550.c
++++ b/drivers/clk/qcom/gcc-sm8550.c
+@@ -3003,7 +3003,8 @@
+ 	.pd = {
+ 		.name = "pcie_0_gdsc",
++		.flags = GENPD_FLAG_ACTIVE_WAKEUP,
+ 	},
+-	.pwrsts = PWRSTS_RET_ON,
++	.pwrsts = PWRSTS_OFF_ON, /* gcc-sm8550-pcie0-gdsc-off-in-suspend.patch */
+ 	.flags = VOTABLE | POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+

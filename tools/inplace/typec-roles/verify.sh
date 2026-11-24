@@ -1,7 +1,9 @@
 #!/bin/sh
 # Checks after booting the Type-C roles kit, and a recorder for plug-in tests.
 #   sh ~/typec-roles/verify.sh                  kernel, key, switches, the root's
-#                                               ext4, UFS, PCIe, GPU, roles now
+#                                               ext4, UFS, PCIe, its power
+#                                               domain's guard, Wi-Fi, GPU,
+#                                               roles now
 #                                               (with sudo also the UFS host
 #                                               clocks' enable counts)
 #   sudo sh ~/typec-roles/verify.sh dock [N]    N plug-ins of a powered dock
@@ -361,7 +363,7 @@ wait_partner() { # present|absent SECONDS; absent has to hold for 3 s, a
 case ${1:-} in
 dock|record|now|swap) plug_test "$@" ;;
 '') ;;
-*) sed -n '2,18s/^# //p' "$0" >&2; exit 2 ;;
+*) sed -n '2,20s/^# //p' "$0" >&2; exit 2 ;;
 esac
 
 echo "kernel: $(uname -v)"
@@ -413,29 +415,50 @@ param_is sink_host_swap Y
 param_is try_snk_extra_wait_ms 600
 
 # Revision 9's debug switches (gcc-sm8550-gdsc-debug-switches.patch and
-# rpmhpd-debug-retention-floor.patch), in revision 10's kernel too: run-time
-# module parameters that every boot starts with off.  On the kit's kernel
-# each has to be there and read N: sleep-test.sh sets them for a run only,
-# and every run ends in a restart.  Another kernel may have none (revision 8
-# and before).
+# rpmhpd-debug-retention-floor.patch), in revisions 10 and 11's kernels too:
+# run-time module parameters, each read as its GDSCs are, which every boot
+# starts as the kernel's table has them.  Revision 11's kernel
+# (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch) boots with pcie_0_gdsc
+# PWRSTS_OFF_ON: its switch reads Y, the others N, and debug_boot_state
+# says so ("pcie0 Y, pcie0phy N, usb N").  Revision 11 adds a sixth, the
+# root port's (pcie-qcom-debug-root-port-d3.patch), N at every boot.  On the
+# kit's kernel each has to be there and read as it boots: sleep-test.sh
+# changes them for a run only, and every run ends in a restart.  Another
+# kernel may have none (revision 8 and before), or boot with every one N
+# (revisions 9 and 10).
+sw_boot_file=/sys/module/gcc_sm8550/parameters/debug_boot_state
 sw_others=
-for sw in gcc_sm8550.debug_pcie0_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_off \
-	gcc_sm8550.debug_pcie0_phy_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off \
-	gcc_sm8550.debug_usb_off:/sys/module/gcc_sm8550/parameters/debug_usb_off \
-	rpmhpd.debug_ret_floor:/sys/module/rpmhpd/parameters/debug_ret_floor; do
-	v=$(cat "${sw#*:}" 2>/dev/null)
+b=$(cat "$sw_boot_file" 2>/dev/null)
+if [ -n "$want" ] && [ "$id" = "$want" ]; then
+	[ "$b" = 'pcie0 Y, pcie0phy N, usb N' ] &&
+		ok "debug switches at boot (gcc_sm8550.debug_boot_state): $b: pcie_0_gdsc collapses in system suspend (OFF_ON), revision 11's default" ||
+		bad "gcc_sm8550.debug_boot_state is ${b:-missing}, expected 'pcie0 Y, pcie0phy N, usb N': the kit's kernel boots with pcie_0_gdsc OFF_ON and the other GDSCs in retention"
+fi
+for sw in gcc_sm8550.debug_pcie0_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_off:Y \
+	gcc_sm8550.debug_pcie0_phy_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off:N \
+	gcc_sm8550.debug_usb_off:/sys/module/gcc_sm8550/parameters/debug_usb_off:N \
+	rpmhpd.debug_ret_floor:/sys/module/rpmhpd/parameters/debug_ret_floor:N \
+	pcie_qcom.debug_root_port_d3:/sys/module/pcie_qcom/parameters/debug_root_port_d3:N; do
+	name=${sw%%:*} rest=${sw#*:}
+	file=${rest%:*} boot=${rest##*:}
+	v=$(cat "$file" 2>/dev/null)
 	if [ -n "$want" ] && [ "$id" = "$want" ]; then
-		[ "$v" = N ] && ok "debug switch ${sw%%:*} = N (off)" ||
-			bad "debug switch ${sw%%:*} is ${v:-missing}, expected N (off): the kit's kernel starts every boot with it off, and only a sleep test sets it, until its restart"
-	elif [ -e "${sw#*:}" ]; then
-		sw_others="$sw_others ${sw%%:*}=${v:--}"
+		if [ "$boot" = Y ]; then
+			[ "$v" = Y ] && ok "debug switch $name = Y (on: pcie_0_gdsc OFF_ON, the kit's default since revision 11)" ||
+				bad "debug switch $name is ${v:-missing}, expected Y: the kit's kernel starts every boot with pcie_0_gdsc OFF_ON, and only a sleep test (gdsc-ret=pcie0) changes it, until its restart"
+		else
+			[ "$v" = N ] && ok "debug switch $name = N (off)" ||
+				bad "debug switch $name is ${v:-missing}, expected N (off): the kit's kernel starts every boot with it off, and only a sleep test sets it, until its restart"
+		fi
+	elif [ -e "$file" ]; then
+		sw_others="$sw_others $name=${v:--}"
 	fi
 done
 if [ -z "$want" ] || [ "$id" != "$want" ]; then
 	if [ -n "$sw_others" ]; then
-		note "debug switches of the running kernel, which is not the kit's:$sw_others"
+		note "debug switches of the running kernel, which is not the kit's:$sw_others${b:+ (at boot: $b)}"
 	else
-		note 'the running kernel is not the kit'"'"'s and offers no debug switches (the kernels of revisions 9 and 10 have them)'
+		note 'the running kernel is not the kit'"'"'s and offers no debug switches (the kernels of revisions 9 to 11 have them, the root port'"'"'s from revision 11)'
 	fi
 fi
 
@@ -536,6 +559,84 @@ if [ -n "$k" ]; then
 	fi
 fi
 
+# Revision 11's guard (the genpd flag of gcc-sm8550-pcie0-gdsc-off-in-suspend.patch
+# and pcie-qcom-keep-power-domain-while-link-kept.patch): pcie_0_gdsc, which
+# revision 11 lets collapse in system suspend, stays on in a suspend in which
+# the PCIe host keeps its link, and the boot's panel cycle
+# (ubuntu-gts9u-panel-coldboot-recover, pm_test=platform, about 22 s in) is
+# such a suspend, with the Wi-Fi bound: the root port stays in D0.  At each
+# resume the host logs what genpd did with its power domain in that sleep
+# (a genpd notifier's record).  On the kit's kernel the boot's first suspend
+# has to have "the link was kept, and its power domain stayed on" (the panel
+# cycle, unless a sleep test ran before it), and no suspend this boot may
+# have "the link was kept, but genpd powered its power domain off", which is
+# a FAIL on any kernel: the guard did not hold, and the controller lost its
+# state under the live link.  "the host powered down" is what a sleep with
+# the root port removed (pci=remove) or in D3hot (root-port-d3) logs.
+guard_re='[0-9a-f]+\.pcie: system sleep: '
+guard_kept='the link was kept, and its power domain stayed on'
+guard_bad='the link was kept, but genpd powered its power domain off'
+if [ -n "$k" ]; then
+	first=$(printf '%s\n' "$ku" | awk '/PM: suspend entry/ { on = 1 } on { print } on && /PM: suspend exit/ { exit }')
+	gall=$(printf '%s\n' "$ku" | grep -E "$guard_re")
+	gn=$(printf '%s\n' "$gall" | grep -cE "$guard_re")
+	gbad=$(printf '%s\n' "$gall" | grep -F "$guard_bad")
+	if [ -n "$gbad" ]; then
+		bad "the guard did not hold this boot: genpd powered the PCIe host's power domain off under a link it kept ($(printf '%s\n' "$gbad" | wc -l) of $gn sleeps; the Wi-Fi's controller lost its state under it):"
+		printf '%s\n' "$gbad" | head -n 3
+	elif [ -z "$first" ]; then
+		note "no suspend has run yet this boot (the panel cycle runs about 22 s in): the PCIe power domain's guard was not checked; run this again later"
+	else
+		g1=$(printf '%s\n' "$first" | grep -E "$guard_re" | sed 's/.*\.pcie: system sleep: //' | head -n 1)
+		if [ -n "$want" ] && [ "$id" = "$want" ]; then
+			case $g1 in
+			"$guard_kept") ok "PCIe power domain guard: in this boot's first suspend (the panel cycle) the host kept its link and pcie_0_gdsc stayed on ($gn sleeps logged this boot, none with the domain off under a kept link)" ;;
+			'') bad "no line of the PCIe power domain's guard in this boot's first suspend: the kit's kernel logs one at every resume (\"system sleep: ...\"); without it nothing shows that pcie_0_gdsc stayed on under the Wi-Fi's link" ;;
+			*) note "PCIe power domain guard, this boot's first suspend: $g1 (a sleep test before the panel cycle, or a Wi-Fi without its link); $gn sleeps logged this boot, none with the domain off under a kept link" ;;
+			esac
+		elif [ "$gn" != 0 ]; then
+			note "the running kernel is not the kit's; its PCIe host logged $gn sleeps, the first: ${g1:-none in the first suspend}"
+		else
+			note 'the running kernel is not the kit'"'"'s and logs no line of the PCIe power domain'"'"'s guard (revision 11'"'"'s kernel has it)'
+		fi
+	fi
+fi
+
+# Did the Wi-Fi come back from the boot's first suspend: no line of the PCI
+# core, ath11k, MHI or the root port since then that says it did not (a FAIL
+# on any kernel), its PCI function on the bus with ath11k bound, and its
+# firmware loaded again after that suspend (ath11k powers the chip down and
+# up at each one); without the function on the bus it is a note (a sleep
+# test's pci=remove).
+wifi_fail='Unable to change power state from [A-Za-z0-9]+ to D0, device inaccessible|ath11k_pci [0-9a-f:.]+: .*(failed|timeout|link down)|mhi mhi[0-9]+: .*(fail|[Ee]rror|timeout|not in valid state|Did not enter)|pcieport [0-9a-f:.]+: AER: |Internal error:|SError'
+if [ -n "$k" ]; then
+	after=$(printf '%s\n' "$ku" | sed -n '/PM: suspend entry/,$p')
+	wfn=
+	for d in /sys/bus/pci/devices/*; do
+		[ -e "$d/driver" ] || continue
+		case $(readlink "$d/driver" 2>/dev/null) in
+		*/ath11k_pci) wfn="${d##*/}, link $(cat "$d/current_link_speed" 2>/dev/null || echo unknown)" ;;
+		esac
+	done
+	if [ -z "$after" ]; then
+		note "no suspend has run yet this boot (the panel cycle runs about 22 s in): the Wi-Fi after it was not checked; run this again later${wfn:+ (Wi-Fi now: $wfn)}"
+	else
+		wf=$(printf '%s\n' "$after" | grep -E "$wifi_fail")
+		fw=$(printf '%s\n' "$after" | grep -c 'ath11k_pci .*fw_version')
+		if [ -n "$wf" ]; then
+			bad "the Wi-Fi did not come back from this boot's first suspend (the panel cycle, unless a sleep test ran before it) ($(printf '%s\n' "$wf" | wc -l) lines):"
+			printf '%s\n' "$wf" | head -n 5
+			[ -z "$want" ] || [ "$id" != "$want" ] ||
+				note 'on revision 11'"'"'s kernel the guard keeps pcie_0_gdsc on in that suspend (the guard'"'"'s line above): README, "Revision 11: the runs", says what to do when the Wi-Fi did not come back all the same'
+		elif [ -z "$wfn" ]; then
+			note 'no Wi-Fi function on the PCI bus with ath11k_pci bound, and no line that says it did not come back from this boot'"'"'s first suspend (a sleep test'"'"'s pci=remove leaves the bus so until a restart)'
+		else
+			ok "Wi-Fi after this boot's first suspend: $wfn, no PCI, ath11k or MHI failure line"
+			[ "$fw" != 0 ] || note 'no ath11k firmware line after this boot'"'"'s first suspend: ath11k did not power the chip down and up in it'
+		fi
+	fi
+fi
+
 # Revision 10 runs the GPU RSC's sleep and wake sequences at every power
 # cycle of the GPU's GMU (msm-adreno-a6xx-fix-stale-rpmh-votes.patch); before
 # it neither ran.  One that times out says so.
@@ -556,19 +657,24 @@ fi
 # on, and takes them once more while UFS is resumed: no count above 3.
 # Before it every runtime resume of the UFS host enabled them once more
 # (enable counts of 522 to 525 on 2026-11-23).  debugfs is root's: this runs
-# under sudo only.  Reading clk_summary wakes the clock controllers for a
-# moment, which a check outside a sleep test can afford.
-clk_sum=/sys/kernel/debug/clk/clk_summary
-if [ -r "$clk_sum" ]; then
-	clks=$(awk '$1 ~ /^(gcc_ufs_phy_(axi|ahb|unipro_core|ice_core)_clk|tcsr_ufs_pad_clkref_en)$/ &&
-		$2 ~ /^[0-9]+$/ && !($1 in seen) {
-			seen[$1] = 1
+# under sudo only.  Each clock's counts are read from its own debugfs files
+# (clk_enable_count, clk_prepare_count), which resume nothing: clk_summary,
+# which revision 10's verify.sh read, resumes every clock controller first
+# and fails whole when one cannot resume (with the ADSP stopped, the audio
+# codec's clocks).
+clk_dir=/sys/kernel/debug/clk
+if [ -r "$clk_dir/gcc_ufs_phy_axi_clk/clk_enable_count" ]; then
+	clks=$(for c in tcsr_ufs_pad_clkref_en gcc_ufs_phy_ahb_clk gcc_ufs_phy_axi_clk gcc_ufs_phy_unipro_core_clk \
+		gcc_ufs_phy_ice_core_clk; do
+		[ -r "$clk_dir/$c/clk_enable_count" ] || continue
+		echo "$c $(cat "$clk_dir/$c/clk_enable_count" 2>/dev/null) $(cat "$clk_dir/$c/clk_prepare_count" 2>/dev/null)"
+	done | awk '$2 ~ /^[0-9]+$/ {
 			printf "%s%s %s/%s", n++ ? ", " : "", $1, $2, $3
 			if ($2 + 0 > m) m = $2 + 0
-		} END { printf "|%d", m }' "$clk_sum" 2>/dev/null)
+		} END { printf "|%d", m }')
 	most=${clks##*|} clks=${clks%|*}
 	if [ -z "$clks" ]; then
-		note "no UFS host clock in $clk_sum"
+		note "no UFS host clock in $clk_dir"
 	elif [ -z "$want" ] || [ "$id" != "$want" ]; then
 		note "UFS host clocks of the running kernel, which is not the kit's (enable/prepare): $clks"
 	elif [ "$most" -gt 3 ]; then

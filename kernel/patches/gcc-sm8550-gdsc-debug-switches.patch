@@ -2,42 +2,48 @@ Subject: [DEBUG, test builds only] clk: qcom: gcc-sm8550: run-time switches for 
 
 Not for release builds.  scripts/build-mainline-kernel.sh applies this only
 with APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1, after
-gcc-sm8550-usb-gdscs-retention.patch, and refuses a default build in a source
-tree that carries it.
+gcc-sm8550-usb-gdscs-retention.patch (and, with
+APPLY_SM8550_PCIE0_GDSC_OFF=1, after gcc-sm8550-pcie0-gdsc-off-in-suspend.patch),
+and refuses a default build in a source tree that carries it.
 
-Three switches, all 0 at every boot, that root writes at run time:
+Three switches that root writes at run time, and one that it reads:
 
   /sys/module/gcc_sm8550/parameters/debug_pcie0_off      pcie_0_gdsc
   /sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off  pcie_0_phy_gdsc
   /sys/module/gcc_sm8550/parameters/debug_usb_off        usb30_prim_gdsc and
                                                          usb3_phy_gdsc
+  /sys/module/gcc_sm8550/parameters/debug_boot_state     the three as the
+                                                         kernel booted
 
-Each moves its GDSCs from PWRSTS_RET_ON to PWRSTS_OFF_ON from the next
-power-off genpd asks for: gdsc_disable() then drops the application
-processor's vote for a PCIe GDSC (they are VOTABLE) or collapses a USB one,
-instead of leaving it on.  They are for telling apart the causes of the
-SM-X710's deep-sleep wake hang (the SoC resets 43-44 s after the RTC alarm,
-2026-11-22): a GDSC left on through a CX collapse, pcie_0_gdsc first; an
-SM8550 board with the same symptom was fixed by making that one OFF_ON
-(ROCKNIX PR 3636, patch 0123).
+Y is PWRSTS_OFF_ON, N is PWRSTS_RET_ON, from the next power-off genpd asks
+for: with Y gdsc_disable() drops the application processor's vote for a
+PCIe GDSC (they are VOTABLE) or collapses a USB one, with N it leaves it on.
+Each switch reads the state its GDSCs have: until it is written, what the
+table gives them, N for all three, or Y for debug_pcie0_off in a build with
+gcc-sm8550-pcie0-gdsc-off-in-suspend.patch.  A write changes its own GDSCs
+alone.  debug_boot_state ("pcie0 Y, pcie0phy N, usb N") is what the three
+read before the first write to any of them.  They are for telling apart the
+causes of the SM-X710's deep-sleep wake hang (the SoC resets 43-44 s after
+the RTC alarm, 2026-11-22): a GDSC left on through a CX collapse, pcie_0_gdsc
+first; an SM8550 board with the same symptom was fixed by making that one
+OFF_ON (ROCKNIX PR 3636, patch 0123).
 
-Set the PCIe ones only for a suspend in which the PCIe host powers itself
-down (tools/inplace/typec-roles/sleep-test.sh pci=remove): genpd powers the
-GDSC off at every system suspend, and a host that stays up would lose its
-registers.  The kernel command line cannot set them (-EPERM before
+Set the PCIe ones to Y only for a suspend in which the PCIe host powers
+itself down (tools/inplace/typec-roles/sleep-test.sh pci=remove): genpd
+powers the GDSC off at every system suspend, and a host that stays up loses
+its link under it (967e011013ed upstream).  The kernel command line cannot set them (-EPERM before
 SYSTEM_RUNNING): the boot's pm_test=platform panel cycle suspends with the
 PCIe host up.  debug_usb_off gives the USB GDSCs mainline's OFF_ON back,
 under which the docked xHCI dies in a host-role suspend: test undocked.
 
-The code reads and writes nothing until a switch is written: with all three
-0 the four .pwrsts are RET_ON as without this patch.  It sits after
+The code writes nothing until a switch is written.  It sits after
 module_exit() so that clang emits the GDSC objects in the order it did
-without it: the compiled .data of gcc-sm8550.o is byte for byte the one
-without this patch.
+without it, and what it adds to the data is const or zero: the compiled
+.data of gcc-sm8550.o is byte for byte the one without this patch.
 
 --- a/drivers/clk/qcom/gcc-sm8550.c
 +++ b/drivers/clk/qcom/gcc-sm8550.c
-@@ -3388,5 +3388,87 @@
+@@ -3388,5 +3388,174 @@
  }
  module_exit(gcc_sm8550_exit);
  
@@ -46,23 +52,31 @@ without this patch.
 + * scripts/build-mainline-kernel.sh adds only with
 + * APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 (gcc-sm8550-gdsc-debug-switches.patch).
 + *
-+ * Each switch moves GDSCs from PWRSTS_RET_ON, which gdsc_disable() leaves on
-+ * in hardware (retention comes only with a collapse of their parent, CX), to
-+ * PWRSTS_OFF_ON, which it collapses, from the next power-off genpd asks for:
++ * Each switch moves its GDSCs between PWRSTS_RET_ON (N), which
++ * gdsc_disable() leaves on in hardware (retention comes only with a collapse
++ * of their parent, CX), and PWRSTS_OFF_ON (Y), which it collapses, from the
++ * next power-off genpd asks for:
 + *   debug_pcie0_off      pcie_0_gdsc
 + *   debug_pcie0_phy_off  pcie_0_phy_gdsc
 + *   debug_usb_off        usb30_prim_gdsc and usb3_phy_gdsc (mainline's
 + *                        OFF_ON, which gcc-sm8550-usb-gdscs-retention.patch
 + *                        made RET_ON: the docked xHCI dies again in a
 + *                        host-role suspend)
++ * A switch reads the state its GDSCs have, so until it is written it reads
++ * what the table above gives them: N for all three, or Y for
++ * debug_pcie0_off where the table has pcie_0_gdsc PWRSTS_OFF_ON
++ * (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch, which the build applies with
++ * APPLY_SM8550_PCIE0_GDSC_OFF=1).  A write changes its own GDSCs and no
++ * other.  debug_boot_state, read-only,
++ * says what the three read before the first write to any of them: the table
++ * this kernel booted with.
 + * Root writes them at run time, /sys/module/gcc_sm8550/parameters/ (lockdown
-+ * refuses only module_param_hw() parameters, kernel/params.c); every boot
-+ * starts with all three 0, and the kernel command line cannot set them: the
-+ * boot's pm_test=platform panel cycle suspends with the PCIe host up, and
-+ * genpd would collapse pcie_0_gdsc under it.  Set the PCIe ones only for a
-+ * suspend in which the PCIe host powers itself down (sleep-test.sh
-+ * pci=remove).  With all three 0 the table above is what it was without this
-+ * patch: nothing writes it.
++ * refuses only module_param_hw() parameters, kernel/params.c); the kernel
++ * command line cannot set them: the boot's pm_test=platform panel cycle
++ * suspends with the PCIe host up, and genpd would collapse an OFF_ON
++ * pcie_0_gdsc under it.  Set a PCIe one to Y only for a suspend in which the
++ * PCIe host powers itself down (sleep-test.sh pci=remove).  Until a switch is
++ * written nothing writes the table.
 + *
 + * What a change of .pwrsts at run time does in gdsc.c (7.2): gdsc_init()
 + * reads it once, at registration, for the PWRSTS_ON force-on and for the
@@ -72,56 +86,135 @@ without this patch.
 + * gdsc_disable() returns before gdsc_toggle_logic() (RET_ON), or drops the
 + * application processor's vote for the GDSC (the PCIe ones are VOTABLE, and
 + * probe clears GDSC_SLEEP_ENA_VOTE, so that vote holds in sleep) or collapses
-+ * it (the USB ones).  gdsc_enable() turns either kind on the same way.  A write that meets a power transition
-+ * is seen by it whole or not at all: one byte, which that one decision reads.
-+ * .pwrsts is const in struct gdsc; these objects are writable .data, and only
-+ * gdsc.c reads the field, through a struct gdsc pointer, at each call.
++ * it (the USB ones).  gdsc_enable() turns either kind on the same way.  A
++ * write that meets a power transition is seen by it whole or not at all: one
++ * byte, which that one decision reads.  .pwrsts is const in struct gdsc;
++ * these objects are writable .data, and only gdsc.c reads the field, through
++ * a struct gdsc pointer, at each call.  The switches' descriptors are const
++ * and their state at boot is .bss: the compiled .data of gcc-sm8550.o is the
++ * one without this patch.
 + */
-+static bool debug_pcie0_off;
-+static bool debug_pcie0_phy_off;
-+static bool debug_usb_off;
++struct gcc_sm8550_debug_switch {
++	const char *name;
++	struct gdsc *gdscs[2];
++};
 +
-+static void gcc_sm8550_debug_pwrsts(struct gdsc *sc, bool off)
++static const struct gcc_sm8550_debug_switch gcc_sm8550_debug_pcie0 = {
++	.name = "pcie0",
++	.gdscs = { &pcie_0_gdsc },
++};
++
++static const struct gcc_sm8550_debug_switch gcc_sm8550_debug_pcie0_phy = {
++	.name = "pcie0phy",
++	.gdscs = { &pcie_0_phy_gdsc },
++};
++
++static const struct gcc_sm8550_debug_switch gcc_sm8550_debug_usb = {
++	.name = "usb",
++	.gdscs = { &usb30_prim_gdsc, &usb3_phy_gdsc },
++};
++
++static const struct gcc_sm8550_debug_switch *const gcc_sm8550_debug_switches[] = {
++	&gcc_sm8550_debug_pcie0,
++	&gcc_sm8550_debug_pcie0_phy,
++	&gcc_sm8550_debug_usb,
++};
++
++/*
++ * What each switch read before the first write: the switches take no write
++ * before SYSTEM_RUNNING, so the first write is the first change.  Under the
++ * parameter lock, as every read and write of a switch is.
++ */
++static bool debug_boot_off[ARRAY_SIZE(gcc_sm8550_debug_switches)];
++static bool debug_boot_saved;
++
++static bool gcc_sm8550_debug_off(const struct gdsc *sc)
 +{
-+	WRITE_ONCE(*(u8 *)&sc->pwrsts, off ? PWRSTS_OFF_ON : PWRSTS_RET_ON);
++	return READ_ONCE(sc->pwrsts) == PWRSTS_OFF_ON;
 +}
 +
 +static int gcc_sm8550_debug_set(const char *val, const struct kernel_param *kp)
 +{
-+	int ret;
++	const struct gcc_sm8550_debug_switch *sw = kp->arg;
++	bool off;
++	int i, ret;
 +
 +	/* Run time only: see above. */
 +	if (system_state != SYSTEM_RUNNING)
 +		return -EPERM;
 +
 +	/* param_attr_store() holds the parameter lock: one write at a time. */
-+	ret = param_set_bool(val, kp);
++	ret = kstrtobool(val, &off);
 +	if (ret)
 +		return ret;
 +
-+	gcc_sm8550_debug_pwrsts(&pcie_0_gdsc, debug_pcie0_off);
-+	gcc_sm8550_debug_pwrsts(&pcie_0_phy_gdsc, debug_pcie0_phy_off);
-+	gcc_sm8550_debug_pwrsts(&usb30_prim_gdsc, debug_usb_off);
-+	gcc_sm8550_debug_pwrsts(&usb3_phy_gdsc, debug_usb_off);
++	if (!debug_boot_saved) {
++		for (i = 0; i < ARRAY_SIZE(gcc_sm8550_debug_switches); i++) {
++			const struct gcc_sm8550_debug_switch *each = gcc_sm8550_debug_switches[i];
++
++			debug_boot_off[i] = gcc_sm8550_debug_off(each->gdscs[0]);
++		}
++		debug_boot_saved = true;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(sw->gdscs) && sw->gdscs[i]; i++)
++		WRITE_ONCE(*(u8 *)&sw->gdscs[i]->pwrsts, off ? PWRSTS_OFF_ON : PWRSTS_RET_ON);
 +	pr_info("gcc-sm8550: debug switches: pcie_0_gdsc %s, pcie_0_phy_gdsc %s, usb30_prim_gdsc and usb3_phy_gdsc %s, from the next power-off\n",
-+		debug_pcie0_off ? "OFF_ON" : "RET_ON",
-+		debug_pcie0_phy_off ? "OFF_ON" : "RET_ON",
-+		debug_usb_off ? "OFF_ON" : "RET_ON");
++		gcc_sm8550_debug_off(&pcie_0_gdsc) ? "OFF_ON" : "RET_ON",
++		gcc_sm8550_debug_off(&pcie_0_phy_gdsc) ? "OFF_ON" : "RET_ON",
++		gcc_sm8550_debug_off(&usb30_prim_gdsc) ? "OFF_ON" : "RET_ON");
 +
 +	return 0;
 +}
 +
++static int gcc_sm8550_debug_get(char *buffer, const struct kernel_param *kp)
++{
++	const struct gcc_sm8550_debug_switch *sw = kp->arg;
++
++	return sprintf(buffer, "%c\n", gcc_sm8550_debug_off(sw->gdscs[0]) ? 'Y' : 'N');
++}
++
 +static const struct kernel_param_ops gcc_sm8550_debug_ops = {
 +	.set = gcc_sm8550_debug_set,
-+	.get = param_get_bool,
++	.get = gcc_sm8550_debug_get,
 +};
 +
-+module_param_cb(debug_pcie0_off, &gcc_sm8550_debug_ops, &debug_pcie0_off, 0644);
-+MODULE_PARM_DESC(debug_pcie0_off, "debug: pcie_0_gdsc OFF_ON instead of RET_ON (run time only)");
-+module_param_cb(debug_pcie0_phy_off, &gcc_sm8550_debug_ops, &debug_pcie0_phy_off, 0644);
-+MODULE_PARM_DESC(debug_pcie0_phy_off, "debug: pcie_0_phy_gdsc OFF_ON instead of RET_ON (run time only)");
-+module_param_cb(debug_usb_off, &gcc_sm8550_debug_ops, &debug_usb_off, 0644);
-+MODULE_PARM_DESC(debug_usb_off, "debug: both USB GDSCs OFF_ON instead of RET_ON (run time only)");
++/* debug_boot_state: "pcie0 N, pcie0phy N, usb N" as the kernel booted. */
++static int gcc_sm8550_debug_boot_set(const char *val, const struct kernel_param *kp)
++{
++	return -EPERM;
++}
++
++static int gcc_sm8550_debug_boot_get(char *buffer, const struct kernel_param *kp)
++{
++	int i, n = 0;
++
++	for (i = 0; i < ARRAY_SIZE(gcc_sm8550_debug_switches); i++) {
++		const struct gcc_sm8550_debug_switch *sw = gcc_sm8550_debug_switches[i];
++		bool off = debug_boot_saved ? debug_boot_off[i] : gcc_sm8550_debug_off(sw->gdscs[0]);
++
++		n += sprintf(buffer + n, "%s%s %c", i ? ", " : "", sw->name, off ? 'Y' : 'N');
++	}
++
++	return n + sprintf(buffer + n, "\n");
++}
++
++static const struct kernel_param_ops gcc_sm8550_debug_boot_ops = {
++	.set = gcc_sm8550_debug_boot_set,
++	.get = gcc_sm8550_debug_boot_get,
++};
++
++module_param_cb(debug_pcie0_off, &gcc_sm8550_debug_ops,
++		(void *)&gcc_sm8550_debug_pcie0, 0644);
++MODULE_PARM_DESC(debug_pcie0_off, "debug: Y: pcie_0_gdsc OFF_ON, N: RET_ON (run time only)");
++module_param_cb(debug_pcie0_phy_off, &gcc_sm8550_debug_ops,
++		(void *)&gcc_sm8550_debug_pcie0_phy, 0644);
++MODULE_PARM_DESC(debug_pcie0_phy_off, "debug: Y: pcie_0_phy_gdsc OFF_ON, N: RET_ON (run time)");
++module_param_cb(debug_usb_off, &gcc_sm8550_debug_ops,
++		(void *)&gcc_sm8550_debug_usb, 0644);
++MODULE_PARM_DESC(debug_usb_off, "debug: Y: both USB GDSCs OFF_ON, N: RET_ON (run time only)");
++module_param_cb(debug_boot_state, &gcc_sm8550_debug_boot_ops, NULL, 0444);
++MODULE_PARM_DESC(debug_boot_state, "debug: the three switches as this kernel booted (read only)");
 +
  MODULE_DESCRIPTION("QTI GCC SM8550 Driver");
  MODULE_LICENSE("GPL");

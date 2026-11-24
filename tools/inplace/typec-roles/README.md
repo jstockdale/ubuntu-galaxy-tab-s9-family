@@ -6,10 +6,16 @@ the kernel changes for powered USB-C docks described in
 can be tested on a tablet, since revision 8 the UFS PHY change described
 in [`docs/resume-recovery.md`](../../../docs/resume-recovery.md#sm-x710-gts9wifi)
 with a sleep test that cannot damage the storage, since revision 9 the
-deep-sleep debug switches (below, "Revision 9"), and since revision 10 three
+deep-sleep debug switches (below, "Revision 9"), since revision 10 three
 upstream fixes for the SoC's sleep and a second UFS PHY diagnostic (below,
-"Revision 10"). Everything the hang-log kit set stays: the same
-configuration, the same DTB, the same ramoops region and sysctl drop-in.
+"Revision 10"), and since revision 11 the PCIe host's power domain
+collapsed in a system suspend in which the host has powered itself down and
+kept on while it keeps its link, with a debug switch that lets the PCIe
+root port go to D3hot, and a fix for the UFS PHY's power reference, which
+lost the storage at a resume, with a diagnostic of it (below, "Revision
+11"). Everything the hang-log kit
+set stays: the same configuration, the same DTB, the same ramoops region
+and sysctl drop-in.
 
 **Why.** A powered dock should leave the tablet as power sink and USB host,
 also when the tablet boots with the dock attached. On the SM-X910 two docks
@@ -80,7 +86,11 @@ nothing else in the kernel:
   ([`docs/resume-recovery.md`](../../../docs/resume-recovery.md#sm-x710-gts9wifi)).
   Since 2026-11-23 it is known not to: every calibration on record starts
   from a freshly reset PCS, and the failure came back on revision 9, which
-  carries the reset (below, "Revision 9: the runs");
+  carries the reset (below, "Revision 9: the runs"). What lost the storage
+  in revision 10's run 5 was a leaked PHY power reference, and the same
+  signature is in revision 9's run 3 (below, "Revision 11"); revision 11
+  fixes it, and keeps the reset for one more kit, so that one thing changes
+  at a time;
 - `kernel/patches/qmp-ufs-pcs-state-diagnostic.patch`, a diagnostic that
   release builds do not get (the build applies it only with
   `APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1`). It reads registers and logs:
@@ -162,6 +172,163 @@ The inline crypto engine's driver keeps its core clock and the UFS AHB
 clock enabled from its probe on, which no upstream commit changes:
 `gcc_ufs_phy_ice_core_clk`, under XO, stays enabled with revision 10 too.
 
+**Revision 11** (written 2026-11-23, not built yet) is revision 10 plus
+`pcie_0_gdsc`, the PCIe host's power domain, collapsed in a system suspend
+in which the host has powered itself down and kept on while the host keeps
+its link (a guard), and a debug switch that lets the PCIe root port go to
+D3hot in a system suspend. Two build variables, which go together or not at
+all (each is refused without the other), `APPLY_SM8550_PCIE0_GDSC_OFF=1` and
+`APPLY_SM8550_PCIE0_GDSC_GUARD=1`; the first needs
+`APPLY_SM8550_SLEEP_FIXES=1` as well (without the PIPE clock revert the
+domain does not power up again, as on revision 9), and the debug switch
+comes with `APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1` and the guard. A default
+build and the SM-X910's builds are unchanged without them, and a build
+without them refuses a tree that carries any of them; with them, both
+tablets' builds get them (no board check):
+- `kernel/patches/gcc-sm8550-pcie0-gdsc-off-in-suspend.patch`:
+  `pcie_0_gdsc` is `PWRSTS_OFF_ON` from the boot, where 7.2-rc3 has
+  `PWRSTS_RET_ON`. genpd's power-off of it at the end of a suspend's noirq
+  phase drops the application processor's vote for it, so that it
+  collapses, instead of leaving it on in hardware. It is what `gdsc=pcie0`
+  did by hand on revisions 9 and 10. With the PCIe root port removed and the
+  interconnect floor released the sleep came back 9 times of 9 with it
+  (twice without the storage, revision 9's run 3 and revision 10's run 5:
+  the UFS PHY's power reference, below) and 0 times of 8 without it
+  (revisions 7, 9 and 10). Nothing else changes:
+  `pcie_0_phy_gdsc`, the PCIe1 and USB domains keep their states;
+- the guard, in two halves. The same patch gives the domain's genpd
+  `GENPD_FLAG_ACTIVE_WAKEUP` (one line more in `pcie_0_gdsc`'s entry), and
+  `kernel/patches/pcie-qcom-keep-power-domain-while-link-kept.patch`
+  (`APPLY_SM8550_PCIE0_GDSC_GUARD=1`) makes the PCIe host tell genpd, at the
+  end of its noirq suspend, whether it kept its link: it puts itself on the
+  awake path when it did, and marks itself out-of-band when it powered
+  itself down. genpd then leaves a domain with
+  that flag on for a device on the awake path, and powers it on again at the
+  resume exactly when it powered it off (`genpd_finish_suspend()`,
+  `genpd_finish_resume()`). So the domain collapses only in a suspend in
+  which the host is down (its root port removed, `sleep-test.sh pci=remove`,
+  or in D3hot, `root-port-d3`), and stays on in every suspend that keeps the
+  Wi-Fi's link, the boot's panel cycle among them, as upstream wants it
+  (967e011013ed). The cost, in such a suspend: CX stays voted at retention or
+  above, where genpd could otherwise vote it off under a live controller.
+  The record: at each resume the host logs what genpd did with its domain
+  in that sleep, from a genpd power notifier: `qcom-pcie 1c00000.pcie:
+  system sleep: the link was kept, and its power domain stayed on`, or `the
+  host powered down, and genpd powered its power domain off`; the warning
+  `the link was kept, but genpd powered its power domain off` is the guard
+  failing. `verify.sh` and `sleep-test.sh` read these lines;
+- the root port's debug switch,
+  `kernel/patches/pcie-qcom-debug-root-port-d3.patch`:
+  `/sys/module/pcie_qcom/parameters/debug_root_port_d3`, `N` at every boot,
+  refused before the system is up (the kernel command line cannot set it).
+  `Y` gives each root port of a qcom PCIe host that the PCI core keeps in D0
+  the PCI core's permission to go to D3 (`bridge_d3`): from the next
+  suspend the root port goes to D3hot after the Wi-Fi does, the host finds
+  every function in D3hot, sends PME_Turn_Off and powers itself down, and
+  its resume sets it up again, trains the link and restores the functions'
+  configuration. The PCI core gives none because the root port is hot-plug
+  capable (33a76fc3c3e6, v7.1) and this kernel has no PCIe hot-plug driver
+  (`CONFIG_HOTPLUG_PCI_PCIE` is not set, so `pci_bridge_d3_possible()`
+  refuses it before it looks at `pcie_port_pm=force`, and 7.3's d4c79b63d82
+  does not help either). It is what the community SM8550 kernels get with
+  `CONFIG_HOTPLUG_PCI_PCIE=y` and `pcie_port_pm=force` (ROCKNIX), without a
+  configuration change; `sleep-test.sh root-port-d3` sets it for a run with
+  the PCI devices kept, inside the run's protection;
+- the debug switches (`kernel/patches/gcc-sm8550-gdsc-debug-switches.patch`,
+  rewritten): each switch reads the state its power domains have, so
+  `debug_pcie0_off` reads `Y` at every boot of revision 11 and `N` on the
+  kernels before it; a write changes its own domains and no other (on
+  revisions 9 and 10 every write set all four from the switches); a new
+  read-only `debug_boot_state` says how the three booted (`pcie0 Y, pcie0phy
+  N, usb N`). Writing `N` to `debug_pcie0_off` gives `pcie_0_gdsc` its
+  retention back until the restart: revision 10's sleep, for an A/B run
+  (`sleep-test.sh gdsc-ret=pcie0`). It goes in one line further down than
+  on revision 10 (the genpd flag's line in `pcie_0_gdsc`'s entry). The
+  compiled data of the clock controller are revision 10's but for two
+  bytes, `pcie_0_gdsc`'s `.pwrsts` and its genpd flags (checked on a
+  scratch build, and by `make-kit.sh`). The flag sits in the GDSC table
+  because clang keeps the order of the GDSC objects in the clock
+  controller's data only that way: set from its probe or its init function
+  it moved `pcie_0_gdsc` (tried on a scratch build).
+
+Why upstream has the domain in retention (967e011013ed, "clk: qcom:
+gcc-sm8550: Do not turn off PCIe GDSCs during gdsc_disable()", v6.14): a
+PCIe host that keeps its link through a suspend loses its controller when
+the domain collapses under it, and its resume breaks. No upstream commit up
+to v7.4-rc4 and linux-next makes the domain collapse only when the host has
+powered itself down; the guard is that change. The community SM8550
+kernels that made the domain `PWRSTS_OFF_ON` (ROCKNIX PR 3636, retroforge
+patch 0143) make the root port go to D3 instead (`CONFIG_HOTPLUG_PCI_PCIE=y`
+and `pcie_port_pm=force`), so that the host powers down in every suspend
+with the Wi-Fi bound; on this kernel that is the debug switch, off at
+boot. Without the guard (revision 11 as first prepared, 2026-11-23) every
+suspend that keeps the Wi-Fi collapsed the domain under the live PCIe host,
+the boot's panel cycle (`ubuntu-gts9u-panel-coldboot-recover`,
+`pm_test=platform`, about 22 s into every boot) among them, and the
+predicted outcome, read from the source and two reports, was a Wi-Fi lost
+until the next boot, or a panic at every boot. With the guard the panel
+cycle keeps the domain on by construction: the root port is in D0 then,
+the host keeps its link, and the root port's switch cannot be set before
+the system is up. That has not run either: `verify.sh` checks the guard's
+line of the boot's first suspend and the Wi-Fi after it, and "Revision 11:
+the runs" (below) says what each outcome means.
+
+**Revision 11 also fixes the UFS PHY's power reference**, in every build of
+both tablets: no build variable and no board check, so a default build
+changes by this patch as well.
+- `kernel/patches/ufs-qcom-track-phy-power-state-gts9u.patch`: ufs-qcom
+  powers the UFS PHY on and off with the host's clocks (`phy_power_on()` and
+  `phy_power_off()`, which count), and ufshcd calls that hook again for
+  clocks that are on: a gate work that gave up on a command being
+  dispatched leaves the clocks on, and the next hold "ungates" them. Each
+  such call left the PHY one power reference more, which nothing dropped.
+  From then on the PHY never powered down, not even with its host
+  clock-gated, and the power-up sequence before each calibration skipped
+  the PHY's power-on; after a sleep that powered `ufs_mem_phy_gdsc` off,
+  every calibration timed out. That is revision 10's run 5 (2026-11-23
+  15:48): 15 calibration entries with `PWRDN 0x0` and not one `power-up
+  write` line, and before the sleep the PHY's supplies on and its own
+  clocks enabled with the host's off. The PHY's supplies were on before
+  the sleep in revision 9's run 3 (the storage lost the same way) and
+  revision 10's run 4 (a hang) too, and in none of the seven runs of
+  revisions 9 and 10 that came back with the storage. The patch keeps a
+  flag of the reference the host holds and takes and drops it only through
+  that flag, as Vladimir Oltean's posted, unmerged v8 13/31 does, and the
+  power-up sequence drops the reference the flag says the host holds, so
+  that the PHY's power-on always runs before the calibration. Mainline
+  v7.4-rc4 has the same bug (since 77d2fa54a945, v6.17-rc1).
+- `kernel/patches/ufs-qcom-phy-power-count-diagnostic.patch`, with
+  `APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1` (a diagnostic, never in a release;
+  on top of the fix, strictly, and refused for any other build in a tree
+  that carries it): at the entry of every power-up sequence, one before
+  each calibration, `ufshcd-qcom 1d84000.ufshc: power-up sequence entry: PHY
+  power_count 1 init_count N, host reference held, setup_clocks repeats:
+  power-on 0, power-off 0`; after one that failed the same at warning
+  level, `power-up sequence failed, before phy_exit(): ...`; and the first
+  16 setup_clocks calls of each kind that find the reference already as
+  they ask, `setup_clocks repeated a PHY power-on (1): clock gating state 3,
+  active_reqs 1, in the ungate work`. Each such line is a leak the fix
+  absorbed: state 3 is `REQ_CLKS_ON`, and "in the ungate work" is the path
+  above. It reads and logs only.
+
+Revision 8's PCS reset was not the fix for this failure (above, "Revision
+8"): it stays in this kit unchanged, as do the UFS PHY's two diagnostics,
+so that one thing changes at a time; it is to be dropped once the fix has
+passed.
+
+`ufs-phy-power-check.sh` (in the kit; read-only, no root, both tablets)
+says whether the running boot has such a leak, on any kernel: `sh
+~/typec-roles/ufs-phy-power-check.sh [SAMPLES] [SECONDS]` (150 samples,
+0.2 s apart, by default) reads the UFS host's runtime state and the load
+requested on its PHY's `vdda-phy` rail (`requested_microamps` of the
+regulator that has the `1d80000.phy-vdda-phy` consumer: the PHY asks
+188 mA while it is powered). `IMBALANCE` (status 1): the PHY stays powered
+while its host is runtime-suspended, a leaked reference, and on a kernel
+without the fix the next sleep's resume loses the UFS; `OK` (0);
+`INCONCLUSIVE` (3): the host was never suspended in the window, sample
+again with the tablet idle. Run it with the camera off (each camera PHY on
+the same rail asks up to 38 mA while it streams).
+
 `sleep-test.sh` is new in revision 8: deep sleeps with every disk
 filesystem frozen, so that a resume that loses the storage costs a restart
 and nothing else. It also runs on revision 7's kernel, for a baseline
@@ -198,8 +365,19 @@ without a sleep.
   9), and `clk-regmap-phy-mux.c`, `phy-qcom-qmp-pcie.c` (without the unpark
   patch), `a6xx_gmu.c`, `ufs-qcom.c` and `ufs-qcom.h` (revision 10). Against
   revision 9's tree six differ: those five and `phy-qcom-qmp-ufs.c`.
+  Revision 11 adds `kernel/patches/gcc-sm8550-pcie0-gdsc-off-in-suspend.patch`,
+  the PCIe host's half of the guard and the root port's debug switch,
+  rewrites the GDSC debug switch patch, and adds the UFS PHY power reference
+  fix and its diagnostic: twenty patches, thirteen files (`pcie-qcom.c` the
+  new one); against revision 10's tree four differ, `gcc-sm8550.c`,
+  `pcie-qcom.c`, `ufs-qcom.c` and `ufs-qcom.h`.
   `make-kit.sh` checks that, and that the configuration and the DTB are
-  byte for byte the hang-log build's.
+  byte for byte the hang-log build's. The fix's line numbers are those of
+  files with the lane clock fix, which goes on top of it, so it goes in 31
+  lines up (one in `ufs-qcom.h`) and patch(1) leaves `ufs-qcom.c.orig` and
+  `ufs-qcom.h.orig` in the build tree, as it does `dwc3-qcom.c.orig` for the
+  NULL check; `make-kit.sh` passes over such a copy when it is the hang-log
+  tree's file.
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
   the DTB, which did not change. `install.sh` checks that it still holds the
   hang-log kit's image.
@@ -207,7 +385,7 @@ without a sleep.
   its build directory, which is archived in the key registry. The hang-log
   kit has another key; revisions 2 to 7 of this kit were built in one
   directory and share theirs, revision 8 is built in that directory as
-  well, and revisions 9 and 10 in directories of their own given that key
+  well, and revisions 9 to 11 in directories of their own given that key
   (below, "Build"). The patches
   add fields to `tcpc_dev` and `tcpm_port`, and the kernel has no
   `MODVERSIONS`; a new key is what marks a module of another build, and
@@ -240,19 +418,26 @@ without a sleep.
   echo 0 | sudo tee /sys/module/sm5714_usbpd/parameters/try_snk_extra_wait_ms
   ```
 
-  The power domain change, the NULL check, the UFS PHY's PCS reset and
-  revision 10's three upstream fixes have no switch; `rollback.sh` is the
-  way back.
-- **Four debug switches** (revision 9), all off at every boot; `sleep-test.sh`
-  sets them for a run (`gdsc=`, `cxmx=ret`), `verify.sh` checks that they
-  are there and off:
+  The USB power domain change, the NULL check, the UFS PHY's PCS reset,
+  revision 10's three upstream fixes and revision 11's UFS PHY power
+  reference fix have no switch; `rollback.sh` is the way back. Revision
+  11's `pcie_0_gdsc` has the debug switch below, until the next restart;
+  its guard has none.
+- **Four debug switches** (revision 9), each read as its power domains are,
+  at every boot as the kernel's table has them: off, but `debug_pcie0_off`
+  on from revision 11; since revision 11 a fifth that says how they booted,
+  and a sixth, the root port's, off at every boot. `sleep-test.sh` changes
+  them for a run (`gdsc=`, `gdsc-ret=pcie0`, `cxmx=ret`, `root-port-d3`),
+  `verify.sh` checks that they are there and as they boot:
 
-  | Parameter | Default | `sleep-test.sh` | Meaning when `Y` |
+  | Parameter | At boot | `sleep-test.sh` | Meaning when `Y` |
   | --- | --- | --- | --- |
-  | `/sys/module/gcc_sm8550/parameters/debug_pcie0_off` | `N` | `gdsc=pcie0` | `pcie_0_gdsc` collapses at the next power-off (`OFF_ON`) |
+  | `/sys/module/gcc_sm8550/parameters/debug_pcie0_off` | `N`; `Y` on revision 11 | `gdsc=pcie0` (`Y`), `gdsc-ret=pcie0` (`N`) | `pcie_0_gdsc` collapses at the next power-off (`OFF_ON`) |
   | `/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off` | `N` | `gdsc=pcie0phy` | `pcie_0_phy_gdsc` the same |
   | `/sys/module/gcc_sm8550/parameters/debug_usb_off` | `N` | `gdsc=usb` | both USB GDSCs the same (mainline's state) |
   | `/sys/module/rpmhpd/parameters/debug_ret_floor` | `N` | `cxmx=ret` | votes for CX and MX at RETENTION or above |
+  | `/sys/module/gcc_sm8550/parameters/debug_boot_state` (revision 11, read-only) | `pcie0 Y, pcie0phy N, usb N` | | how the first three booted |
+  | `/sys/module/pcie_qcom/parameters/debug_root_port_d3` (revision 11) | `N` | `root-port-d3` | the PCIe root port goes to D3hot in system suspend, so that the host powers itself down with the Wi-Fi kept |
 
 **What it can change for other things you plug in** (the write-up has the
 detail):
@@ -285,6 +470,7 @@ X=/path/to/scratch/build-typec     # on the external drive, no spaces
 git worktree add --detach $X/source <commit>
 DEVICE=gts9wifi UBUNTU_WORKDIR=$HOME/ubuntu-gts9u TMPDIR=$HOME/ubuntu-gts9u/tmp \
   APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 APPLY_SM8550_SLEEP_FIXES=1 \
+  APPLY_SM8550_PCIE0_GDSC_OFF=1 APPLY_SM8550_PCIE0_GDSC_GUARD=1 \
   KERNEL_WORKTREE=$X/linux-src-gts9wifi KERNEL_BUILD_DIR=$X/linux-gts9wifi \
   KERNEL_OUT_DIR=$HOME/ubuntu-gts9u/out/kernel-gts9wifi-typec \
   bash $X/source/scripts/build-mainline-kernel.sh
@@ -297,14 +483,22 @@ HANG_SCRATCH=/path/to/scratch/build-hang \
 ```
 
 Without `APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1` the kernel has no
-diagnostic, without `APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1` no debug switches,
-and without `APPLY_SM8550_SLEEP_FIXES=1` none of revision 10's fixes and
-`unpark-pcie0-pipe-mux.patch` instead; `make-kit.sh` refuses each (their
-strings are not in the image, or the PIPE clock checks fail). A build tree
-that carries the diagnostics, the switches or the fixes is refused for a
-build without its variable, so a release cannot be built from it by
-mistake; and a tree that carries the unpark patch is refused for a build
-with the fixes.
+diagnostic (neither the UFS PHY's two nor ufs-qcom's counts; the UFS PHY
+power reference fix is in every build), without
+`APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1` no debug switches,
+without `APPLY_SM8550_SLEEP_FIXES=1` none of revision 10's fixes and
+`unpark-pcie0-pipe-mux.patch` instead, and without
+`APPLY_SM8550_PCIE0_GDSC_OFF=1` and `APPLY_SM8550_PCIE0_GDSC_GUARD=1`
+`pcie_0_gdsc` in retention, no guard and no root port switch (the two are
+refused one without the other); `make-kit.sh` refuses each (their strings
+are not in the image, the PIPE clock checks fail, or the build tree's
+`pcie_0_gdsc` is not `PWRSTS_OFF_ON` with the guard's flag). A build tree
+that carries the diagnostics, the switches, the fixes, the `pcie_0_gdsc`
+line or the guard is refused for a build without its variable, so a
+release cannot be built from it by mistake; a tree that carries the unpark
+patch is refused for a build with the fixes; and
+`APPLY_SM8550_PCIE0_GDSC_OFF=1` without `APPLY_SM8550_SLEEP_FIXES=1` is
+refused before anything is done.
 
 Revisions 2 to 8 were built in one directory, `build-typec`, which holds
 their module key. Revision 9 was built from scratch in a directory of its
@@ -316,7 +510,10 @@ the build's log). The build archived its row under the same key ID in the
 registry. Revision 10 was built the same way, in `build-r10`, on
 2026-11-23 from commit ab2c536: kernel build ID
 `90da273a8a49a60284ad7b06c15288b05913d931`, the same module key, no
-`GENKEY`, and the three warnings of revision 9's build.
+`GENKEY`, and the three warnings of revision 9's build. Revision 11 is to
+be built the same way, in `build-r11`, its `certs` given that key from
+`build-r10` (`~/ubuntu-gts9u/tmp/kit-r11/build-r11.sh` on the build host,
+which stops if the build makes a key of its own).
 
 The build archives its module key in the registry
 (`scripts/kernel-key-registry.sh`); `make-kit.sh` refuses a build whose key is
@@ -341,7 +538,13 @@ calls no `clk_set_rate()`; with `HANG_SCRATCH` the hang-log build's shows
 the opposite of each, and its tree is compared with the unpark patch taken
 out of its `phy-qcom-qmp-pcie.c`. The NULL check and the GMU fix leave no
 string in the image: the build tree's source and the date of its object
-are what show them.
+are what show them. For revision 11's ufs-qcom it checks that the fix and
+its diagnostic are whole in the build tree's `ufs-qcom.c` and `ufs-qcom.h`
+(the diagnostic, then the fix, come out again with no fuzz from under the
+lane clock fix), and that the image has the fix's message for a PHY
+power-on that failed and two of the diagnostic's strings; with
+`HANG_SCRATCH` its replay puts them on the hang-log tree's files after the
+lane clock fix, which gives the same files.
 `SOURCE` in the kit records the checkout, the revision and which of the
 checks ran; `REVISION` holds the revision number.
 
@@ -396,7 +599,10 @@ and running, revision 8's files copied into `~/typec-roles` and never
 installed: they changed nothing), and over an installed revision 8 alike.
 Revision 10 installs the same way over revision 9, which squirtle has had
 since 2026-11-22 20:59 (installed by its own `install.sh`, which recorded
-it), and over every earlier revision.
+it), and over every earlier revision. Revision 11 installs the same way
+over revision 10, which squirtle has had since 2026-11-23 11:37 (installed
+by its own `install.sh` over revision 9, which recorded both), and over
+every earlier revision.
 
 `rollback.sh` writes boot and the module tree back first and syncs. If it
 stops after that, it says that the hang-log kernel and its modules are back
@@ -415,6 +621,29 @@ this kit's modules, which it refuses: **no NAT, no v4l2loopback and no
 netconsole until `rollback.sh` has run**. Wi-Fi, USB networking and
 Bluetooth are built in, so it can be run over SSH; then reboot.
 
+From revision 11, the way back to revision 10 in one step: its `boot.img`
+is on the build host, `~/ubuntu-gts9u/backups/typec-roles-kit-r10/boot.img`
+(sha256 `9c09ec008578550159e6a50088cf14e9bbf2099d93cd0e0948d95e109757a606`).
+In TWRP, with the tablet on the USB cable:
+
+```sh
+adb push ~/ubuntu-gts9u/backups/typec-roles-kit-r10/boot.img /tmp/boot-r10.img  # on the host
+sha256sum /tmp/boot-r10.img                                                     # in TWRP: the hash above
+dd if=/tmp/boot-r10.img of=/dev/block/by-name/boot bs=4M                        # in TWRP
+```
+
+That boot runs revision 10's kernel with revision 11's module tree. The
+two builds share their module key, but revision 11 changes types of the
+kernel (its debug switches' descriptor, the PCIe host's new fields), and
+the kernel checks each module's BTF against its own
+(`CONFIG_DEBUG_INFO_BTF_MODULES`, without
+`CONFIG_MODULE_ALLOW_BTF_MISMATCH`): it probably refuses the tree's modules,
+as the hang-log kernel does after a restore of its image (built in: Wi-Fi,
+USB networking, Bluetooth). Then copy revision 10's kit back into
+`~/typec-roles` and run its `install.sh`: boot holds an image the record
+knows, so it runs as an upgrade and puts revision 10's module tree back;
+reboot.
+
 ## The sleep test
 
 ```sh
@@ -430,10 +659,11 @@ The whole form, with the experiment options (each off unless given; below,
 
 ```sh
 sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
-     [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
-     [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok
+     [pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
+     [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]
+     [sensors=stop] restart-ok
 sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]
-     [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok
+     [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok
 ```
 
 Each run freezes every disk filesystem and **ends with a restart of the
@@ -593,7 +823,9 @@ In order:
    `noirq suspend of devices failed`, `... suspend of devices aborted after`,
    or a device's `failed to suspend ...: error N`); less than 1 s of
    `Timekeeping suspended`; no UFS or I/O failure line, no diagnostic line
-   but calibration entries, and no line about the UFS that says something
+   but calibration entries, power-up writes and, on revision 11's kernel,
+   the counts at a power-up sequence's entry and setup_clocks lines (healthy
+   cycles have them), and no line about the UFS that says something
    failed (a line with `ufs`, `[sda]`, or a SCSI device of the UFS host
    such as `sd 0:0:0:0:`, with `fail`, `error`, `timed out`, `timing out`,
    `abort`, `offline` or `rejecting` in it: a UFS device that refused to
@@ -640,8 +872,14 @@ In order:
    N/M: diagnostic:`, revision 8's kernel) go to the result file and to
    `/dev/pmsg0` too, just before the cycle's verdict: all of them up to 16,
    otherwise the first 12, a line saying how many were left out, and the
-   last 4 (a failed resume retries its calibration 15 times, up to four
-   lines each, and pmsg is a small ring). The terminal and the run's log in
+   last 4 (a failed resume retries its calibration 15 times, up to seven
+   lines each on revision 11's kernel, and pmsg is a small ring). A failed
+   cycle whose calibrations had no PHY power-on before them gets one more
+   NEXT line, `NEXT: the UFS PHY's power-on did not run before its
+   calibration: a leaked PHY power reference (docs/resume-recovery.md, "The
+   PHY power reference")`: an entry with no `power-up write` line before it
+   on a kernel that logged one this boot, or a `power-up sequence entry` line
+   with `power_count` 2 or more. The terminal and the run's log in
    `/run` have every line until the restart. The diagnostic lines do not go
    to the kernel log, which has the driver's own. Every `RESULT` line ends
    with the experiment options in force (`; options: none` without them).
@@ -848,7 +1086,7 @@ added. Stop there. Warnings:
 - never set a PCIe switch by hand for a suspend without `pci=remove`; the
   kernel command line cannot set them, and every boot starts with them off.
 
-**Revision 10: the runs** (2026-11-23; four have run, listed after the
+**Revision 10: the runs** (2026-11-23; six have run, listed after the
 command). Install revision 10 over revision 9, reboot, and run `sh
 ~/typec-roles/verify.sh`, then `sudo sh ~/typec-roles/verify.sh` for the
 UFS host's clock counts: the kit's kernel, every debug switch `N`, the PCIe
@@ -872,8 +1110,9 @@ sleep, and `qcom_stats` and the DDR times whether the GPU and UFS fixes
 moved the depth. A `gdsc=usb` run comes only after the owner has looked at
 these: on revision 9 it cost the storage once.
 
-What ran on squirtle on 2026-11-23, the first three with the command above
-and the fourth without its `gdsc=pcie0` (logs `squirtle-sleep-r10-*.log`).
+What ran on squirtle on 2026-11-23, the first three with the command above,
+the fourth without its `gdsc=pcie0`, the fifth and sixth with `rpmh` added
+(logs `squirtle-sleep-r10-*.log`).
 The install went on over revision 9 with one command and one reboot, the
 PCIe link came up at boot without the unpark patch, Wi-Fi connected, and
 `sudo sh verify.sh` passed every check (UFS host clocks enabled once or
@@ -896,17 +1135,205 @@ twice each, where revision 9's read 522 to 525):
    tablet was restarted some 70 s later, and the record of that boot has
    nothing after the script's `cycle 1` line. Revision 9 hung the same way
    seven times of seven.
+5. 15:48, run 3's command with `rpmh`, 3 h 16 min into its boot (the floor
+   held at boot, released by the script), the ADSP and its sensor clients
+   running: the sleep came back (31.8 s, woken by the RTC) and the PCIe
+   host with it, **the storage did not**: 15 calibrations, each entry
+   `PWRDN 0x0`, not one `power-up write` line, then I/O errors and a read
+   that failed. ext4 logged 5 errors on the read-only disk and saved none;
+   the next boot mounted the root with `errors_count` 0. `ddr +830` (30.3 s
+   in low power), `adsp +1439` in 49.7 s, `aosd +0 cxsd +0`. Before the
+   sleep the UFS PHY's supplies were on and its own clocks enabled with
+   the host's clocks off: a leaked PHY power reference (above, "Revision
+   11").
+6. 16:31, run 5's command, the sensor clients stopped by hand first
+   (iio-sensor-proxy and hexagonrpcd-adsp-sensorspd): SHALLOW; the sleep,
+   the PCIe host and the storage came back (`PWRDN 0x1` after its power-up
+   write), **`adsp +0`** (1439 in run 5), `ddr +1` with the DDR in low power
+   for all 31.3 s, and still `aosd +0 cxsd +0`; the DSPs' interrupts were
+   `ipcc_0 +2, aoss-qmp +2`.
 
-So on revision 10 the PCIe host's resume is fixed with `gdsc=pcie0` (three
-of three), the storage came back each time with `PWRDN 0x1`, and the DDR
-reaches its low-power mode with the ADSP running, whichever way the floor
-was released. A stopped ADSP keeps the DDR at 547 MHz (revision 9's run 2c
-did the same): do not stop it for a run. No run reached AOSS sleep or CX
-collapse: the ADSP went in and out of its own sleep 974 to 1494 times in
-the 31 s, and the DDR as often, some 30 to 45 wakes a second. And the
-three upstream fixes do not cure the hang itself (run 4): with the root
-port removed, `pcie_0_gdsc` still has to be let off (`gdsc=pcie0`) for the
-sleep to return.
+So on revision 10 the PCIe host's resume is fixed with `gdsc=pcie0` (five
+of five), the storage came back four times of five, each with `PWRDN 0x1`
+(run 5 lost it to the leaked PHY power reference), and the DDR reaches its
+low-power mode with the ADSP running, whichever way the floor was released.
+A stopped ADSP keeps the DDR at 547 MHz (revision 9's run 2c did the
+same): do not stop it for a run. No run reached AOSS sleep or CX collapse:
+with its sensor clients running the ADSP went in and out of its own sleep
+974 to 1494 times in the 31 s, and the DDR as often, some 30 to 45 wakes a
+second; with them stopped (run 6) it did not wake, and AOSS sleep and CX
+collapse still did not come. And the three upstream fixes do not cure the
+hang itself (run 4): with the root port removed, `pcie_0_gdsc` still has to
+be let off (`gdsc=pcie0`) for the sleep to return.
+
+**Revision 11: the runs** (none has run; the kernel is not built yet). In
+this order, each in a boot of its own (every run ends in a restart),
+undocked on the PC's USB cable, without touching the screen, and each
+sleep-test command after the check of its checksum:
+
+```sh
+cd ~/typec-roles && grep ' sleep-test.sh$' SHA256SUMS | sha256sum -c --quiet &&
+  sudo sh ~/typec-roles/sleep-test.sh ...
+```
+
+1. **Install and check.** Copy the kit over revision 10's in
+   `~/typec-roles`, `sudo sh ~/typec-roles/install.sh` (an upgrade: one
+   command, one reboot), `sudo reboot`, then, a minute after the boot, `sh
+   ~/typec-roles/verify.sh` and `sudo sh ~/typec-roles/verify.sh`. No drop-in
+   is needed: the guard keeps `pcie_0_gdsc` on in the boot's panel cycle by
+   construction (above, "Revision 11"). Expected: the kit's kernel (revision
+   11), `ok   debug switches at boot (gcc_sm8550.debug_boot_state): pcie0 Y,
+   pcie0phy N, usb N`, `debug switch gcc_sm8550.debug_pcie0_off = Y`, the
+   other switches `N` (`pcie_qcom.debug_root_port_d3` among them), the PCIe
+   link up at boot, the UFS checks as on revision 10, and two lines about
+   the panel cycle (below). The UFS PHY power reference fix's diagnostic, in
+   `sudo dmesg | grep -e 'power-up sequence' -e 'setup_clocks repeated' -e
+   'power-up write' -e 'calibration entry'`: before each calibration (the
+   probe's, the panel cycle's), in this order, `ufshcd-qcom 1d84000.ufshc:
+   power-up sequence entry: PHY power_count 1 init_count N, host reference
+   held, setup_clocks repeats: power-on 0, power-off 0`, then `power-up
+   write: PWRDN 0x1 ...`, then `calibration entry: ... PWRDN 0x1 ...`.
+   `power_count 1` is the reference the host holds; 2 or more would be a
+   leak the fix did not catch. A line `setup_clocks repeated a PHY power-on
+   (n): clock gating state 3, active_reqs 1, in the ungate work` is a leak
+   the fix absorbed: it proves the trigger, and costs nothing now. And `sh
+   ~/typec-roles/ufs-phy-power-check.sh` (no root, half a minute) should say
+   `OK: the UFS PHY powers down with its host`. Before the install, on
+   revision 10's kernel, the same check says whether that boot had the leak
+   (`IMBALANCE`). The two lines about the panel cycle:
+
+   | What you see | What it means |
+   | --- | --- |
+   | `ok   PCIe power domain guard: in this boot's first suspend (the panel cycle) the host kept its link and pcie_0_gdsc stayed on` and `ok   Wi-Fi after this boot's first suspend` | the guard did its work; the Wi-Fi works as on revision 10 (check it with a ping) |
+   | `FAIL the guard did not hold this boot` | genpd powered the domain off under the live link: the controller lost its state, and the Wi-Fi line probably fails too. `sleep-test.sh` refuses a sleep with the PCI devices kept without `pci=keep` from then on. Keep `journalctl -k -b > ~/r11-guard.txt`, and go back to revision 10 (its kit's `install.sh` over this one: one command, one reboot) |
+   | `FAIL no line of the PCIe power domain's guard in this boot's first suspend` | the record is missing (the notifier did not register): the guard may work, but nothing shows it, and `sleep-test.sh` treats it as absent. Keep `journalctl -k -b` |
+   | the tablet restarts by itself 20 to 40 s into every boot | a crash in the panel cycle, which the guard is there to prevent: TWRP (Power and Volume Down until the screen goes dark, then at once Power and Volume Up), back to revision 10 (above, "If the tablet does not come back"), and the panic's record from `/var/lib/ubuntu-gts9u/pstore` after that boot |
+
+   Only as a way to use a revision 11 boot whose guard did not hold: a
+   drop-in for the panel cycle's unit that keeps the domain in retention for
+   that cycle alone, through the debug switch (the first preparation of
+   revision 11 proposed it before there was a guard). It is a change of the
+   system's configuration, not part of the kit, and it acts only on a
+   kernel that booted with `pcie0 Y`; masking the unit instead does not do
+   (the floor is then never released):
+
+   ```sh
+   d=/etc/systemd/system/ubuntu-gts9u-panel-coldboot-recover.service.d
+   sudo mkdir -p $d
+   sudo tee $d/r11-pcie0-retention.conf <<'CONF'
+   [Service]
+   # Kit revision 11: pcie_0_gdsc in retention for the boot's panel cycle (the
+   # Wi-Fi keeps its link in it), collapsed in the sleeps after it.
+   ExecStartPre=-/bin/sh -c 'p=/sys/module/gcc_sm8550/parameters; grep -qx "pcie0 Y, pcie0phy N, usb N" $$p/debug_boot_state && echo N > $$p/debug_pcie0_off'
+   ExecStartPost=-/bin/sh -c 'p=/sys/module/gcc_sm8550/parameters; grep -qx "pcie0 Y, pcie0phy N, usb N" $$p/debug_boot_state && echo Y > $$p/debug_pcie0_off'
+   CONF
+   sudo systemctl daemon-reload
+   ```
+
+   (`$$` is systemd's way to write a `$` for the shell.) To undo: `sudo rm
+   $d/r11-pcie0-retention.conf && sudo systemctl daemon-reload`.
+2. **The sleep with the root port removed**, which `pcie_0_gdsc`'s collapse
+   is for:
+
+   ```sh
+   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=remove mode=s2idle hold=60 rpmh restart-ok
+   ```
+
+   Expected: revision 10's runs 1 and 3 with `gdsc=pcie0`: the sleep comes
+   back, `PCIe came back` with `PCIe Gen.2 x1 link up` and the host's line
+   `the host powered down, and genpd powered its power domain off`, the UFS
+   reads back, `ddr` counts, `aosd +0 cxsd +0`; every verdict ends
+   `switches: pcie0 Y, pcie0phy N, usb N, cxmx N, rpd3 N; at boot: pcie0 Y`.
+   Revision 10's run 5 (2026-11-23 15:48, these options with `gdsc=pcie0`)
+   lost the storage at the resume (`qcom-qmp-ufs-phy 1d80000.phy: phy
+   initialization timed-out`, then I/O errors): the leaked UFS PHY power
+   reference, which this revision fixes (above, "Revision 11"). Each of the
+   resume's calibrations should now come with its three lines (step 1:
+   `power-up sequence entry: PHY power_count 1 ... host reference held`, then
+   `power-up write`, then `PWRDN 0x1` at the entry), also after a long
+   uptime; a `setup_clocks repeated a PHY power-on (n): clock gating state 3
+   ... in the ungate work` line, in this cycle's kernel lines or the boot's,
+   is a leak the fix absorbed. Before the first sleep the evidence has a line
+   `evidence: UFS PHY: LEAKED POWER REFERENCE: ...` if the PHY's supply is on
+   with the host clock-gated: on this kernel that would be a leak by another
+   path. A FAIL whose NEXT line says `the UFS PHY's power-on did not run
+   before its calibration: a leaked PHY power reference` is the fix not
+   holding: keep the run's pmsg record and, from the next boot, `journalctl
+   -k -b -1` (that boot's kernel lines up to the freeze). A tablet that
+   does not come back (restarted some 45 s after the RTC alarm, the pmsg
+   record ending at `entering the sleep`) means the default
+   is not what the switch did: read `debug_boot_state` in the next boot's
+   `verify.sh` and the record. A `PCIE-DOWN` with `stuck at 'off'` means the
+   PIPE clock revert is not in this kernel (`make-kit.sh` checks it). The
+   evidence lines answer what keeps the SoC from AOSS sleep and CX collapse:
+   `genpd powered off in the sleep` (`cx +1` is Linux's CX vote off), `XO
+   held by`, `rpmh sleep set`, `dsp interrupts`, and `awake, 5 s before the
+   first sleep` against the cycle's `adsp` count (below, the evidence list
+   and `rpmh`). One restart.
+3. **The guard in a real sleep, the PCI devices kept**, in `deep`, as
+   revision 7's thirteen baselines with the PCI devices kept (all came back,
+   SHALLOW):
+
+   ```sh
+   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor pci=keep hold=60 restart-ok
+   ```
+
+   Expected: `SHALLOW`, `pcie link kept (the link was kept, and its power
+   domain stayed on)`, `wifi: pci 0000:00:00.0 pcieport D0 5.0 GT/s PCIe,
+   0000:01:00.0 ath11k_pci D0 5.0 GT/s PCIe; no Wi-Fi failure line; ath11k
+   firmware loads 1`, and `genpd powered off in the sleep:
+   ... pcie_0_gdsc +0`. A `PCIE-DOWN` with the guard's warning is the guard
+   failing in a real sleep. A suspend-to-idle with the PCI devices kept has
+   not run on this port on any revision: in it `qcom_pcie_suspend_noirq()`
+   drops the host's bandwidth and OPP votes with the link up, which upstream
+   marks as breaking the link's L1 substates (ced835ae1f62); the same run
+   with `mode=s2idle` is a separate one, after this.
+4. **The root port to D3hot, at the panel cycle's level** (the switch's
+   first use, inside the protection, with no SoC sleep):
+
+   ```sh
+   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 pm_test=platform pci=keep root-port-d3 hold=60 restart-ok
+   ```
+
+   | What you see | What it means |
+   | --- | --- |
+   | `PM-TEST platform`, the pcie evidence with `PCIe Gen.2 x1 link up` and `the host powered down, and genpd powered its power domain off`, the wifi evidence with `ath11k_pci D0 5.0 GT/s PCIe; no Wi-Fi failure line; ath11k firmware loads 1` | the host powered down with the Wi-Fi bound, and the host, the root port and the Wi-Fi came back: next, step 5 |
+   | `the link was kept, and its power domain stayed on` | the root port did not go to D3hot: the cycle's kernel lines say whether the switch took (`debug: goes to D3hot in system suspend` from the root port) and the Wi-Fi's power state |
+   | `PCIE-DOWN` with `Unable to change power state from D3hot to D0, device inaccessible` | the host and its link came back, the Wi-Fi's configuration space did not answer (the PCI core reads it right after the link is up): the Wi-Fi is gone until the restart |
+   | `PCIE-DOWN` with `Link failed to come up` | the Wi-Fi chip, powered down and up with the host (pwrctrl), did not train its link |
+   | `PCIE-DOWN` with an ath11k or MHI line | the PCI side came back, and ath11k's firmware load on the cold chip failed |
+   | a restart by itself | a crash, a bus error at a first register access, probably: once only, the next boot's switch is `N` again |
+
+5. **A real sleep with the root port in D3hot**, after step 4 passed:
+
+   ```sh
+   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 hold=60 rpmh restart-ok
+   ```
+
+   Expected: step 2's result with the Wi-Fi back: the host is down in the
+   sleep as with its root port removed, the Wi-Fi chip powered down as
+   then. A tablet that does not come back means this sleep differs from
+   step 2's in something not seen yet; the record and the PMIC's reset log
+   say how far it got. It is what a normal sleep with Wi-Fi would need to
+   reach the depth of step 2.
+6. **The audio DSP's wakes**: step 2's command (or step 5's, once it
+   passes) with `sensors=stop` added. Revision 10's run 6 (2026-11-23 16:31,
+   step 2's options with `gdsc=pcie0` and the two units stopped by hand)
+   answered it once: `adsp +0` (1439 in run 5, with them running), `ddr +1`
+   for all 31.3 s, and still `aosd +0 cxsd +0`. So the sensor streams are
+   what wakes the audio DSP, and something else keeps AOSS sleep and CX
+   collapse away. `sensors=stop` makes that run repeatable, for the
+   evidence of what holds XO and CX without the DSP's wakes in it (`XO held
+   by`, `rpmh sleep set`, `genpd powered off in the sleep`).
+   Auto-rotation and auto-brightness are off until the restart.
+
+None of these makes a normal sleep with the Wi-Fi deep: that needs the root
+port to go to D3 in every suspend, the switch's effect by default, which
+a later revision can make so once step 5 has passed several times. The boot's
+panel cycle would then power the host down and up as well, at every boot:
+a link training more in it (0.27 s in revision 10's resumes, up to 3.7 s
+before the link wait gives up), and the Wi-Fi's firmware load that ath11k
+does after every suspend already.
 
 `fstrim.timer` (weekly) would, if it fired during a run, send discards to
 the read-only disk, which the block layer logs as a write and the run
@@ -921,8 +1348,26 @@ nothing):
   (`regulator_summary`), the interconnect nodes with a vote and the requests
   that make it (`interconnect_summary`; a request whose tag is 0 or has the
   sleep bit is marked `(sleep set too)`: it holds bandwidth while the CPUs
-  sleep), the wakeup sources with events, and each PCIe function's power
-  state, link, `d3cold_allowed` and wakeup;
+  sleep), the wakeup sources with events, each PCIe function's power
+  state, link, `d3cold_allowed` and wakeup; since revision 11 also every
+  prepared clock with its enable and prepare counts and its parent, the
+  clocks among them that keep XO voted in the sleep set (`XO (bi_tcxo)
+  voted in the sleep set by these prepared clocks below it`: the prepared
+  clocks below `bi_tcxo`, RPMh's XO clock, that have no prepared clock below
+  them), a line when the rails and the clocks show the UFS PHY powered with
+  its host clock-gated (`evidence: UFS PHY: LEAKED POWER REFERENCE: its
+  supply 1d80000.phy-vdda-phy is enabled (use 1) with the UFS host
+  clock-gated (gcc_ufs_phy_axi_clk 0/0) and its own clocks on
+  (gcc_ufs_phy_phy_aux_clk 1/1, tcsr_ufs_clkref_en 1/1): this boot has a
+  leaked UFS PHY power reference, ...`, and a short form in pmsg: revision
+  10's run 5 before its sleep; evidence only, the run goes on), and what the
+  SoC's states and each subsystem counted in 5 s with
+  the CPUs awake (`awake, 5 s before the first sleep: ... subsystems adsp
+  +150 ...`), to compare the audio DSP's rate awake with its rate in the
+  sleeps; the header has the audio DSP's clients in userspace (the sensor
+  proxy, the sensor and root FastRPC daemons, PipeWire), the sound streams
+  that are open, and the `*_ignore_unused` options of the kernel command
+  line;
 - before each sleep: the runtime state and clock of the UFS host, the USB
   controller's runtime state and wakeup, each PCIe function's power state,
   the DSPs (`remoteproc`), the panel's backlight, the warmest thermal zone,
@@ -930,9 +1375,11 @@ nothing):
   (`cycle N/M: evidence: before: clocks (enable/prepare): bi_tcxo 6/6,
   tcsr_ufs_pad_clkref_en 522/522, gcc_ufs_phy_axi_clk 522/522,
   gcc_ufs_phy_ahb_clk 525/525, gcc_ufs_phy_unipro_core_clk 524/524,
-  gcc_ufs_phy_ice_core_clk 525/525`, from `clk_summary`; `clk_summary not
-  readable` without it), and the power domains of the rails, the UFS, USB
-  and PCIe and any that is on;
+  gcc_ufs_phy_ice_core_clk 525/525`; `clock counts not readable` without
+  debugfs), the clocks that keep XO voted (`before: XO held by: ...`), each
+  PCI function's driver, power state and link speed (`before: pci ...`),
+  and the power domains of the rails, the UFS, USB and PCIe and any that is
+  on;
 - after it: what every `qcom_stats` file counted during the sleep (the
   SoC's `aosd`, `cxsd`, `ddr`; the subsystems, `apss` being the CPUs', with
   the time each spent asleep; `ddr_stats`' low-power modes and the time at
@@ -941,11 +1388,23 @@ nothing):
   in the cycle's kernel lines; none means the PCIe host kept its link,
   clocks and votes through the sleep) and whether the PCIe host came back
   at all (`PCIe came back (no host failure line)`, or `PCIe did not come
-  back (qcom-pcie 1c00000.pcie: Host init failed: -16)`), the same clock
-  counts as read right after the wake (`after: clocks`), the same power
-  domains, and the cycle's kernel lines (the PM core's, the CPUs', the
-  storage's, USB's, PCIe's, the DSPs', warnings and errors; at most 150,
-  without the Wi-Fi's per-packet lines and the hung-task reports).
+  back (qcom-pcie 1c00000.pcie: Host init failed: -16)`), on revision 11
+  what genpd did with the PCIe host's power domain, as the host logged it
+  (`the host logged: the link was kept, and its power domain stayed on`),
+  the Wi-Fi's state (`wifi: pci 0000:00:00.0 pcieport D0 5.0 GT/s PCIe,
+  0000:01:00.0 ath11k_pci D0 5.0 GT/s PCIe; no Wi-Fi failure line; ath11k
+  firmware loads 1`), the DSPs' interrupt lines that fired (`dsp interrupts:` IPCC, glink, SMP2P, the
+  remoteprocs' and the AOSS mailbox's), what genpd powered off in the sleep
+  (`genpd powered off in the sleep (idle states usage of each domain): cx
+  +1, mx +0, ...`: `cx +1` is Linux voting CX off, level 0, in every RPMh
+  set at the end of the noirq phase; `+0` is a domain that genpd kept on),
+  the clocks that keep XO voted as read right after the wake (`after: XO
+  held by:`), with `rpmh` the sets Linux handed the RPMh hardware for the
+  sleep (`rpmh sleep set`, below), the same clock counts (`after:
+  clocks`), the same power domains, and the cycle's kernel lines (the PM
+  core's, the CPUs', the storage's, USB's, PCIe's, the DSPs', warnings and
+  errors; at most 150, without the Wi-Fi's per-packet lines and the
+  hung-task reports).
 
 The clock counts are for revision 10's UFS fix: with it, ufshcd enables
 the UFS host's clocks once while UFS works and not while it idles, so
@@ -953,18 +1412,41 @@ the UFS host's clocks once while UFS works and not while it idles, so
 `tcsr_ufs_pad_clkref_en` read 0 or 1, and the inline crypto engine's
 driver holds `gcc_ufs_phy_ice_core_clk` and `gcc_ufs_phy_ahb_clk` from its
 probe on, so those read 1 to 3. Counts in the hundreds are the leak.
-Reading `clk_summary` resumes the clock controllers for a moment; the run
-reads it once before each sleep, before its other reads, and once right
-after the wake.
+Since revision 11 the counts and parents come from each clock's own
+debugfs directory (`/sys/kernel/debug/clk/NAME/clk_enable_count`,
+`clk_prepare_count`, `clk_parent`): plain counters, which resume no clock
+controller and cannot fail for another clock. Revision 10 read
+`clk_summary`, which resumes every clock controller first and fails whole
+when one cannot resume: with the ADSP stopped, `clk_summary not readable`
+and the kernel's `clk: Failed to runtime PM get '6d44000.codec' for clk
+'fsgen'`.
 
-pmsg gets three short lines of it per cycle (`cycle N/M: evidence: ...`,
+What the XO line is for: RPMh's `bi_tcxo` votes XO on in the sleep set as
+well while it is prepared (`clk-rpmh.c`), and every clock prepared below it
+keeps it prepared. XO voted in the sleep set rules out XO shutdown, and with
+it CX collapse and AOSS sleep (`cxsd`, `aosd`; Qualcomm's QCS6490 page:
+`cxsd` is XO off and CX at its lowest). The list is read with the CPUs
+awake, right before the sleep and right after the wake; a clock in both
+that its driver does not drop in its suspend is a holder through the
+sleep, and so is a consumer of XO itself (`bi_tcxo itself N`: a PHY's or a
+DSP's reference clock). The inline crypto engine's core clock, for one,
+reads 1 with the UFS host idle, but ufs-qcom's suspend releases the
+engine's reference (`qcom_ice_suspend()`), so it probably does not hold XO
+in a sleep: read from the source, to be seen in these lines.
+
+pmsg gets five short lines of it per cycle (`cycle N/M: evidence: ...`,
 the `qcom_stats` line, one with the PCIe link, whether the PCIe host came
-back, the top interrupts, the wakeup sources and the state before, and
-one with the clock counts before and after in short names: `clocks before:
+back, the top interrupts, the wakeup sources and the state before, one
+with the clock counts before and after in short names: `clocks before:
 xo 6/6, pad_clkref 0/0, axi 0/0, ahb 1/1, unipro_core 0/0, ice_core 1/1;
-after: ...`), between the cycle's diagnostic lines and its verdict. Reading
-`qcom_stats/ddr_stats` sends the AOSS a request to update its numbers, as
-every read of that file does; everything else is a plain read.
+after: ...`, one with the Wi-Fi's state, what genpd powered off among the
+rails and the UFS, PCIe and USB domains, and the DSPs' interrupts, and one
+with the clocks that held XO after the wake; with `rpmh` a sixth, the
+levels and the voted BCMs of the sleep set), between the cycle's
+diagnostic lines and its verdict. Reading `qcom_stats/ddr_stats` sends the
+AOSS a request to update its numbers, as every read of that file does;
+reading a domain's `idle_states` takes that domain's lock for a moment;
+everything else is a plain read.
 
 **The experiment options** (2026-11-22). Each is off unless given, so a run
 without them does what it did before. They are for telling apart why a deep
@@ -1123,29 +1605,144 @@ name the ones in force (`options: none` without them).
   - **ABORTED (s2idle)**, **NO-SLEEP (freezer, s2idle)**, **PM-TEST LEVEL
     (s2idle)**, **PCIE-DOWN (s2idle)**: as in `deep`; a PM-TEST cycle
     never enters the idle loop (`no suspend-to-idle`).
-- **`gdsc=LIST`** and **`cxmx=ret`** (`ro` and `dry`; the kernels of
-  revisions 9 and 10):
-  the debug switches (above, "Revision 9"). `gdsc=` takes one or more of
-  `pcie0`, `pcie0phy` and `usb`, comma-separated, and is refused without
-  `pci=remove`: with the PCI devices kept the PCIe host stays up through
-  the sleep, and a PCIe GDSC that collapses would take the controller away
-  from a live host. Refused too, with nothing changed, when the kernel does
-  not offer a switch asked for (revisions 8 and before), or when any switch
-  it offers is on already (set by hand: put it back, `echo N | sudo tee
-  FILE`, or restart). The run writes `Y` to each switch asked for right
-  before the freeze, after `pci=remove`'s removal, and reads each back; one
-  that does not read `Y` stops the run before anything is frozen, with the
-  ones that took put back to `N`. After that nothing puts them back but the
-  restart that ends the run. Every run, with switches or not, prints them as
-  they read: the header (`debug switches: pcie0 N, pcie0phy N, usb N, cxmx
-  N (...)`, or `debug switches: not offered by this kernel` on revision 8's
-  and older kernels), a progress line in pmsg right after the write, the
-  progress line before each sleep, every cycle's verdict and every `RESULT`
-  line (`...; floor released; switches: pcie0 Y, pcie0phy N, usb N, cxmx
-  N`, and `; options: pci=remove gdsc=pcie0; switches: ...` at the end of a
-  `RESULT`). So the pstore record of a run that never comes back says which
-  were set for the sleep it entered. With `gdsc=usb` while the tablet is USB
-  host the run says the xHCI is not expected to survive: run undocked.
+- **`gdsc=LIST`**, **`gdsc-ret=pcie0`** and **`cxmx=ret`** (`ro` and `dry`;
+  the kernels of revisions 9 to 11): the debug switches (above, "Revision
+  9" and "Revision 11"; the root port's is `root-port-d3`, below). Each
+  boots as the kernel's table has it: `N`, but `pcie0` `Y` on revision 11's
+  kernel, which says how they booted in
+  `debug_boot_state`; on an earlier one every switch boots `N`. `gdsc=`
+  takes one or more of `pcie0`, `pcie0phy` and `usb`, comma-separated, and
+  writes `Y` to each (on revision 11 `pcie0` is `Y` already); it is refused
+  without `pci=remove`: with the PCI devices kept the PCIe host stays up
+  through the sleep, and a PCIe GDSC that collapses would take the
+  controller away from a live host. `gdsc-ret=pcie0` writes `N` to `pcie0`:
+  `pcie_0_gdsc` stays on in retention in the run's sleeps, as on revision
+  10, for an A/B run on revision 11 (with `pci=remove` that is the sleep
+  that hung 8 times of 8; with the PCI devices kept, the sleep revision 10
+  had, in which revision 11's guard keeps the domain on either way).
+  Refused too, with nothing changed, when the kernel does not offer a
+  switch asked for (revisions 8 and before), or when any switch it offers
+  does not read as it booted (set by hand: put it back, `echo N | sudo tee
+  FILE`, `echo Y` for revision 11's `pcie0`, or restart). The run writes
+  each switch it was given right before the freeze, after `pci=remove`'s
+  removal, and reads each back; one that does not read what was written
+  stops the run before anything is frozen, with the ones that took put back
+  as they booted. After that nothing puts them back but the restart that
+  ends the run. Every run, with switches or not, prints them as they read:
+  the header (`debug switches: pcie0 N, pcie0phy N, usb N, cxmx N (...)`,
+  with `rpd3 N` after them on revision 11,
+  or `debug switches: not offered by this kernel` on revision 8's and older
+  kernels; on revision 11 also `debug switches at boot: pcie0 Y, pcie0phy N,
+  usb N` and what `pcie_0_gdsc` does in the run's sleeps), a progress line
+  in pmsg right after the write, the progress line before each sleep, every
+  cycle's verdict and every `RESULT` line (`...; floor released; switches:
+  pcie0 Y, pcie0phy N, usb N, cxmx N`, `rpd3 N` and `; at boot: pcie0 Y`
+  after it on revision 11, and `; options: pci=remove gdsc=pcie0; switches: ...` at the
+  end of a `RESULT`). So the pstore record of a run that never comes back
+  says which were set for the sleep it entered, and whether by the kernel
+  or by the run. With `gdsc=usb` while the tablet is USB host the run says
+  the xHCI is not expected to survive: run undocked.
+- **`pci=keep`** (`ro`): the PCI devices stay, and the run watches the
+  Wi-Fi. It reads the Wi-Fi's state after each resume (`evidence: wifi`:
+  each PCI function's driver, power state and link speed, the first line of
+  the cycle that says the Wi-Fi did not come back, and how often ath11k
+  loaded its firmware), and a cycle whose kernel lines say the PCIe host or
+  the Wi-Fi did not come back (`Unable to change power state from D3hot to
+  D0, device inaccessible`, an ath11k or MHI failure, a root port error) or
+  that the guard did not hold ends the run with `SLEEP-TEST RESULT:
+  PCIE-DOWN after cycle N/M: with the PCI devices kept, ...` and its restart.
+  Give it one cycle. On revision 11's kernel `pcie_0_gdsc` collapses in a
+  sleep in which the PCIe host has powered itself down, and its guard keeps
+  it on in one in which the host keeps its link (above, "Revision 11"). The
+  run reads this boot's kernel log for the host's lines before it does
+  anything (the header names what it found, `PCIe power domain guard:
+  held this boot ...`): the guard held when at least one sleep logged `the
+  link was kept, and its power domain stayed on` and none `the link was
+  kept, but genpd powered its power domain off`. A sleep with the PCI
+  devices kept, on a kernel whose `pcie0` switch reads `Y` at the sleep
+  (without `gdsc-ret=pcie0`) and whose guard did not hold, or which has none
+  (revision 11 as first prepared), is refused without `pci=keep` or
+  `pci=remove`, with nothing changed (`dry`, and `pm_test=freezer` or
+  `devices`, which stop before the noirq phase, need nothing): genpd could
+  collapse the domain under the live host, and the Wi-Fi not come back
+  until the next boot, or the tablet crash at the resume. With a guard that
+  held, a run without `pci=` keeps the PCI devices as on revision 10, and a
+  line of the guard failing ends it as with `pci=keep`. On an earlier
+  kernel a run without `pci=keep` or `pci=remove` does what it did before.
+- **`root-port-d3`** (`ro`, with `pci=keep`; revision 11's kernel): `Y` to
+  `/sys/module/pcie_qcom/parameters/debug_root_port_d3` right before the
+  freeze, read back, and nothing puts it back but the restart (the
+  switch's word in the record is `rpd3`). From the next sleep the PCIe root
+  port goes to D3hot after the Wi-Fi does, the host powers itself down with
+  the Wi-Fi bound (PME_Turn_Off, then the link, the PHY, the Wi-Fi chip's
+  power and `pcie_0_gdsc` go off), and the resume sets the host up again,
+  trains the link and restores the root port and the Wi-Fi; ath11k powers
+  its chip down and up at every suspend anyway (above, "Revision 11"). It
+  is a sleep with the root port removed (`pci=remove`) with the Wi-Fi kept:
+  whether the Wi-Fi comes back from it is what such a run is for. The
+  cycle's pcie evidence names the host's line (`the host powered down, and
+  genpd powered its power domain off`) and the link coming back (`PCIe
+  Gen.2 x1 link up`), the wifi evidence the functions and ath11k's firmware
+  loads. Refused, with nothing changed: without `pci=keep`; with
+  `pci=remove` (no root port left); with `gdsc-ret=pcie0` (a host powered
+  down under `pcie_0_gdsc` kept in retention is the sleep that hung 8 times
+  of 8); with `dry` or `pm_test=freezer` or `devices` (the root port goes to
+  D3hot in the noirq phase); on a kernel without the switch; and when the
+  guard did not hold this boot. A write the kernel does not take (`-ENODEV`
+  when it finds no root port of a qcom PCIe host) stops the run before
+  anything is frozen. First use on the tablet: see "Revision 11: the runs",
+  steps 4 and 5.
+- **`sensors=stop`** (`ro`): `sudo systemctl stop iio-sensor-proxy.service
+  hexagonrpcd-adsp-sensorspd.service` right after the record of the state
+  before the run, which names both as they were (`ADSP clients: ...`),
+  before the floor's release, then 10 s to settle; the log names what each
+  is afterwards, and one still active stops the run before anything is
+  frozen. iio-sensor-proxy keeps the SSC sensor streams the desktop asks for
+  (orientation, ambient light) open through libssc; `hexagonrpcd -s` is the
+  sensor protection domain's file server on the audio DSP. With both
+  stopped the audio DSP's wakes (`qcom_stats` `adsp` in each sleep, and
+  `awake, 5 s before the first sleep`) say whether those streams wake it 30
+  to 50 times a second. A systemd suspend stops `hexagonrpcd-adsp-sensorspd`
+  itself (`Conflicts=suspend.target`) and a system-sleep hook starts it
+  again after the resume, while iio-sensor-proxy keeps running; `rtcwake`,
+  which the run sleeps with, goes around both, so without `sensors=stop`
+  both run through the test's sleeps. Nothing starts them before the
+  restart that ends the run; a stop before any sleep leaves them stopped
+  until the next boot (`sudo reboot` brings them back; the sensor protection
+  domain's unit makes one attempt per boot, `Restart=no`, as a failed attach
+  can take the audio DSP and the sound down with it). Auto-rotation and
+  auto-brightness are off until then. The options name it in every
+  `RESULT` line.
+- **`rpmh`** (`ro`; revision 11's script, any kit kernel): what of Linux's
+  own votes stands in the way of XO shutdown, CX collapse and AOSS sleep
+  (`cxsd`, `aosd`). When the CPUs' cluster powers down, Linux hands the RPMh
+  hardware a sleep set and a wake set (`rpmh_flush()`), written whole when a
+  vote changed since the last time; a resource whose sleep vote is its wake
+  vote is left out of both, and stays at that vote through the sleep. The
+  run turns the kernel's tracepoint for those writes on right before the
+  freeze (`/sys/kernel/tracing/events/rpmh/rpmh_send_msg/enable`), reads
+  the command DB once (`/sys/kernel/debug/cmd-db`, the names of the RPMh
+  addresses), empties the trace right before each sleep, and after it
+  prints the last write of the sets before the sleep (`evidence: rpmh sleep
+  set: the last of N flushes before the sleep at T (at T0, C commands),
+  sleep/wake: xo.lvl 0x0/0x3, MC0 0x40000000/0x60004001, ...; left out, so
+  held at their vote through the sleep: cx.lvl (active 0x0), mx.lvl`, and a
+  short form in pmsg). How to read it: `xo.lvl`, `cx.lvl` and `mx.lvl` are
+  levels, `0` is off; a sleep value of `0` for `xo.lvl` is XO free to shut
+  down as far as Linux goes, and `xo.lvl` among the left-out ones is XO
+  held on by Linux (`bi_tcxo` prepared: its sleep vote equals its wake
+  vote); `cx.lvl` left out with `active 0x0` is CX voted off by Linux in
+  every set. A BCM (`MC0` is the DDR, `SH0` the memory NoC, ...) whose
+  sleep value has bit 29 set (`0x2...` or `0x6...`) holds bandwidth in the
+  sleep. `no flush before the sleep` means no vote changed between the
+  emptying and the sleep: the hardware slept with an earlier flush's sets,
+  and the line cannot say which. Refused, with nothing changed, without the
+  tracepoint, with tracing off (`tracing_on` 0) or with a trace clock other
+  than `local` (the kernel log's, by which the sleep is found). It changes
+  no vote and costs a few trace lines per write; a stop before any sleep
+  turns the tracepoint off again, and the restart that ends every run does
+  too. It shows Linux's votes only: the audio DSP's and the AOSS's own are
+  not in it.
 
 **The interconnect floor.** `ubuntu-gts9u-icc-late-release` releases it
 about 45 s into a boot. After a boot that released it and then ended
@@ -1178,31 +1775,43 @@ frozen (`sudo`, `reboot` and a new login may hang): force the restart with
 Power and Volume Down held; for TWRP, hold Power and Volume Down until the
 screen goes dark, then at once Power and Volume Up.
 
-**Reading the diagnostic** (the kernels of revisions 8 to 10). After each
+**Reading the diagnostic** (the kernels of revisions 8 to 11). After each
 resume the run prints the diagnostic's lines of the cycle. `calibration
 entry:` shows the PCS and SerDes state the calibration started from. What
 follows is inferred from the registers, not proven. `SW_RESET 0 START 0x1`
 after a resume would be what the last calibration left: the PCS kept its
 registers through the sleep, the case revision 8's reset was written for.
 It has not been seen: every entry on record, 11 that passed and 15 that
-failed, reads `SW_RESET 0x1 START 0x0`, a PCS fresh from its reset.
+failed up to revision 9's runs, and the 4 and 15 of revision 10's sleeps
+since, reads `SW_RESET 0x1 START 0x0`, a PCS fresh from its reset.
 `PWRDN` is the analog power-up bit that the PHY's power-on sets right
 before the calibration: `0x1` in every calibration that passed, `0x0` in
-every one of the 2026-11-23 failure. Revision 10 logs a line before each
-entry, `power-up write: PWRDN A right after it, B 100 us later`: `0x1` and
-`0x1` with `PWRDN 0x0` at the entry means the bit was undone after the
-power-on; `0x1` then `0x0`, undone within 100 us; `0x0` right after the
-write, the write did not take (the PHY lacked an input it needs, its core
-supply L1D the first suspect). If a cycle fails with `phy initialization
-timed-out`, the lines after it say what to try next:
+every one of the 2026-11-23 failures. Revision 10 logs a line in that
+power-on, right before each entry, `power-up write: PWRDN A right after it,
+B 100 us later`. **`PWRDN 0x0` at the entry with no `power-up write` line
+before it means the power-on did not run**: the PHY held a power reference
+more than its host's, so `phy_power_on()` skipped it, and its registers
+were at their reset values after a sleep that powered its GDSC off. That
+is revision 10's run 5, all 15 entries, and not a write that did not hold
+(docs/resume-recovery.md, "The PHY power reference"); the run's NEXT line
+says so. Revision 11's line before it, `power-up sequence entry: PHY
+power_count N ...`, tells the same from the count: 1 is the host's
+reference, 2 or more a leak. With the write's line there: `0x1` and `0x1`
+with `PWRDN 0x0` at the entry means the bit was undone after the power-on;
+`0x1` then `0x0`, undone within 100 us; `0x0` right after the write, the
+write did not take. None of these has been seen. If a cycle fails with `phy
+initialization timed-out` after a power-up write, the lines after it say
+what to try next:
 - `PCS_READY ... us after the timeout, within 1 s of SERDES_START`: the PHY
   was only slow; give the poll the Kalama driver's 1 s;
 - `no PCS_READY within 1 s` with `C_READY 0x1` (the SerDes PLL ready): the
   PCS is stuck despite its reset; next, the external `ufsphy` reset that the
   Kalama driver asserts around calibration;
 - `no PCS_READY within 1 s` with `C_READY 0`: the PLL never became ready;
-  next, the PHY's analog supply (L1D, which the stock device tree gives the
-  PHY and this one does not describe) or its reference clock.
+  next, the PHY's reference clock or its analog supply. (The stock device
+  tree gives the PHY's `vdda-phy` as L1D, which this one does not describe,
+  where it has L1E: a device-tree difference to put right on its own, which
+  the failures of 2026-11-23 no longer need to explain.)
 
 ## The plug-in recorder
 
@@ -1281,7 +1890,12 @@ the kit's kernel, on a boot without a PCIe link-up line, fails on a GPU
 RSC sequence that timed out (`Unable to power off the GPU RSC` and the
 like), and under `sudo` reads the UFS host's clock counts from
 `clk_summary`: more than 3 on the kit's kernel fails (the leak), and on
-another kernel they are a note.
+another kernel they are a note. For revision 11 it fails on any sleep this
+boot whose PCIe host logged the guard failing (`the link was kept, but
+genpd powered its power domain off`), and, on the kit's kernel, on a boot's
+first suspend without a line of the guard (`ok` for `the link was kept, and
+its power domain stayed on`, a note for any other), and wants the root
+port's switch `N`; then the Wi-Fi after that suspend, as before.
 
 What a passing dock looks like in `trial-N.tcpm.log` is in the write-up:
 `SNK_READY -> AMS_START`, `Requesting DFP before discovery`, `AMS_START ->
@@ -1297,7 +1911,11 @@ again, up to three per attach; the verdict is still the roles.
    10 also the PCIe link up at boot, no GPU RSC failure, a `power-up write`
    line per calibration, and under `sudo` the UFS host's clock counts at 3
    or less. Then check that Wi-Fi works: revision 10 switches PCIe0's pipe
-   clock without `unpark-pcie0-pipe-mux.patch`.
+   clock without `unpark-pcie0-pipe-mux.patch`. On revision 11 also
+   `debug switches at boot ... pcie0 Y, pcie0phy N, usb N`, the root port's
+   switch `N`, the PCIe power domain's guard in the boot's first suspend,
+   the panel cycle, and the Wi-Fi after it (above, "Revision 11: the runs",
+   step 1).
 2. `sudo sh ~/typec-roles/verify.sh dock 10` with each powered dock. Note
    whether the battery charges; near 100 % it reports `Full` and no current.
    Keep a dock's own charger plugged in: without it the dock has no power
@@ -1346,7 +1964,7 @@ again, up to three per attach; the verdict is still the roles.
    reached a PASS yet: no recorded sleep of the SM-X710 has counted AOSS
    sleep, CX collapse or DDR low power. Revision 9's runs ("Revision 9:
    the runs", above) came first; revision 10's run comes before any of the
-   rest.
+   rest, and revision 11's (above, "Revision 11: the runs") after it.
 7. Bluetooth, Wi-Fi, audio and the rear camera at a known size: the kernel was
    rebuilt. Revision 10 changes the PCIe PHY's pipe clock (Wi-Fi), the GPU's
    power-down and power-up, and the UFS host's clocks; watch for GPU hangs

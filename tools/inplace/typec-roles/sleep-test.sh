@@ -2,10 +2,11 @@
 # Deep sleeps of the SM-X710 with every disk filesystem frozen, to test
 # whether the UFS storage comes back, without risking the data on it.
 #   sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
-#        [pci=remove] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
-#        [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok
+#        [pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
+#        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]
+#        [sensors=stop] restart-ok
 #   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]
-#        [gdsc=pcie0,pcie0phy,usb] [cxmx=ret] restart-ok
+#        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok
 #   sh ~/typec-roles/sleep-test.sh status
 # ro (the default): CYCLES deep sleeps (default 3, at most 10) of SECONDS
 # each (15, 30 or 60; default 30), each woken by the RTC.  dry: the same
@@ -23,7 +24,14 @@
 # Do not touch the screen during a run.
 # Experiments, each off unless given (below, "The experiment options"):
 # pci=remove removes every PCI root port, and the Wi-Fi with it, right
-# before the freeze, until the restart.  pm_test=LEVEL (freezer, devices,
+# before the freeze, until the restart; pci=keep keeps them and watches the
+# Wi-Fi, and a kernel that collapses pcie_0_gdsc in the sleep (revision 11)
+# without a guard that held this boot needs one or the other.
+# root-port-d3 (with pci=keep) lets the PCIe root port go to D3hot in the
+# sleeps, so that the host powers itself down with the Wi-Fi kept (revision
+# 11's debug switch).  sensors=stop stops iio-sensor-proxy and
+# hexagonrpcd-adsp-sensorspd before the run, until the restart, for an A/B of
+# the audio DSP's wakes.  pm_test=LEVEL (freezer, devices,
 # platform, processors or core) makes each cycle's suspend stop at that
 # level, wait there and resume, with no SoC sleep call: a PM-TEST verdict,
 # no depth.  mode=s2idle sleeps each cycle with rtcwake -m freeze
@@ -34,10 +42,14 @@
 # resume); trace=live also keeps the consoles printing while devices
 # suspend and resume (console_suspend N), at a cost: read the risks below
 # first.  gdsc=LIST (pcie0, pcie0phy and usb, comma-separated; with
-# pci=remove only) and cxmx=ret set the kernel's debug switches (revision
-# 9's kernel) right before the freeze, until the restart: the PCIe and USB
-# GDSCs collapse in the sleep instead of staying on, and the CX and MX votes
-# stay at RETENTION or above.  Every run prints the switches as they are.
+# pci=remove only), gdsc-ret=pcie0 and cxmx=ret set the kernel's debug
+# switches (the kernels of revisions 9 to 11) right before the freeze, until
+# the restart: the PCIe and USB GDSCs collapse in the sleep instead of
+# staying on, pcie_0_gdsc stays on (in retention) where revision 11 lets it
+# collapse, and the CX and MX votes stay at RETENTION or above.  Every run
+# prints the switches as they are, and how they booted.  rpmh turns the
+# RPMh tracepoint on for the run and names, after each sleep, the sleep set
+# that the application processor's RSC slept with (XO, CX, MX, bandwidth).
 # status (no root) prints the latest run's result from /run.
 #
 # On 2026-11-21 one deep sleep (rtcwake -m mem -s 30) did not bring the UFS
@@ -150,12 +162,18 @@
 #     none), the power domains of the rails, the UFS, USB and PCIe, the
 #     runtime state of the UFS host and of the USB controller, the DSPs, the
 #     panel's backlight, the warmest thermal zone, the enable and prepare
-#     counts of the UFS host's clocks and of XO (clk_summary, right before
-#     the sleep and right after the wake), and the cycle's kernel lines;
-#     once before the first sleep, every power domain, the rails in use, the
-#     bandwidth votes (those in the sleep set marked) and the PCIe
-#     functions.  The terminal gets all of it ("evidence:" lines), pmsg three
-#     short lines per cycle; a read that fails changes nothing;
+#     counts of the UFS host's clocks and of XO (each clock's own debugfs
+#     files, right before the sleep and right after the wake), the prepared
+#     clocks below XO that keep it voted in the sleep set, the PCI functions'
+#     state, what genpd powered off in the sleep (each domain's idle states),
+#     the DSPs' interrupts, and the cycle's kernel lines; once before the
+#     first sleep, every power domain, the rails in use, the bandwidth votes
+#     (those in the sleep set marked), the PCIe functions, every prepared
+#     clock, a line when those show the UFS PHY powered with its host
+#     clock-gated (a leaked PHY power reference: ev_phy_leak), and the SoC's
+#     and subsystems' sleep counts over 5 s awake.  The
+#     terminal gets all of it ("evidence:" lines), pmsg five short lines per
+#     cycle; a read that fails changes nothing;
 #   - a suspend that the kernel gave up before the tablet slept (a wakeup
 #     on the way down, such as the touchscreen's double tap, or a device
 #     that refused to suspend), with the storage reading back as before and
@@ -389,36 +407,141 @@
 #     cycle is tried again like an ABORTED attempt, within the same aborts=N,
 #     past which the run ends with NO-SLEEP (s2idle).  A cycle in which no
 #     CPU entered its s2idle state and no such wakeup explains it FAILs.
-#   - gdsc=LIST and cxmx=ret (ro and dry; the kernels of revisions 9 and
-#     10): the kernel's
-#     debug switches, run-time module parameters that every boot starts with
-#     off (N) and that nothing but root's write changes
+#   - gdsc=LIST, gdsc-ret=pcie0 and cxmx=ret (ro and dry; the kernels of
+#     revisions 9 to 11): the kernel's debug switches, run-time module
+#     parameters that nothing but root's write changes
 #     (gcc-sm8550-gdsc-debug-switches.patch, rpmhpd-debug-retention-floor.patch):
-#       pcie0     gcc_sm8550 debug_pcie0_off: pcie_0_gdsc OFF_ON, not RET_ON
+#       pcie0     gcc_sm8550 debug_pcie0_off: pcie_0_gdsc OFF_ON (Y), not RET_ON (N)
 #       pcie0phy  gcc_sm8550 debug_pcie0_phy_off: pcie_0_phy_gdsc the same
 #       usb       gcc_sm8550 debug_usb_off: both USB GDSCs the same
 #                 (mainline's; the docked xHCI dies with it: run undocked)
 #       cxmx=ret  rpmhpd debug_ret_floor: the APPS votes for cx.lvl and
 #                 mx.lvl at RETENTION or above in every RPMh set
-#     With a GDSC switch on, genpd's power-off of that GDSC at the end of the
-#     suspend's noirq phase collapses it (drops the APPS vote of a PCIe one)
-#     instead of leaving it on in hardware.  gdsc= is refused without
-#     pci=remove: with the PCI devices kept the PCIe host stays up through
-#     the sleep, and a collapsed PCIe GDSC would take the controller away
-#     from a live host.  Refused, with nothing changed, when the kernel does
-#     not offer a switch asked for (r8 and before), or when any switch it
-#     offers is on already (set by hand: the run's record would not say
-#     who set it).  The run writes Y to each switch asked for right before
-#     the freeze (after pci=remove's removal, in RAM, the disk still
-#     writable), reads each back (one that does not read Y stops the run
-#     before anything is frozen, with the ones that took put back to N),
-#     and never puts them back after that: the restart that ends every run
-#     does.  The header, the progress line right after the write and the
-#     one before each sleep, every cycle's verdict and every RESULT line
-#     name the switches as read then ("switches: pcie0 Y, pcie0phy N, usb
-#     Y, cxmx N"; "switches: not offered by this kernel" on a kernel
-#     without them), whether a run asked for any or not, so the pmsg record
-#     of a run that never comes back says which were set.
+#     Each boots as the kernel's table has it: N on the kernels of revisions
+#     9 and 10, and N but pcie0 Y on revision 11's, whose pcie_0_gdsc is
+#     OFF_ON from the boot (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch).  A
+#     revision 11 kernel says how they booted (debug_boot_state, sw_boot);
+#     on an earlier one every switch booted N.  gdsc=LIST writes Y to each
+#     switch it names, gdsc-ret=pcie0 writes N to pcie0 (pcie_0_gdsc kept in
+#     retention: revision 10's sleep, for an A/B run on revision 11), and
+#     cxmx=ret writes Y to cxmx.  With a GDSC switch Y, genpd's power-off of
+#     that GDSC at the end of the suspend's noirq phase collapses it (drops
+#     the APPS vote of a PCIe one) instead of leaving it on in hardware.
+#     gdsc= is refused without pci=remove: with the PCI devices kept the PCIe
+#     host stays up through the sleep, and a PCIe GDSC that collapses would
+#     take the controller away from a live host.  Refused, with nothing
+#     changed, when the kernel does not offer a switch asked for (r8 and
+#     before), or when any switch it offers does not read as it booted (set
+#     by hand: the run's record would not say who set it).  The run writes
+#     each switch it is given right before the freeze (after pci=remove's
+#     removal, in RAM, the disk still writable), reads each back (one that
+#     does not read what was written stops the run before anything is
+#     frozen, with the ones that took put back as they booted), and never
+#     puts them back after that: the restart that ends every run does.  The
+#     header, the progress line right after the write and the one before
+#     each sleep, every cycle's verdict and every RESULT line name the
+#     switches as read then ("switches: pcie0 Y, pcie0phy N, usb Y, cxmx N",
+#     with "; at boot: pcie0 Y" after it where a switch booted Y, and
+#     "switches: not offered by this kernel" on a kernel without them),
+#     whether a run asked for any or not, so the pmsg record of a run that
+#     never comes back says which were set.
+#   - pci=keep (ro): the PCI devices stay, and the run watches the Wi-Fi:
+#     it reads the Wi-Fi's state after each resume (evidence: wifi), and a
+#     cycle whose kernel lines say the PCIe host or the Wi-Fi did not come
+#     back ends the run (PCIE-DOWN) and restarts it.  Give it one cycle.  In
+#     a sleep with the PCI devices kept the PCIe host keeps its link (the
+#     root port stays in D0, see pci=remove), unless root-port-d3 (below)
+#     lets the root port go to D3hot.  Revision 11's kernel lets pcie_0_gdsc
+#     collapse in system suspend (its pcie0 switch boots Y), and its guard
+#     (the genpd flag of gcc-sm8550-pcie0-gdsc-off-in-suspend.patch and
+#     pcie-qcom-keep-power-domain-while-link-kept.patch) keeps it on in a
+#     suspend in which the host keeps its link: genpd leaves a domain with
+#     GENPD_FLAG_ACTIVE_WAKEUP on for a device on the awake path, which the
+#     host sets then.  The host logs at each resume what genpd did with its
+#     domain ("system sleep: the link was kept, and its power domain stayed
+#     on", guard_re below), the boot's panel cycle (pm_test=platform, at
+#     every boot) among those, so the run knows from this boot's kernel log
+#     whether the guard held: "held" is at least one such line and none
+#     "the link was kept, but genpd powered its power domain off" (a
+#     controller that lost its state under its live link).  On a kernel whose
+#     pcie0 switch reads Y at the sleep (without gdsc-ret=pcie0) and whose
+#     guard did not hold, or which has none (revision 11 as first prepared),
+#     a sleep with the PCI devices kept is refused without pci=keep, with
+#     nothing changed (dry, and a pm_test= level short of the noirq phase, do
+#     not need it): genpd would collapse the GDSC under the live host, and
+#     the Wi-Fi would be lost until a reboot, or the tablet panic at the
+#     resume (read from the source and two reports, not run; README,
+#     "Revision 11").  A line that says the guard did not hold ends a run
+#     with the PCI devices kept, pci=keep or not (PCIE-DOWN).
+#   - root-port-d3 (ro, with pci=keep; revision 11's kernel): Y to
+#     pcie_qcom.debug_root_port_d3 right before the freeze, read back, and
+#     nothing puts it back but the restart (pcie-qcom-debug-root-port-d3.patch;
+#     the switch word rpd3 in the record).  The root port is hot-plug
+#     capable and pciehp is not built, so the PCI core keeps it in D0 in a
+#     suspend (pci_bridge_d3_possible()); the switch gives it bridge_d3, so
+#     that it goes to D3hot after the Wi-Fi does, the host finds every
+#     function in D3hot, sends PME_Turn_Off and powers down
+#     (dw_pcie_suspend_noirq()), genpd collapses pcie_0_gdsc (the guard marks
+#     the host out-of-band then), and the resume sets the host up again,
+#     trains the link and restores the functions (pci_pm_resume_noirq());
+#     ath11k powers its chip down and up at every suspend anyway.  It is a
+#     sleep with the root port removed, but with the Wi-Fi kept: whether the
+#     Wi-Fi comes back from it is what the run is for.  The cycle's pcie
+#     evidence names the host's line ("the host powered down, and genpd
+#     powered its power domain off"), the link coming back ("PCIe Gen.2 x1
+#     link up"), and the wifi evidence the functions' state and whether
+#     ath11k loaded its firmware again.  Refused, with nothing changed,
+#     without pci=keep, with pci=remove (no root port left), with
+#     gdsc-ret=pcie0 (a host powered down under pcie_0_gdsc kept on in
+#     retention is the sleep that hung 8 times of 8), with dry or a pm_test=
+#     level short of the noirq phase (freezer, devices), on a kernel without
+#     the switch, and on one whose guard did not hold this boot.
+#   - sensors=stop (ro): right after the record of the state before the run
+#     (which names the audio DSP's clients), and before the floor's release,
+#     systemctl stop iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service,
+#     then 10 s to settle.  The record says what each is afterwards; either
+#     still active or activating stops the run before anything is frozen.
+#     iio-sensor-proxy holds the SSC sensor streams the desktop asks for
+#     (orientation, ambient light) open through libssc; hexagonrpcd -s is
+#     the sensor protection domain's file server.  With both stopped, the
+#     audio DSP's wakes in a sleep (qcom_stats adsp) and awake (evidence:
+#     awake, 5 s) say whether those streams are what wakes it 30 to 50 times
+#     a second.  A systemd suspend stops hexagonrpcd-adsp-sensorspd itself
+#     (its unit's Conflicts=suspend.target) and a system-sleep hook starts it
+#     again after the resume, but iio-sensor-proxy keeps running; rtcwake,
+#     which this script sleeps with, goes around both, so without
+#     sensors=stop both run through the test's sleeps.  Nothing starts them
+#     again before the restart that ends the run (the boot starts both), and
+#     a stop before any sleep leaves them stopped until the next boot: the
+#     sensor protection domain's unit makes one attempt per boot (Restart=no,
+#     as a failed attach can take the audio DSP, and the sound, down with
+#     it), so start it by hand only knowing that.  Auto-rotation and
+#     auto-brightness are off until then.  The options name it in every
+#     RESULT line.
+#   - rpmh (ro): what of Linux's own votes stands in the way of XO shutdown,
+#     CX collapse and AOSS sleep (cxsd, aosd), from the commands that
+#     rpmh-rsc writes to the application processor's RSC (the tracepoint
+#     rpmh_send_msg, drivers/soc/qcom/trace-rpmh.h).  When the CPUs'
+#     cluster powers down, rpmh_flush() (drivers/soc/qcom/rpmh.c) writes
+#     the sleep and wake sets the hardware applies while the CPUs sleep,
+#     whole, if a vote changed since the last flush; a resource whose sleep
+#     vote is its wake vote is left out of both and stays at that vote
+#     through the sleep.  The run turns the tracepoint on right before the
+#     freeze (events/rpmh/rpmh_send_msg/enable in tracefs) and reads the
+#     command DB once (debugfs cmd-db, the names of the RPMh addresses);
+#     right before each sleep it empties the trace buffer, and after it
+#     names the last flush before the sleep (by the kernel's
+#     "Timekeeping suspended" line, the trace's clock being the kernel
+#     log's): each address in it with its sleep and wake values, and which
+#     of xo.lvl, cx.lvl and mx.lvl it left out, so that they stayed at their
+#     vote through the sleep (with the last active vote the trace has).
+#     xo.lvl, cx.lvl and mx.lvl are levels, 0 is off; a BCM's value with
+#     bit 29 (0x20000000) set is a bandwidth vote.  "no flush" means no vote
+#     changed between the emptying and the sleep: the RSC slept with an
+#     earlier flush's sets.  Refused without the tracepoint (tracefs, a
+#     kernel with CONFIG_FTRACE: the kit's kernels), with tracing off
+#     (tracing_on 0) or with a trace clock other than local.  It changes no vote; a stop before any sleep turns it
+#     off again, and so does the restart that ends every run.
 set -u
 export LC_ALL=C
 umask 022
@@ -457,6 +580,20 @@ debug_messages_ctl=/sys/power/pm_debug_messages
 sw_gcc=/sys/module/gcc_sm8550/parameters
 sw_rpmhpd=/sys/module/rpmhpd/parameters
 sw_names='pcie0 pcie0phy usb cxmx'
+# How the three GDSC switches booted, on revision 11's kernel ("pcie0 Y,
+# pcie0phy N, usb N"): sw_boot.
+sw_boot_file=$sw_gcc/debug_boot_state
+# Revision 11's root port switch (root-port-d3; the record's word rpd3), N at
+# every boot.
+sw_pcie=/sys/module/pcie_qcom/parameters
+sw_names="$sw_names rpd3"
+# The line revision 11's PCIe host logs at each resume, and the one of a
+# guard that did not hold (pcie-qcom-keep-power-domain-while-link-kept.patch).
+guard_re='[0-9a-f]+\.pcie: system sleep: '
+guard_bad_re='[0-9a-f]+\.pcie: system sleep: the link was kept, but genpd powered its power domain off'
+guard_kept_re='[0-9a-f]+\.pcie: system sleep: the link was kept, and its power domain stayed on'
+# sensors=stop: the audio DSP's sensor clients in userspace.
+sensor_units='iio-sensor-proxy.service hexagonrpcd-adsp-sensorspd.service'
 # mode=s2idle's checks and evidence (reads only): each CPU's cpuidle states,
 # and the idle states of the CPU cluster's power domain (debugfs).
 cpu_devs=/sys/devices/system/cpu
@@ -481,7 +618,11 @@ ram_tools='rtcwake dmesg dd sha256sum sleep grep awk sync blockdev fsfreeze nsen
 # EOPNOTSUPP).
 freeze_types=' ext4 '
 ufs_fail='phy initialization timed-out|Failed to calibrate PHY|Enabling the controller failed|Host init failed|ufshcd_wl_resume failed|Trying to write to read-only block-device'
-ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET|power-up write: PWRDN'
+ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET|power-up write: PWRDN|power-up sequence entry: PHY power_count|power-up sequence failed, before phy_exit|setup_clocks repeated a PHY power-'
+# The UFS PHY's supply as regulator_summary names its consumer (the PHY's
+# device, then the supply), for ev_once's line about the PHY's power
+# reference (ev_phy_leak).
+ufs_phy_supply=1d80000.phy-vdda-phy
 # The lines of the PCIe host and of its PHY.  Two of ufs_fail's are theirs as
 # well, in the same words ("qcom-pcie 1c00000.pcie: Host init failed: -16",
 # "qcom-qmp-pcie-phy 1c06000.phy: phy initialization timed-out"): a failure
@@ -519,6 +660,12 @@ freezer_re='Freezing (user space processes|remaining freezable tasks) failed aft
 # With pci=remove the run ends after such a cycle (the RESULT line
 # PCIE-DOWN).
 pcie_down_re='[0-9a-f]+\.pcie: (PM: )?(Link failed to come up|Host init failed|failed to resume[a-z ]*: error)'
+# The Wi-Fi did not come back from a sleep with the PCI devices kept
+# (pci=keep): the PCI core could not reach its configuration space through
+# the link (pci_power_up(), drivers/pci/pci.c), ath11k or MHI said a resume
+# step failed (ath11k_warn()/ath11k_err() lines of drivers/net/wireless/ath/
+# ath11k/core.c and pci.c, MHI's), or the root port reported an error.
+wifi_fail_re='Unable to change power state from [A-Za-z0-9]+ to D0, device inaccessible|ath11k_pci [0-9a-f:.]+: .*(failed|timeout|link down)|mhi mhi[0-9]+: .*(fail|[Ee]rror|timeout|not in valid state|Did not enter)|pcieport [0-9a-f:.]+: AER: '
 # A line about the UFS or its disk (storage_lines) that says something
 # failed (this, without case) is never an aborted attempt, whatever it is:
 # a UFS device that refused to suspend, too.  "timing out command" and
@@ -537,26 +684,33 @@ freeze_deadline=120
 mount_deadline=60
 # How many of a cycle's diagnostic lines go to the result file and to pmsg:
 # the first diag_head and the last diag_tail, and one line for the ones
-# between.  A resume whose calibration fails retries it 15 times, up to five
-# lines each (revision 10's power-up write, the entry, the state after the
-# timeout, the late poll's outcome, the state 1 s on); the terminal and the
-# run's log in /run get
+# between.  A resume whose calibration fails retries it 15 times, up to seven
+# lines each (revision 11's PHY counts at the power-up sequence's entry,
+# revision 10's power-up write, the entry, the state after the timeout, the
+# late poll's outcome, the state 1 s on, and revision 11's counts of the
+# failed power-up sequence); revision 11 also logs, at any time, the first 16
+# setup_clocks calls of each kind that found the PHY power reference as
+# they asked.  The terminal and the run's log in /run get
 # every line, and those go with the restart.  pmsg is 128 KiB of ramoops
 # (the hang-log kit's DTB), about 73 KiB of it data with ECC 96, and it is
 # a ring: what goes there must leave room for the verdicts.  A cycle puts at
 # most 17 diagnostic lines there, each cut at 300 characters; a passing one
-# has only its entry lines, one or two.  Ten cycles, the last one failed,
+# has only its entry lines, one to three, and revision 11's setup_clocks
+# lines if any came (32 at most in a boot).  Ten cycles, the last one failed,
 # come to well under 20 KiB with their verdicts; an aborted attempt adds its
 # entry lines and its verdict, about 1 KiB, and a run has at most 21 of them.
 # ext4's own lines, when it recorded or logged an error, add at most 6.
-# Each cycle that was not given up before its sleep adds three evidence
-# lines (ev_keep), at most 1000 bytes: 10 KiB for ten; mode=s2idle adds a
-# fourth, at most 300 bytes more, and a WOKEN EARLY attempt adds its evidence lines
-# and its verdict, about 1.5 KiB, within the same 21.  The progress lines
+# Each cycle that was not given up before its sleep adds five evidence
+# lines (ev_keep), at most 1600 bytes: 16 KiB for ten; mode=s2idle and
+# rpmh add one each, at most 300 bytes more each, and a WOKEN EARLY attempt
+# adds its evidence lines and its verdict, about 2.5 KiB, within the same
+# 21.  The progress lines
 # (progress) add the run's start, the PCI removal, the debug switches and
 # the protection, under 1 KiB, and one line of about 200 bytes before each
 # attempt at a sleep, at most 31 in a run: under 7 KiB in all.  Every
-# verdict and RESULT line carries the debug switches, under 60 bytes each.
+# verdict and RESULT line carries the debug switches, under 80 bytes each.
+# The evidence before the first sleep adds one line, under 300 bytes, when
+# it shows a leaked UFS PHY power reference (ev_phy_leak).
 diag_head=12
 diag_tail=4
 # Evidence around each cycle (added after the r7 baselines of 2026-11-22,
@@ -565,8 +719,8 @@ diag_tail=4
 # and DDR low power.  Reads only, of debugfs (not on the disk), sysfs, /proc
 # and the kernel log, with the RAM root's tools; a read that fails gives "-"
 # or nothing and changes nothing in the run.  The terminal and the run's log
-# get every line ("cycle N/M: evidence: ..."), pmsg two short ones per cycle
-# (three with mode=s2idle; ev_pmsg).  One read is not passive: ddr_stats
+# get every line ("cycle N/M: evidence: ..."), pmsg five short ones per
+# cycle (six with mode=s2idle; ev_pmsg).  One read is not passive: ddr_stats
 # asks the AOSS to bring its numbers up to date (a QMP message,
 # qcom_ddr_stats_show in drivers/soc/qcom/qcom_stats.c), as every read of
 # that file does.
@@ -574,13 +728,36 @@ genpd_sum=/sys/kernel/debug/pm_genpd/pm_genpd_summary
 reg_sum=/sys/kernel/debug/regulator/regulator_summary
 icc_sum=/sys/kernel/debug/interconnect/interconnect_summary
 wake_sum=/sys/kernel/debug/wakeup_sources
-# The clocks whose enable and prepare counts each cycle shows (clk_summary):
-# XO, and the UFS host's five that the kernels up to revision 9 kept
-# enabled, one more time at each runtime resume of the UFS host (522 to 525 on
-# 2026-11-23), which revision 10's ufs-qcom-enable-only-lane-clocks.patch
-# ends.  Reading clk_summary resumes the clock controllers for a moment.
-clk_sum=/sys/kernel/debug/clk/clk_summary
+# The clocks whose enable and prepare counts each cycle shows: XO, and the
+# UFS host's five that the kernels up to revision 9 kept enabled, one more
+# time at each runtime resume of the UFS host (522 to 525 on 2026-11-23),
+# which revision 10's ufs-qcom-enable-only-lane-clocks.patch ends.  Read from
+# each clock's own debugfs directory (clk_debug_create_one(),
+# drivers/clk/clk.c: clk_enable_count and clk_prepare_count are the core's
+# counters as plain numbers, clk_parent its parent's name), which resumes
+# nothing and fails for no other clock.  Revision 10's script read
+# clk_summary, whose read runtime-resumes every clock controller first and
+# fails whole when one cannot resume (clk_pm_runtime_get_all(): with the ADSP
+# stopped, "clk: Failed to runtime PM get '6d44000.codec' for clk 'fsgen'").
+clk_dir=/sys/kernel/debug/clk
 ev_clk_names='bi_tcxo tcsr_ufs_pad_clkref_en gcc_ufs_phy_axi_clk gcc_ufs_phy_ahb_clk gcc_ufs_phy_unipro_core_clk gcc_ufs_phy_ice_core_clk'
+# The clock whose prepare count is XO's vote in the RPMh sleep set: clk-rpmh's
+# bi_tcxo (RPMH_CXO_CLK) votes in the sleep, wake and active sets while it is
+# prepared (__DEFINE_CLK_RPMH, drivers/clk/qcom/clk-rpmh.c), bi_tcxo_ao in
+# the wake and active sets only.  XO voted in the sleep set rules out XO
+# shutdown, and with it CX collapse and AOSS sleep (cxsd, aosd: README,
+# "Evidence around each cycle").  A clock prepared below it keeps it
+# prepared.
+xo_clk=bi_tcxo
+# The interrupt lines of the DSPs' messages and signals (IPCC, glink, SMP2P,
+# the remoteprocs' q6v5 lines, the AOSS QMP mailbox, FastRPC): their counts
+# across each sleep (evidence: dsp irq).
+ev_irq_dsp='ipcc|glink|smp2p|q6v5|wdog|fatal|ready|handover|stop-ack|qmp|aoss|fastrpc|apr|qrtr'
+# rpmh (an option): the tracepoint of rpmh-rsc's commands and its switch,
+# in tracefs, and the command DB that names their addresses.
+trace_dir=/sys/kernel/tracing
+rpmh_event=$trace_dir/events/rpmh/rpmh_send_msg/enable
+cmd_db=/sys/kernel/debug/cmd-db
 ufs_ctl=/sys/bus/platform/devices/1d84000.ufshc
 usb_ctl=/sys/bus/platform/devices/a600000.usb
 pci_devs=/sys/bus/pci/devices
@@ -874,23 +1051,44 @@ sw_file() { # WORD
 	pcie0phy) echo "$sw_gcc/debug_pcie0_phy_off" ;;
 	usb) echo "$sw_gcc/debug_usb_off" ;;
 	cxmx) echo "$sw_rpmhpd/debug_ret_floor" ;;
+	rpd3) echo "$sw_pcie/debug_root_port_d3" ;;
 	esac
+}
+
+# The debug switch WORD as this kernel booted it: what debug_boot_state says
+# on a kernel that has it (revision 11's, "pcie0 Y, pcie0phy N, usb N"), N
+# on an earlier one (every switch of revisions 9 and 10 boots N), and N for
+# cxmx and rpd3 always.  The shell reads sysfs itself.
+sw_boot() { # WORD
+	sbv=
+	if [ "$1" != cxmx ] && [ "$1" != rpd3 ] && [ -e "$sw_boot_file" ]; then
+		sbl=
+		read -r sbl 2>/dev/null < "$sw_boot_file" || :
+		case ", $sbl," in
+		*", $1 Y,"*) sbv=Y ;;
+		*", $1 N,"*) sbv=N ;;
+		esac
+	fi
+	echo "${sbv:-N}"
 }
 
 # The debug switches as they read now, for the record: "switches: pcie0 Y,
 # pcie0phy N, usb N, cxmx N", a switch this kernel does not offer left out,
-# or "switches: not offered by this kernel".  The shell reads sysfs itself.
+# or "switches: not offered by this kernel"; then "; at boot: pcie0 Y" for
+# the switches that booted Y (revision 11's pcie0), so that a Y says whether
+# it is the kernel's or the run's.  The shell reads sysfs itself.
 sw_now() {
-	swl=
+	swl= swy=
 	for swn in $sw_names; do
 		swf=$(sw_file "$swn")
 		[ -e "$swf" ] || continue
 		swv=
 		read -r swv 2>/dev/null < "$swf" || :
 		swl="$swl, $swn ${swv:--}"
+		[ "$(sw_boot "$swn")" != Y ] || swy="$swy, $swn Y"
 	done
 	if [ -n "$swl" ]; then
-		echo "switches: ${swl#, }"
+		echo "switches: ${swl#, }${swy:+; at boot: ${swy#, }}"
 	else
 		echo 'switches: not offered by this kernel'
 	fi
@@ -1126,7 +1324,7 @@ sw_note() {
 
 # What to do after a debug switch that did not take stopped the run.
 sw_next() {
-	sn='NEXT: the kernel did not take that write (its own line, if it wrote one: sudo dmesg | grep -e gcc-sm8550 -e rpmhpd); run again once that is understood'
+	sn='NEXT: the kernel did not take that write (its own line, if it wrote one: sudo dmesg | grep -e gcc-sm8550 -e rpmhpd -e debug_root_port_d3; a root-port-d3 that found no root port of a qcom PCIe host gets -ENODEV); run again once that is understood'
 	[ "$pci_remove" = 0 ] ||
 		sn="$sn; what pci=remove removed stays removed until the restart, the Wi-Fi with it (sudo reboot brings it back)"
 	echo "$sn"
@@ -1137,14 +1335,19 @@ sw_next() {
 # that nothing the run ends with, a stop or the restart, finds one set.
 # $knobs_why says what did not take (pm_test= then does not sleep; a trace
 # knob that did not take is said and the sleep goes on), $knobs_now what is
-# in force.
+# in force.  With rpmh the trace buffer is emptied here too, so that what
+# is in it after the sleep is this attempt's.
 knobs_on() {
 	knobs_why= knobs_now=
 	knobs_set=1
+	if [ "$rpmh" = 1 ]; then
+		: 2>/dev/null > "$trace_dir/trace"
+		knobs_now='rpmh trace emptied'
+	fi
 	if [ -n "$pm_test" ]; then
 		printf '%s' "$pm_test" 2>/dev/null > "$pm_test_ctl"
 		if [ "$(selected "$pm_test_ctl")" = "$pm_test" ]; then
-			knobs_now="pm_test $pm_test"
+			knobs_now="${knobs_now:+$knobs_now, }pm_test $pm_test"
 		else
 			knobs_why="pm_test=$pm_test did not take ($pm_test_ctl: $(ev_val "$pm_test_ctl"))"
 		fi
@@ -1177,38 +1380,55 @@ knobs_off() {
 	knobs_set=0
 }
 
-# gdsc= and cxmx=: Y to each debug switch the run was given ($sw_set),
-# right before the freeze, each read back.  1 and $sw_why when one does not
-# read Y.  They stay until the restart; a stop before any sleep puts them
-# back (sw_off).
+# gdsc=, gdsc-ret= and cxmx=: Y to each debug switch of $sw_set, N to each
+# of $sw_ret (gdsc-ret=pcie0), right before the freeze, each read back.  1
+# and $sw_why when one does not read what was written.  They stay until the
+# restart; a stop before any sleep puts them back as they booted (sw_off).
 sw_on() {
 	sw_why=
 	sw_tried=1
-	for swn in $sw_set; do
+	for swn in $sw_set $sw_ret; do
 		swf=$(sw_file "$swn")
-		printf Y 2>/dev/null > "$swf"
+		case " $sw_ret " in *" $swn "*) sww=N ;; *) sww=Y ;; esac
+		printf '%s' "$sww" 2>/dev/null > "$swf"
 		swv=$(ev_val "$swf")
-		[ "$swv" = Y ] || sw_why="$sw_why; $swn ($swf) reads $swv after a write of Y"
+		[ "$swv" = "$sww" ] || sw_why="$sw_why; $swn ($swf) reads $swv after a write of $sww"
 	done
 	sw_why=${sw_why#; }
 	[ -z "$sw_why" ]
 }
 
-# A stop before any sleep: N to each switch this run wrote Y to.  $sw_back
-# says how that went, for the RESULT line; nothing when the run wrote none.
+# rpmh: the tracepoint as the run found it, at a stop before any sleep (the
+# restart that ends a run turns it off anyway).
+rpmh_off() {
+	[ "${rpmh_set:-0}" = 1 ] || return 0
+	printf '%s' "${rpmh_was:-0}" 2>/dev/null > "$rpmh_event"
+	rpmh_set=0
+}
+
+# A stop before any sleep: each switch this run wrote back as it booted (N,
+# but pcie0 Y on revision 11's kernel).  $sw_back says how that went, for
+# the RESULT line; nothing when the run wrote none.
 sw_off() {
 	sw_back=
 	[ "${sw_tried:-0}" = 1 ] || return 0
-	swl=
-	for swn in $sw_set; do
+	swl= swas=N
+	for swn in $sw_set $sw_ret; do
 		swf=$(sw_file "$swn")
-		printf N 2>/dev/null > "$swf"
-		[ "$(ev_val "$swf")" = N ] || swl="$swl $swn ($swf)"
+		swb=$(sw_boot "$swn")
+		[ "$swb" = N ] || swas=boot
+		printf '%s' "$swb" 2>/dev/null > "$swf"
+		[ "$(ev_val "$swf")" = "$swb" ] || swl="$swl $swn ($swf)"
 	done
-	if [ -n "$swl" ]; then
-		sw_back="; but the debug switch(es)$swl did not go back to N: off at the next restart, or by hand (echo N | sudo tee FILE)"
+	if [ "$swas" = N ]; then
+		swas='back to N' swhand='off at the next restart, or by hand (echo N | sudo tee FILE)'
 	else
-		sw_back="; the debug switches it set are back to N"
+		swas='back as they booted' swhand='as booted at the next restart, or by hand (echo Y or N | sudo tee FILE, as sw_boot says: debug_boot_state)'
+	fi
+	if [ -n "$swl" ]; then
+		sw_back="; but the debug switch(es)$swl did not go $swas: $swhand"
+	else
+		sw_back="; the debug switches it set are $swas"
 	fi
 }
 
@@ -1268,13 +1488,29 @@ pci_remove_all() {
 # dw_pcie_suspend_noirq(), drivers/pci/controller/dwc/): no further sleep in
 # this boot.  pcie_down_end ends the run.
 pcie_down() {
-	[ "$pci_remove" = 1 ] && grep -qE "$pcie_down_re" "$k"
+	if [ "$pci_remove" = 1 ]; then
+		grep -qE "$pcie_down_re" "$k"
+	elif [ "$pci_keep" = 1 ]; then
+		# pci=keep: a host that lost its controller under the kept link,
+		# or a Wi-Fi that did not come back, is not tried again.
+		grep -qE "$pcie_down_re|$wifi_fail_re|$guard_bad_re" "$k"
+	else
+		# The PCI devices kept without pci=keep (a guard that held this
+		# boot): a guard that did not hold in this sleep ends it too.
+		grep -qE "$guard_bad_re" "$k"
+	fi
 }
 
 pcie_down_end() {
-	pdown=$(grep -E "$pcie_down_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
-	verdict "SLEEP-TEST RESULT: PCIE-DOWN$mword after $cyc: the PCIe host did not come back ($pdown), and with pci=remove a later suspend would read its registers with its clocks off, so the run ends here; $passes of $cycles cycles came back with the UFS readable; floor $floor; kernel $kernel$optnote"
-	verdict 'NEXT: no further sleep in this boot: the restart brings the PCIe host back; the pcie evidence and kernel lines of that cycle say how its link failed'
+	if [ "$pci_remove" = 0 ]; then
+		pdown=$(grep -E "$pcie_down_re|$wifi_fail_re|$guard_bad_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+		verdict "SLEEP-TEST RESULT: PCIE-DOWN$mword after $cyc: with the PCI devices kept, the PCIe host or the Wi-Fi did not come back ($pdown), and a later suspend would meet a controller that lost its registers under its link, so the run ends here; $passes of $cycles cycles came back with the UFS readable; floor $floor; kernel $kernel$optnote"
+		verdict 'NEXT: no further sleep in this boot: the restart brings the PCIe host and the Wi-Fi back; the wifi and pcie evidence and the kernel lines of that cycle say what failed (README, "Revision 11: the runs")'
+	else
+		pdown=$(grep -E "$pcie_down_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+		verdict "SLEEP-TEST RESULT: PCIE-DOWN$mword after $cyc: the PCIe host did not come back ($pdown), and with pci=remove a later suspend would read its registers with its clocks off, so the run ends here; $passes of $cycles cycles came back with the UFS readable; floor $floor; kernel $kernel$optnote"
+		verdict 'NEXT: no further sleep in this boot: the restart brings the PCIe host back; the pcie evidence and kernel lines of that cycle say how its link failed'
+	fi
 	finish healthy
 }
 
@@ -1502,18 +1738,28 @@ ev_state() {
 	echo "$evs; warmest $evt"
 }
 
-# clk_summary copied to OUT, in one read (each read resumes the clock
-# controllers for a moment).
+# Every clock as "NAME ENABLE PREPARE PARENT" lines (- for what was not
+# read, or no parent), from each clock's own debugfs directory ($clk_dir;
+# its counters and its parent's name, no clock controller resumed).
 ev_clk_snap() { # OUT
-	awk '{ print }' "$clk_sum" 2>/dev/null > "$1"
+	for evc in "$clk_dir"/*/; do
+		[ -e "${evc}clk_enable_count" ] || continue
+		evn=${evc%/}
+		evn=${evn##*/}
+		eve= evp= evq=
+		read -r eve 2>/dev/null < "${evc}clk_enable_count" || :
+		read -r evp 2>/dev/null < "${evc}clk_prepare_count" || :
+		[ ! -e "${evc}clk_parent" ] || read -r evq 2>/dev/null < "${evc}clk_parent" || :
+		printf '%s %s %s %s\n' "$evn" "${eve:--}" "${evp:--}" "${evq:--}"
+	done 2>/dev/null > "$1"
 }
 
-# The counts of ev_clk_names in a clk_summary copy, one line:
+# The counts of ev_clk_names in an ev_clk_snap copy, one line:
 # "bi_tcxo 6/6, tcsr_ufs_pad_clkref_en 522/522, ..." (enable/prepare), "-"
 # for a clock it does not list; with short, "xo 6/6, pad_clkref 522/522, axi
-# 522/522, ..." for pmsg; "clk_summary not readable" for an empty copy.
+# 522/522, ..." for pmsg; "clock counts not readable" for an empty copy.
 ev_clk_line() { # FILE full|short
-	[ -s "$1" ] || { echo 'clk_summary not readable'; return 0; }
+	[ -s "$1" ] || { echo 'clock counts not readable'; return 0; }
 	awk -v names="$ev_clk_names" -v short="$2" '
 		BEGIN { n = split(names, want, " ") }
 		$2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && !($1 in got) { got[$1] = $2 "/" $3 }
@@ -1531,6 +1777,233 @@ ev_clk_line() { # FILE full|short
 		}' "$1" 2>/dev/null
 }
 
+# The clocks of an ev_clk_snap copy that keep XO ($xo_clk) voted in the
+# sleep set while they are prepared: the prepared clocks below it (by their
+# parents) with no prepared clock below them, "NAME ENABLE/PREPARE" each in
+# name order, then "bi_tcxo itself N" for the prepares of XO's own
+# consumers (a PHY's or a DSP's reference clock: XO's prepare count less one
+# for each prepared clock directly below it, clk_core_prepare() counting a
+# child once), "none", or "clock counts not readable".  A clock that its
+# driver leaves prepared through its suspend holds XO through the sleep; the
+# copies are made right before the sleep and right after the wake, so a
+# clock in both is a candidate for that, not a proof (a driver's suspend may
+# still drop it).
+ev_xo_holders() { # FILE
+	[ -s "$1" ] || { echo 'clock counts not readable'; return 0; }
+	awk -v xo="$xo_clk" '
+		{ en[$1] = $2; pr[$1] = $3; pa[$1] = $4 }
+		END {
+			for (c in pr) {
+				if (c == xo || pr[c] !~ /^[0-9]+$/ || pr[c] + 0 == 0) continue
+				x = pa[c]
+				for (d = 0; d < 64 && x != "-" && x != "" && x != xo; d++) x = (x in pa) ? pa[x] : ""
+				if (x == xo) held[c] = 1
+			}
+			for (c in held) if (pa[c] in held) inner[pa[c]] = 1
+			own = (pr[xo] ~ /^[0-9]+$/) ? pr[xo] + 0 : 0
+			for (c in held) if (pa[c] == xo) own--
+			n = 0
+			for (c in held) if (!(c in inner)) leaf[++n] = c
+			# In name order (mawk has no sort).
+			for (i = 2; i <= n; i++) {
+				v = leaf[i]
+				for (j = i - 1; j >= 1 && leaf[j] > v; j--) leaf[j + 1] = leaf[j]
+				leaf[j + 1] = v
+			}
+			if (!n && own <= 0) { print "none"; exit }
+			for (i = 1; i <= n; i++) printf "%s%s %s/%s", (i > 1 ? ", " : ""), leaf[i], en[leaf[i]], pr[leaf[i]]
+			if (own > 0) printf "%s%s itself %d", n ? ", " : "", xo, own
+			printf "\n"
+		}' "$1" 2>/dev/null
+}
+
+# Each power domain with its idle states' usage and rejected counts added
+# up ("NAME USAGE REJECTED" lines; pm_genpd/NAME/idle_states,
+# idle_states_show(), drivers/pmdomain/core.c).  A usage is a power-off that
+# went through, genpd_sync_power_off()'s at the end of a suspend's noirq
+# phase among them: for a rail (cx, mx, ...) the moment rpmhpd votes it off
+# (level 0) in every set, for a GDSC its gdsc_disable().  One awk for every
+# domain.
+ev_genpd_offs() { # OUT
+	awk 'FNR == 1 { if (nm != "") print nm, u + 0, r + 0; nm = FILENAME; sub(/\/idle_states$/, "", nm); sub(/.*\//, "", nm); u = r = 0; next }
+		$3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ { u += $3; r += $4 }
+		END { if (nm != "") print nm, u + 0, r + 0 }' /sys/kernel/debug/pm_genpd/*/idle_states 2>/dev/null > "$1"
+}
+
+# What genpd powered off between two ev_genpd_offs snapshots: every domain
+# of ev_domains, "cx +1, mx +0, ..." ("(rejected +N)" after one that was
+# refused); with short, the rails and the domains of the UFS, PCIe and USB
+# alone, for pmsg; "-" when nothing was read.
+ev_genpd_offs_delta() { # BEFORE AFTER full|short
+	awk -v re="$ev_domains" -v short="$3" '
+		BEGIN { split("cx mx mmcx ebi pcie_0_gdsc pcie_0_phy_gdsc usb30_prim_gdsc ufs_phy_gdsc ufs_mem_phy_gdsc", k, " ")
+			for (i in k) key[k[i]] = 1 }
+		FILENAME == ARGV[1] { u[$1] = $2; r[$1] = $3; next }
+		$1 ~ re && ($1 in u) && (short != "short" || ($1 in key)) {
+			du = $2 - u[$1]; dr = $3 - r[$1]
+			s = s (s == "" ? "" : ", ") $1 " +" du (dr ? " (rejected +" dr ")" : "")
+		}
+		END { print s == "" ? "-" : s }' "$1" "$2" 2>/dev/null
+}
+
+# The DSPs' interrupt lines (ev_irq_dsp) that fired between two ev_irqs
+# snapshots: "13 ipcc_0 +40, 16 smp2p-adsp +2", or none.
+ev_irq_dsp_delta() { # BEFORE AFTER
+	awk -v re="$ev_irq_dsp" '
+		FILENAME == ARGV[1] { b[$1] = $2; next }
+		$3 ~ re { d = $2 - (($1 in b) ? b[$1] : 0); if (d > 0) s = s (s == "" ? "" : ", ") sprintf("%s %s +%.0f", $1, $3, d) }
+		END { print s == "" ? "none" : s }' "$1" "$2" 2>/dev/null
+}
+
+# The PCI functions as they are now: each one's driver, power state and
+# link speed ("0000:01:00.0 ath11k_pci D0 5.0 GT/s PCIe"), or "pci none".
+# The power state is the PCI core's record; the link speed a read of the
+# function's link status, which the host refuses when its link is down
+# ("Unknown" then, dw_pcie_other_conf_map_bus()).
+ev_pci_state() {
+	evp=
+	for evd in "$pci_devs"/*; do
+		[ -e "$evd" ] || continue
+		evdr=-
+		if [ -e "$evd/driver" ]; then
+			evdr=$(readlink "$evd/driver" 2>/dev/null)
+			evdr=${evdr##*/}
+		fi
+		evp="$evp, ${evd##*/} ${evdr:--} $(ev_val "$evd/power_state") $(ev_val "$evd/current_link_speed")"
+	done
+	if [ -n "$evp" ]; then
+		echo "pci ${evp#, }"
+	else
+		echo 'pci none'
+	fi
+}
+
+# rpmh: the trace's lines of rpmh-rsc's commands copied to OUT, in one read
+# (reading the trace pauses tracing while the file is open).
+ev_rpmh_snap() { # OUT
+	awk '/ rpmh_send_msg: /' "$trace_dir/trace" 2>/dev/null > "$1"
+}
+
+# rpmh: the last flush of the sleep and wake sets before the sleep, from
+# TRACE (the rpmh_send_msg lines of this attempt) and the cycle's kernel
+# lines K: the sleep is where "Timekeeping suspended" is in K (the trace's
+# clock is the kernel log's, and it stands still in the sleep), else "PM:
+# suspend exit"; a sleep or wake command more than 1 ms after the one before
+# it starts another flush.  One line: the flush's commands, "NAME
+# SLEEP/WAKE" each (the address when the command DB does not name it; a
+# VRM's register as NAME+4 and so on), then which of xo.lvl, cx.lvl and
+# mx.lvl it left out (sleep = wake: held at that vote through the sleep),
+# each with the last active vote before the sleep, if the trace has one.
+# With short, the levels and the BCMs with a vote in the sleep set alone,
+# for pmsg.
+ev_rpmh() { # TRACE K full|short
+	[ -s "$1" ] || { echo 'no RPMh command in the trace'; return 0; }
+	evb=$(awk '/Timekeeping suspended for / { s = $0; exit } /PM: suspend exit/ && x == "" { x = $0 }
+		END { if (s == "") s = x; if (match(s, /^\[ *[0-9]+\.[0-9]+\]/)) { s = substr(s, RSTART + 1, RLENGTH - 2); gsub(/ /, "", s); print s } }' "$2" 2>/dev/null)
+	awk -v bound="$evb" -v short="$3" -v keys='xo.lvl cx.lvl mx.lvl' '
+		function hex(s,   i, c, v) {
+			s = tolower(s)
+			sub(/^0x/, "", s)
+			v = 0
+			for (i = 1; i <= length(s); i++) {
+				c = index("0123456789abcdef", substr(s, i, 1))
+				if (!c) return -1
+				v = v * 16 + c - 1
+			}
+			return v
+		}
+		function name(a,   v, o, k) {
+			v = hex(a)
+			for (o = 0; o <= 12; o += 4) {
+				k = sprintf("%x", v - o)
+				if (k in nm) return o ? nm[k] "+" o : nm[k]
+			}
+			return a
+		}
+		FILENAME == ARGV[1] {
+			if ($1 ~ /^0x[0-9a-fA-F]+:$/ && NF >= 2) { a = $1; sub(/:$/, "", a); nm[sprintf("%x", hex(a))] = $2; named[$2] = 1; nnamed++ }
+			next
+		}
+		{
+			for (i = 1; i <= NF; i++) if ($i == "rpmh_send_msg:") break
+			if (i > NF || i < 2) next
+			ts = $(i - 1)
+			sub(/:$/, "", ts)
+			if (bound != "" && ts + 0 >= bound + 0) { after++; next }
+			st = ""
+			if (match($0, /\[(sleep|wake|active)\]/)) st = substr($0, RSTART + 1, RLENGTH - 2)
+			ad = da = ""
+			for (j = i; j < NF; j++) { if ($j == "addr:") ad = $(j + 1); if ($j == "data:") da = $(j + 1) }
+			if (ad == "" || da == "" || st == "") next
+			n = name(ad)
+			if (st == "active") { act[n] = da; nact++; next }
+			if (!nf || ts - lt > 0.001) { nf++; ft[nf] = ts }
+			lt = ts
+			if (!((nf, n) in inf)) { inf[nf, n] = 1; no[nf]++; ord[nf, no[nf]] = n }
+			if (st == "sleep") sl[nf, n] = da
+			else wk[nf, n] = da
+			cnt[nf]++
+		}
+		END {
+			b = (bound == "") ? "in the whole trace (no sleep line in the kernel log)" : "before the sleep at " bound
+			if (!nf) {
+				printf "no flush %s (%d active votes in it): the RSC slept with the sets of an earlier flush\n", b, nact
+				exit
+			}
+			s = ""
+			for (k = 1; k <= no[nf]; k++) {
+				n = ord[nf, k]
+				v = ((nf, n) in sl) ? sl[nf, n] : "-"
+				w = ((nf, n) in wk) ? wk[nf, n] : "-"
+				if (short == "short" && n !~ /\.lvl$/ && !(hex(v) > 0 && int(hex(v) / 536870912) % 2)) continue
+				s = s (s == "" ? "" : ", ") n " " v "/" w
+			}
+			h = ""
+			nk = split(keys, kk, " ")
+			for (k = 1; k <= nk; k++) {
+				if (!(kk[k] in named) || ((nf, kk[k]) in inf)) continue
+				h = h (h == "" ? "" : ", ") kk[k] ((kk[k] in act) ? " (active " act[kk[k]] ")" : "")
+			}
+			if (!nnamed) h = "not known (no command DB)"
+			if (short == "short")
+				printf "flush %d of %d at %s, sleep/wake: %s; held: %s\n", nf, nf, ft[nf], (s == "" ? "none" : s), (h == "" ? "none" : h)
+			else
+				printf "the last of %d flushes %s (at %s, %d commands), sleep/wake: %s; left out, so held at their vote through the sleep: %s; active votes before the sleep %d, commands after it %d\n", nf, b, ft[nf], cnt[nf], (s == "" ? "none" : s), (h == "" ? "none" : h), nact, after
+		}' "$ramdir/cmd-db" "$1" 2>/dev/null
+}
+
+# The UFS PHY's power reference as ev_once's reads show it
+# (docs/resume-recovery.md, "The PHY power reference"): with the disk frozen
+# the UFS host is idle, its clock gating turns its clocks off 150 ms after
+# its last command, and turns the PHY off with them, the PHY's supplies and
+# its own clocks, unless the PHY holds one more power reference than the
+# host's (a setup_clocks call that powered it on again while it was on,
+# which ufs-qcom-track-phy-power-state-gts9u.patch ends).  One line when
+# REGULATORS (a copy of regulator_summary) has the PHY's supply enabled and
+# CLOCKS (an ev_clk_snap copy, read after it) has the host's core clock off
+# with the PHY's own two clocks on (gcc_ufs_phy_phy_aux_clk and
+# tcsr_ufs_clkref_en, its ref_aux and qref, which nothing but the PHY's
+# power-on enables): this boot has a leaked reference, and on a kernel
+# without that patch the resume from a sleep that powers ufs_mem_phy_gdsc
+# off loses the UFS (2026-11-23, revision 10's run 5).  Nothing otherwise,
+# and nothing when a read failed.
+ev_phy_leak() { # REGULATORS CLOCKS
+	awk -v phy="$ufs_phy_supply" '
+		FILENAME == ARGV[1] { if ($1 == phy && $2 ~ /^[0-9]+$/) use = $2 + 0; next }
+		$2 ~ /^[0-9]+$/ { c[$1] = $2 "/" $3; en[$1] = $2 + 0 }
+		END {
+			if (use < 1 || !("gcc_ufs_phy_axi_clk" in en) || en["gcc_ufs_phy_axi_clk"] != 0) exit
+			if (en["gcc_ufs_phy_phy_aux_clk"] < 1 || en["tcsr_ufs_clkref_en"] < 1) exit
+			printf "LEAKED POWER REFERENCE: its supply %s is enabled (use %d) with the UFS host clock-gated (gcc_ufs_phy_axi_clk %s) and its own clocks on (gcc_ufs_phy_phy_aux_clk %s, tcsr_ufs_clkref_en %s): this boot has a leaked UFS PHY power reference, and on a kernel without ufs-qcom-track-phy-power-state-gts9u.patch the resume from a sleep that powers ufs_mem_phy_gdsc off will lose the UFS (docs/resume-recovery.md, \"The PHY power reference\")\n", phy, use, c["gcc_ufs_phy_axi_clk"], c["gcc_ufs_phy_phy_aux_clk"], c["tcsr_ufs_clkref_en"]
+		}' "$1" "$2" 2>/dev/null
+}
+
+# regulator_summary copied to OUT, in one read: for ev_once's lines of the
+# rails in use, and for ev_phy_leak.
+ev_reg() { # OUT
+	awk '{ print }' "$reg_sum" 2>/dev/null > "$1"
+}
+
 # Once, before the first sleep: the domains, the rails, the bandwidth votes,
 # the wakeup sources and the PCIe functions as they are with the disk frozen.
 # A request on an interconnect node whose tag is 0 or has bit 2
@@ -1541,9 +2014,10 @@ ev_once() {
 	say "evidence: power domains (pm_genpd_summary; every line):"
 	ev_genpd all | while IFS= read -r evl; do say "evidence:   $evl"; done
 	say "evidence: rails in use (regulator_summary: the regulators with users, and those users):"
+	ev_reg "$ramdir/ev-reg-once"
 	awk 'NR <= 2 { next }
 		NF >= 7 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { show = $2 > 0; if (show) print; next }
-		show && NF == 5 && $2 ~ /^[0-9]+$/ && $2 > 0 { print }' "$reg_sum" 2>/dev/null |
+		show && NF == 5 && $2 ~ /^[0-9]+$/ && $2 > 0 { print }' "$ramdir/ev-reg-once" 2>/dev/null |
 		while IFS= read -r evl; do say "evidence:   $evl"; done
 	say "evidence: bandwidth (interconnect_summary: the nodes with a vote and the requests that make it):"
 	awk 'NR <= 2 { next }
@@ -1562,6 +2036,27 @@ ev_once() {
 		say "evidence: pci ${evd##*/}: $(ev_val "$evd/power_state"), link $(ev_val "$evd/current_link_speed"), d3cold_allowed $(ev_val "$evd/d3cold_allowed"), wakeup $(ev_val "$evd/power/wakeup"), runtime $(ev_val "$evd/power/runtime_status")"
 	done
 	say "evidence: state: $(ev_state)"
+	# What keeps XO voted in the sleep set (ev_xo_holders), and every clock
+	# that is prepared now, with its parent.
+	ev_clk_snap "$ramdir/ev-clk-once"
+	say "evidence: XO ($xo_clk) voted in the sleep set by these prepared clocks below it (enable/prepare): $(ev_xo_holders "$ramdir/ev-clk-once")"
+	say "evidence: prepared clocks (name, enable, prepare, parent):"
+	awk '$3 ~ /^[0-9]+$/ && $3 > 0' "$ramdir/ev-clk-once" 2>/dev/null |
+		while IFS= read -r evl; do say "evidence:   $evl"; done
+	# A leaked UFS PHY power reference, from the two reads above: in pmsg
+	# as well, for a run that loses the UFS.
+	evleak=$(ev_phy_leak "$ramdir/ev-reg-once" "$ramdir/ev-clk-once")
+	if [ -n "$evleak" ]; then
+		say "evidence: UFS PHY: $evleak"
+		ev_pmsg "evidence: UFS PHY: leaked power reference before the first sleep (its supply on, the host clock-gated, its own clocks on): a kernel without ufs-qcom-track-phy-power-state-gts9u.patch loses the UFS at the resume"
+	fi
+	# The SoC's sleep states and each subsystem's while the CPUs are awake,
+	# for 5 s: an audio DSP that goes in and out of its sleep as often awake
+	# as in the run's sleeps does so on its own, whatever the CPUs do.
+	ev_stats "$ramdir/ev-awake.0"
+	sleep 5
+	ev_stats "$ramdir/ev-awake.1"
+	say "evidence: awake, 5 s before the first sleep: $(ev_stats_delta "$ramdir/ev-awake.0" "$ramdir/ev-awake.1")"
 }
 
 # mode=s2idle: each CPU's cpuidle states that have an s2idle entry, as "CPU
@@ -1667,6 +2162,7 @@ ev_before() { # SFX
 	ev_stats "$ramdir/ev-stats-$1.0"
 	ev_irqs "$ramdir/ev-irqs-$1.0"
 	ev_wake "$ramdir/ev-wake-$1.0"
+	ev_genpd_offs "$ramdir/ev-gpd-$1.0"
 	if [ "$sleep_mode" = s2idle ]; then
 		ev_cpuidle "$ramdir/ev-cpuidle-$1.0"
 		ev_cluster "$ramdir/ev-cluster-$1.0"
@@ -1674,6 +2170,8 @@ ev_before() { # SFX
 	evstate=$(ev_state)
 	say "$cyc: evidence: before: $evstate"
 	say "$cyc: evidence: before: clocks (enable/prepare): $(ev_clk_line "$ramdir/ev-clk-$1.0" full)"
+	say "$cyc: evidence: before: XO held by: $(ev_xo_holders "$ramdir/ev-clk-$1.0")"
+	say "$cyc: evidence: before: $(ev_pci_state)"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: before: genpd: $evl"; done
 }
 
@@ -1682,6 +2180,7 @@ ev_resumed() { # SFX
 	ev_stats "$ramdir/ev-stats-$1.1"
 	ev_irqs "$ramdir/ev-irqs-$1.1"
 	ev_wake "$ramdir/ev-wake-$1.1"
+	ev_genpd_offs "$ramdir/ev-gpd-$1.1"
 	if [ "$sleep_mode" = s2idle ]; then
 		ev_cpuidle "$ramdir/ev-cpuidle-$1.1"
 		ev_cluster "$ramdir/ev-cluster-$1.1"
@@ -1690,10 +2189,12 @@ ev_resumed() { # SFX
 }
 
 # Once the cycle's kernel lines are in K: what the sleep reached, what woke
-# or kept it, whether the PCIe link went down and came back, the domains
-# now, and the cycle's kernel lines (and with mode=s2idle, ev_s2idle).
-# ev_keep then puts two short lines of it in pmsg (three with mode=s2idle),
-# for an attempt that was not given up before the sleep.
+# or kept it, whether the PCIe link went down and came back, the Wi-Fi's
+# state, what genpd powered off, the DSPs' interrupts, what held XO, the
+# domains now, and the cycle's kernel lines (and with mode=s2idle,
+# ev_s2idle; with rpmh, the sleep set, ev_rpmh).  ev_keep then puts five
+# short lines of it in pmsg (one more with mode=s2idle, one more with
+# rpmh), for an attempt that was not given up before the sleep.
 ev_after() { # SFX K
 	evdepth=$(ev_stats_delta "$ramdir/ev-stats-$1.0" "$ramdir/ev-stats-$1.1")
 	evwake=$(ev_wake_delta "$ramdir/ev-wake-$1.0" "$ramdir/ev-wake-$1.1")
@@ -1713,6 +2214,14 @@ ev_after() { # SFX K
 		*) evpcie="pcie: $evlink" ;;
 		esac
 	fi
+	# Revision 11's guard: what genpd did with the PCIe host's power domain
+	# in this sleep, as the host logged it at the resume.
+	# (Only grep and awk: this runs from the RAM root.)
+	evguard=$(grep -E "$guard_re" "$2" 2>/dev/null | awk '{sub(/.*\.pcie: system sleep: /, ""); print; exit}')
+	if [ -n "$evguard" ]; then
+		evlink="$evlink; the host logged: $evguard"
+		evpcie="$evpcie ($evguard)"
+	fi
 	# Did the PCIe host come back at all: a line of pcie_down_re (its link
 	# wait, its init or its noirq resume failed), or none.
 	evback=$(grep -E "$pcie_down_re" "$2" 2>/dev/null | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
@@ -1723,10 +2232,28 @@ ev_after() { # SFX K
 	fi
 	evclk0=$(ev_clk_line "$ramdir/ev-clk-$1.0" short)
 	evclk1=$(ev_clk_line "$ramdir/ev-clk-$1.1" short)
+	# The Wi-Fi with the PCI devices kept: its function's state now, and the
+	# first line of the cycle's that says it did not come back
+	# (wifi_fail_re), or none.
+	evwifi=$(grep -E "$wifi_fail_re" "$2" 2>/dev/null | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+	evfw=$(grep -c 'ath11k_pci .*fw_version' "$2" 2>/dev/null)
+	evwifi="$(ev_pci_state); ${evwifi:-no Wi-Fi failure line}; ath11k firmware loads ${evfw:-0}"
+	evgpd=$(ev_genpd_offs_delta "$ramdir/ev-gpd-$1.0" "$ramdir/ev-gpd-$1.1" full)
+	evdsp=$(ev_irq_dsp_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1")
+	evxo1=$(ev_xo_holders "$ramdir/ev-clk-$1.1")
 	say "$cyc: evidence: qcom_stats: $evdepth"
 	say "$cyc: evidence: wakeup sources: $evwake"
 	say "$cyc: evidence: interrupts: $evirq"
+	say "$cyc: evidence: dsp interrupts: $evdsp"
 	say "$cyc: evidence: pcie: $evlink; $evback"
+	say "$cyc: evidence: wifi: $evwifi"
+	say "$cyc: evidence: genpd powered off in the sleep (idle states usage of each domain): $evgpd"
+	say "$cyc: evidence: after: XO held by: $evxo1"
+	if [ "$rpmh" = 1 ]; then
+		ev_rpmh_snap "$ramdir/ev-rpmh-$1"
+		say "$cyc: evidence: rpmh sleep set: $(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" full)"
+		evrpmh=$(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" short)
+	fi
 	say "$cyc: evidence: after: clocks (enable/prepare): $(ev_clk_line "$ramdir/ev-clk-$1.1" full)"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: after: genpd: $evl"; done
 	awk -v re="$ev_kernel" -v skip="$ev_kernel_skip" -v max="$ev_klines" '
@@ -1741,6 +2268,9 @@ ev_keep() { # SFX
 	ev_pmsg "$cyc: evidence: qcom_stats: $evdepth"
 	ev_pmsg "$cyc: evidence: $evpcie; $evback; irq $(ev_irq_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1" 3); wakeup $evwake; before: $evstate"
 	ev_pmsg "$cyc: evidence: clocks before: $evclk0; after: $evclk1"
+	ev_pmsg "$cyc: evidence: wifi: $evwifi; genpd off: $(ev_genpd_offs_delta "$ramdir/ev-gpd-$1.0" "$ramdir/ev-gpd-$1.1" short); dsp irq $evdsp"
+	ev_pmsg "$cyc: evidence: XO held by: $evxo1"
+	[ "$rpmh" = 0 ] || ev_pmsg "$cyc: evidence: rpmh: $evrpmh"
 	[ "$sleep_mode" != s2idle ] || ev_pmsg "$cyc: evidence: s2idle: $s2pmsg"
 }
 
@@ -1762,6 +2292,26 @@ storage_lines() { # FILE
 		grep -iE "(^|[^a-zA-Z0-9])ufs|\\[$disk\\]|(^|\\] )(sd|scsi) $ufs_host:[0-9]+:[0-9]+:[0-9]+: "
 }
 
+# Did a calibration in DIAG (a cycle's diagnostic lines) start without the
+# UFS PHY's power-on?  Revision 10's second diagnostic logs its power-up
+# write line in that power-on, right before each calibration entry, and a
+# kernel that has it logged one this boot already, at the UFS probe
+# (pwrdn_seen): an entry with no such line since the entry before it had no
+# power-on.  Revision 11's line at the entry of a power-up sequence with
+# power_count 2 or more says the same: the code before
+# ufs-qcom-track-phy-power-state-gts9u.patch powers the PHY off and on again
+# there only from 1.  Either is a leaked PHY power reference
+# (docs/resume-recovery.md, "The PHY power reference").
+phy_leak_seen() { # DIAG
+	awk -v pw="$pwrdn_seen" '
+		/power-up sequence entry: PHY power_count / {
+			for (i = 1; i < NF; i++) if ($i == "power_count" && $(i + 1) ~ /^[0-9]+$/ && $(i + 1) + 0 >= 2) leak = 1
+		}
+		/power-up write: PWRDN/ { w = 1 }
+		/calibration entry: SW_RESET/ { if (pw == 1 && !w) leak = 1; w = 0 }
+		END { exit !leak }' "$1" 2>/dev/null
+}
+
 # Was this attempt a suspend that the kernel gave up before the tablet
 # slept, with the storage as it was before?  Only if every one of these
 # holds; anything else, or anything that cannot be read, leaves it a FAIL:
@@ -1777,8 +2327,10 @@ storage_lines() { # FILE
 #      SECONDS logs about that);
 #   6. no failure line (fail_re: the UFS and its PHY, I/O and ext4 errors,
 #      a write the block layer logged), and no line of the diagnostic but
-#      its calibration entries and revision 10's power-up write lines (the
-#      others come with a timeout);
+#      its calibration entries, revision 10's power-up write lines and
+#      revision 11's PHY counts at a power-up sequence's entry and
+#      setup_clocks lines (the others come with a timeout or a failed
+#      power-up sequence);
 #   7. no line about the UFS or its disk that says something failed
 #      (storage_lines, storage_bad_re);
 #   8. every filesystem still frozen (still_frozen);
@@ -1799,7 +2351,9 @@ gave_up_early() {
 	fi
 	[ -z "$prot_why" ] || return 1
 	[ "$storage" = healthy ] && [ "${fails:-0}" = 0 ] || return 1
-	! grep -v -e 'calibration entry: SW_RESET' -e 'power-up write: PWRDN' "$ramdir/diag-$sfx" | grep -q . ||
+	! grep -v -e 'calibration entry: SW_RESET' -e 'power-up write: PWRDN' \
+		-e 'power-up sequence entry: PHY power_count' -e 'setup_clocks repeated a PHY power-' \
+		"$ramdir/diag-$sfx" | grep -q . ||
 		return 1
 	! storage_lines "$k" | grep -qiE "$storage_bad_re" || return 1
 	[ -n "$read_hash" ] && [ "$read_hash" = "$base_hash" ]
@@ -2256,8 +2810,10 @@ unprotect_and_stop() { # WHY NEXT
 		finish healthy
 	fi
 	if thaw_all; then
-		# The debug switches this run set go back to N: the tablet runs on.
+		# The debug switches this run set go back to N, and the RPMh
+		# tracepoint off: the tablet runs on.
 		sw_off
+		rpmh_off
 		sw_note
 		if errors_back; then
 			eb="every filesystem this run froze is thawed again${back_done:+, errors= is back as it was on:$back_done}, and the tablet is not restarted$sw_back"
@@ -2347,7 +2903,7 @@ run_from_ram() { # CONFIG
 	: > "$ramdir/started"
 	: > "$ramdir/frozen"
 	rmarker="gts9u sleep-test: $stamp start"
-	setro=0 freeze_hung=0 prot_why= prot_bad= ext4_said= slept=0 knobs_set=0 sw_tried=0 sw_back= pcie_fail=
+	setro=0 freeze_hung=0 prot_why= prot_bad= ext4_said= slept=0 knobs_set=0 sw_tried=0 sw_back= pcie_fail= rpmh_set=0
 	sw_note
 	# The first line in pmsg: a run that never comes back from its first
 	# sleep leaves this, the protection's and its cycle's.
@@ -2365,11 +2921,24 @@ run_from_ram() { # CONFIG
 	# GDSC switch is for a host that powers itself down) and before anything
 	# is frozen; one that does not read back Y stops the run here, with the
 	# ones that took put back.
-	if [ -n "$sw_set" ]; then
+	if [ -n "$sw_set$sw_ret" ]; then
 		sw_on || unprotect_and_stop "a debug switch did not take: $sw_why" "$(sw_next)"
 		sw_note
-		say "debug switches set right before the freeze:$sw_set; $swnote; they stay so until the restart that ends the run"
-		progress "debug switches set:$sw_set; $swnote"
+		sw_words="$sw_set${sw_ret:+ (N: $sw_ret)}"
+		say "debug switches set right before the freeze:$sw_words; $swnote; they stay so until the restart that ends the run"
+		progress "debug switches set:$sw_words; $swnote"
+	fi
+	# rpmh: the command DB copied once, then the tracepoint on and read
+	# back; one that does not take stops the run here, nothing frozen.
+	if [ "$rpmh" = 1 ]; then
+		awk '{ print }' "$cmd_db" 2>/dev/null > "$ramdir/cmd-db"
+		rpmh_set=1
+		printf 1 2>/dev/null > "$rpmh_event"
+		[ "$(ev_val "$rpmh_event")" = 1 ] ||
+			unprotect_and_stop "the RPMh tracepoint did not go on ($rpmh_event reads $(ev_val "$rpmh_event") after a write of 1)" 'NEXT: run again without rpmh, or once that is understood'
+		evn=$(grep -c '^0x' "$ramdir/cmd-db")
+		say "rpmh: the tracepoint rpmh_send_msg is on until the restart; the command DB names ${evn:-0} RPMh addresses"
+		progress "rpmh: tracepoint on, ${evn:-0} addresses named"
 	fi
 	# Nothing recorded or given up since the checks before the run (minutes
 	# ago with release-floor's settling): an error saved by now would be in
@@ -2685,6 +3254,10 @@ run_from_ram() { # CONFIG
 			an=$(abort_note)
 			verdict "SLEEP-TEST $cyc: FAIL$mword: $reasons ($dline; floor $floor; $swnote)"
 			verdict "SLEEP-TEST RESULT: FAIL$mword at $cyc: $reasons; $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
+			# A calibration of this cycle without the UFS PHY's power-on
+			# before it (phy_leak_seen): what that means, first.
+			! phy_leak_seen "$ramdir/diag-$sfx" ||
+				verdict "NEXT: the UFS PHY's power-on did not run before its calibration: a leaked PHY power reference (docs/resume-recovery.md, \"The PHY power reference\")"
 			# The storage came back: finish says what did not, if it was
 			# the PCIe host.
 			[ "$storage" != healthy ] ||
@@ -2733,7 +3306,8 @@ fi
 
 # ------------------------------------------------------ before: the disk ---
 cycles=3 seconds=30 hold=300 aborts=5 release=0 confirmed=0 numbers=0 dry=0 mode= aborts_given=0
-pci_remove=0 pm_test= trace= sleep_mode= sw_set= gdsc_given=0 cxmx_given=0
+pci_remove=0 pci_keep=0 pm_test= trace= sleep_mode= sw_set= sw_ret= gdsc_given=0 cxmx_given=0 ret_given=0 rpmh=0
+rpd3_given=0 sensors_stop=0
 for a in "$@"; do
 	case $a in
 	ro|dry)
@@ -2744,8 +3318,10 @@ for a in "$@"; do
 	release-floor) release=1 ;;
 	hold=*) hold=${a#hold=} ;;
 	aborts=*) aborts=${a#aborts=} aborts_given=1 ;;
-	pci=remove) pci_remove=1 ;;
-	pci=*) echo "$me: pci=remove is the only pci= option, not '$a'" >&2; usage ;;
+	pci=remove|pci=keep)
+		[ "$pci_remove$pci_keep" = 00 ] || { echo "$me: one pci= at most (pci=remove or pci=keep)" >&2; usage; }
+		[ "$a" = pci=remove ] && pci_remove=1 || pci_keep=1 ;;
+	pci=*) echo "$me: pci= is remove or keep, not '${a#pci=}'" >&2; usage ;;
 	pm_test=*)
 		[ -z "$pm_test" ] || { echo "$me: one pm_test= at most" >&2; usage; }
 		pm_test=${a#pm_test=}
@@ -2779,11 +3355,27 @@ for a in "$@"; do
 			case " $sw_set " in *" $gw "*) echo "$me: gdsc= names $gw twice" >&2; usage ;; esac
 			sw_set="$sw_set $gw"
 		done ;;
+	gdsc-ret=pcie0)
+		[ "$ret_given" = 0 ] || { echo "$me: one gdsc-ret= at most" >&2; usage; }
+		ret_given=1
+		sw_ret=pcie0 ;;
+	gdsc-ret=*) echo "$me: gdsc-ret=pcie0 is the only gdsc-ret= option, not '$a'" >&2; usage ;;
+	rpmh)
+		[ "$rpmh" = 0 ] || { echo "$me: one rpmh at most" >&2; usage; }
+		rpmh=1 ;;
 	cxmx=ret)
 		[ "$cxmx_given" = 0 ] || { echo "$me: one cxmx= at most" >&2; usage; }
 		cxmx_given=1
 		sw_set="$sw_set cxmx" ;;
 	cxmx=*) echo "$me: cxmx=ret is the only cxmx= option, not '$a'" >&2; usage ;;
+	root-port-d3)
+		[ "$rpd3_given" = 0 ] || { echo "$me: one root-port-d3 at most" >&2; usage; }
+		rpd3_given=1
+		sw_set="$sw_set rpd3" ;;
+	sensors=stop)
+		[ "$sensors_stop" = 0 ] || { echo "$me: one sensors=stop at most" >&2; usage; }
+		sensors_stop=1 ;;
+	sensors=*) echo "$me: sensors=stop is the only sensors= option, not '$a'" >&2; usage ;;
 	*)
 		num "$a" || { echo "$me: unknown argument '$a'" >&2; usage; }
 		numbers=$((numbers + 1))
@@ -2797,6 +3389,10 @@ done
 if [ "$dry" = 1 ]; then
 	[ "$numbers" = 0 ] && [ "$aborts_given" = 0 ] || { echo "$me: dry sleeps not at all: no CYCLES, SECONDS or aborts=" >&2; usage; }
 	[ -z "$pm_test" ] && [ -z "$trace" ] || { echo "$me: dry sleeps not at all: no pm_test= or trace" >&2; usage; }
+	[ "$pci_keep" = 0 ] || { echo "$me: dry sleeps not at all: pci=keep is for a sleep with the PCI devices kept" >&2; usage; }
+	[ "$rpmh" = 0 ] || { echo "$me: dry sleeps not at all: rpmh is for the RPMh commands of a sleep" >&2; usage; }
+	[ "$rpd3_given" = 0 ] || { echo "$me: dry sleeps not at all: root-port-d3 is for the sleeps of a pci=keep run" >&2; usage; }
+	[ "$sensors_stop" = 0 ] || { echo "$me: dry sleeps not at all: sensors=stop is for the audio DSP's wakes in a sleep" >&2; usage; }
 	cycles=0
 else
 	[ "$cycles" -ge 1 ] && [ "$cycles" -le 10 ] || { echo "$me: CYCLES is 1 to 10, not $cycles" >&2; usage; }
@@ -2813,11 +3409,26 @@ if [ "$sleep_mode" = s2idle ]; then
 	processors|core) echo "$me: pm_test=$pm_test with mode=s2idle: suspend-to-idle never gets there (it enters its idle loop after the devices' noirq phase, before the other CPUs would go offline), and the kernel refuses that level with it; use freezer, devices or platform" >&2; usage ;;
 	esac
 fi
+case " $sw_set " in
+*" pcie0 "*) [ -z "$sw_ret" ] || { echo "$me: gdsc=pcie0 and gdsc-ret=pcie0 contradict each other" >&2; usage; } ;;
+esac
+# root-port-d3 is for a sleep with the PCI devices kept, in which the host
+# then powers itself down: not with pci=remove (no root port left), and not
+# with pcie_0_gdsc kept in retention (the host powered down under it is the
+# sleep that hung 8 times of 8), nor where the noirq phase is not reached.
+if [ "$rpd3_given" = 1 ] && [ "$dry" = 0 ]; then
+	[ "$pci_keep" = 1 ] || { echo "$me: root-port-d3 needs pci=keep: it is for a sleep with the PCI devices kept, which pci=keep watches" >&2; usage; }
+	[ -z "$sw_ret" ] || { echo "$me: root-port-d3 with gdsc-ret=pcie0: the host would power down under pcie_0_gdsc kept on in retention, the sleep that never came back (8 of 8)" >&2; usage; }
+	case $pm_test in
+	freezer|devices) echo "$me: root-port-d3 with pm_test=$pm_test: the root port goes to D3hot in the noirq phase, which pm_test=$pm_test does not reach" >&2; usage ;;
+	esac
+fi
 mode_words
 # The experiment options in force, as every RESULT line names them.
 options= trace_word=
 [ "$sleep_mode" = deep ] || options="$options mode=s2idle"
 [ "$pci_remove" = 0 ] || options="$options pci=remove"
+[ "$pci_keep" = 0 ] || options="$options pci=keep"
 [ -z "$pm_test" ] || options="$options pm_test=$pm_test"
 case $trace in
 on) trace_word=trace ;;
@@ -2829,12 +3440,27 @@ sw_asked=$sw_set sw_set= gdsc_word=
 for swn in $sw_names; do
 	case " $sw_asked " in *" $swn "*) ;; *) continue ;; esac
 	sw_set="$sw_set $swn"
-	[ "$swn" = cxmx ] || gdsc_word="$gdsc_word,$swn"
+	case $swn in cxmx|rpd3) ;; *) gdsc_word="$gdsc_word,$swn" ;; esac
 done
 [ -z "$gdsc_word" ] || options="$options gdsc=${gdsc_word#,}"
+[ -z "$sw_ret" ] || options="$options gdsc-ret=$sw_ret"
 [ "$cxmx_given" = 0 ] || options="$options cxmx=ret"
+[ "$rpd3_given" = 0 ] || options="$options root-port-d3"
+[ "$rpmh" = 0 ] || options="$options rpmh"
+[ "$sensors_stop" = 0 ] || options="$options sensors=stop"
 options=${options# }
 options=${options:-none}
+
+# The audio DSP's clients in userspace, by their units' state: "iio-sensor-proxy
+# active, hexagonrpcd-adsp-sensorspd active, hexagonrpcd-adsp-rootpd inactive".
+adsp_units() {
+	au=
+	for aun in iio-sensor-proxy hexagonrpcd-adsp-sensorspd hexagonrpcd-adsp-rootpd; do
+		auv=$(systemctl is-active "$aun.service" 2>/dev/null)
+		au="$au, $aun ${auv:-unknown}"
+	done
+	echo "${au#, }"
+}
 
 # printf, not echo: dash's echo would read the backslash of an escaped
 # mount point (\040) as an escape.
@@ -2904,20 +3530,100 @@ fi
 if [ -n "$gdsc_word" ] && [ "$pci_remove" = 0 ]; then
 	refuse "gdsc=${gdsc_word#,} needs pci=remove: with the PCI devices kept the PCIe host stays up through the sleep, and a PCIe GDSC that collapses (OFF_ON) takes the controller away from a live host; the GDSC switches are for runs with pci=remove"
 fi
-for swn in $sw_set; do
+for swn in $sw_set $sw_ret; do
 	swf=$(sw_file "$swn")
 	[ -e "$swf" ] && [ -w "$swf" ] ||
-		refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 and 10 have it (sh ~/typec-roles/verify.sh says which kernel runs)"
+		refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 to 11 have it, revision 11's alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"
 done
-swon=
+# Each switch as it booted (sw_boot): N, but pcie0 Y on revision 11's
+# kernel.  One that reads otherwise was written since the boot.
+swon= swset=
 for swn in $sw_names; do
 	swf=$(sw_file "$swn")
 	[ -e "$swf" ] || continue
 	swv=$(cat "$swf" 2>/dev/null)
-	[ "$swv" = N ] || swon="$swon $swn ($swf: ${swv:-unreadable})"
+	swb=$(sw_boot "$swn")
+	[ "$swv" = "$swb" ] || swon="$swon $swn ($swf: ${swv:-unreadable})"
+	[ "$swb" = N ] || swset="$swset $swn $swb"
 done
-[ -z "$swon" ] ||
-	refuse "a debug switch is on already:$swon; a run sets the ones it is given itself, right before the freeze, and records what it set: put it back (echo N | sudo tee FILE) or restart the tablet"
+if [ -n "$swon" ]; then
+	if [ -z "$swset" ]; then
+		refuse "a debug switch is on already:$swon; a run sets the ones it is given itself, right before the freeze, and records what it set: put it back (echo N | sudo tee FILE) or restart the tablet"
+	fi
+	refuse "a debug switch does not read as this kernel booted it:$swon (at boot:$swset, the others N; $sw_boot_file); a run sets the ones it is given itself, right before the freeze, and records what it set: put it back (echo Y or N | sudo tee FILE) or restart the tablet"
+fi
+# Revision 11's kernel lets pcie_0_gdsc collapse in system suspend (its
+# pcie0 switch booted Y), and its guard keeps it on while the PCIe host keeps
+# its link; the host's line at each resume says what genpd did (the header,
+# pci=keep).  The guard held this boot: at least one sleep logged its kept
+# link with the domain on, and none the domain off under a kept link.
+guard_state=none guard_n=0 guard_first=
+guard_lines=$(dmesg 2>/dev/null | grep -E "$guard_re")
+# The ring buffer may have dropped the boot's first lines: the journal has
+# them (on the disk, which is writable still).
+[ -n "$guard_lines" ] || guard_lines=$(journalctl -k -b --no-pager -q 2>/dev/null | grep -E "$guard_re")
+if [ -n "$guard_lines" ]; then
+	guard_n=$(printf '%s\n' "$guard_lines" | grep -cE "$guard_re")
+	guard_first=$(printf '%s\n' "$guard_lines" | head -n 1 | sed 's/.*\.pcie: system sleep: //')
+	if printf '%s\n' "$guard_lines" | grep -qE "$guard_bad_re"; then
+		guard_state=failed
+	elif printf '%s\n' "$guard_lines" | grep -qE "$guard_kept_re"; then
+		guard_state=held
+	else
+		guard_state=unseen
+	fi
+fi
+# A sleep with the PCI devices kept on a kernel that collapses
+# pcie_0_gdsc, whose guard did not hold this boot (or which has none:
+# revision 11 as first prepared), collapses it under the live host at the end
+# of the noirq phase: refused unless the run removes them, keeps the GDSC in
+# retention for the run, or says pci=keep.  dry and pm_test= levels before
+# the noirq phase (freezer, devices) do not get there.
+pcie0_off=N
+[ ! -e "$(sw_file pcie0)" ] || pcie0_off=$(sw_boot pcie0)
+case " $sw_set " in *" pcie0 "*) pcie0_off=Y ;; esac
+[ -z "$sw_ret" ] || pcie0_off=N
+case $pm_test in freezer|devices) pcie0_reached=0 ;; *) pcie0_reached=1 ;; esac
+if [ "$dry" = 0 ] && [ "$pcie0_reached" = 1 ] && [ "$pcie0_off" = Y ] && [ "$pci_remove" = 0 ] && [ "$pci_keep" = 0 ] &&
+	[ "$guard_state" != held ]; then
+	case $guard_state in
+	failed) guard_why="its guard did not hold this boot (a sleep logged \"the link was kept, but genpd powered its power domain off\")" ;;
+	unseen) guard_why="its guard's line of a kept link with the domain on is not in this boot's kernel log (the first sleep logged: $guard_first)" ;;
+	*) guard_why='it has no guard (no "system sleep:" line of the PCIe host in this boot'"'"'s kernel log: revision 11 as first prepared, or no suspend yet)' ;;
+	esac
+	refuse "pcie_0_gdsc collapses in this kernel's suspend (its debug switch pcie0 booted Y: revision 11), and $guard_why, so with the PCI devices kept genpd may collapse that GDSC under the live PCIe host: give pci=remove, or gdsc-ret=pcie0 to keep it in retention for the run, or pci=keep to run it so (the Wi-Fi may not come back, or the tablet may crash at the resume: README, \"Revision 11\")"
+fi
+if [ "$rpd3_given" = 1 ] && [ "$guard_state" != held ]; then
+	refuse "root-port-d3 needs a guard that held this boot (a sleep that logged \"the link was kept, and its power domain stayed on\", none that logged it off): guard $guard_state${guard_first:+, the first sleep logged: $guard_first}"
+fi
+# Revision 10's second UFS PHY diagnostic logs a power-up write line before
+# each calibration, the UFS probe's among them: on a kernel that logged one
+# this boot (pwrdn_seen 1) a calibration entry without one before it had no
+# PHY power-on (phy_leak_seen).  The kernel's own lines, from dmesg, or the
+# journal when the ring buffer has dropped the boot's first lines.
+pwrdn_seen=0
+if dmesg 2>/dev/null | grep -v 'gts9u sleep-test: ' | grep -q 'power-up write: PWRDN' ||
+	journalctl -k -b --no-pager -q 2>/dev/null | grep -v 'gts9u sleep-test: ' | grep -q 'power-up write: PWRDN'; then
+	pwrdn_seen=1
+fi
+# rpmh: the tracepoint there and writable, and tracing on, or the trace
+# would stay empty.  The command DB names the addresses; without it they
+# stay numbers (the header says so).
+rpmh_was=
+if [ "$rpmh" = 1 ]; then
+	[ -e "$rpmh_event" ] && [ -w "$rpmh_event" ] ||
+		refuse "rpmh needs the RPMh tracepoint ($rpmh_event): tracefs, and a kernel with CONFIG_FTRACE (the kit's kernels have both)"
+	ton=$(cat "$trace_dir/tracing_on" 2>/dev/null)
+	[ "$ton" = 1 ] ||
+		refuse "rpmh: tracing is off ($trace_dir/tracing_on reads ${ton:-nothing}), so the trace would stay empty: echo 1 | sudo tee $trace_dir/tracing_on, or run without rpmh"
+	# Its clock has to be the kernel log's (local, the default) for the
+	# sleep to be found in it by the kernel's lines.
+	tclk=
+	[ ! -e "$trace_dir/trace_clock" ] || tclk=$(selected "$trace_dir/trace_clock")
+	[ "$tclk" = local ] ||
+		refuse "rpmh: the trace clock is ${tclk:-unknown} ($trace_dir/trace_clock), not local, the kernel log's: echo local | sudo tee $trace_dir/trace_clock, or run without rpmh"
+	rpmh_was=$(cat "$rpmh_event" 2>/dev/null)
+fi
 # The first resume with a filesystem frozen from userspace logs one kernel
 # warning (fs/super.c:1919, may_unfreeze: the suspend's own thaw finds no
 # freeze of its own), and a writer that waits on the frozen disk for
@@ -3189,7 +3895,33 @@ fi
 	pci_list=$(pci_names)
 	echo "PCI: $(pci_count) devices${pci_list:+:$pci_list}; root ports:$(pci_root_ports | awk '{ printf " %s", $0 } END { if (!NR) printf " none" }')$([ "$pci_remove" = 0 ] || echo '; pci=remove: all of them go right before the freeze')"
 	echo "printk: kernel.printk ${printk_was:-n/a}, console_suspend ${suspend_was:-n/a}, ignore_loglevel $(cat "$ignore_loglevel_ctl" 2>/dev/null || echo n/a); pm_debug_messages ${debug_was:-n/a}$debug_plan, pm_print_times $(cat "$print_times_ctl" 2>/dev/null || echo n/a); pm_test [$(selected "$pm_test_ctl")], pm_test_delay ${pm_test_delay}s"
-	echo "debug $(sw_now) ($sw_gcc/debug_pcie0_off, debug_pcie0_phy_off, debug_usb_off; $sw_rpmhpd/debug_ret_floor)$([ -z "$sw_set" ] || echo "; this run sets$sw_set to Y right before the freeze")"
+	echo "debug $(sw_now) ($sw_gcc/debug_pcie0_off, debug_pcie0_phy_off, debug_usb_off; $sw_rpmhpd/debug_ret_floor; $sw_pcie/debug_root_port_d3)$([ -z "$sw_set" ] || echo "; this run sets$sw_set to Y right before the freeze")$([ -z "$sw_ret" ] || echo "; this run sets $sw_ret to N right before the freeze")"
+	[ ! -e "$sw_boot_file" ] || echo "debug switches at boot: $(cat "$sw_boot_file" 2>/dev/null) ($sw_boot_file); pcie_0_gdsc in this run's sleeps: $([ "$pcie0_off" = Y ] && echo 'OFF_ON, collapsed when the PCIe host has powered down' || echo 'RET_ON, left on')"
+	case $guard_state in
+	held) echo "PCIe power domain guard: held this boot ($guard_n sleeps logged, none with the domain off under a kept link; the first: $guard_first)" ;;
+	failed) echo "PCIe power domain guard: did NOT hold this boot ($guard_n sleeps logged; at least one: the link was kept, but genpd powered its power domain off)" ;;
+	unseen) echo "PCIe power domain guard: no sleep this boot logged a kept link with the domain on ($guard_n sleeps logged; the first: $guard_first)" ;;
+	*) echo 'PCIe power domain guard: no "system sleep:" line of the PCIe host this boot (a kernel without the guard, or no suspend yet)' ;;
+	esac
+	# What may keep the audio DSP awake or the clocks and rails on: its
+	# clients in userspace, the sound streams open, the boot's ignore_unused
+	# options (reads only).
+	pw=0
+	for pc in /proc/[0-9]*/comm; do
+		pn=
+		read -r pn 2>/dev/null < "$pc" || continue
+		case $pn in pipewire*|wireplumber) pw=$((pw + 1)) ;; esac
+	done
+	pcm=
+	for ps in /proc/asound/card*/pcm*/sub*/status; do
+		[ -r "$ps" ] || continue
+		pst=
+		read -r pst 2>/dev/null < "$ps" || :
+		[ "$pst" = closed ] || pcm="$pcm ${ps#/proc/asound/}(${pst:-?})"
+	done
+	echo "ADSP clients: $(adsp_units); PipeWire and WirePlumber processes $pw; sound streams not closed:${pcm:- none}$([ "$sensors_stop" = 0 ] || echo "; sensors=stop: this run stops $sensor_units next, until the restart")"
+	[ "$rpmh" = 0 ] || echo "rpmh: the tracepoint $rpmh_event (${rpmh_was:-?} now) goes on right before the freeze; command DB: $([ -r "$cmd_db" ] && echo "$cmd_db, $(grep -c '^0x' "$cmd_db" 2>/dev/null) addresses" || echo "$cmd_db not readable: the addresses stay numbers")"
+	echo "kernel command line, the ignore_unused options:$({ tr ' ' '\n' < /proc/cmdline; } 2>/dev/null | grep -E '^(clk|pd|regulator)_ignore_unused$' | sed 's/^/ /' | tr -d '\n')"
 	echo "root: $rootsrc ext4, ext4 errors_count $rooterr, state $rootstate; to freeze, the root last:$(freeze_order "$rootsrc" | awk '!seen[$1]++ { printf " %s", $2 }')"
 	echo 'ext4, as the run found it (errors_count, error behaviour, the superblock'"'"'s default):'
 	printf '%s\n' "$targets" |
@@ -3203,6 +3935,30 @@ fi
 } > "$ramdir/before" 2>&1
 cp "$ramdir/before" "$logs/before"
 while IFS= read -r l; do say "$l"; done < "$ramdir/before"
+
+# sensors=stop (the header): the audio DSP's sensor clients stopped for the
+# run, the last change before the floor's release; one still running stops
+# the run here, nothing frozen.
+if [ "$sensors_stop" = 1 ]; then
+	say "sensors=stop: systemctl stop $sensor_units (auto-rotation and auto-brightness are off until the restart)"
+	systemctl stop $sensor_units >> "$ramdir/log" 2>&1
+	sensors_rc=$?
+	sensors_now=$(adsp_units)
+	sensors_up=
+	for sun in $sensor_units; do
+		case $(systemctl is-active "$sun" 2>/dev/null) in
+		active|activating|reloading|deactivating) sensors_up="$sensors_up $sun" ;;
+		esac
+	done
+	debug_note="${debug_note:+$debug_note; }iio-sensor-proxy and hexagonrpcd-adsp-sensorspd stay stopped until the next boot (sudo reboot brings them back)"
+	if [ -n "$sensors_up" ]; then
+		cp "$ramdir/log" "$logs/log"
+		own
+		stop "sensors=stop: still running after systemctl stop (status $sensors_rc):$sensors_up; ADSP clients now: $sensors_now"
+	fi
+	say "sensors=stop: ADSP clients now: $sensors_now (systemctl stop status $sensors_rc); ${settle}s to settle"
+	sleep "$settle"
+fi
 
 if [ "$floor" != released ]; then
 	if [ "$release" = 1 ]; then
@@ -3241,7 +3997,7 @@ fi
 if [ "$dry" = 0 ] && [ -n "$debug_was" ] && [ "$debug_was" != 1 ]; then
 	printf 1 > "$debug_messages_ctl" 2>/dev/null
 	if [ "$(cat "$debug_messages_ctl" 2>/dev/null)" = 1 ]; then
-		debug_note="pm_debug_messages stays 1 until the next boot (it was $debug_was)"
+		debug_note="${debug_note:+$debug_note; }pm_debug_messages stays 1 until the next boot (it was $debug_was)"
 		say "pm_debug_messages 1 for this run (it was $debug_was), so that each cycle's kernel lines have the PM core's: the restart that ends the run puts it back; a stop before any sleep leaves it at 1 until the next boot"
 	fi
 fi
@@ -3257,7 +4013,8 @@ sync
 
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for v in stamp ramdir part disk cycles seconds hold aborts dry rootsrc rootname floor armed kernel mount_cmd ufs_host \
-	pci_remove pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note sw_set; do
+	pci_remove pci_keep pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note sw_set sw_ret \
+	rpmh rpmh_was guard_state sensors_stop pwrdn_seen; do
 	eval "printf '%s=%s\n' $v \"\$(q \"\$$v\")\""
 done > "$ramdir/run.conf"
 say 'the run goes on from RAM in a session of its own: it ends with a restart even if this terminal goes away'
@@ -3266,6 +4023,29 @@ say 'while the disk is frozen, programs that write to it wait (the desktop, the 
 say 'do not touch the screen until the restart: a double tap on it wakes the tablet and aborts the sleep it is in'
 if [ "$pci_remove" = 1 ]; then
 	say "pci=remove: right before it freezes the disks the run removes the PCI root port(s)$pci_roots and everything below them, the Wi-Fi with them: Wi-Fi is gone from then until the restart, and an SSH session over Wi-Fi drops there while the run carries on; follow it over the USB cable (usb0), or read its result in pstore after the restart"
+fi
+if [ "$pci_keep" = 1 ]; then
+	if [ "$rpd3_given" = 1 ]; then
+		pk_host='the PCI devices stay, and with root-port-d3 the root port goes to D3hot after the Wi-Fi in each sleep, so that the PCIe host powers itself down and is set up again at the resume'
+	else
+		pk_host='the PCI devices stay and the PCIe host keeps its link through each sleep'
+	fi
+	if [ "$pcie0_off" != Y ]; then
+		pk_gdsc='pcie_0_gdsc stays on in retention (RET_ON), as before revision 11'
+	elif [ "$rpd3_given" = 1 ]; then
+		pk_gdsc='pcie_0_gdsc collapses once the host is down (the guard marks it out-of-band)'
+	elif [ "$guard_state" = held ]; then
+		pk_gdsc='pcie_0_gdsc stays on under the kept link (the guard, which held this boot)'
+	else
+		pk_gdsc='pcie_0_gdsc may collapse under the kept link (OFF_ON, and no guard that held this boot): the Wi-Fi may not come back, or the tablet may crash at the resume and restart by itself'
+	fi
+	say "pci=keep: $pk_host; $pk_gdsc; a cycle whose kernel lines say the PCIe host or the Wi-Fi did not come back, or that the guard did not hold, ends the run (PCIE-DOWN); give it one cycle"
+fi
+if [ "$rpd3_given" = 1 ]; then
+	say "root-port-d3: right before it freezes the disks the run writes Y to $(sw_file rpd3) and reads it back; it stays so until the restart that ends the run. First use of the switch: the root port, the Wi-Fi and the PCIe host come back through a host power-down, or the Wi-Fi is gone until the restart (PCIE-DOWN), or the tablet restarts by itself"
+fi
+if [ -n "$sw_ret" ]; then
+	say "gdsc-ret=$sw_ret: right before it freezes the disks$([ "$pci_remove" = 0 ] || echo ', after the PCI removal,') the run writes N to its switch: pcie_0_gdsc stays on in retention in the sleeps, as on revision 10$([ "$pci_remove" = 0 ] || echo ', where every such sleep with the PCI devices removed and the floor released hung (8 of 8): a control run')"
 fi
 if [ -n "$sw_set" ]; then
 	say "debug switches$sw_set: right before it freezes the disks$([ "$pci_remove" = 0 ] || echo ', after the PCI removal,') the run writes Y to each and reads it back; they stay so until the restart that ends the run, and every verdict says how they read"
