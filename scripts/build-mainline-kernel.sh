@@ -55,6 +55,11 @@ apply_va_macro_pm_clk=${APPLY_LPASS_VA_MACRO_PM_CLK:-0}
 # keeps XO voted through a system sleep (see
 # msm-dsi-phy-release-ahb-clock-in-system-sleep.patch below).
 apply_dsi_phy_ahb=${APPLY_DSI_PHY_AHB_RELEASE:-0}
+# Test builds until it has run on hardware: the geni UARTs' resources, which
+# a port in use (the console, the Bluetooth UART) kept through a system
+# sleep, its "se" clock keeping XO voted (see
+# qcom-geni-serial-force-suspend-in-system-sleep.patch below).
+apply_geni_force_suspend=${APPLY_GENI_SERIAL_FORCE_SUSPEND:-0}
 # Test builds until it has had more hardware passes: the root ports of qcom
 # PCIe hosts to D3hot in every system suspend, from the boot on (see
 # pcie-qcom-root-port-d3-in-system-suspend.patch below), with
@@ -104,6 +109,7 @@ if [ "$apply_pcie0_gdsc_off" != "$apply_pcie0_gdsc_guard" ]; then
 fi
 validate_bool APPLY_LPASS_VA_MACRO_PM_CLK "$apply_va_macro_pm_clk"
 validate_bool APPLY_DSI_PHY_AHB_RELEASE "$apply_dsi_phy_ahb"
+validate_bool APPLY_GENI_SERIAL_FORCE_SUSPEND "$apply_geni_force_suspend"
 # A PCIe host that powers itself down in a sleep with pcie_0_gdsc left on in
 # retention is the sleep that never came back (8 of 8 on kit revisions 7 to
 # 10); the root ports' D3 is what lets the host power down with the Wi-Fi
@@ -665,6 +671,36 @@ if [ "$DEVICE" = gts9wifi ]; then
 	apply_unless 'Serve the interrupt even once uart_suspend_port()' \
 		drivers/tty/serial/qcom_geni_serial.c \
 		qcom-geni-serial-serve-irq-while-suspending.patch
+fi
+# qcom-geni-serial-force-suspend-in-system-sleep.patch, upstream d0cd9c8d0fd5
+# (v7.3-rc1) with its fix 3098c989bd38 (v7.3-rc6) folded in, with
+# APPLY_GENI_SERIAL_FORCE_SUSPEND=1: in v7.2-rc3 a geni UART in use keeps its
+# "se" clock, its QUP bandwidth and its CX vote through a system sleep, as
+# the serial core's power-off (pm_runtime_put_sync()) cannot runtime suspend
+# a device the PM core holds for the whole transition, and on the SM8550
+# those clocks sit on the XO that is voted in the sleep set.  Both tablets'
+# console (uart7) and Bluetooth UART (uart14) are such ports: kit revision
+# 12's clock trace found them the only clocks still holding XO at the entry
+# to the sleep.  The patch force-suspends the port at the end of its suspend
+# callback and force-resumes it first in its resume callback.  Every system
+# sleep runs it, the boot's panel cycle (pm_test) too: test builds until it
+# has run on hardware.  No board gate: both tablets have the same two UARTs.
+# Strictly, with or without the patch above (another function), and refused
+# for a build without it in a tree that carries it.
+geni_fs_patch=qcom-geni-serial-force-suspend-in-system-sleep.patch
+geni_fs_marker='return pm_runtime_force_suspend(dev);'
+if [ "$apply_geni_force_suspend" = 1 ]; then
+	if grep -qF "$geni_fs_marker" "$kernel_tree/drivers/tty/serial/qcom_geni_serial.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$geni_fs_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$geni_fs_patch"
+	fi
+elif grep -qF "$geni_fs_marker" "$kernel_tree/drivers/tty/serial/qcom_geni_serial.c"; then
+	echo "$geni_fs_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_GENI_SERIAL_FORCE_SUSPEND=1." >&2
+	exit 1
 fi
 apply_unless 'sc8280xp_snd_startup' \
 	sound/soc/qcom/sc8280xp.c set-mi2s-codec-dai-format.patch

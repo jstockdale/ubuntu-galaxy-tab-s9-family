@@ -4,9 +4,11 @@ scripts/build-mainline-kernel.sh applies each behind a variable of its own:
 lpass-va-macro-pm-clock-framework.patch (upstream eb667d0fbdd3, v7.3-rc1)
 with APPLY_LPASS_VA_MACRO_PM_CLK=1, and
 msm-dsi-phy-release-ahb-clock-in-system-sleep.patch (posted and reviewed
-upstream, not merged) with APPLY_DSI_PHY_AHB_RELEASE=1.  The build script's block runs from its
-own text on files taken from the pinned kernel checkout (only read, with
-git show): off by default, 0 or 1 only, the patch applied strictly and
+upstream, not merged) with APPLY_DSI_PHY_AHB_RELEASE=1, and
+qcom-geni-serial-force-suspend-in-system-sleep.patch (upstream d0cd9c8d0fd5
+with 3098c989bd38, v7.3) with APPLY_GENI_SERIAL_FORCE_SUSPEND=1.  The build
+script's block runs from its own text on files taken from the pinned kernel
+checkout (only read, with git show): off by default, 0 or 1 only, the patch applied strictly and
 once, a tree that carries it refused for a build without the variable, a
 damaged copy refused.  The patch's own content is checked against what its
 header says.  Nothing is built and no kernel tree is written.
@@ -27,6 +29,9 @@ KCONFIG = "sound/soc/codecs/Kconfig"
 VA_PATCH = "lpass-va-macro-pm-clock-framework.patch"
 DSI_PHY = "drivers/gpu/drm/msm/dsi/phy/dsi_phy"
 DSI_PATCH = "msm-dsi-phy-release-ahb-clock-in-system-sleep.patch"
+GENI = "drivers/tty/serial/qcom_geni_serial.c"
+GENI_PATCH = "qcom-geni-serial-force-suspend-in-system-sleep.patch"
+GENI_IRQ_PATCH = "qcom-geni-serial-serve-irq-while-suspending.patch"
 
 
 def kernel_source():
@@ -58,7 +63,8 @@ def validate(text):
 
 class VariableTest(unittest.TestCase):
     CASES = (("APPLY_LPASS_VA_MACRO_PM_CLK", "apply_va_macro_pm_clk"),
-             ("APPLY_DSI_PHY_AHB_RELEASE", "apply_dsi_phy_ahb"))
+             ("APPLY_DSI_PHY_AHB_RELEASE", "apply_dsi_phy_ahb"),
+             ("APPLY_GENI_SERIAL_FORCE_SUSPEND", "apply_geni_force_suspend"))
 
     def test_each_variable_is_off_by_default_and_0_or_1(self):
         text = BUILD.read_text()
@@ -80,7 +86,8 @@ class VariableTest(unittest.TestCase):
 
     def test_no_board_gate(self):
         for start in ("# lpass-va-macro-pm-clock-framework.patch, upstream eb667d0fbdd3",
-                      "# msm-dsi-phy-release-ahb-clock-in-system-sleep.patch, posted upstream"):
+                      "# msm-dsi-phy-release-ahb-clock-in-system-sleep.patch, posted upstream",
+                      "# qcom-geni-serial-force-suspend-in-system-sleep.patch, upstream d0cd9c8d0fd5"):
             with self.subTest(start):
                 self.assertNotIn("DEVICE", block(start))
 
@@ -244,6 +251,165 @@ class DsiPhyAhbTest(unittest.TestCase):
             result = self.run_block(tree, "1")
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((tree / (DSI_PHY + ".h")).read_text(), damaged)
+
+
+class GeniSerialForceSuspendTest(unittest.TestCase):
+    """The console's and the Bluetooth UART's resources off in system
+    sleep: upstream's two commits, folded, on the geni UART driver, with or
+    without the SM-X710's interrupt patch (another function)."""
+    START = "# qcom-geni-serial-force-suspend-in-system-sleep.patch, upstream d0cd9c8d0fd5"
+    # The two callbacks as v7.3 and v7.4-rc4 have them, less e95442c31ae6's
+    # pm_runtime_resume() of the console, which that tree needs because
+    # aee1f94dab13 removed the uart_ops .pm callback this tree keeps.
+    SUSPEND = """static int qcom_geni_serial_suspend(struct device *dev)
+{
+\tstruct qcom_geni_serial_port *port = dev_get_drvdata(dev);
+\tstruct uart_port *uport = &port->uport;
+\tstruct qcom_geni_private_data *private_data = uport->private_data;
+\tint ret;
+
+\t/*
+\t * This is done so we can hit the lowest possible state in suspend
+\t * even with no_console_suspend
+\t */
+\tif (uart_console(uport)) {
+\t\tgeni_icc_set_tag(&port->se, QCOM_ICC_TAG_ACTIVE_ONLY);
+\t\tgeni_icc_set_bw(&port->se);
+\t}
+
+\tret = uart_suspend_port(private_data->drv, uport);
+\tif (ret)
+\t\treturn ret;
+
+\t/*
+\t * When no_console_suspend is set the console must remain active
+\t * across system sleep, so skip the force suspend path.
+\t */
+\tif (!console_suspend_enabled && uart_console(uport))
+\t\treturn 0;
+
+\treturn pm_runtime_force_suspend(dev);
+}
+"""
+    RESUME = """static int qcom_geni_serial_resume(struct device *dev)
+{
+\tint ret;
+\tstruct qcom_geni_serial_port *port = dev_get_drvdata(dev);
+\tstruct uart_port *uport = &port->uport;
+\tstruct qcom_geni_private_data *private_data = uport->private_data;
+
+\tif (console_suspend_enabled || !uart_console(uport)) {
+\t\tret = pm_runtime_force_resume(dev);
+\t\tif (ret)
+\t\t\treturn ret;
+\t}
+
+\tret = uart_resume_port(private_data->drv, uport);
+\tif (uart_console(uport)) {
+\t\tgeni_icc_set_tag(&port->se, QCOM_ICC_TAG_ALWAYS);
+\t\tgeni_icc_set_bw(&port->se);
+\t}
+\treturn ret;
+}
+"""
+
+    def run_block(self, tree, value):
+        return subprocess.run(["bash", "-c", "set -euo pipefail\nkernel_tree=$1 pat=$2 apply_geni_force_suspend=$3\n"
+                               + block(self.START), "build", str(tree), str(PATCHES), value],
+                              capture_output=True, text=True)
+
+    def test_the_patch_is_upstream_s_two_commits_on_the_driver_and_says_so(self):
+        text = (PATCHES / GENI_PATCH).read_text()
+        self.assertTrue(text.startswith("From d0cd9c8d0fd59bc7d140f3d60cf02e1d80376dab "), text[:80])
+        self.assertIn("commit d0cd9c8d0fd59bc7d140f3d60cf02e1d80376dab upstream (v7.3-rc1), with\n"
+                      "its fix 3098c989bd38edff871d798acd7f1d1b269f7edd upstream (v7.3-rc6,", text)
+        self.assertIn("Link: https://patch.msgid.link/20260702-add_force_suspend_resume_to_system_sleep_callbacks-v2-1-"
+                      "b79e254a7015@oss.qualcomm.com", text)
+        self.assertIn("Fixes: d0cd9c8d0fd5 (\"serial: qcom-geni: add force suspend/resume to system sleep callbacks\")",
+                      text)
+        self.assertEqual(targets(GENI_PATCH), [GENI])
+        diff = text[text.index("\n--- a/"):]
+        added = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+        removed = [l for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")]
+        self.assertEqual((len(added), len(removed)), (20, 1))
+        self.assertEqual(removed, ["-\treturn uart_suspend_port(private_data->drv, uport);"])
+        self.assertIn("+\treturn pm_runtime_force_suspend(dev);", added)
+        self.assertIn("+\t\tret = pm_runtime_force_resume(dev);", added)
+        self.assertIn(" 1 file changed, 20 insertions(+), 1 deletion(-)", text)
+        # What it changes, the variable, both boards, and what it leaves.
+        self.assertIn("APPLY_GENI_SERIAL_FORCE_SUSPEND=1", text)
+        self.assertIn("No board gate: both tablets have the same two\nUARTs", text)
+        self.assertIn("aee1f94dab13, v7.3-rc1, and fixed what that broke in 2de1066dc859 and\n"
+                      "e95442c31ae6; none of the three is taken", text)
+
+    def test_no_patch_but_the_interrupt_one_touches_the_driver(self):
+        others = sorted(p.name for p in PATCHES.glob("*.patch") if p.name != GENI_PATCH and GENI in targets(p.name))
+        self.assertEqual(others, [GENI_IRQ_PATCH])
+
+    def test_the_build_applies_it_for_both_boards_after_the_interrupt_patch(self):
+        """The interrupt patch is the SM-X710's alone; this block is not
+        inside its board test, and comes after it."""
+        text = BUILD.read_text()
+        irq = text.index("\t\tqcom-geni-serial-serve-irq-while-suspending.patch\nfi\n")
+        self.assertLess(irq, text.index(block(self.START)))
+        self.assertNotIn("DEVICE", block(self.START))
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_its_callbacks_are_upstream_s_with_or_without_the_interrupt_patch(self):
+        for irq_first in (False, True):
+            with self.subTest(irq_first=irq_first), tempfile.TemporaryDirectory() as tmp:
+                tree = pathlib.Path(tmp)
+                (tree / GENI).parent.mkdir(parents=True)
+                (tree / GENI).write_text(pinned(GENI))
+                order = [GENI_IRQ_PATCH, GENI_PATCH] if irq_first else [GENI_PATCH, GENI_IRQ_PATCH]
+                for name in order:
+                    result = subprocess.run(["patch", "--forward", "--batch", "--fuzz=0", "--no-backup-if-mismatch",
+                                             "-d", str(tree), "-p1"], input=(PATCHES / name).read_text(),
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                text = (tree / GENI).read_text()
+                self.assertEqual(text.count(self.SUSPEND), 1)
+                self.assertEqual(text.count(self.RESUME), 1)
+                self.assertNotIn("\tif (uport->suspended)\n\t\treturn IRQ_NONE;\n", text)
+                self.assertEqual(sorted(p.name for p in (tree / GENI).parent.iterdir()), ["qcom_geni_serial.c"])
+
+    @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
+    def test_the_variable_applies_it_once_and_a_build_without_it_refuses_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = pathlib.Path(tmp)
+            (tree / GENI).parent.mkdir(parents=True)
+            # As an SM-X710 build has the file when the block runs.
+            (tree / GENI).write_text(pinned(GENI))
+            subprocess.run(["patch", "-s", "-d", str(tree), "-p1", "--no-backup-if-mismatch"],
+                           input=(PATCHES / GENI_IRQ_PATCH).read_text(), check=True, text=True)
+            before = (tree / GENI).read_text()
+            result = self.run_block(tree, "0")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((tree / GENI).read_text(), before)
+            result = self.run_block(tree, "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("fuzz", result.stdout)
+            patched = (tree / GENI).read_text()
+            self.assertEqual(patched.count("\treturn pm_runtime_force_suspend(dev);\n"), 1)
+            self.assertIn(self.RESUME, patched)
+            self.assertEqual(sorted(p.name for p in (tree / GENI).parent.iterdir()), ["qcom_geni_serial.c"])
+            # Again: a reused tree, nothing changes.
+            result = self.run_block(tree, "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((tree / GENI).read_text(), patched)
+            # A build without the variable in that tree: refused, unchanged.
+            result = self.run_block(tree, "0")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(f"{GENI_PATCH} remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for "
+                          "a build without APPLY_GENI_SERIAL_FORCE_SUSPEND=1.", result.stderr)
+            self.assertEqual((tree / GENI).read_text(), patched)
+            # A copy with the marker but not the whole patch: refused.
+            damaged = patched.replace("\t\tret = pm_runtime_force_resume(dev);\n", "\t\tret = 0;\n")
+            self.assertNotEqual(damaged, patched)
+            (tree / GENI).write_text(damaged)
+            result = self.run_block(tree, "1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((tree / GENI).read_text(), damaged)
 
 
 if __name__ == "__main__":
