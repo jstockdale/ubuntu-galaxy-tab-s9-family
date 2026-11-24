@@ -1,0 +1,138 @@
+Subject: [DIAGNOSTIC, test builds only] scsi: ufs: ufs-qcom: log the PHY's power and init counts
+
+Not for release builds.  scripts/build-mainline-kernel.sh applies this only
+with APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, on top of
+ufs-qcom-track-phy-power-state-gts9u.patch, and refuses a build without the
+variable in a source tree that carries it.
+
+On 2026-11-23 (the SM-X710's Type-C kit revision 10, run 5) a resume's 15
+calibrations of the UFS PHY started with POWER_DOWN_CONTROL at its reset
+value and no power-up write before them: the PHY's power_on callback did not
+run, which phy_power_on() skips when the PHY's power_count is not 0.  The
+patch below the diagnostic keeps ufs-qcom from leaving such a reference.
+This logs what proves it on the tablet, or disproves it:
+
+  at the entry of every ufs_qcom_power_up_sequence() (one before each
+  calibration), at KERN_DEBUG:
+    power-up sequence entry: PHY power_count 1 init_count 3, host reference
+    held, setup_clocks repeats: power-on 0, power-off 0
+  on its error path, before phy_exit(), the same at KERN_WARNING, as
+    power-up sequence failed, before phy_exit(): ...
+  each ufs_qcom_setup_clocks() call that finds the reference already as it
+  asks for (counted always, the first 16 of each kind logged at KERN_DEBUG):
+    setup_clocks repeated a PHY power-on (1): clock gating state 3,
+    active_reqs 1, in the ungate work
+
+power_count 1 at every entry with the patch below is the balance it keeps;
+a kernel without it showed the leak as power_count 2 or more.  A
+"repeated a PHY power-on" line is one reference the old code would have
+left behind; clock gating state 3 is REQ_CLKS_ON, and "in the ungate work"
+names the path the patch below describes.  init_count grows by one with
+each calibration that passes (ufs_qcom_power_up_sequence() calls
+phy_init() without a phy_exit() when it succeeds); the QMP UFS PHY has no
+exit callback, so that is harmless, and only a failure's line shows it
+falling back.
+
+It writes no register and changes no return value: two counters in
+struct ufs_qcom_host, reads of the PHY's counts without its mutex (a
+diagnostic; nothing else changes them while the host is held), and log
+lines.  Every ufs-qcom host logs them; the tablets have one, the SM8550's.
+
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -560,6 +560,45 @@ static void ufs_qcom_phy_power_off(struc
+ 	host->phy_powered_on = false;
+ }
+ 
++/*
++ * Diagnostic for SM8550 resume tests, not for release builds: the PHY's
++ * power and init counts at each power-up sequence and when one fails, and
++ * each ufs_qcom_setup_clocks() call that finds the PHY power reference
++ * already in the state it asks for (counted always, logged the first
++ * UFS_QCOM_DBG_PHY_REPEAT_LOGGED times of each kind).  Reads and log lines
++ * only.
++ */
++#define UFS_QCOM_DBG_PHY_REPEAT_LOGGED	16U
++
++static void ufs_qcom_dbg_phy_counts(struct ufs_qcom_host *host,
++				    const char *level, const char *when)
++{
++	struct phy *phy = host->generic_phy;
++
++	dev_printk(level, host->hba->dev,
++		   "%s: PHY power_count %d init_count %d, host reference %s, setup_clocks repeats: power-on %u, power-off %u\n",
++		   when, phy->power_count, phy->init_count,
++		   host->phy_powered_on ? "held" : "not held",
++		   host->dbg_phy_repeat_on, host->dbg_phy_repeat_off);
++}
++
++static void ufs_qcom_dbg_phy_repeat(struct ufs_qcom_host *host, bool on)
++{
++	struct ufs_hba *hba = host->hba;
++	unsigned int n = on ? ++host->dbg_phy_repeat_on :
++			      ++host->dbg_phy_repeat_off;
++
++	if (n > UFS_QCOM_DBG_PHY_REPEAT_LOGGED)
++		return;
++
++	dev_printk(KERN_DEBUG, hba->dev,
++		   "setup_clocks repeated a PHY power-%s (%u): clock gating state %d, active_reqs %d, %s\n",
++		   on ? "on" : "off", n, hba->clk_gating.state,
++		   hba->clk_gating.active_reqs,
++		   current_work() == &hba->clk_gating.ungate_work ?
++		   "in the ungate work" : "not in the ungate work");
++}
++
+ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
+ {
+ 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+@@ -578,6 +617,8 @@ static int ufs_qcom_power_up_sequence(st
+ 
+ 	mode = host_params->hs_rate == PA_HS_MODE_B ? PHY_MODE_UFS_HS_B : PHY_MODE_UFS_HS_A;
+ 
++	ufs_qcom_dbg_phy_counts(host, KERN_DEBUG, "power-up sequence entry");
++
+ 	/* Reset UFS Host Controller and PHY */
+ 	ret = ufs_qcom_host_reset(hba);
+ 	if (ret)
+@@ -617,6 +658,8 @@ static int ufs_qcom_power_up_sequence(st
+ 	return 0;
+ 
+ out_disable_phy:
++	ufs_qcom_dbg_phy_counts(host, KERN_WARNING,
++				"power-up sequence failed, before phy_exit()");
+ 	phy_exit(phy);
+ 
+ 	return ret;
+@@ -1531,11 +1574,15 @@ static int ufs_qcom_setup_clocks(struct
+ 				ufs_qcom_dev_ref_clk_ctrl(host, false);
+ 			}
+ 
++			if (!host->phy_powered_on)
++				ufs_qcom_dbg_phy_repeat(host, false);
+ 			ufs_qcom_phy_power_off(host);
+ 		}
+ 		break;
+ 	case POST_CHANGE:
+ 		if (on) {
++			if (host->phy_powered_on)
++				ufs_qcom_dbg_phy_repeat(host, true);
+ 			err = ufs_qcom_phy_power_on(host);
+ 			if (err)
+ 				return err;
+--- a/drivers/ufs/host/ufs-qcom.h
++++ b/drivers/ufs/host/ufs-qcom.h
+@@ -345,6 +345,13 @@ struct ufs_qcom_host {
+ 	void __iomem *dev_ref_clk_ctrl_mmio;
+ 	bool is_dev_ref_clk_enabled;
+ 	bool phy_powered_on;
++	/*
++	 * Diagnostic for SM8550 resume tests, not for release builds: the
++	 * ufs_qcom_setup_clocks() calls that found phy_powered_on already as
++	 * they asked (ufs_qcom_dbg_phy_repeat()).
++	 */
++	unsigned int dbg_phy_repeat_on;
++	unsigned int dbg_phy_repeat_off;
+ 	struct ufs_hw_version hw_ver;
+ 
+ 	u32 dev_ref_clk_en_mask;

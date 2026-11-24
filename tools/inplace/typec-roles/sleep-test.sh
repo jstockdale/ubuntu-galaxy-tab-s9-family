@@ -169,7 +169,9 @@
 #     the DSPs' interrupts, and the cycle's kernel lines; once before the
 #     first sleep, every power domain, the rails in use, the bandwidth votes
 #     (those in the sleep set marked), the PCIe functions, every prepared
-#     clock and the SoC's and subsystems' sleep counts over 5 s awake.  The
+#     clock, a line when those show the UFS PHY powered with its host
+#     clock-gated (a leaked PHY power reference: ev_phy_leak), and the SoC's
+#     and subsystems' sleep counts over 5 s awake.  The
 #     terminal gets all of it ("evidence:" lines), pmsg five short lines per
 #     cycle; a read that fails changes nothing;
 #   - a suspend that the kernel gave up before the tablet slept (a wakeup
@@ -616,7 +618,11 @@ ram_tools='rtcwake dmesg dd sha256sum sleep grep awk sync blockdev fsfreeze nsen
 # EOPNOTSUPP).
 freeze_types=' ext4 '
 ufs_fail='phy initialization timed-out|Failed to calibrate PHY|Enabling the controller failed|Host init failed|ufshcd_wl_resume failed|Trying to write to read-only block-device'
-ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET|power-up write: PWRDN'
+ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET|power-up write: PWRDN|power-up sequence entry: PHY power_count|power-up sequence failed, before phy_exit|setup_clocks repeated a PHY power-'
+# The UFS PHY's supply as regulator_summary names its consumer (the PHY's
+# device, then the supply), for ev_once's line about the PHY's power
+# reference (ev_phy_leak).
+ufs_phy_supply=1d80000.phy-vdda-phy
 # The lines of the PCIe host and of its PHY.  Two of ufs_fail's are theirs as
 # well, in the same words ("qcom-pcie 1c00000.pcie: Host init failed: -16",
 # "qcom-qmp-pcie-phy 1c06000.phy: phy initialization timed-out"): a failure
@@ -678,15 +684,19 @@ freeze_deadline=120
 mount_deadline=60
 # How many of a cycle's diagnostic lines go to the result file and to pmsg:
 # the first diag_head and the last diag_tail, and one line for the ones
-# between.  A resume whose calibration fails retries it 15 times, up to five
-# lines each (revision 10's power-up write, the entry, the state after the
-# timeout, the late poll's outcome, the state 1 s on); the terminal and the
-# run's log in /run get
+# between.  A resume whose calibration fails retries it 15 times, up to seven
+# lines each (revision 11's PHY counts at the power-up sequence's entry,
+# revision 10's power-up write, the entry, the state after the timeout, the
+# late poll's outcome, the state 1 s on, and revision 11's counts of the
+# failed power-up sequence); revision 11 also logs, at any time, the first 16
+# setup_clocks calls of each kind that found the PHY power reference as
+# they asked.  The terminal and the run's log in /run get
 # every line, and those go with the restart.  pmsg is 128 KiB of ramoops
 # (the hang-log kit's DTB), about 73 KiB of it data with ECC 96, and it is
 # a ring: what goes there must leave room for the verdicts.  A cycle puts at
 # most 17 diagnostic lines there, each cut at 300 characters; a passing one
-# has only its entry lines, one or two.  Ten cycles, the last one failed,
+# has only its entry lines, one to three, and revision 11's setup_clocks
+# lines if any came (32 at most in a boot).  Ten cycles, the last one failed,
 # come to well under 20 KiB with their verdicts; an aborted attempt adds its
 # entry lines and its verdict, about 1 KiB, and a run has at most 21 of them.
 # ext4's own lines, when it recorded or logged an error, add at most 6.
@@ -699,6 +709,8 @@ mount_deadline=60
 # the protection, under 1 KiB, and one line of about 200 bytes before each
 # attempt at a sleep, at most 31 in a run: under 7 KiB in all.  Every
 # verdict and RESULT line carries the debug switches, under 80 bytes each.
+# The evidence before the first sleep adds one line, under 300 bytes, when
+# it shows a leaked UFS PHY power reference (ev_phy_leak).
 diag_head=12
 diag_tail=4
 # Evidence around each cycle (added after the r7 baselines of 2026-11-22,
@@ -1960,6 +1972,38 @@ ev_rpmh() { # TRACE K full|short
 		}' "$ramdir/cmd-db" "$1" 2>/dev/null
 }
 
+# The UFS PHY's power reference as ev_once's reads show it
+# (docs/resume-recovery.md, "The PHY power reference"): with the disk frozen
+# the UFS host is idle, its clock gating turns its clocks off 150 ms after
+# its last command, and turns the PHY off with them, the PHY's supplies and
+# its own clocks, unless the PHY holds one more power reference than the
+# host's (a setup_clocks call that powered it on again while it was on,
+# which ufs-qcom-track-phy-power-state-gts9u.patch ends).  One line when
+# REGULATORS (a copy of regulator_summary) has the PHY's supply enabled and
+# CLOCKS (an ev_clk_snap copy, read after it) has the host's core clock off
+# with the PHY's own two clocks on (gcc_ufs_phy_phy_aux_clk and
+# tcsr_ufs_clkref_en, its ref_aux and qref, which nothing but the PHY's
+# power-on enables): this boot has a leaked reference, and on a kernel
+# without that patch the resume from a sleep that powers ufs_mem_phy_gdsc
+# off loses the UFS (2026-11-23, revision 10's run 5).  Nothing otherwise,
+# and nothing when a read failed.
+ev_phy_leak() { # REGULATORS CLOCKS
+	awk -v phy="$ufs_phy_supply" '
+		FILENAME == ARGV[1] { if ($1 == phy && $2 ~ /^[0-9]+$/) use = $2 + 0; next }
+		$2 ~ /^[0-9]+$/ { c[$1] = $2 "/" $3; en[$1] = $2 + 0 }
+		END {
+			if (use < 1 || !("gcc_ufs_phy_axi_clk" in en) || en["gcc_ufs_phy_axi_clk"] != 0) exit
+			if (en["gcc_ufs_phy_phy_aux_clk"] < 1 || en["tcsr_ufs_clkref_en"] < 1) exit
+			printf "LEAKED POWER REFERENCE: its supply %s is enabled (use %d) with the UFS host clock-gated (gcc_ufs_phy_axi_clk %s) and its own clocks on (gcc_ufs_phy_phy_aux_clk %s, tcsr_ufs_clkref_en %s): this boot has a leaked UFS PHY power reference, and on a kernel without ufs-qcom-track-phy-power-state-gts9u.patch the resume from a sleep that powers ufs_mem_phy_gdsc off will lose the UFS (docs/resume-recovery.md, \"The PHY power reference\")\n", phy, use, c["gcc_ufs_phy_axi_clk"], c["gcc_ufs_phy_phy_aux_clk"], c["tcsr_ufs_clkref_en"]
+		}' "$1" "$2" 2>/dev/null
+}
+
+# regulator_summary copied to OUT, in one read: for ev_once's lines of the
+# rails in use, and for ev_phy_leak.
+ev_reg() { # OUT
+	awk '{ print }' "$reg_sum" 2>/dev/null > "$1"
+}
+
 # Once, before the first sleep: the domains, the rails, the bandwidth votes,
 # the wakeup sources and the PCIe functions as they are with the disk frozen.
 # A request on an interconnect node whose tag is 0 or has bit 2
@@ -1970,9 +2014,10 @@ ev_once() {
 	say "evidence: power domains (pm_genpd_summary; every line):"
 	ev_genpd all | while IFS= read -r evl; do say "evidence:   $evl"; done
 	say "evidence: rails in use (regulator_summary: the regulators with users, and those users):"
+	ev_reg "$ramdir/ev-reg-once"
 	awk 'NR <= 2 { next }
 		NF >= 7 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { show = $2 > 0; if (show) print; next }
-		show && NF == 5 && $2 ~ /^[0-9]+$/ && $2 > 0 { print }' "$reg_sum" 2>/dev/null |
+		show && NF == 5 && $2 ~ /^[0-9]+$/ && $2 > 0 { print }' "$ramdir/ev-reg-once" 2>/dev/null |
 		while IFS= read -r evl; do say "evidence:   $evl"; done
 	say "evidence: bandwidth (interconnect_summary: the nodes with a vote and the requests that make it):"
 	awk 'NR <= 2 { next }
@@ -1998,6 +2043,13 @@ ev_once() {
 	say "evidence: prepared clocks (name, enable, prepare, parent):"
 	awk '$3 ~ /^[0-9]+$/ && $3 > 0' "$ramdir/ev-clk-once" 2>/dev/null |
 		while IFS= read -r evl; do say "evidence:   $evl"; done
+	# A leaked UFS PHY power reference, from the two reads above: in pmsg
+	# as well, for a run that loses the UFS.
+	evleak=$(ev_phy_leak "$ramdir/ev-reg-once" "$ramdir/ev-clk-once")
+	if [ -n "$evleak" ]; then
+		say "evidence: UFS PHY: $evleak"
+		ev_pmsg "evidence: UFS PHY: leaked power reference before the first sleep (its supply on, the host clock-gated, its own clocks on): a kernel without ufs-qcom-track-phy-power-state-gts9u.patch loses the UFS at the resume"
+	fi
 	# The SoC's sleep states and each subsystem's while the CPUs are awake,
 	# for 5 s: an audio DSP that goes in and out of its sleep as often awake
 	# as in the run's sleeps does so on its own, whatever the CPUs do.
@@ -2240,6 +2292,26 @@ storage_lines() { # FILE
 		grep -iE "(^|[^a-zA-Z0-9])ufs|\\[$disk\\]|(^|\\] )(sd|scsi) $ufs_host:[0-9]+:[0-9]+:[0-9]+: "
 }
 
+# Did a calibration in DIAG (a cycle's diagnostic lines) start without the
+# UFS PHY's power-on?  Revision 10's second diagnostic logs its power-up
+# write line in that power-on, right before each calibration entry, and a
+# kernel that has it logged one this boot already, at the UFS probe
+# (pwrdn_seen): an entry with no such line since the entry before it had no
+# power-on.  Revision 11's line at the entry of a power-up sequence with
+# power_count 2 or more says the same: the code before
+# ufs-qcom-track-phy-power-state-gts9u.patch powers the PHY off and on again
+# there only from 1.  Either is a leaked PHY power reference
+# (docs/resume-recovery.md, "The PHY power reference").
+phy_leak_seen() { # DIAG
+	awk -v pw="$pwrdn_seen" '
+		/power-up sequence entry: PHY power_count / {
+			for (i = 1; i < NF; i++) if ($i == "power_count" && $(i + 1) ~ /^[0-9]+$/ && $(i + 1) + 0 >= 2) leak = 1
+		}
+		/power-up write: PWRDN/ { w = 1 }
+		/calibration entry: SW_RESET/ { if (pw == 1 && !w) leak = 1; w = 0 }
+		END { exit !leak }' "$1" 2>/dev/null
+}
+
 # Was this attempt a suspend that the kernel gave up before the tablet
 # slept, with the storage as it was before?  Only if every one of these
 # holds; anything else, or anything that cannot be read, leaves it a FAIL:
@@ -2255,8 +2327,10 @@ storage_lines() { # FILE
 #      SECONDS logs about that);
 #   6. no failure line (fail_re: the UFS and its PHY, I/O and ext4 errors,
 #      a write the block layer logged), and no line of the diagnostic but
-#      its calibration entries and revision 10's power-up write lines (the
-#      others come with a timeout);
+#      its calibration entries, revision 10's power-up write lines and
+#      revision 11's PHY counts at a power-up sequence's entry and
+#      setup_clocks lines (the others come with a timeout or a failed
+#      power-up sequence);
 #   7. no line about the UFS or its disk that says something failed
 #      (storage_lines, storage_bad_re);
 #   8. every filesystem still frozen (still_frozen);
@@ -2277,7 +2351,9 @@ gave_up_early() {
 	fi
 	[ -z "$prot_why" ] || return 1
 	[ "$storage" = healthy ] && [ "${fails:-0}" = 0 ] || return 1
-	! grep -v -e 'calibration entry: SW_RESET' -e 'power-up write: PWRDN' "$ramdir/diag-$sfx" | grep -q . ||
+	! grep -v -e 'calibration entry: SW_RESET' -e 'power-up write: PWRDN' \
+		-e 'power-up sequence entry: PHY power_count' -e 'setup_clocks repeated a PHY power-' \
+		"$ramdir/diag-$sfx" | grep -q . ||
 		return 1
 	! storage_lines "$k" | grep -qiE "$storage_bad_re" || return 1
 	[ -n "$read_hash" ] && [ "$read_hash" = "$base_hash" ]
@@ -3178,6 +3254,10 @@ run_from_ram() { # CONFIG
 			an=$(abort_note)
 			verdict "SLEEP-TEST $cyc: FAIL$mword: $reasons ($dline; floor $floor; $swnote)"
 			verdict "SLEEP-TEST RESULT: FAIL$mword at $cyc: $reasons; $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
+			# A calibration of this cycle without the UFS PHY's power-on
+			# before it (phy_leak_seen): what that means, first.
+			! phy_leak_seen "$ramdir/diag-$sfx" ||
+				verdict "NEXT: the UFS PHY's power-on did not run before its calibration: a leaked PHY power reference (docs/resume-recovery.md, \"The PHY power reference\")"
 			# The storage came back: finish says what did not, if it was
 			# the PCIe host.
 			[ "$storage" != healthy ] ||
@@ -3515,6 +3595,16 @@ if [ "$dry" = 0 ] && [ "$pcie0_reached" = 1 ] && [ "$pcie0_off" = Y ] && [ "$pci
 fi
 if [ "$rpd3_given" = 1 ] && [ "$guard_state" != held ]; then
 	refuse "root-port-d3 needs a guard that held this boot (a sleep that logged \"the link was kept, and its power domain stayed on\", none that logged it off): guard $guard_state${guard_first:+, the first sleep logged: $guard_first}"
+fi
+# Revision 10's second UFS PHY diagnostic logs a power-up write line before
+# each calibration, the UFS probe's among them: on a kernel that logged one
+# this boot (pwrdn_seen 1) a calibration entry without one before it had no
+# PHY power-on (phy_leak_seen).  The kernel's own lines, from dmesg, or the
+# journal when the ring buffer has dropped the boot's first lines.
+pwrdn_seen=0
+if dmesg 2>/dev/null | grep -v 'gts9u sleep-test: ' | grep -q 'power-up write: PWRDN' ||
+	journalctl -k -b --no-pager -q 2>/dev/null | grep -v 'gts9u sleep-test: ' | grep -q 'power-up write: PWRDN'; then
+	pwrdn_seen=1
 fi
 # rpmh: the tracepoint there and writable, and tracing on, or the trace
 # would stay empty.  The command DB names the addresses; without it they
@@ -3924,7 +4014,7 @@ sync
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for v in stamp ramdir part disk cycles seconds hold aborts dry rootsrc rootname floor armed kernel mount_cmd ufs_host \
 	pci_remove pci_keep pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note sw_set sw_ret \
-	rpmh rpmh_was guard_state sensors_stop; do
+	rpmh rpmh_was guard_state sensors_stop pwrdn_seen; do
 	eval "printf '%s=%s\n' $v \"\$(q \"\$$v\")\""
 done > "$ramdir/run.conf"
 say 'the run goes on from RAM in a session of its own: it ends with a restart even if this terminal goes away'

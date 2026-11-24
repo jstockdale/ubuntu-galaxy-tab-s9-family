@@ -1,0 +1,211 @@
+Subject: scsi: ufs: ufs-qcom: keep track of the PHY power reference the host holds
+
+ufs_qcom_setup_clocks() powers the UFS PHY on and off with phy_power_on()
+and phy_power_off(), and those count: the PHY's power_on callback runs only
+when power_count goes from 0 to 1, its power_off only from 1 to 0
+(drivers/phy/phy-core.c).  ufshcd_setup_clocks() calls the hook every time,
+whether or not its clocks are already in the state it asks for; it skips
+only the clock calls, by clki->enabled.  The clock gating code asks for
+clocks that are on.  ufshcd_gate_work() gives up when
+ufshcd_is_ufs_dev_busy() is true, and scsi_host_busy() counts a command from
+blk_mq_start_request() on, before ufshcd_queuecommand() takes
+ufshcd_hold().  It then leaves REQ_CLKS_OFF with the clocks on.  That
+command's ufshcd_hold() can no longer cancel the gate work, so it queues
+ufshcd_ungate_work(), and the ungate work calls ufshcd_setup_clocks(hba,
+true) on clocks that are on.  Each time, the PHY keeps one more power
+reference, and nothing drops it.
+
+From then on the PHY never powers down: it stays powered through clock
+gating, runtime suspend and system suspend, holding XO through its clocks.
+ufs_qcom_power_up_sequence()'s power-off and power-on no longer reach the
+callbacks either, so nothing powers the PHY up before the calibration.  That
+is harmless as long as the PHY keeps its registers.  A system suspend powers
+ufs_mem_phy_gdsc off (PWRSTS_OFF_ON on SM8550), the PHY comes back with
+POWER_DOWN_CONTROL at its reset value (SW_PWRDN 0, analog power-down), its
+PLL cannot lock, and every calibration of the resume's reset and restore
+times out (15), with the UFS and the root lost.  The failed retries do not
+recover it: each one drops and takes one reference, and the count stays
+where it was.
+
+That is what the SM-X710 showed on 2026-11-23 (Type-C kit revision 10, run
+5): 15 calibration entries with PWRDN 0x0 and not one "power-up write" line
+(the diagnostic that logs the power_on callback, which every passing
+calibration has right before its entry line).  Before that sleep, one read
+of clk_summary had the host's clocks gated (gcc_ufs_phy_axi_clk and
+gcc_ufs_phy_unipro_core_clk not prepared) and the PHY's own clocks on
+(gcc_ufs_phy_phy_aux_clk and tcsr_ufs_clkref_en 1/1), and the regulator
+summary had the PHY's vdda-phy (188 mA) and vdda-pll (18 mA) enabled.  The
+two other runs whose snapshot had the PHY's supplies on also failed or did
+not come back (revision 9 run 3, revision 10 run 4); none of the six passing
+runs had them.
+
+Keep a flag of the reference this host holds, and take and drop it in two
+helpers that do nothing when the flag already says so, as Vladimir Oltean's
+"scsi: ufs: qcom: keep separate track of PHY power state" does ([PATCH v8
+phy-next 13/31], 2026-05-05, not in mainline as of v7.4-rc4).  The helpers,
+the setup_clocks() and exit() hunks are that patch's.  It also changes
+ufs_qcom_power_up_sequence(), where the series' 12/31 instead moves the
+power cycle into the PHY driver's set_mode() (not taken here): the power-off
+before the calibration is now the reference the flag says this host holds,
+not phy->power_count, so the power-on that follows always runs the PHY's
+power_on callback.
+
+When the calls alternate nothing changes.  A repeated call now does
+nothing.  This also fixes the underflow on removal that upstream's patch
+was written for (ufs_qcom_exit() then ufshcd_setup_clocks(false)).  As
+upstream's patch does, a phy_power_off() error no longer stops
+ufshcd_setup_clocks(false); qmp_ufs_power_off() always returns 0.  The flag
+needs no lock, like is_dev_ref_clk_enabled next to it: its callers run with
+the clock gating held, or are the gating work.  The new field goes after
+is_dev_ref_clk_enabled, so the header hunk has the same context with and
+without ufs-qcom-enable-only-lane-clocks.patch.
+
+No board gate: both tablets run this code, with the same PHY and the same
+clock gating.  The diff goes in with no fuzz on the pinned file, on top of
+ufs-qcom-hs-g5-at-300mhz-sm8550.patch, and under or over
+ufs-qcom-enable-only-lane-clocks.patch (the same file either way), and on
+mainline v7.4-rc4.
+
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -516,6 +516,50 @@ static u32 ufs_qcom_get_hs_gear(struct u
+ 	return UFS_HS_G3;
+ }
+ 
++/*
++ * The PHY power reference of this host, taken and dropped here only.
++ * ufshcd_setup_clocks() calls ufs_qcom_setup_clocks() whether or not its
++ * clocks are already in the state it asks for, and phy_power_on() and
++ * phy_power_off() count: a repeated power-on would leave a reference that
++ * nothing drops, and from then on the PHY's power_on callback, the one that
++ * powers it up, would never run again, before a calibration included.
++ */
++static int ufs_qcom_phy_power_on(struct ufs_qcom_host *host)
++{
++	int ret;
++
++	if (host->phy_powered_on)
++		return 0;
++
++	ret = phy_power_on(host->generic_phy);
++	if (ret) {
++		dev_err(host->hba->dev, "Failed to power on PHY: %pe\n",
++			ERR_PTR(ret));
++		return ret;
++	}
++
++	host->phy_powered_on = true;
++
++	return 0;
++}
++
++static void ufs_qcom_phy_power_off(struct ufs_qcom_host *host)
++{
++	int ret;
++
++	if (!host->phy_powered_on)
++		return;
++
++	ret = phy_power_off(host->generic_phy);
++	if (ret) {
++		dev_warn(host->hba->dev, "Failed to power off PHY: %pe\n",
++			 ERR_PTR(ret));
++		return;
++	}
++
++	host->phy_powered_on = false;
++}
++
+ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
+ {
+ 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+@@ -539,9 +583,11 @@ static int ufs_qcom_power_up_sequence(st
+ 	if (ret)
+ 		return ret;
+ 
+-	if (phy->power_count)
+-		phy_power_off(phy);
+-
++	/*
++	 * Power the PHY off if this host holds its power, so that the power-on
++	 * below runs the PHY's power_on callback right before the calibration.
++	 */
++	ufs_qcom_phy_power_off(host);
+ 
+ 	/* phy initialization - calibrate the phy */
+ 	ret = phy_init(phy);
+@@ -556,12 +602,9 @@ static int ufs_qcom_power_up_sequence(st
+ 		goto out_disable_phy;
+ 
+ 	/* power on phy - start serdes and phy's power and clocks */
+-	ret = phy_power_on(phy);
+-	if (ret) {
+-		dev_err(hba->dev, "%s: phy power on failed, ret = %d\n",
+-			__func__, ret);
++	ret = ufs_qcom_phy_power_on(host);
++	if (ret)
+ 		goto out_disable_phy;
+-	}
+ 
+ 	ret = phy_calibrate(phy);
+ 	if (ret) {
+@@ -1461,7 +1504,6 @@ static int ufs_qcom_setup_clocks(struct
+ 				 enum ufs_notify_change_status status)
+ {
+ 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+-	struct phy *phy;
+ 	int err;
+ 
+ 	/*
+@@ -1472,8 +1514,6 @@ static int ufs_qcom_setup_clocks(struct
+ 	if (!host)
+ 		return 0;
+ 
+-	phy = host->generic_phy;
+-
+ 	switch (status) {
+ 	case PRE_CHANGE:
+ 		if (on) {
+@@ -1491,20 +1531,14 @@ static int ufs_qcom_setup_clocks(struct
+ 				ufs_qcom_dev_ref_clk_ctrl(host, false);
+ 			}
+ 
+-			err = phy_power_off(phy);
+-			if (err) {
+-				dev_err(hba->dev, "phy power off failed, ret=%d\n", err);
+-				return err;
+-			}
++			ufs_qcom_phy_power_off(host);
+ 		}
+ 		break;
+ 	case POST_CHANGE:
+ 		if (on) {
+-			err = phy_power_on(phy);
+-			if (err) {
+-				dev_err(hba->dev, "phy power on failed, ret = %d\n", err);
++			err = ufs_qcom_phy_power_on(host);
++			if (err)
+ 				return err;
+-			}
+ 
+ 			/* enable the device ref clock for HS mode*/
+ 			if (ufshcd_is_hs_mode(&hba->pwr_info))
+@@ -1694,7 +1728,7 @@ static void ufs_qcom_exit(struct ufs_hba
+ 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+ 
+ 	ufs_qcom_disable_lane_clks(host);
+-	phy_power_off(host->generic_phy);
++	ufs_qcom_phy_power_off(host);
+ 	phy_exit(host->generic_phy);
+ }
+ 
+--- a/drivers/ufs/host/ufs-qcom.h
++++ b/drivers/ufs/host/ufs-qcom.h
+@@ -344,6 +344,7 @@ struct ufs_qcom_host {
+ 	u32 caps;
+ 	void __iomem *dev_ref_clk_ctrl_mmio;
+ 	bool is_dev_ref_clk_enabled;
++	bool phy_powered_on;
+ 	struct ufs_hw_version hw_ver;
+ 
+ 	u32 dev_ref_clk_en_mask;

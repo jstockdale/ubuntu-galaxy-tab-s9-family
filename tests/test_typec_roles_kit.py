@@ -164,6 +164,10 @@ GUARD_FLAG_LINE = "\t\t.flags = GENPD_FLAG_ACTIVE_WAKEUP,\n"
 PCIE_PATCHES = ["pcie-qcom-keep-power-domain-while-link-kept.patch", "pcie-qcom-debug-root-port-d3.patch"]
 GUARD_LINE = "qcom_pcie_mark_sleep_path(dev, pcie->link_kept);"
 RPD3_MARKER = "PCIe root port to D3 for a sleep test, not for release builds"
+# Revision 11's ufs-qcom: the UFS PHY power reference fix, which every build
+# applies, and its diagnostic, behind APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC
+# (tests/test_ufs_qcom_phy_power.py has their own tests).
+UFS_QCOM_PATCHES = ["ufs-qcom-track-phy-power-state-gts9u.patch", "ufs-qcom-phy-power-count-diagnostic.patch"]
 # Revision 10's three upstream commits, each with the file it changes (and
 # ufs-qcom.h with ufs-qcom.c), its upstream hash, and the line the build
 # script knows it by; and the patch it leaves out.
@@ -197,10 +201,10 @@ GUARD_DOWN = "qcom-pcie 1c00000.pcie: system sleep: the host powered down, and g
 
 
 def kit_patches(text):
-    """make-kit.sh's six lists of patches, as it names them."""
+    """make-kit.sh's seven lists of patches, as it names them."""
     return [re.search(rf"^{name}=\((.*?)\)$", text, re.M | re.S).group(1).split()
             for name in ("typec_patches", "gdsc_patches", "debug_patches", "fix_patches", "ufs_patches",
-                         "pcie_patches")]
+                         "pcie_patches", "ufs_qcom_patches")]
 
 PREFIXES = (
     "/dev/disk/by-partlabel/", "/usr/lib/modules/", "/var/backups", "/var/log/", "/run/",
@@ -318,6 +322,23 @@ UFS_TIMEOUT = (
     "kernel: ufshcd-qcom 1d84000.ufshc: Enabling the controller failed",
     "kernel: ufs_device_wlun 0:0:0:49488: ufshcd_wl_resume failed: -5",
 )
+# Revision 11's ufs-qcom diagnostic (ufs-qcom-phy-power-count-diagnostic.patch;
+# made from its format strings, not seen on a tablet yet): the PHY's counts
+# at the entry of each power-up sequence, the same after one that failed,
+# and a setup_clocks call that found the PHY's power reference already as it
+# asked.  And a calibration entry as revision 10's run 5 logged all 15 of
+# its own (2026-11-23, the line of its log), with no power-up write before.
+UFS_COUNTS = ("ufshcd-qcom 1d84000.ufshc: power-up sequence entry: PHY power_count {count} init_count 3, "
+              "host reference held, setup_clocks repeats: power-on 0, power-off 0")
+UFS_COUNTS_FAILED = ("ufshcd-qcom 1d84000.ufshc: power-up sequence failed, before phy_exit(): PHY power_count 1 "
+                     "init_count 3, host reference held, setup_clocks repeats: power-on 0, power-off 0")
+UFS_REPEAT = ("ufshcd-qcom 1d84000.ufshc: setup_clocks repeated a PHY power-on (1): clock gating state 3, "
+              "active_reqs 1, in the ungate work")
+UFS_CAL_ENTRY_DOWN = ("qcom-qmp-ufs-phy 1d80000.phy: calibration entry: SW_RESET 0x1 START 0x0 PWRDN 0x0 READY 0x4 "
+                      "C_READY 0x0 CMN 0xa0")
+# The NEXT line of a cycle whose calibration had no PHY power-on before it.
+LEAK_NEXT = ("NEXT: the UFS PHY's power-on did not run before its calibration: a leaked PHY power reference "
+             "(docs/resume-recovery.md, \"The PHY power reference\")")
 
 PASS_LOG = """\
 [  100.000001] state change SNK_DEBOUNCED -> SNK_ATTACHED [rev3 NONE_AMS]
@@ -729,7 +750,8 @@ class FakeTablet(unittest.TestCase):
         (self.kit / "KEY_ID").write_text(KEY_ID + "\n")
         (self.kit / "SIGNER").write_text(SIGNER + "\n")
         (self.kit / "REVISION").write_text("11\n")
-        for name in ("install.sh", "rollback.sh", "verify.sh", "sleep-test.sh", "README.md"):
+        for name in ("install.sh", "rollback.sh", "verify.sh", "sleep-test.sh", "ufs-phy-power-check.sh",
+                     "README.md"):
             (self.kit / name).write_bytes((KIT_SRC / name).read_bytes())
         self.seal()
 
@@ -4059,12 +4081,14 @@ def qcom_stat(count, seconds):
 
 # The clocks the fake debugfs has, each with its parent's name (None: no
 # clk_parent file, a clock without a parent): XO and its AO peer, the UFS
-# host's five, a PLL under XO for them, and a clock that is no UFS host's.
+# host's five, a PLL under XO for them, and a clock that is no UFS host's;
+# and the UFS PHY's own two (ref_aux and qref), off unless a test says.
 CLK_PARENTS = {"xo_board": None, "bi_tcxo": "xo_board", "bi_tcxo_ao": "xo_board",
                "tcsr_ufs_pad_clkref_en": "bi_tcxo", "gcc_gpll0": "bi_tcxo",
                "gcc_ufs_phy_ahb_clk": None, "gcc_ufs_phy_axi_clk": "gcc_gpll0",
                "gcc_ufs_phy_unipro_core_clk": "gcc_gpll0", "gcc_ufs_phy_ice_core_clk": "gcc_gpll0",
-               "gcc_usb30_prim_master_clk": "gcc_gpll0"}
+               "gcc_usb30_prim_master_clk": "gcc_gpll0",
+               "gcc_ufs_phy_phy_aux_clk": "bi_tcxo", "tcsr_ufs_clkref_en": "bi_tcxo"}
 
 
 def write_clocks(directory, **counts):
@@ -4589,6 +4613,199 @@ class SleepTestTest(FakeTablet):
         self.assertIn("%.300s", re.search(r"^ev_pmsg\(\) \{\n.*?^\}\n", self.script("sleep-test.sh"),
                                           re.M | re.S).group(0))
 
+    def leaked_resume(self, sets, count=None, pwrup=False):
+        """A resume whose calibration timed out SETS times as in revision
+        10's run 5 (2026-11-23): each entry with PWRDN 0x0, and before it
+        revision 10's power-up write line only if PWRUP, revision 11's
+        counts line only with a COUNT; then the host's failure lines and an
+        I/O error."""
+        lines = ["PM: suspend entry (deep)"]
+        for _ in range(sets):
+            if count is not None:
+                lines.append(UFS_COUNTS.format(count=count))
+            if pwrup:
+                lines.append(UFS_PWRUP[len("kernel: "):])
+            lines += [UFS_CAL_ENTRY_DOWN, UFS_TIMEOUT[1][len("kernel: "):]]
+            if count is not None:
+                lines.append(UFS_COUNTS_FAILED)
+        lines += [line[len("kernel: "):] for line in UFS_TIMEOUT[5:]]
+        lines += ["PM: suspend exit", "I/O error, dev sda, sector 29026560 op 0x0:(READ) flags 0x80700"]
+        return "".join(f"[  800.{n:06d}] {line}\n" for n, line in enumerate(lines, 1))
+
+    def test_a_resume_whose_calibrations_had_no_phy_power_on_names_a_leaked_reference(self):
+        """Revision 10's run 5: a kernel whose second UFS PHY diagnostic
+        logged its power-up write at this boot's calibrations (here, the
+        probe's in the kernel log; with the ring buffer past it, the
+        journal's), then a resume whose 15 calibration entries have none
+        before them: the FAIL, then a NEXT line that names the leaked PHY
+        power reference, in pmsg too, before the run's other NEXT lines.  A
+        kernel that logged no power-up write this boot (revision 9's) gets
+        no such line from the same resume."""
+        boot = f"[    5.080000] {UFS_PWRUP[len('kernel: '):]}\n[    5.080100] {UFS_CAL_ENTRY[len('kernel: '):]}\n"
+        for name, where in (("the kernel log", "kmsg"), ("the journal", "journal"), ("neither", None)):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "dev/pmsg0").write_text("")
+                if where == "kmsg":
+                    with open(self.root / "dev/kmsg", "a") as kmsg:
+                        kmsg.write(boot)
+                elif where == "journal":
+                    (self.root / "journal").write_text("kernel: " + boot.replace("\n[", "\nkernel: ["))
+                self.cycle(1, "storage-dead", log=self.leaked_resume(15))
+                result = self.run_test("ro", "1", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                self.assertIn("SLEEP-TEST cycle 1/1: FAIL: ", self.out)
+                self.assertIn(f"cycle 1/1: diagnostic: {UFS_CAL_ENTRY_DOWN}", self.out)
+                self.assertIn("NEXT: the storage did not come back", self.out)
+                pmsg = self.pmsg_lines(evidence=False)
+                if where is None:
+                    self.assertNotIn("leaked PHY power reference", self.out)
+                    self.assertFalse([line for line in pmsg if "leaked" in line])
+                    continue
+                self.assertEqual(self.out.count(LEAK_NEXT), 1)
+                self.assertIn(LEAK_NEXT, pmsg)
+                result_line = next(i for i, line in enumerate(pmsg) if line.startswith("SLEEP-TEST RESULT: FAIL"))
+                self.assertEqual(pmsg[result_line + 1], LEAK_NEXT)
+                self.assertLess(pmsg.index(LEAK_NEXT),
+                                next(i for i, line in enumerate(pmsg) if "NEXT: the storage did not come back" in line))
+                self.assertIn(LEAK_NEXT, (self.ramdir() / "result").read_text())
+
+    def leak_seen(self, diag, pwrdn_seen):
+        """sleep-test.sh's phy_leak_seen on the diagnostic lines DIAG."""
+        body = re.search(r"^phy_leak_seen\(\) \{ # DIAG\n.*?^\}\n", (KIT_SRC / "sleep-test.sh").read_text(),
+                         re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp, "diag")
+            path.write_text("".join(f"{line}\n" for line in diag))
+            return subprocess.run(["sh", "-c", f"pwrdn_seen={pwrdn_seen}\n{body}phy_leak_seen \"$1\"", "sh",
+                                   str(path)], capture_output=True, text=True).returncode == 0
+
+    def test_a_calibration_is_without_a_phy_power_on_by_the_lines_before_it(self):
+        """phy_leak_seen: on a kernel with the second diagnostic, an entry
+        with no power-up write since the entry before it; on revision 11's,
+        a power-up sequence that began with power_count 2 or more, whatever
+        else; never a healthy cycle, a failure whose power-on ran, or a
+        kernel without the second diagnostic."""
+        pwrup = UFS_PWRUP[len("kernel: "):]
+        entry = UFS_CAL_ENTRY[len("kernel: "):]
+        for name, diag, pwrdn_seen, leak in (
+                ("revision 10's run 5", [UFS_CAL_ENTRY_DOWN] * 15, 1, True),
+                ("the same, a kernel without the second diagnostic", [UFS_CAL_ENTRY_DOWN] * 15, 0, False),
+                ("a pass on revision 10", [pwrup, entry], 1, False),
+                ("a failure whose power-on ran", [pwrup, UFS_CAL_ENTRY_DOWN] * 3, 1, False),
+                ("one entry of three without its power-on", [pwrup, entry, entry, pwrup, entry], 1, True),
+                ("revision 11, balanced", [UFS_COUNTS.format(count=1), pwrup, entry], 1, False),
+                ("revision 11, power_count 2", [UFS_COUNTS.format(count=2), entry], 0, True),
+                ("revision 11, power_count 12", [UFS_COUNTS.format(count=12), pwrup, entry], 1, True),
+                ("revision 11, a setup_clocks repeat", [UFS_REPEAT, UFS_COUNTS.format(count=1), pwrup, entry], 1,
+                 False),
+                ("no line", [], 1, False)):
+            with self.subTest(name):
+                self.assertEqual(self.leak_seen(diag, pwrdn_seen), leak)
+
+    def test_revision_11_s_counts_and_setup_clocks_lines_leave_an_aborted_attempt_aborted(self):
+        """The counts at a power-up sequence's entry and the setup_clocks
+        lines come in healthy cycles: an attempt given up before the sleep
+        with them is ABORTED and tried again, and they are the cycle's
+        diagnostic lines.  The line of a failed power-up sequence makes it a
+        FAIL."""
+        exit_line = "[13861.416262] PM: suspend exit\n"
+        extra = (f"[13859.031800] {UFS_COUNTS.format(count=1)}\n[13859.031801] {UFS_PWRUP[len('kernel: '):]}\n"
+                 f"[13859.031802] {UFS_CAL_ENTRY[len('kernel: '):]}\n[13859.500000] {UFS_REPEAT}\n")
+        for name, log, aborted in (("counts and a repeat", TOUCH_ABORT.replace(exit_line, extra + exit_line), True),
+                                   ("a failed power-up sequence", TOUCH_ABORT.replace(
+                                       exit_line, extra + f"[13860.000000] {UFS_COUNTS_FAILED}\n" + exit_line), False)):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                SleepTestTest.setUp(self)
+                (self.root / "proc/interrupts").write_text(INTERRUPTS)
+                self.touch_abort(1, log=log)
+                result = self.run_test("ro", "2", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assert_read_only_rules()
+                for line in (UFS_COUNTS.format(count=1), UFS_REPEAT):
+                    self.assertIn(f"cycle 1/2: diagnostic: {line}", self.out)
+                if aborted:
+                    self.assertIn("SLEEP-TEST cycle 1/2: ABORTED: the kernel gave up the suspend", self.out)
+                    self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles", self.out)
+                    self.assertNotIn("FAIL", self.out)
+                else:
+                    self.assertIn(f"cycle 1/2: diagnostic: {UFS_COUNTS_FAILED}", self.out)
+                    self.assertNotIn("ABORTED", self.out)
+                    self.assertIn("SLEEP-TEST RESULT: FAIL at cycle 1/2:", self.out)
+                self.assertNotIn(LEAK_NEXT, self.out)
+
+    def test_the_evidence_before_the_first_sleep_names_a_leaked_ufs_phy_power_reference(self):
+        """Revision 10's run 5 before its sleep: the UFS PHY's supply enabled
+        in regulator_summary, and in the clock read after it the host's core
+        clock off with the PHY's own two clocks on.  One line, on the
+        terminal and in pmsg, and the run as without it."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.evidence_files()
+        write_clocks(self.root / "sys/kernel/debug/clk", **{**CLK_LEAK, "gcc_ufs_phy_axi_clk": (0, 0),
+                                                            "gcc_ufs_phy_unipro_core_clk": (0, 0),
+                                                            "tcsr_ufs_pad_clkref_en": (0, 0),
+                                                            "gcc_ufs_phy_phy_aux_clk": (1, 1),
+                                                            "tcsr_ufs_clkref_en": (1, 1)})
+        self.evidence_cycle(1)
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        line = ("evidence: UFS PHY: LEAKED POWER REFERENCE: its supply 1d80000.phy-vdda-phy is enabled (use 1) with "
+                "the UFS host clock-gated (gcc_ufs_phy_axi_clk 0/0) and its own clocks on (gcc_ufs_phy_phy_aux_clk "
+                "1/1, tcsr_ufs_clkref_en 1/1): this boot has a leaked UFS PHY power reference, and on a kernel "
+                "without ufs-qcom-track-phy-power-state-gts9u.patch the resume from a sleep that powers "
+                "ufs_mem_phy_gdsc off will lose the UFS (docs/resume-recovery.md, \"The PHY power reference\")")
+        self.assertEqual(self.out.count(line), 1)
+        self.assertIn("SLEEP-TEST RESULT: SHALLOW: 1 of 1 cycles resumed with the UFS readable", self.out)
+        pmsg = [l for l in self.pmsg_lines() if "UFS PHY" in l]
+        self.assertEqual(pmsg, ["evidence: UFS PHY: leaked power reference before the first sleep (its supply on, "
+                                "the host clock-gated, its own clocks on): a kernel without "
+                                "ufs-qcom-track-phy-power-state-gts9u.patch loses the UFS at the resume"])
+        # Once, with the evidence before the first sleep, before the read.
+        log = (self.ramdir() / "log").read_text()
+        self.assertLess(log.index("1d80000.phy-vdda-phy"), log.index(line))
+        self.assertLess(log.index(line), log.index("read of "))
+
+    def leak_line(self, regulators, clocks):
+        """sleep-test.sh's ev_phy_leak on a regulator_summary and clock
+        lines ("NAME ENABLE PREPARE PARENT"); None for a file not given."""
+        body = re.search(r"^ev_phy_leak\(\) \{ # REGULATORS CLOCKS\n.*?^\}\n", (KIT_SRC / "sleep-test.sh").read_text(),
+                         re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            args = []
+            for name, text in (("reg", regulators), ("clk", clocks)):
+                path = pathlib.Path(tmp, name)
+                if text is not None:
+                    path.write_text(text)
+                args.append(str(path))
+            result = subprocess.run(["sh", "-c", "ufs_phy_supply=1d80000.phy-vdda-phy\n" + body +
+                                     'ev_phy_leak "$1" "$2"', "sh", *args], capture_output=True, text=True)
+        # A file that cannot be read says nothing either (its status is
+        # awk's, which the caller does not look at).
+        self.assertEqual(result.stderr, "")
+        return result.stdout
+
+    def test_the_leak_line_needs_the_supply_on_the_host_gated_and_the_phy_s_clocks_on(self):
+        on = REGULATOR_SUMMARY
+        off = REGULATOR_SUMMARY.replace("1d80000.phy-vdda-phy          1", "1d80000.phy-vdda-phy          0")
+        self.assertNotEqual(on, off)
+        leak = "gcc_ufs_phy_axi_clk 0 0 gcc_gpll0\ngcc_ufs_phy_phy_aux_clk 1 1 -\ntcsr_ufs_clkref_en 1 1 bi_tcxo\n"
+        self.assertTrue(self.leak_line(on, leak).startswith("LEAKED POWER REFERENCE: its supply 1d80000.phy-vdda-phy "
+                                                            "is enabled (use 1) with the UFS host clock-gated"))
+        for name, regulators, clocks in (
+                ("the supply off", off, leak),
+                ("the host's clocks on", on, leak.replace("axi_clk 0 0", "axi_clk 1 1")),
+                ("the PHY's clocks off", on, leak.replace("aux_clk 1 1", "aux_clk 0 0")
+                 .replace("clkref_en 1 1", "clkref_en 0 0")),
+                ("one of the PHY's clocks off", on, leak.replace("clkref_en 1 1", "clkref_en 0 0")),
+                ("no host clock read", on, leak.replace("gcc_ufs_phy_axi_clk 0 0 gcc_gpll0\n", "")),
+                ("no clocks", on, ""), ("no clock file", on, None), ("no regulator file", None, leak)):
+            with self.subTest(name):
+                self.assertEqual(self.leak_line(regulators, clocks), "")
+
     def evidence_files(self):
         """The files the evidence reads, as squirtle has them (made-up
         values): the sleep statistics, the domains, rails, votes and wakeup
@@ -4740,6 +4957,9 @@ class SleepTestTest(FakeTablet):
                  "cycle 1/2: asleep", "cycle 1/2: evidence: qcom_stats", "SLEEP-TEST cycle 1/2: SHALLOW",
                  "cycle 2/2: evidence: before:", "cycle 2/2: deep sleep", "cycle 2/2: evidence: qcom_stats"]
         self.assertEqual([log.index(said) for said in order], sorted(log.index(said) for said in order))
+        # The UFS host's clocks are on here (counts in the hundreds, the
+        # lane clock leak): no line about the UFS PHY's power reference.
+        self.assertNotIn("UFS PHY: LEAKED POWER REFERENCE", self.out)
         # pmsg: five lines per cycle, each cut at 300 characters.
         pmsg = [line for line in self.pmsg_lines() if ": evidence: " in line]
         self.assertEqual(len(pmsg), 10, pmsg)
@@ -8463,8 +8683,9 @@ class SleepFixesTest(unittest.TestCase):
     def test_the_fixes_come_after_every_other_patch_of_their_files_on_both_boards(self):
         """No board in the blocks; the fixes go on after this script's other
         patches of their files (the HS-G5 one of ufs-qcom.c on the SM-X710
-        alone), and no other patch of the checkout touches those files; the
-        unpark patch is the PCIe PHY's only one."""
+        alone, and since revision 11 the UFS PHY power reference fix of
+        every build and its diagnostic), and no other patch of the checkout
+        touches those files; the unpark patch is the PCIe PHY's only one."""
         text = self.text()
         block, unpark, pwrdn = self.fix_block(), self.unpark_block(), self.pwrdn_block()
         for name, part in (("fixes", block), ("unpark", unpark), ("diagnostics", pwrdn)):
@@ -8473,7 +8694,9 @@ class SleepFixesTest(unittest.TestCase):
                 self.assertNotIn("gts9", part.replace("gts9u.patch", ""))
         at = text.index(block)
         for earlier in ("msm-adreno-gmu-hub-clk-param.patch", "msm-adreno-a740-scm-init-param.patch",
-                        'bash "$repo/scripts/stage-gpu-recovery-experiment.sh"', "ufs-qcom-hs-g5-at-300mhz-sm8550.patch"):
+                        'bash "$repo/scripts/stage-gpu-recovery-experiment.sh"', "ufs-qcom-hs-g5-at-300mhz-sm8550.patch",
+                        f"drivers/ufs/host/ufs-qcom.c {UFS_QCOM_PATCHES[0]}\n",
+                        f'< "$pat/{UFS_QCOM_PATCHES[1]}"'):
             self.assertLess(text.index(earlier), at, earlier)
         self.assertLess(text.index('if [ "$apply_sm8550_sleep_fixes" = 1 ]; then\n\tif grep -q \'clk_set_rate'), at)
         touching = {}
@@ -8484,8 +8707,9 @@ class SleepFixesTest(unittest.TestCase):
         self.assertEqual(touching[f"{GMU}.c"], {FIX_PATCHES[1], "msm-adreno-bound-fault-coredump-wait-gts9u.patch",
                                                 "msm-adreno-a740-scm-init-param.patch",
                                                 "msm-adreno-gmu-hub-clk-param.patch"})
-        self.assertEqual(touching[f"{UFS_QCOM}.c"], {FIX_PATCHES[2], "ufs-qcom-hs-g5-at-300mhz-sm8550.patch"})
-        self.assertEqual(touching[f"{UFS_QCOM}.h"], {FIX_PATCHES[2]})
+        self.assertEqual(touching[f"{UFS_QCOM}.c"], {FIX_PATCHES[2], "ufs-qcom-hs-g5-at-300mhz-sm8550.patch",
+                                                     *UFS_QCOM_PATCHES})
+        self.assertEqual(touching[f"{UFS_QCOM}.h"], {FIX_PATCHES[2], *UFS_QCOM_PATCHES})
         self.assertEqual(touching[f"{QMP_PCIE}.c"], {UNPARK})
         self.assertEqual(touching[f"{QMP}.c"], {"qmp-ufs-reset-serdes-before-power-down-gts9u.patch",
                                                 UFS_PATCHES[0], UFS_PATCHES[1], UFS_PATCHES[2]})
@@ -9179,10 +9403,111 @@ class PipeClockGateTest(unittest.TestCase):
                 self.assertIn(message, out)
 
 
+class UfsPhyPowerCheckTest(unittest.TestCase):
+    """ufs-phy-power-check.sh (revision 11), on a fake sysfs: read-only and
+    without root, it samples the UFS host's runtime state and the load
+    requested on the rail of the UFS PHY's vdda-phy supply, which it finds by
+    that consumer's link (on the SM-X910 the rail may be another regulator),
+    and says IMBALANCE when the PHY stays powered while its host is
+    runtime-suspended."""
+
+    # A stand-in for sleep: each call moves the fake sysfs on to the next
+    # sample of samples.txt ("STATUS MICROAMPS" lines; the first is set
+    # before the run).
+    SLEEP = '''#!/bin/sh
+n=$(cat "$D/n")
+n=$((n + 1))
+echo "$n" > "$D/n"
+line=$(sed -n "$((n + 1))p" "$D/samples.txt")
+[ -n "$line" ] || exit 0
+set -- $line
+echo "$1" > "$D/sys/devices/platform/soc@0/1d84000.ufshc/power/runtime_status"
+echo "$2" > "$D/sys/class/regulator/$RAIL/requested_microamps"
+'''
+
+    def check(self, samples, rail="regulator.11", consumer=True, host=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            reg = d / "sys/class/regulator"
+            for name, label, consumers in (("regulator.0", "regulator-dummy", ()),
+                                           ("regulator.12", "vreg_l3e_1p2", ("1d80000.phy-vdda-pll",)),
+                                           (rail, "vreg_l1e_0p88", ("1c06000.phy-vdda-phy", "ae94000.dsi-vdds")
+                                            + (("1d80000.phy-vdda-phy",) if consumer else ()))):
+                (reg / name).mkdir(parents=True)
+                (reg / name / "name").write_text(label + "\n")
+                (reg / name / "requested_microamps").write_text("0\n")
+                for c in consumers:
+                    (reg / name / c).symlink_to("../../../devices/platform/soc@0")
+            status = d / "sys/devices/platform/soc@0/1d84000.ufshc/power/runtime_status"
+            if host:
+                status.parent.mkdir(parents=True)
+                status.write_text(samples[0].split()[0] + "\n")
+                (reg / rail / "requested_microamps").write_text(samples[0].split()[1] + "\n")
+            (d / "samples.txt").write_text("".join(s + "\n" for s in samples))
+            (d / "n").write_text("0\n")
+            (d / "bin").mkdir()
+            (d / "bin/sleep").write_text(self.SLEEP)
+            (d / "bin/sleep").chmod(0o755)
+            script = d / "check.sh"
+            text = (KIT_SRC / "ufs-phy-power-check.sh").read_text()
+            self.assertEqual(text.count("/sys/"), 2)
+            script.write_text(text.replace("/sys/", f"{d}/sys/"))
+            before = {str(p): p.read_bytes() for p in d.rglob("*") if p.is_file() and "regulator" in str(p)}
+            result = subprocess.run(["sh", str(script), str(len(samples)), "0"], capture_output=True, text=True,
+                                    env={"PATH": f"{d}/bin:/usr/bin:/bin", "D": str(d), "RAIL": rail}, timeout=60)
+            # It wrote nothing (only the stand-in moved the loads on).
+            after = {str(p): p.read_bytes() for p in d.rglob("*") if p.is_file() and "regulator" in str(p)}
+            self.assertEqual(sorted(after), sorted(before))
+            return result.returncode, result.stdout.replace(str(d), "D"), result.stderr.replace(str(d), "D")
+
+    def test_a_phy_powered_while_its_host_is_suspended_is_an_imbalance(self):
+        code, out, err = self.check(["suspended 286000"] * 8 + ["active 286000"] * 2)
+        self.assertEqual((code, err), (1, ""))
+        self.assertIn("UFS PHY vdda-phy: vreg_l1e_0p88 (D/sys/class/regulator/regulator.11), consumers: "
+                      "1c06000.phy-vdda-phy 1d80000.phy-vdda-phy ae94000.dsi-vdds", out)
+        self.assertIn("samples 10: host suspended 8 (PHY powered in 8), active 2 (PHY powered in 2), in transition 0",
+                      out)
+        self.assertIn("IMBALANCE: the UFS PHY stays powered while its host is runtime-suspended", out)
+
+    def test_a_phy_that_powers_down_with_its_host_is_ok_and_one_stray_sample_is_tolerated(self):
+        for name, samples in (("balanced", ["suspended 98000"] * 6 + ["active 286000"] * 4),
+                              ("one stray sample", ["suspended 98000"] * 6 + ["suspended 188000"] + ["active 188000"]),
+                              ("a resume between the two reads", ["suspended 0", "resuming 188000", "active 188000",
+                                                                 "suspended 0"])):
+            with self.subTest(name):
+                code, out, err = self.check(samples)
+                self.assertEqual((code, err), (0, ""), out)
+                self.assertTrue(out.endswith("OK: the UFS PHY powers down with its host\n"), out)
+
+    def test_the_rail_is_found_by_its_consumer_on_either_tablet(self):
+        """The SM-X910's rail may be another regulator: found by the link."""
+        code, out, _ = self.check(["suspended 286000"] * 4, rail="regulator.27")
+        self.assertEqual(code, 1, out)
+        self.assertIn("(D/sys/class/regulator/regulator.27)", out)
+
+    def test_what_it_cannot_judge_it_says(self):
+        code, out, _ = self.check(["active 286000"] * 4)
+        self.assertEqual(code, 3)
+        self.assertIn("INCONCLUSIVE: the UFS host was never runtime-suspended in the window", out)
+        code, _, err = self.check(["suspended 0"], host=False)
+        self.assertEqual((code, err), (2, "no UFS host at D/sys/devices/platform/soc@0/1d84000.ufshc\n"))
+        code, _, err = self.check(["suspended 0"], consumer=False)
+        self.assertEqual((code, err), (2, "no regulator with the consumer 1d80000.phy-vdda-phy\n"))
+
+    def test_it_reads_and_writes_nothing_and_needs_no_root(self):
+        text = (KIT_SRC / "ufs-phy-power-check.sh").read_text()
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertEqual(re.findall(r"(?<![0-9&<])>>?\s*\S+", code), [">&2"] * len(re.findall(">&2", code)))
+        for word in ("sudo", "id -u", "tee ", "/sys/kernel/debug", "echo 1", "rm ", "mv ", "cp "):
+            self.assertNotIn(word, code)
+        self.assertIn("load=188000", code)
+        self.assertIn('if [ -e "$r/$phy-vdda-phy" ]; then', code)
+
+
 class ScriptsTest(unittest.TestCase):
     def test_scripts_parse(self):
         for name, shell in (("install.sh", "sh"), ("rollback.sh", "sh"), ("verify.sh", "sh"),
-                            ("sleep-test.sh", "sh"), ("make-kit.sh", "bash")):
+                            ("sleep-test.sh", "sh"), ("ufs-phy-power-check.sh", "sh"), ("make-kit.sh", "bash")):
             with self.subTest(name):
                 subprocess.run([shell, "-n", str(KIT_SRC / name)], check=True)
 
@@ -9249,6 +9574,45 @@ class ScriptsTest(unittest.TestCase):
                      "install.sh", "rollback.sh", "verify.sh"):
             self.assertIn(name, shipped)
         self.assertNotIn("vendor_boot.img", text.replace("$hangkit/vendor_boot.img", ""))
+        # Every script and the README go into the kit, and each is in its
+        # SHA256SUMS: revision 11's UFS PHY power check among them.
+        copied = re.search(r'^install -m 0644 (.*?) "\$kit/"$', text, re.M | re.S).group(1).split()
+        scripts = ["install.sh", "rollback.sh", "verify.sh", "sleep-test.sh", "ufs-phy-power-check.sh", "README.md"]
+        self.assertEqual([w for w in copied if w != "\\"], [f'"$here/{name}"' for name in scripts])
+        for name in scripts:
+            self.assertIn(name, shipped)
+            self.assertTrue((KIT_SRC / name).is_file(), name)
+
+    def test_the_sleep_test_reads_revision_11_s_ufs_qcom_lines(self):
+        """ufs_diag takes the ufs-qcom diagnostic's three kinds of line, as
+        their format strings give them; an attempt given up before the sleep
+        may have the counts at a power-up sequence's entry and the
+        setup_clocks lines (healthy cycles have them) but not the line of a
+        failed power-up sequence."""
+        text = (KIT_SRC / "sleep-test.sh").read_text()
+        diag = re.search(r"^ufs_diag='([^']*)'$", text, re.M).group(1)
+        self.assertEqual(diag.split("|")[-3:], ["power-up sequence entry: PHY power_count",
+                                                "power-up sequence failed, before phy_exit",
+                                                "setup_clocks repeated a PHY power-"])
+        for line in (UFS_COUNTS.format(count=1), UFS_COUNTS_FAILED, UFS_REPEAT,
+                     UFS_REPEAT.replace("power-on (1)", "power-off (16)")):
+            self.assertRegex(line, diag)
+        # The lines are those the patch's format strings make.
+        added = "\n".join(added_lines(UFS_QCOM_PATCHES[1])[f"{UFS_QCOM}.c"])
+        self.assertIn('"%s: PHY power_count %d init_count %d, host reference %s, setup_clocks repeats: power-on %u, '
+                      'power-off %u\\n",', added)
+        self.assertIn('"power-up sequence entry"', added)
+        self.assertIn('"power-up sequence failed, before phy_exit()"', added)
+        self.assertIn('"setup_clocks repeated a PHY power-%s (%u): clock gating state %d, active_reqs %d, %s\\n",',
+                      added)
+        body = re.search(r"^gave_up_early\(\) \{\n.*?^\}\n", text, re.M | re.S).group(0)
+        self.assertEqual(re.findall(r"-e '([^']*)'", body), ["calibration entry: SW_RESET", "power-up write: PWRDN",
+                                                             "power-up sequence entry: PHY power_count",
+                                                             "setup_clocks repeated a PHY power-"])
+        # The NEXT line and the evidence name a section that is there.
+        self.assertEqual(text.count('(docs/resume-recovery.md, \\"The PHY power reference\\")'), 2)
+        self.assertIn("\n### The PHY power reference (2026-11-23)\n", (REPO / "docs/resume-recovery.md").read_text())
+        self.assertIn("(resume-recovery.md#the-phy-power-reference-2026-11-23)", (REPO / "docs/porting-log.md").read_text())
 
     def test_tree_comparison_skips_build_products_and_nothing_else(self):
         """The M= module builds leave objects in the kernel source tree, and
@@ -9349,7 +9713,22 @@ class ScriptsTest(unittest.TestCase):
                                    "gcc_sm8550.debug_boot_state",
                                    "system sleep: the link was kept, and its power domain stayed on",
                                    "system sleep: the link was kept, but genpd powered its power domain off",
-                                   "pcie_qcom.debug_root_port_d3"])
+                                   "pcie_qcom.debug_root_port_d3",
+                                   "Failed to power on PHY: %pe", "power-up sequence entry",
+                                   "setup_clocks repeats: power-on"])
+        # Revision 11's ufs-qcom: the fix's message for a PHY power-on that
+        # failed (a format string of its code), and two of the diagnostic's,
+        # its entry line's label and its counts' format; each in no other
+        # patch, and in no driver of this checkout.
+        for line, patch, form in ((strings[25], UFS_QCOM_PATCHES[0], f'"{strings[25]}\\n"'),
+                                  (strings[26], UFS_QCOM_PATCHES[1], f'"{strings[26]}"'),
+                                  (strings[27], UFS_QCOM_PATCHES[1], f'setup_clocks repeats: power-on %u, power-off %u\\n"')):
+            with self.subTest(line):
+                self.assertEqual(len([added for added in added_lines(patch)[f"{UFS_QCOM}.c"] if form in added]), 1, form)
+                self.assertEqual([p.name for p in (REPO / "kernel/patches").glob("*.patch") if line in p.read_text()],
+                                 [patch])
+                self.assertFalse([p.name for p in (REPO / "kernel/drivers").rglob("*") if p.is_file()
+                                  and line in p.read_text(errors="replace")])
         # Revision 11's guard: two of the lines its PCIe half logs at a
         # resume, format strings of that patch's code and of no other patch.
         guard = added_lines(PCIE_PATCHES[0])[f"{PCIE_QCOM}.c"]
@@ -9448,11 +9827,13 @@ class ScriptsTest(unittest.TestCase):
 
     def test_the_kit_s_patches_are_patches_the_build_applies(self):
         text = (KIT_SRC / "make-kit.sh").read_text()
-        typec, gdsc, debug, fix, ufs, pcie = kit_patches(text)
-        self.assertEqual((typec, gdsc, debug, fix, ufs, pcie),
-                         (TYPEC_PATCHES, GDSC_PATCHES, DEBUG_PATCHES, FIX_PATCHES, UFS_PATCHES, PCIE_PATCHES))
+        typec, gdsc, debug, fix, ufs, pcie, ufs_qcom = kit_patches(text)
+        self.assertEqual((typec, gdsc, debug, fix, ufs, pcie, ufs_qcom),
+                         (TYPEC_PATCHES, GDSC_PATCHES, DEBUG_PATCHES, FIX_PATCHES, UFS_PATCHES, PCIE_PATCHES,
+                          UFS_QCOM_PATCHES))
         self.assertIn('\npatches=("${typec_patches[@]}" "${gdsc_patches[@]}" "${debug_patches[@]}" '
-                      '"${fix_patches[@]}" "${ufs_patches[@]}"\n\t"${pcie_patches[@]}")\n', text)
+                      '"${fix_patches[@]}" "${ufs_patches[@]}"\n\t"${pcie_patches[@]}" "${ufs_qcom_patches[@]}")\n',
+                      text)
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text().replace("\\\n", " ")
         for name in typec:
             with self.subTest(name):
@@ -9500,6 +9881,16 @@ class ScriptsTest(unittest.TestCase):
         for name in pcie:
             with self.subTest(name):
                 self.assertTrue((REPO / "kernel/patches" / name).is_file())
+        # Revision 11's ufs-qcom two: the fix by apply_unless, in every
+        # build, and its diagnostic behind the UFS PHY's diagnostic switch,
+        # strictly, by the function its marker names.
+        for name in ufs_qcom:
+            with self.subTest(name):
+                self.assertTrue((REPO / "kernel/patches" / name).is_file())
+        self.assertEqual(len(re.findall(rf"^apply_unless '[^']+'\s+drivers/ufs/host/ufs-qcom\.c\s+"
+                                        rf"{re.escape(ufs_qcom[0])}\s*$", build, re.M)), 1)
+        self.assertEqual(build.count(f'< "$pat/{ufs_qcom[1]}"'), 2)
+        self.assertIn("\nufs_qcom_count_marker='static void ufs_qcom_dbg_phy_counts('\n", build)
         # Revision 9's two behind their switch, each by the file it changes.
         for name, target in zip(debug, (f"{GCC}.c", f"{RPMHPD}.c")):
             with self.subTest(name):
@@ -9510,7 +9901,7 @@ class ScriptsTest(unittest.TestCase):
         # build's, and so is the PCIe PHY's, which loses the unpark patch.
         patched = re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1)
         changed = set()
-        for name in typec + gdsc + debug + fix + ufs:
+        for name in typec + gdsc + debug + fix + ufs + ufs_qcom:
             changed.update(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / name).read_text(),
                                       re.M))
         self.assertEqual(changed, {f"{TCPM_DIR}/tcpm.c", "include/linux/usb/tcpm.h", f"{GCC}.c",
@@ -10048,7 +10439,7 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         kit = sum(kit_patches(text), [])
         self.assertEqual(sorted(set(re.findall(r"`kernel/patches/([^`]+)`", readme))), sorted(kit))
-        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (18, 5))
+        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (20, 5))
         self.assertIn("and the UFS PHY's two (revision 8): nine patches, five of them to TCPM. Revision 9 adds the "
                       "two debug patches above: eleven patches. Revision 10 adds the three upstream fixes and the "
                       "second UFS PHY diagnostic, fifteen patches, and leaves out `unpark-pcie0-pipe-mux.patch`, "
@@ -10056,9 +10447,28 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn("In the kernel source tree twelve files differ from the hang-log build:", readme)
         self.assertIn("Against revision 9's tree six differ: those five and `phy-qcom-qmp-ufs.c`.", readme)
         self.assertIn("Revision 11 adds `kernel/patches/gcc-sm8550-pcie0-gdsc-off-in-suspend.patch`, the PCIe "
-                      "host's half of the guard and the root port's debug switch, and rewrites the GDSC debug switch "
-                      "patch: eighteen patches, thirteen files (`pcie-qcom.c` the new one); against revision 10's "
-                      "tree two differ, `gcc-sm8550.c` and `pcie-qcom.c`.", readme)
+                      "host's half of the guard and the root port's debug switch, rewrites the GDSC debug switch "
+                      "patch, and adds the UFS PHY power reference fix and its diagnostic: twenty patches, thirteen "
+                      "files (`pcie-qcom.c` the new one); against revision 10's tree four differ, `gcc-sm8550.c`, "
+                      "`pcie-qcom.c`, `ufs-qcom.c` and `ufs-qcom.h`.", readme)
+        # Revision 11's ufs-qcom: in every build, what its lines are, the
+        # PCS reset kept, and the check without root.
+        for said in ("**Revision 11 also fixes the UFS PHY's power reference**, in every build of both tablets: no "
+                     "build variable and no board check, so a default build changes by this patch as well.",
+                     "Revision 8's PCS reset was not the fix for this failure",
+                     "`ufshcd-qcom 1d84000.ufshc: power-up sequence entry: PHY power_count 1 init_count N, host "
+                     "reference held, setup_clocks repeats: power-on 0, power-off 0`",
+                     "`setup_clocks repeated a PHY power-on (1): clock gating state 3, active_reqs 1, in the ungate "
+                     "work`. Each such line is a leak the fix absorbed",
+                     "`ufs-phy-power-check.sh` (in the kit; read-only, no root, both tablets)",
+                     "the sleep came back 9 times of 9 with it (twice without the storage, revision 9's run 3 and "
+                     "revision 10's run 5",
+                     "**`PWRDN 0x0` at the entry with no `power-up write` line before it means the power-on did not "
+                     "run**"):
+            with self.subTest(said):
+                self.assertIn(said, readme)
+        self.assertNotIn("its core supply L1D the first suspect", readme)
+        self.assertNotIn("a UFS PHY fault of its own, which this revision does not change", readme)
         # Revision 9: what it is, how it is built, and the runs it was for.
         for said in ("**Revision 9** is revision 8 plus two debug patches, which a release build does not get",
                      "**never set a PCIe one for a suspend in which the PCIe host stays up**",
@@ -10083,7 +10493,7 @@ class ScriptsTest(unittest.TestCase):
                      # Revision 10: what it is, what it leaves out, and its run.
                      "**Revision 10** (built 2026-11-23, on squirtle since 11:37 that day) is revision 9 plus three upstream commits",
                      "`unpark-pcie0-pipe-mux.patch`, which selected the PHY's clock at each PHY power-on, is left out",
-                     "**Revision 10: the runs** (2026-11-23; four have run, listed after the command).",
+                     "**Revision 10: the runs** (2026-11-23; six have run, listed after the command).",
                      "`pcie_0_gdsc` still has to be let off (`gdsc=pcie0`) for the sleep to return.",
                      "A stopped ADSP keeps the DDR at 547 MHz (revision 9's run 2c did the same): do not stop it for a run.",
                      "Revision 10 installs the same way over revision 9, which squirtle has had since 2026-11-22 20:59",

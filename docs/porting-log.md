@@ -10104,3 +10104,177 @@ files differ, `gcc-sm8550.c` and `pcie-qcom.c`, the patches apply strictly
 (the debug switches one line further down), and a reused tree is refused
 for a build without them, and so is one with the first form of the GDSC
 patch. Not built, not run.
+
+### Kit revision 10's runs 5 and 6: the storage lost after three hours, and the audio DSP quiet without its sensor clients (2026-11-23)
+
+Both on revision 10's kernel (90da273a8a49), undocked on the PC's cable,
+one 30 s suspend-to-idle cycle with `release-floor pci=remove mode=s2idle
+hold=60 gdsc=pcie0 rpmh`, each in a boot that held the floor once (the
+loop breaker) and had it released by the script; the logs are
+`~/ubuntu-gts9u/backups/squirtle-sleep-r10-5-rpmh-20261123.log` and
+`squirtle-sleep-r10-6-rpmh-sensors-stopped-20261123.log`, with the pstore
+directories of those names.
+
+**15:48, run 5** (boot f3862a68, up 11751 s, 3 h 16 min; the ADSP running,
+iio-sensor-proxy and hexagonrpcd-adsp-sensorspd active):
+- the sleep came back (31.8 s, woken by the RTC, IRQ 21), and the PCIe host
+  with it (`PCIe Gen.2 x1 link up`, `PCIe came back`);
+- **the storage did not**: 15 calibrations, each entry `SW_RESET 0x1 START
+  0x0 PWRDN 0x0 READY 0x4 C_READY 0x0 CMN 0xa0`, each followed by the
+  timeout's lines and `no PCS_READY within 1 s of SERDES_START`, and not
+  one `power-up write` line; 58 failure lines, the first `phy
+  initialization timed-out`, and the read failed with an I/O error. ext4
+  logged 5 errors on the read-only disk and, with `errors=continue`, saved
+  none (`SLEEP-TEST NOTE`); the next boot (9b79e848) mounted the root with
+  `errors_count` 0;
+- `aosd +0`, `cxsd +0`, `ddr +830` with 30.3 s in low power (0xd4) and
+  30.5 s at 200 MHz; `adsp +1439` in 49.7 s (`+283` in the 4.9 s awake
+  before the sleep); DSP interrupts `ipcc_0 +58, glink-smem +66,
+  smp2p-adsp +7, q6v5_ready +7, aoss-qmp +2`; genpd powered `cx`,
+  `pcie_0_gdsc`, `ufs_mem_phy_gdsc` and `ufs_phy_gdsc` off (+1 each);
+  `rpmh`: no flush before the sleep (230 active votes), so the RSC slept
+  with the sets of an earlier flush;
+- before the sleep, with the root frozen, the regulator summary had the UFS
+  PHY's `1d80000.phy-vdda-phy` (188 mA) and `1d80000.phy-vdda-pll` (18 mA)
+  enabled, and the prepared clocks `gcc_ufs_phy_phy_aux_clk 1 1` and
+  `tcsr_ufs_clkref_en 1 1`, with the host's `axi 0/0`, `unipro_core 0/0`
+  and `pad_clkref 0/0`: the PHY powered with its host clock-gated (next
+  entry).
+
+**16:31, run 6** (boot 9b79e848, up 2365 s; the same options, with
+iio-sensor-proxy and hexagonrpcd-adsp-sensorspd stopped by hand first: the
+record has `iio-sensor-proxy failed, hexagonrpcd-adsp-sensorspd inactive`):
+- SHALLOW: the sleep came back (31.3 s, woken by the RTC), the PCIe host
+  with it, and the storage (`power-up write: PWRDN 0x1 right after it, 0x1
+  100 us later`, then the entry with `PWRDN 0x1`);
+- **`adsp +0`** (1439 in run 5; `+0` in the 5 s awake as well), `ddr +1`
+  with the DDR in low power and at 200 MHz for all 31.3 s, and still `aosd
+  +0 cxsd +0`; DSP interrupts `ipcc_0 +2, aoss-qmp +2`; `rpmh`: no flush
+  before the sleep (223 active votes);
+- no UFS PHY supply enabled before the sleep.
+
+So the sensor streams are what wakes the audio DSP 30 to 45 times a second,
+and something else keeps AOSS sleep and CX collapse away (the proposals in
+`~/ubuntu-gts9u/backups/kit-r11-pcie-fix-2026-11-23.md`, section 8). With
+`gdsc=pcie0`, the root port removed and the floor released, the sleep has
+now come back 9 times of 9 on revisions 9 and 10, and 2 of those lost the
+storage: revision 9's run 3 and this run 5.
+
+### The UFS PHY's power-up never ran: a leaked power reference (2026-11-23)
+
+A read-only analysis of run 5 against the as-built revision 10 tree and
+upstream v7.4-rc4
+(`~/ubuntu-gts9u/backups/ufs-phy-power-count-rootcause-2026-11-23.md`; its
+cited facts and the run numbers above were checked again against the logs).
+The details are in [the resume notes](resume-recovery.md#the-phy-power-reference-2026-11-23).
+
+**Cause.** ufs-qcom powers the UFS PHY with `phy_power_on()` and
+`phy_power_off()` from its clock hook, and those count: the PHY's callbacks
+run only on 0 to 1 and 1 to 0. ufshcd calls the hook whatever state the
+clocks are in, and its clock gating sometimes asks for clocks that are on:
+`ufshcd_gate_work()` gives up when a command is being dispatched and leaves
+`REQ_CLKS_OFF` with the clocks on, and the command's `ufshcd_hold()` then
+queues the ungate work, whose `ufshcd_setup_clocks(hba, true)` powers the
+PHY on once more. Nothing drops that reference. From then on the PHY never
+powers down (run 5's supplies and clocks before the sleep), and
+`ufs_qcom_power_up_sequence()`'s power-off and power-on never reach the
+callbacks; after a sleep that powered `ufs_mem_phy_gdsc` off the PHY's
+registers are at reset (SW_PWRDN 0), nothing powers it up, and all 15
+calibrations time out. `PWRDN 0x0` at the entry with no `power-up write`
+line is that skipped power-on, not a write that did not hold, and the L1D
+supply is not needed to explain it (it stays a device-tree item of its own).
+Confidence: high that a leaked reference kept the power-on from running in
+run 5 (no `power-up write` line where every passing calibration has one,
+and the PHY powered with its host gated before the sleep); the same
+signature is in revision 9's run 3 and revision 10's run 4 and in none of
+the seven runs that came back with the storage. Medium that the gate/ungate
+race is the trigger: it is the only path in the source that adds a
+reference and logs nothing, and the step model reproduces it. Mainline
+v7.4-rc4 has the same code (since 77d2fa54a945, v6.17-rc1).
+
+**Kit revision 11, third form (written, not built; the revision number
+stays 11).** By the owner's decisions:
+- `kernel/patches/ufs-qcom-track-phy-power-state-gts9u.patch`, the fix, in
+  every build of both tablets, with no variable and no board gate: ufs-qcom
+  keeps a flag of the reference the host holds and takes and drops it only
+  through it (Vladimir Oltean's posted, unmerged v8 13/31), and the power-up
+  sequence drops the reference the flag says the host holds, so the PHY's
+  power-on always runs before the calibration. A default build therefore
+  changes by this patch. `scripts/build-mainline-kernel.sh` applies it
+  (`apply_unless`) right after the SM-X710's HS-G5 patch; its line numbers
+  are those of a file with the lane clock fix, which goes on top of it, so
+  it goes in 31 lines up (one in `ufs-qcom.h`) with no fuzz, and patch(1)
+  keeps `ufs-qcom.c.orig` and `ufs-qcom.h.orig` in the tree, which
+  `make-kit.sh` passes over as copies of the hang-log tree's files.
+- `kernel/patches/ufs-qcom-phy-power-count-diagnostic.patch`, the
+  diagnostic, with `APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1` alone, strictly on
+  top of the fix; a tree that carries it is refused for a build without the
+  variable. At every power-up sequence `power-up sequence entry: PHY
+  power_count N init_count N, host reference held|not held, setup_clocks
+  repeats: ...`, after a failed one `power-up sequence failed, before
+  phy_exit(): ...`, and the first 16 setup_clocks calls of each kind that
+  find the reference as they ask, `setup_clocks repeated a PHY power-on
+  (n): clock gating state S, active_reqs N, in the ungate work|not in the
+  ungate work`. Reads only.
+- `qmp-ufs-assert-pcs-reset-before-calibration-gts9u.patch` and the UFS
+  PHY's two diagnostics stay as they are: the PCS reset was not the fix for
+  this failure, and stays one more kit so that one thing changes at a time.
+- `make-kit.sh`: twenty patches (`ufs_qcom_patches`), both checked whole in
+  the build tree's `ufs-qcom.c` and `ufs-qcom.h` (the diagnostic, then the
+  fix, reversed with no fuzz from under the lane clock fix), replayed after
+  the lane clock fix on the hang-log tree's files, three new image strings
+  (`Failed to power on PHY: %pe`, `power-up sequence entry`, `setup_clocks
+  repeats: power-on`), and `ufs-phy-power-check.sh` in the kit.
+- `sleep-test.sh`: the diagnostic's three lines among the cycle's
+  diagnostic lines; the entry's counts and the setup_clocks lines do not
+  stop an attempt given up before its sleep from being ABORTED (healthy
+  cycles have them), the failed power-up sequence's does; a failed cycle
+  whose calibration entries had no power-up write before them, on a kernel
+  that logged one this boot, or whose counts line has `power_count` 2 or
+  more, gets `NEXT: the UFS PHY's power-on did not run before its
+  calibration: a leaked PHY power reference (docs/resume-recovery.md, "The
+  PHY power reference")`; and the evidence before the first sleep gets one
+  line, also in pmsg, when the UFS PHY's supply is enabled while the host's
+  core clock is off and the PHY's own clocks are on (`evidence: UFS PHY:
+  LEAKED POWER REFERENCE: ...`). Evidence only: the run is not refused.
+- `ufs-phy-power-check.sh` (read-only, no root, both tablets): samples the
+  UFS host's runtime state and the load on its PHY's `vdda-phy` rail, found
+  by the consumer link, and says `IMBALANCE` when the PHY stays powered
+  while its host is runtime-suspended. On squirtle, boot 9b79e848 (revision
+  10, about 25 minutes up), it said `OK`.
+- `scripts/test-ufs-phy-power-balance.py`, a step model of the paths that
+  change the PHY's counts (48 interleavings of the gate work with one
+  command: 24 leave a reference on the old code, none on the fixed one),
+  run by the new `tests/test_ufs_qcom_phy_power.py`.
+
+Checked on scratch copies of v7.2-rc3 with the build script's own steps, for
+every combination of the five variables on both boards: against the
+previous commit's script every tree differs in `ufs-qcom.c` and
+`ufs-qcom.h` alone, plus patch(1)'s two copies of them, and those two files
+are the patches applied strictly in the build's order; no fuzz in any
+ufs-qcom hunk; a reused tree is refused for a build without the diagnostic,
+and a tree with the diagnostic damaged is refused with it. `ufs-qcom.o`,
+`pcie-qcom.o` and `gcc-sm8550.o` built for arm64 from the tree of the r11
+build's variables with revision 10's configuration, and the SM-X910's
+`ufs-qcom.o` (the fix alone, and with the diagnostic) with an SM-X910
+configuration, all with no warning, with and without `W=1`.
+`make-kit.sh`'s source checks, with the hang-log tree, pass on that tree
+(thirteen files, the three copies patch(1) kept passed over) and refuse the
+previous commit's tree. Not built, not run.
+
+The next run, once revision 11 is built and installed (its README,
+"Revision 11: the runs"): at the first boot each calibration logs the
+counts with `power_count 1 ... host reference held`, then `power-up write`,
+then `PWRDN 0x1`, and `ufs-phy-power-check.sh` says `OK`; a `setup_clocks
+repeated a PHY power-on (n): clock gating state 3 ... in the ungate work`
+line at any time is a leak the fix absorbed and proves the trigger. Then
+run 5's sleep again, after a long uptime if the trigger has not shown
+itself: the storage should come back with the same three lines at the
+resume's calibration.
+
+Open: whether, and how, to report the bug upstream (a reply to Oltean's
+series asking that 13/31 go to stable with `Fixes: 77d2fa54a945`, or a
+patch of its own); whether ufs-qcom's host reset (`GCC_UFS_PHY_BCR`) also
+resets the PHY's PCS; the race's rate; the 2026-11-21 failure and the
+SM-X910's of September, which fit this and were not checked; and when to
+drop the PCS reset.

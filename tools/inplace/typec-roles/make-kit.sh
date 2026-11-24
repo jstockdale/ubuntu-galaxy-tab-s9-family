@@ -16,8 +16,11 @@
 # the guard's genpd flag, and the guard's other half,
 # pcie-qcom-keep-power-domain-while-link-kept.patch), with a run-time debug
 # switch that lets the PCIe root port go to D3hot in system suspend
-# (pcie-qcom-debug-root-port-d3.patch), in boot, plus the build's module
-# tree, signed with its own key.  The configuration and the DTB do not
+# (pcie-qcom-debug-root-port-d3.patch), and the UFS PHY power reference
+# that ufs-qcom keeps track of (ufs-qcom-track-phy-power-state-gts9u.patch,
+# which every build applies) with a diagnostic of it
+# (ufs-qcom-phy-power-count-diagnostic.patch), in boot, plus the build's
+# module tree, signed with its own key.  The configuration and the DTB do not
 # change, so vendor_boot stays the hang-log kit's.  The build for this kit
 # sets APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1,
 # APPLY_SM8550_SLEEP_FIXES=1, APPLY_SM8550_PCIE0_GDSC_OFF=1 and
@@ -46,8 +49,9 @@
 # configuration and the module list are the hang-log build's, the source
 # trees differ in the three Type-C files, the clock controller, the
 # dwc3-qcom glue, the UFS PHY driver, the RPMh power domain driver, the
-# PIPE clock mux, the PCIe PHY, the GMU and ufs-qcom files of revision 10,
-# and the PCIe host driver of revision 11 alone, and those are what this
+# PIPE clock mux, the PCIe PHY, the GMU and ufs-qcom files of revision 10
+# (ufs-qcom's changed again in revision 11), and the PCIe host driver of
+# revision 11 alone, and those are what this
 # checkout's patches, stage script and driver give (the PCIe PHY's without
 # unpark-pcie0-pipe-mux.patch), the new image has the new code (the debug
 # switches' parameters among it) and the old one does not and was built
@@ -82,7 +86,8 @@ size=100663296
 # tablets and its diagnostic (8), plus the deep-sleep debug switches (9),
 # plus the SM8550 sleep fixes and the second UFS PHY diagnostic (10), plus
 # pcie_0_gdsc collapsed in system suspend with its guard and the root port's
-# debug switch (11).  Written to the kit for people; install.sh knows a
+# debug switch, and ufs-qcom's UFS PHY power reference fix with its
+# diagnostic (11).  Written to the kit for people; install.sh knows a
 # revision by its boot image and kernel build ID.
 revision=11
 dts=sm8550-samsung-gts9wifi
@@ -137,8 +142,13 @@ fix_patches=(clk-qcom-regmap-phy-mux-revert-rework.patch msm-adreno-a6xx-fix-sta
 	ufs-qcom-enable-only-lane-clocks.patch)
 fix_files=("$phymux.c" "$gmu.c" "$ufs_qcom.c")
 unpark=unpark-pcie0-pipe-mux.patch
+# Revision 11's ufs-qcom, in both of its files: the UFS PHY power reference
+# the host keeps track of, which every build applies, then its diagnostic,
+# with APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1; both go in under the lane clock
+# fix above.
+ufs_qcom_patches=(ufs-qcom-track-phy-power-state-gts9u.patch ufs-qcom-phy-power-count-diagnostic.patch)
 patches=("${typec_patches[@]}" "${gdsc_patches[@]}" "${debug_patches[@]}" "${fix_patches[@]}" "${ufs_patches[@]}"
-	"${pcie_patches[@]}")
+	"${pcie_patches[@]}" "${ufs_qcom_patches[@]}")
 # The files those patches change, and the PCIe PHY's.
 patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c" "$rpmhpd.c"
 	"$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c")
@@ -172,9 +182,12 @@ hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
 # object dates for the last.  Last, revision 11: the debug switches' fifth
 # parameter, debug_boot_state; two of the four lines the guard's PCIe half
 # logs at a resume (the one a kept link should give, and its warning); the
-# root port's debug switch, as the kernel keeps it.  Its pcie_0_gdsc's power
-# states and genpd flags are two bytes of a table: the power domain check
-# below is for them.
+# root port's debug switch, as the kernel keeps it; the message the UFS PHY
+# power reference fix gives a failed PHY power-on in ufs-qcom (in no other
+# driver), and two of its diagnostic's: the label of its line at each
+# power-up sequence, and the end of that line, the setup_clocks repeats.
+# Its pcie_0_gdsc's power states and genpd flags are two bytes of a table:
+# the power domain check below is for them.
 new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
 	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
 	'Swap is still queued, left pending' 'Partner swapped first, queued DR_SWAP_SEND dropped'
@@ -188,7 +201,8 @@ new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait
 	gcc_sm8550.debug_boot_state
 	'system sleep: the link was kept, and its power domain stayed on'
 	'system sleep: the link was kept, but genpd powered its power domain off'
-	pcie_qcom.debug_root_port_d3)
+	pcie_qcom.debug_root_port_d3
+	'Failed to power on PHY: %pe' 'power-up sequence entry' 'setup_clocks repeats: power-on')
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
@@ -381,6 +395,16 @@ for i in "${!fix_patches[@]}"; do
 		< "$repo/kernel/patches/${fix_patches[$i]}" ||
 		die "the build tree's $f does not carry ${fix_patches[$i]} whole"
 done
+# Revision 11's ufs-qcom patches: both whole in the build tree's two files,
+# under the lane clock fix (they come out again with no fuzz, the diagnostic
+# first).
+mkdir -p "$tmp/ufsq/${ufs_qcom%/*}"
+cp "$tree/$ufs_qcom.c" "$tree/$ufs_qcom.h" "$tmp/ufsq/${ufs_qcom%/*}/"
+for ((i = ${#ufs_qcom_patches[@]} - 1; i >= 0; i--)); do
+	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/ufsq" -p1 \
+		< "$repo/kernel/patches/${ufs_qcom_patches[$i]}" ||
+		die "the build tree's $ufs_qcom.c and $ufs_qcom.h do not carry ${ufs_qcom_patches[$i]} whole"
+done
 ! grep -q 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' "$tree/$qmp_pcie.c" ||
 	die "the build tree's $qmp_pcie.c carries $unpark, which revision 10 leaves out"
 source_check='marker lines only (HANG_SCRATCH not set)'
@@ -417,6 +441,10 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 		die 'the hang-log tree carries one of the SM8550 sleep fixes already'
 	grep -q 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' "$hang_tree/$qmp_pcie.c" ||
 		die "the hang-log tree's $qmp_pcie.c does not carry $unpark"
+	# Revision 11's ufs-qcom patches: the hang-log build had neither.
+	! grep -qF -e 'Power the PHY off if this host holds its power' -e 'static void ufs_qcom_dbg_phy_counts(' \
+		"$hang_tree/$ufs_qcom.c" ||
+		die "the hang-log tree carries revision 11's ufs-qcom patches already"
 	# Like every build before revision 8, the hang-log build gave the PCS
 	# reset to the SM-X910 alone, and has no diagnostic.
 	grep -q 'SM-X910 experiment: assert PCS reset before calibration tables' "$hang_tree/$qmp.c" &&
@@ -445,6 +473,13 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
 		< "$repo/kernel/patches/$unpark" ||
 		die "$unpark does not come out of the hang-log tree's $qmp_pcie.c whole"
+	# Revision 11's ufs-qcom patches, strictly: here on top of the lane clock
+	# fix, where the build has them under it; the two files come out the same.
+	for p in "${ufs_qcom_patches[@]}"; do
+		patch -s --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
+			< "$repo/kernel/patches/$p" ||
+			die "$p does not apply to the hang-log tree"
+	done
 	# The UFS PHY as the build changes it: this checkout's stage script
 	# replaces the SM-X910-only PCS reset, then the diagnostic goes on top,
 	# then revision 10's second diagnostic.
@@ -469,9 +504,11 @@ if [ -n "${HANG_SCRATCH:-}" ]; then
 	# patch(1) keeps the file it started from as FILE.orig when a hunk goes
 	# in at an offset, and scripts/build-mainline-kernel.sh does not tell it
 	# not to: the dwc3-qcom guard goes in four lines down, after the opps
-	# patch.  Such a backup is in the new tree alone.  It is passed over
-	# when it is what patch(1) kept there, the hang-log tree's file, and
-	# shown like any other file when it is anything else.
+	# patch, and revision 11's ufs-qcom fix 31 lines up in ufs-qcom.c and one
+	# in ufs-qcom.h (its line numbers are those of the lane clock fix's files,
+	# which go on top of it).  Such a backup is in the new tree alone.  It is
+	# passed over when it is what patch(1) kept there, the hang-log tree's
+	# file, and shown like any other file when it is anything else.
 	backups=
 	for f in "${patched[@]}"; do
 		[ -f "$tree/$f.orig" ] && [ ! -e "$hang_tree/$f.orig" ] &&
@@ -501,14 +538,14 @@ EOF
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $hang_tree: thirteen files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, gcc-sm8550.c by revision 11's pcie_0_gdsc, gcc-sm8550.c and rpmhpd.c by its two debug switch patches, clk-regmap-phy-mux.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h by its three sleep fixes, phy-qcom-qmp-pcie.c by $unpark left out, phy-qcom-qmp-ufs.c by its stage script and the two UFS PHY diagnostics, pcie-qcom.c by revision 11's guard and the root port's debug switch"
+	source_check="compared with $hang_tree: thirteen files differ, tcpm.c, tcpm.h, gcc-sm8550.c and dwc3-qcom.c by this checkout's seven patches, gcc-sm8550.c by revision 11's pcie_0_gdsc, gcc-sm8550.c and rpmhpd.c by its two debug switch patches, clk-regmap-phy-mux.c, a6xx_gmu.c, ufs-qcom.c and ufs-qcom.h by its three sleep fixes, ufs-qcom.c and ufs-qcom.h by revision 11's PHY power reference fix and its diagnostic, phy-qcom-qmp-pcie.c by $unpark left out, phy-qcom-qmp-ufs.c by its stage script and the two UFS PHY diagnostics, pcie-qcom.c by revision 11's guard and the root port's debug switch"
 	echo 'sources: only sm5714_usbpd.c, tcpm.c, tcpm.h, gcc-sm8550.c, dwc3-qcom.c, phy-qcom-qmp-ufs.c, rpmhpd.c, clk-regmap-phy-mux.c, phy-qcom-qmp-pcie.c, a6xx_gmu.c, ufs-qcom.c, ufs-qcom.h and pcie-qcom.c differ from the hang-log tree, by exactly this checkout'"'"'s changes'
 	if [ -n "$backups" ]; then
 		source_check="$source_check; passed over, a copy of the hang-log tree's file that patch(1) kept:$backups"
 		echo "sources: passed over$backups, the hang-log tree's file as patch(1) kept it"
 	fi
 else
-	echo 'sources: the eighteen patches and this checkout'"'"'s driver are in the build tree, and unpark-pcie0-pipe-mux.patch is not (HANG_SCRATCH not set: no tree comparison)'
+	echo 'sources: the twenty patches and this checkout'"'"'s driver are in the build tree, and unpark-pcie0-pipe-mux.patch is not (HANG_SCRATCH not set: no tree comparison)'
 fi
 
 # 4. The images: the new code is in the new one and not in the old one.
@@ -791,10 +828,11 @@ printf '%s\n' "$revision" > "$kit/REVISION"
 	echo "pcie_0_gdsc: PWRSTS_OFF_ON (kernel/patches/${gdsc_patches[0]}, APPLY_SM8550_PCIE0_GDSC_OFF=1)"
 	echo "pcie_0_gdsc guard: GENPD_FLAG_ACTIVE_WAKEUP (kernel/patches/${gdsc_patches[0]}) and the PCIe host on the awake path while it keeps its link (kernel/patches/${pcie_patches[0]}, APPLY_SM8550_PCIE0_GDSC_GUARD=1)"
 	echo "root port debug switch: pcie_qcom.debug_root_port_d3, N at boot (kernel/patches/${pcie_patches[1]}, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 with APPLY_SM8550_PCIE0_GDSC_GUARD=1)"
+	echo "UFS PHY power reference: kept track of by ufs-qcom (kernel/patches/${ufs_qcom_patches[0]}, every build), its counts logged (kernel/patches/${ufs_qcom_patches[1]}, APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1)"
 } > "$kit/SOURCE"
 install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/sleep-test.sh" \
-	"$here/README.md" "$kit/"
+	"$here/ufs-phy-power-check.sh" "$here/README.md" "$kit/"
 files=(boot.img "modules-$release.tar" BUILD_ID KEY_ID SIGNER REVISION SOURCE
-	install.sh rollback.sh verify.sh sleep-test.sh README.md)
+	install.sh rollback.sh verify.sh sleep-test.sh ufs-phy-power-check.sh README.md)
 (cd "$kit" && sha256sum "${files[@]}" > SHA256SUMS)
 cat "$kit/SHA256SUMS"

@@ -32,7 +32,7 @@ fingerprint_sensor=${FINGERPRINT_EL721:-$enable_fingerprint}
 qtee_admin_null_credentials=${QCOMTEE_ADMIN_NULL_CREDENTIALS:-0}
 enable_gunyah_cma=${ENABLE_GUNYAH_CMA:-0}
 # Diagnostic only, never in a release: see qmp-ufs-pcs-state-diagnostic.patch
-# below.
+# and ufs-qcom-phy-power-count-diagnostic.patch below.
 apply_qmp_ufs_diagnostic=${APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC:-0}
 # Debug only, never in a release: see gcc-sm8550-gdsc-debug-switches.patch
 # and rpmhpd-debug-retention-floor.patch below.
@@ -368,6 +368,41 @@ if [ "$DEVICE" = gts9wifi ]; then
 	apply_unless 'it runs HS-G5' \
 		drivers/ufs/host/ufs-qcom.c ufs-qcom-hs-g5-at-300mhz-sm8550.patch
 fi
+# ufs-qcom powers the UFS PHY with the host clocks, and ufshcd calls that
+# hook again for clocks that are on (a gate work that gave up on a command
+# being dispatched, then an ungate): each such call left the PHY a power
+# reference nothing dropped, and the next resume timed out every PHY
+# calibration (2026-11-23, Type-C kit revision 10, run 5).  Both tablets,
+# every build.  Its line numbers are those of files that carry
+# ufs-qcom-enable-only-lane-clocks.patch, which goes on top of it here (with
+# APPLY_SM8550_SLEEP_FIXES=1, below): its hunks go in 31 lines up in
+# ufs-qcom.c and one line up in ufs-qcom.h, with no fuzz, and patch(1) keeps
+# the two files as they were as ufs-qcom.c.orig and ufs-qcom.h.orig.
+apply_unless 'Power the PHY off if this host holds its power, so that the power-on' \
+	drivers/ufs/host/ufs-qcom.c ufs-qcom-track-phy-power-state-gts9u.patch
+# ufs-qcom-phy-power-count-diagnostic.patch is deliberately NOT applied by
+# default, like qmp-ufs-pcs-state-diagnostic.patch above: at every power-up
+# sequence of the UFS PHY it logs the PHY's power and init counts and whether
+# the host holds its power reference, and each setup_clocks call that finds
+# that reference already as it asks.  It only reads.  Test builds only, with
+# APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 (the SM-X710's Type-C roles kit,
+# revision 11), on top of the patch above; strictly, and refused for any
+# other build in a tree that carries it.
+ufs_qcom_source=$kernel_tree/drivers/ufs/host/ufs-qcom.c
+ufs_qcom_count_marker='static void ufs_qcom_dbg_phy_counts('
+if [ "$apply_qmp_ufs_diagnostic" = 1 ]; then
+	if grep -qF "$ufs_qcom_count_marker" "$ufs_qcom_source"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/ufs-qcom-phy-power-count-diagnostic.patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/ufs-qcom-phy-power-count-diagnostic.patch"
+	fi
+elif grep -qF "$ufs_qcom_count_marker" "$ufs_qcom_source"; then
+	echo 'The ufs-qcom PHY count diagnostic remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a default build.' >&2
+	exit 1
+fi
 apply_unless 'Users may open the misc device as soon as it is registered' \
 	drivers/misc/fastrpc.c fastrpc-publish-after-session-init.patch
 apply_unless 'qcom,early-tx-intent' \
@@ -652,8 +687,9 @@ apply_unless 'qcom_overlay_all' \
 #     ufs-qcom turns its three lane clocks on and off once, where it turned
 #     every clock of the UFS host on again at each runtime resume, which
 #     kept them, and XO under them, on through every sleep; on top of
-#     ufs-qcom-hs-g5-at-300mhz-sm8550.patch on the SM-X710, on the pinned
-#     file on the SM-X910.
+#     ufs-qcom-track-phy-power-state-gts9u.patch (and its diagnostic), and
+#     on the SM-X710 of ufs-qcom-hs-g5-at-300mhz-sm8550.patch; its hunks go
+#     in with no offset.
 # Each strictly; a tree that carries any of them is refused for a build
 # without the variable, so that a release built in a reused test tree
 # cannot ship them.  Upstream code has no marker of this port's: each is
