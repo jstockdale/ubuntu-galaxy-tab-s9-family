@@ -4128,6 +4128,12 @@ def rpmh_line(ts, state, addr, data):
             f"cmd(n): 0 msgid: 0x10108 addr: {addr} data: {data} complete: 0\n")
 
 
+def clk_line(ts, event, name):
+    """A line of the trace for a clock's prepare or unprepare (clk_prepare,
+    clk_unprepare, include/trace/events/clk.h)."""
+    return f"     kworker/0:1-12      [000] ...1. {ts:12.6f}: {event}: {name}\n"
+
+
 # The command DB as its debugfs file dumps it (made-up addresses).
 CMD_DB = ("Command DB DUMP\nSlave ARC (v1.0)\n-------------------------\n0x30000: cx.lvl [00 01]\n0x30010: mx.lvl\n"
           "0x30030: xo.lvl\nSlave BCM (v1.0)\n-------------------------\n0x50000: MC0\n0x50004: SH0\n"
@@ -7864,6 +7870,106 @@ exit 0
         self.assertIn("options: rpmh;", self.out)
         self.assertEqual((self.root / "sys/kernel/tracing/events/rpmh/rpmh_send_msg/enable").read_text(), "1")
 
+    def clk_events(self):
+        """The clock framework's prepare and unprepare tracepoints, off."""
+        for ev in ("clk_prepare", "clk_unprepare"):
+            d = self.root / "sys/kernel/tracing/events/clk" / ev
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "enable").write_text("0\n")
+
+    def test_rpmh_names_a_suspend_to_idle_flush_at_the_sleep_s_entry_and_what_holds_xo_there(self):
+        """A suspend-to-idle flushes the sets after the last CPU stopped
+        sched_clock: at the time of the "Timekeeping suspended" line, which
+        the trace prints up to 1 us later than the kernel log.  That flush
+        is the sleep's ("the sleep's entry"), where revision 11's script
+        said "no flush" (2026-11-23).  With the clock tracepoints the XO line
+        names what the suspend left prepared below XO (a prepare before the
+        sleep, none after it, counts), the whole flush goes to pmsg in
+        pieces, and the clock tracepoints are on until the restart."""
+        (self.root / "dev/pmsg0").write_text("")
+        (self.root / "sys/power/mem_sleep").write_text("[s2idle]\n")
+        self.s2idle_files()
+        self.rpmh_files()
+        self.clk_events()
+        write_clocks(self.root / "sys/kernel/debug/clk", bi_tcxo=(3, 3), gcc_gpll0=(2, 2),
+                     gcc_ufs_phy_ice_core_clk=(1, 1), gcc_usb30_prim_master_clk=(1, 1))
+        # Cycle 1: USB's clock unprepared before the sleep, the ICE clock
+        # not; the flush at the sleep's instant (708.000000 in the kernel
+        # log: s2idle_log's Timekeeping line), one command 1 us later as the
+        # trace rounds it, and one 2 us later, after the sleep.
+        self.cycle(1, log=self.s2idle_log())
+        (self.tmp / "cycle-1/trace").write_text(
+            clk_line(703.000000, "clk_unprepare", "gcc_usb30_prim_master_clk")
+            + rpmh_line(704.000000, "active", "0x30030", "0x3")
+            + rpmh_line(708.000000, "sleep", "0x50000", "0x0") + rpmh_line(708.000000, "wake", "0x50000", "0x60004001")
+            + rpmh_line(708.000001, "sleep", "0x30000", "0x0") + rpmh_line(708.000001, "wake", "0x30000", "0x2")
+            + rpmh_line(708.000002, "sleep", "0x30010", "0x0")
+            + clk_line(709.000000, "clk_prepare", "gcc_usb30_prim_master_clk"))
+        result = self.run_test("ro", "1", "mode=s2idle", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("rpmh: the clk_prepare and clk_unprepare tracepoints are on until the restart too (XO at each "
+                      "sleep's entry)\n", self.out)
+        flush = ("the last of 1 flushes before the sleep at 708.000000 (at 708.000000, the sleep's entry, 4 commands), "
+                 "sleep/wake: MC0 0x0/0x60004001, cx.lvl 0x0/0x2; left out, so held at their vote through the sleep: "
+                 "xo.lvl (active 0x3), mx.lvl; active votes before the sleep 1, commands after it 1")
+        self.assertIn(f"cycle 1/1: evidence: rpmh sleep set: {flush}\n", self.out)
+        self.assertIn("cycle 1/1: evidence: XO at the entry to the sleep (clock trace): XO still voted at the entry "
+                      "to the sleep, held by: gcc_ufs_phy_ice_core_clk; unprepared in the suspend before the sleep: "
+                      "gcc_usb30_prim_master_clk (1 prepares and unprepares traced before the sleep)\n", self.out)
+        pmsg = [line for line in self.pmsg_lines() if ": evidence: " in line]
+        self.assertIn("cycle 1/1: evidence: rpmh: flush 1 of 1 at 708.000000, the sleep's entry, sleep/wake: cx.lvl "
+                      "0x0/0x2; held: xo.lvl (active 0x3), mx.lvl", pmsg)
+        entry = [line for line in pmsg if ": evidence: XO at entry: " in line]
+        self.assertEqual(len(entry), 1, pmsg)
+        self.assertTrue(entry[0].startswith("cycle 1/1: evidence: XO at entry: XO held by gcc_ufs_phy_ice_core_clk; "
+                                            "data="), entry)
+        pieces = [line for line in pmsg if ": evidence: rpmh sleep set (" in line]
+        self.assertEqual(len(pieces), 2, pieces)
+        self.assertEqual("".join(line.split("): ", 1)[1] for line in pieces), flush)
+        self.assertTrue(pieces[0].startswith("cycle 1/1: evidence: rpmh sleep set (1/2): "), pieces)
+        self.assertTrue(all(len(line) <= 300 for line in pieces), pieces)
+        for ev in ("clk_prepare", "clk_unprepare"):
+            self.assertEqual((self.root / "sys/kernel/tracing/events/clk" / ev / "enable").read_text(), "1")
+
+    def test_xo_at_the_sleep_s_entry_is_free_when_the_suspend_unprepared_xo_itself(self):
+        """XO's own unprepare before the sleep: no clock of Linux votes it in
+        the sleep set.  A deep sleep flushes before sched_clock stops, so its
+        flush is before the Timekeeping line's time, as before.  Without the
+        clock tracepoints the XO line says so and the run goes on."""
+        (self.root / "dev/pmsg0").write_text("")
+        self.rpmh_files()
+        self.clk_events()
+        write_clocks(self.root / "sys/kernel/debug/clk", bi_tcxo=(1, 1), gcc_gpll0=(1, 1),
+                     gcc_usb30_prim_master_clk=(1, 1))
+        self.cycle(1)
+        (self.tmp / "cycle-1/trace").write_text(
+            clk_line(701.000000, "clk_unprepare", "gcc_usb30_prim_master_clk")
+            + clk_line(701.000001, "clk_unprepare", "gcc_gpll0") + clk_line(701.000002, "clk_unprepare", "bi_tcxo")
+            + rpmh_line(729.999000, "sleep", "0x30030", "0x0") + rpmh_line(729.999001, "wake", "0x30030", "0x3"))
+        result = self.run_test("ro", "1", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("cycle 1/1: evidence: rpmh sleep set: the last of 1 flushes before the sleep at 730.000000 (at "
+                      "729.999000, 2 commands), sleep/wake: xo.lvl 0x0/0x3; left out, so held at their vote through the "
+                      "sleep: cx.lvl, mx.lvl; active votes before the sleep 0, commands after it 0\n", self.out)
+        self.assertIn("cycle 1/1: evidence: XO at the entry to the sleep (clock trace): XO free at the entry to the "
+                      "sleep: bi_tcxo unprepared at 701.000002, so no clock of Linux votes XO in the sleep set (3 prepares "
+                      "and unprepares traced before the sleep)\n", self.out)
+        entry = [line for line in self.pmsg_lines() if ": evidence: XO at entry: " in line]
+        self.assertEqual(len(entry), 1)
+        self.assertTrue(entry[0].startswith("cycle 1/1: evidence: XO at entry: XO free; data="), entry)
+        # A kernel without the clock tracepoints: said, and the run goes on.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.rpmh_files()
+        self.cycle(1)
+        result = self.run_test("ro", "1", "rpmh", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST RESULT: PASS: 1 of 1 cycles", self.out)
+        self.assertIn("rpmh: no clk_prepare and clk_unprepare tracepoints to turn on", self.out)
+        self.assertIn("cycle 1/1: evidence: XO at the entry to the sleep (clock trace): no clock trace (the "
+                      "clk_prepare and clk_unprepare tracepoints were not on)\n", self.out)
+
     def test_rpmh_is_refused_without_the_tracepoint_tracing_or_the_kernel_log_s_clock_and_a_stop_turns_it_off(self):
         tr = "sys/kernel/tracing"
         cases = (
@@ -7889,11 +7995,14 @@ exit 0
         FakeTablet.setUp(self)
         SleepTestTest.setUp(self)
         self.rpmh_files()
+        self.clk_events()
         (self.tmp / "freeze-fails").write_text("/media/stick\n")
         result = self.run_test("ro", "1", "rpmh", "restart-ok", "hold=0")
         self.assertEqual(result.returncode, 1, self.out)
         self.assertIn("SLEEP-TEST RESULT: STOPPED before any sleep", self.out)
         self.assertEqual((self.root / tr / "events/rpmh/rpmh_send_msg/enable").read_text(), "0")
+        for ev in ("clk_prepare", "clk_unprepare"):
+            self.assertEqual((self.root / tr / "events/clk" / ev / "enable").read_text(), "0")
         self.assertEqual(self.sysrq(), "")
 
     def test_revision_11_s_evidence_names_xo_s_holders_genpd_s_power_offs_and_the_dsps_interrupts(self):

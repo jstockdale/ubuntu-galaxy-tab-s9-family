@@ -529,7 +529,8 @@
 #     through the sleep.  The run turns the tracepoint on right before the
 #     freeze (events/rpmh/rpmh_send_msg/enable in tracefs) and reads the
 #     command DB once (debugfs cmd-db, the names of the RPMh addresses);
-#     right before each sleep it empties the trace buffer, and after it
+#     right before each sleep (before its clock read) it empties the trace
+#     buffer, and after it
 #     names the last flush before the sleep (by the kernel's
 #     "Timekeeping suspended" line, the trace's clock being the kernel
 #     log's): each address in it with its sleep and wake values, and which
@@ -538,10 +539,27 @@
 #     xo.lvl, cx.lvl and mx.lvl are levels, 0 is off; a BCM's value with
 #     bit 29 (0x20000000) set is a bandwidth vote.  "no flush" means no vote
 #     changed between the emptying and the sleep: the RSC slept with an
-#     earlier flush's sets.  Refused without the tracepoint (tracefs, a
+#     earlier flush's sets.  A suspend-to-idle flushes at the sleep's own
+#     instant, the time of the "Timekeeping suspended" line, which the
+#     trace prints up to 1 us later (sched_clock stands still from the last
+#     CPU's tick_freeze() on, ev_rpmh): such a flush is named "at ..., the
+#     sleep's entry".  Up to revision 11 the script counted those commands
+#     as after the sleep, and every suspend-to-idle said "no flush" (the
+#     sets were flushed: the cluster's S1 power-off, which flushes, counted
+#     +1 with no rejection).  With the kernel's clk_prepare and
+#     clk_unprepare tracepoints (events/clk/, on with rpmh until the
+#     restart) the trace also tells which of the clocks that keep XO voted
+#     in the sleep set (the "XO held by" read right before the sleep) the
+#     suspend unprepared before the sleep began, and which it left: "XO at
+#     the entry to the sleep (clock trace): ..." (ev_xo_entry), also in pmsg
+#     with the Type-C roles; and the whole flush goes to pmsg too, in eight
+#     pieces at most, for a run whose terminal went away (over Wi-Fi).
+#     Refused without the RPMh tracepoint (tracefs, a
 #     kernel with CONFIG_FTRACE: the kit's kernels), with tracing off
-#     (tracing_on 0) or with a trace clock other than local.  It changes no vote; a stop before any sleep turns it
-#     off again, and so does the restart that ends every run.
+#     (tracing_on 0) or with a trace clock other than local; without the
+#     clock tracepoints the XO line says there is no clock trace.  It
+#     changes no vote; a stop before any sleep turns them off again, and so
+#     does the restart that ends every run.
 set -u
 export LC_ALL=C
 umask 022
@@ -757,6 +775,11 @@ ev_irq_dsp='ipcc|glink|smp2p|q6v5|wdog|fatal|ready|handover|stop-ack|qmp|aoss|fa
 # in tracefs, and the command DB that names their addresses.
 trace_dir=/sys/kernel/tracing
 rpmh_event=$trace_dir/events/rpmh/rpmh_send_msg/enable
+# With rpmh also the clock framework's prepare and unprepare tracepoints
+# (trace_clk_prepare() and trace_clk_unprepare() in drivers/clk/clk.c: a
+# clock's 0 -> 1 and 1 -> 0, its parents' with it), when the kernel has
+# them: which clocks below XO the suspend left prepared (ev_xo_entry).
+clk_events="$trace_dir/events/clk/clk_prepare/enable $trace_dir/events/clk/clk_unprepare/enable"
 cmd_db=/sys/kernel/debug/cmd-db
 ufs_ctl=/sys/bus/platform/devices/1d84000.ufshc
 usb_ctl=/sys/bus/platform/devices/a600000.usb
@@ -1335,15 +1358,14 @@ sw_next() {
 # that nothing the run ends with, a stop or the restart, finds one set.
 # $knobs_why says what did not take (pm_test= then does not sleep; a trace
 # knob that did not take is said and the sleep goes on), $knobs_now what is
-# in force.  With rpmh the trace buffer is emptied here too, so that what
-# is in it after the sleep is this attempt's.
+# in force.  With rpmh the trace buffer was emptied right before the
+# attempt's clock read (the cycle's loop, before ev_before), so that what is
+# in it after the sleep is this attempt's, and its clock prepares and
+# unprepares follow that read.
 knobs_on() {
 	knobs_why= knobs_now=
 	knobs_set=1
-	if [ "$rpmh" = 1 ]; then
-		: 2>/dev/null > "$trace_dir/trace"
-		knobs_now='rpmh trace emptied'
-	fi
+	[ "$rpmh" = 0 ] || knobs_now='rpmh trace emptied'
 	if [ -n "$pm_test" ]; then
 		printf '%s' "$pm_test" 2>/dev/null > "$pm_test_ctl"
 		if [ "$(selected "$pm_test_ctl")" = "$pm_test" ]; then
@@ -1403,6 +1425,15 @@ sw_on() {
 rpmh_off() {
 	[ "${rpmh_set:-0}" = 1 ] || return 0
 	printf '%s' "${rpmh_was:-0}" 2>/dev/null > "$rpmh_event"
+	# The clock tracepoints too, each as it was ($clk_was, in $clk_events'
+	# order).
+	if [ "${clk_trace:-0}" = 1 ]; then
+		set -- $clk_was
+		for evf in $clk_events; do
+			printf '%s' "${1:-0}" 2>/dev/null > "$evf"
+			[ $# = 0 ] || shift
+		done
+	fi
 	rpmh_set=0
 }
 
@@ -1817,6 +1848,84 @@ ev_xo_holders() { # FILE
 		}' "$1" 2>/dev/null
 }
 
+# rpmh with the clock tracepoints (clk_trace): what of XO's prepared clocks
+# the suspend left prepared when the sleep began.  CLOCKS is the ev_clk_snap
+# copy right before the sleep (the trace was emptied right before it), CLKT
+# the trace's clk_prepare and clk_unprepare lines of the attempt
+# (ev_rpmh_snap), K the cycle's kernel lines: each clock prepared in CLOCKS
+# is taken as prepared unless a clk_unprepare up to the sleep's entry
+# (ev_sleep_bound) took it to 0, one that was not unless a clk_prepare made
+# it 1 (the framework traces a clock's prepare and unprepare only on its 0
+# -> 1 and 1 -> 0, its parents' with it, clk_core_prepare() and
+# clk_core_unprepare()), and the parents are CLOCKS's.  One line: XO free
+# (bi_tcxo unprepared: no clock of Linux votes XO in the sleep set, xo.lvl
+# 0 in every set, clk_rpmh_unprepare()), or the clocks that still hold it,
+# as ev_xo_holders names them (those prepared in the suspend marked), then
+# what the suspend unprepared of the holders before it.  With short, for
+# pmsg, the holders alone.  A prepare count above 1 is not seen moving, nor
+# XO's own consumers (a PHY's reference clock) until XO's count reaches 0.
+ev_xo_entry() { # CLOCKS CLKT K full|short
+	[ "${clk_trace:-0}" = 1 ] || { echo 'no clock trace (the clk_prepare and clk_unprepare tracepoints were not on)'; return 0; }
+	[ -s "$1" ] || { echo 'clock counts not readable'; return 0; }
+	evb=$(ev_sleep_bound "$3")
+	awk -v xo="$xo_clk" -v bound="${evb% *}" -v frozen="${evb#* }" -v short="$4" '
+		'"$ev_bound_awk"'
+		function below(c,   x, d) {
+			x = pa[c]
+			for (d = 0; d < 64 && x != "-" && x != "" && x != xo; d++) x = (x in pa) ? pa[x] : ""
+			return x == xo
+		}
+		function sorted(a, n,   i, j, v) {
+			for (i = 2; i <= n; i++) {
+				v = a[i]
+				for (j = i - 1; j >= 1 && a[j] > v; j--) a[j + 1] = a[j]
+				a[j + 1] = v
+			}
+		}
+		FILENAME == ARGV[1] { on[$1] = ($3 ~ /^[0-9]+$/ && $3 + 0 > 0); was[$1] = on[$1]; pa[$1] = $4; next }
+		{
+			for (i = 2; i <= NF; i++) if ($i == "clk_prepare:" || $i == "clk_unprepare:") break
+			if (i > NF) next
+			ts = $(i - 1)
+			sub(/:$/, "", ts)
+			if (ev_after_sleep(ts)) next
+			c = $(i + 1)
+			if ($i == "clk_prepare:") on[c] = 1
+			else {
+				on[c] = 0
+				if (c == xo) xo_off = ts
+			}
+			seen++
+		}
+		END {
+			if (!(xo in on)) { print "XO not in the clock read"; exit }
+			if (!on[xo]) {
+				if (short == "short") print "XO free"
+				else printf "XO free at the entry to the sleep: %s unprepared%s, so no clock of Linux votes XO in the sleep set (%d prepares and unprepares traced before the sleep)\n", xo, (xo_off != "" ? " at " xo_off : ""), seen
+				exit
+			}
+			for (c in on) if (c != xo && on[c] && below(c)) held[c] = 1
+			for (c in held) if (pa[c] in held) inner[pa[c]] = 1
+			n = 0
+			for (c in held) if (!(c in inner)) leaf[++n] = c
+			sorted(leaf, n)
+			s = ""
+			for (i = 1; i <= n; i++) s = s (i > 1 ? ", " : "") leaf[i] (was[leaf[i]] ? "" : " (prepared in the suspend)")
+			if (s == "") s = xo " itself (one of its own consumers: a PHY\047s or a DSP\047s reference clock)"
+			if (short == "short") { print "XO held by " s; exit }
+			# The holders before the sleep (ev_xo_holders leaves) that it
+			# unprepared.
+			for (c in was) if (was[c] && c != xo && below(c)) wheld[c] = 1
+			for (c in wheld) if (pa[c] in wheld) winner[pa[c]] = 1
+			m = 0
+			for (c in wheld) if (!(c in winner) && !on[c]) gone[++m] = c
+			sorted(gone, m)
+			g = ""
+			for (i = 1; i <= m; i++) g = g (i > 1 ? ", " : "") gone[i]
+			printf "XO still voted at the entry to the sleep, held by: %s; unprepared in the suspend before the sleep: %s (%d prepares and unprepares traced before the sleep)\n", s, (g == "" ? "none" : g), seen
+		}' "$1" "$2" 2>/dev/null
+}
+
 # Each power domain with its idle states' usage and rejected counts added
 # up ("NAME USAGE REJECTED" lines; pm_genpd/NAME/idle_states,
 # idle_states_show(), drivers/pmdomain/core.c).  A usage is a power-off that
@@ -1878,29 +1987,70 @@ ev_pci_state() {
 	fi
 }
 
-# rpmh: the trace's lines of rpmh-rsc's commands copied to OUT, in one read
-# (reading the trace pauses tracing while the file is open).
+# rpmh: the trace's lines of rpmh-rsc's commands, and those of the clock
+# framework's prepares and unprepares (when the run turned those
+# tracepoints on: clk_trace), copied to OUT in one read (reading the trace
+# pauses tracing while the file is open).  ev_rpmh and ev_xo_entry each take
+# their own lines of it.
 ev_rpmh_snap() { # OUT
-	awk '/ rpmh_send_msg: /' "$trace_dir/trace" 2>/dev/null > "$1"
+	awk '/ rpmh_send_msg: | clk_(un)?prepare: /' "$trace_dir/trace" 2>/dev/null > "$1"
 }
+
+# The sleep's time in the cycle's kernel lines K, as ev_rpmh and ev_xo_entry
+# take it: "TIME tk" from the first "Timekeeping suspended for" line (the
+# sleep's own instant, see ev_rpmh), else "TIME exit" from "PM: suspend
+# exit", else nothing.
+ev_sleep_bound() { # K
+	awk '/Timekeeping suspended for / && s == "" { s = $0; k = "tk" } /PM: suspend exit/ && x == "" { x = $0 }
+		END { if (s == "") { s = x; k = "exit" } if (match(s, /^\[ *[0-9]+\.[0-9]+\]/)) { s = substr(s, RSTART + 1, RLENGTH - 2); gsub(/ /, "", s); print s, k } }' "$1" 2>/dev/null
+}
+
+# awk functions for a trace line's time TS against the sleep's: after it,
+# or at its entry (the frozen instant, up to 1 us after a "Timekeeping
+# suspended" line's time; ev_rpmh).  For awk programs given bound= and
+# frozen= (ev_sleep_bound's two words).
+ev_bound_awk='
+		function ev_after_sleep(ts) {
+			if (bound == "") return 0
+			if (frozen == "tk") return ts + 0 > bound + 0.0000015
+			return ts + 0 >= bound + 0
+		}
+		function ev_at_entry(ts) {
+			return bound != "" && frozen == "tk" && ts + 0 >= bound - 0.0000005 && ts + 0 <= bound + 0.0000015
+		}'
 
 # rpmh: the last flush of the sleep and wake sets before the sleep, from
 # TRACE (the rpmh_send_msg lines of this attempt) and the cycle's kernel
 # lines K: the sleep is where "Timekeeping suspended" is in K (the trace's
 # clock is the kernel log's, and it stands still in the sleep), else "PM:
 # suspend exit"; a sleep or wake command more than 1 ms after the one before
-# it starts another flush.  One line: the flush's commands, "NAME
-# SLEEP/WAKE" each (the address when the command DB does not name it; a
-# VRM's register as NAME+4 and so on), then which of xo.lvl, cx.lvl and
-# mx.lvl it left out (sleep = wake: held at that vote through the sleep),
-# each with the last active vote before the sleep, if the trace has one.
-# With short, the levels and the BCMs with a vote in the sleep set alone,
-# for pmsg.
+# it starts another flush.  The time of the "Timekeeping suspended" line is
+# the sleep's own instant: the last CPU stops sched_clock, the clock of the
+# kernel log and of the trace, before anything sleeps (tick_freeze(),
+# kernel/time/tick-common.c), and the line is printed at the resume before
+# it runs again (timekeeping_resume(), then sched_clock_resume(), in
+# tick_unfreeze() and in the syscore resume of a deep sleep).  A
+# suspend-to-idle flushes the sets after that, when the last CPU takes the
+# cluster's power domain down from its idle state
+# (psci_enter_s2idle_domain_idle_state() -> dev_pm_genpd_suspend() ->
+# the RSC's GENPD_NOTIFY_PRE_OFF, rpmh_rsc_pd_callback() -> rpmh_flush()):
+# its commands carry that same instant, which the trace prints rounded to
+# the microsecond and the kernel log cut to it, so up to 1 us after the
+# line's time.  Such a flush is the sleep's, "at the sleep's entry"; a deep
+# sleep flushes before (the PSCI syscore hook, whose suspend runs before
+# sched_clock's).  Revision 11's script counted a command at the line's own
+# time as after the sleep, and every suspend-to-idle with rpmh (revision 10's
+# runs 5 and 6, revision 11's 1, 4 and 5) said "no flush" for it.  One line:
+# the flush's commands, "NAME SLEEP/WAKE" each (the address when the command
+# DB does not name it; a VRM's register as NAME+4 and so on), then which of
+# xo.lvl, cx.lvl and mx.lvl it left out (sleep = wake: held at that vote
+# through the sleep), each with the last active vote before the sleep, if
+# the trace has one.  With short, the levels and the BCMs with a vote in the
+# sleep set alone, for pmsg.
 ev_rpmh() { # TRACE K full|short
-	[ -s "$1" ] || { echo 'no RPMh command in the trace'; return 0; }
-	evb=$(awk '/Timekeeping suspended for / { s = $0; exit } /PM: suspend exit/ && x == "" { x = $0 }
-		END { if (s == "") s = x; if (match(s, /^\[ *[0-9]+\.[0-9]+\]/)) { s = substr(s, RSTART + 1, RLENGTH - 2); gsub(/ /, "", s); print s } }' "$2" 2>/dev/null)
-	awk -v bound="$evb" -v short="$3" -v keys='xo.lvl cx.lvl mx.lvl' '
+	grep -q ' rpmh_send_msg: ' "$1" 2>/dev/null || { echo 'no RPMh command in the trace'; return 0; }
+	evb=$(ev_sleep_bound "$2")
+	awk -v bound="${evb% *}" -v frozen="${evb#* }" -v short="$3" -v keys='xo.lvl cx.lvl mx.lvl' '
 		function hex(s,   i, c, v) {
 			s = tolower(s)
 			sub(/^0x/, "", s)
@@ -1920,6 +2070,7 @@ ev_rpmh() { # TRACE K full|short
 			}
 			return a
 		}
+		'"$ev_bound_awk"'
 		FILENAME == ARGV[1] {
 			if ($1 ~ /^0x[0-9a-fA-F]+:$/ && NF >= 2) { a = $1; sub(/:$/, "", a); nm[sprintf("%x", hex(a))] = $2; named[$2] = 1; nnamed++ }
 			next
@@ -1929,7 +2080,7 @@ ev_rpmh() { # TRACE K full|short
 			if (i > NF || i < 2) next
 			ts = $(i - 1)
 			sub(/:$/, "", ts)
-			if (bound != "" && ts + 0 >= bound + 0) { after++; next }
+			if (ev_after_sleep(ts)) { after++; next }
 			st = ""
 			if (match($0, /\[(sleep|wake|active)\]/)) st = substr($0, RSTART + 1, RLENGTH - 2)
 			ad = da = ""
@@ -1965,10 +2116,11 @@ ev_rpmh() { # TRACE K full|short
 				h = h (h == "" ? "" : ", ") kk[k] ((kk[k] in act) ? " (active " act[kk[k]] ")" : "")
 			}
 			if (!nnamed) h = "not known (no command DB)"
+			e = ev_at_entry(ft[nf]) ? ", the sleep\047s entry" : ""
 			if (short == "short")
-				printf "flush %d of %d at %s, sleep/wake: %s; held: %s\n", nf, nf, ft[nf], (s == "" ? "none" : s), (h == "" ? "none" : h)
+				printf "flush %d of %d at %s%s, sleep/wake: %s; held: %s\n", nf, nf, ft[nf], e, (s == "" ? "none" : s), (h == "" ? "none" : h)
 			else
-				printf "the last of %d flushes %s (at %s, %d commands), sleep/wake: %s; left out, so held at their vote through the sleep: %s; active votes before the sleep %d, commands after it %d\n", nf, b, ft[nf], cnt[nf], (s == "" ? "none" : s), (h == "" ? "none" : h), nact, after
+				printf "the last of %d flushes %s (at %s%s, %d commands), sleep/wake: %s; left out, so held at their vote through the sleep: %s; active votes before the sleep %d, commands after it %d\n", nf, b, ft[nf], e, cnt[nf], (s == "" ? "none" : s), (h == "" ? "none" : h), nact, after
 		}' "$ramdir/cmd-db" "$1" 2>/dev/null
 }
 
@@ -2251,8 +2403,11 @@ ev_after() { # SFX K
 	say "$cyc: evidence: after: XO held by: $evxo1"
 	if [ "$rpmh" = 1 ]; then
 		ev_rpmh_snap "$ramdir/ev-rpmh-$1"
-		say "$cyc: evidence: rpmh sleep set: $(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" full)"
+		evrpmhf=$(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" full)
+		say "$cyc: evidence: rpmh sleep set: $evrpmhf"
 		evrpmh=$(ev_rpmh "$ramdir/ev-rpmh-$1" "$2" short)
+		say "$cyc: evidence: XO at the entry to the sleep (clock trace): $(ev_xo_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" full)"
+		evxoe=$(ev_xo_entry "$ramdir/ev-clk-$1.0" "$ramdir/ev-rpmh-$1" "$2" short)
 	fi
 	say "$cyc: evidence: after: clocks (enable/prepare): $(ev_clk_line "$ramdir/ev-clk-$1.1" full)"
 	ev_genpd domains | while IFS= read -r evl; do say "$cyc: evidence: after: genpd: $evl"; done
@@ -2270,8 +2425,30 @@ ev_keep() { # SFX
 	ev_pmsg "$cyc: evidence: clocks before: $evclk0; after: $evclk1"
 	ev_pmsg "$cyc: evidence: wifi: $evwifi; genpd off: $(ev_genpd_offs_delta "$ramdir/ev-gpd-$1.0" "$ramdir/ev-gpd-$1.1" short); dsp irq $evdsp"
 	ev_pmsg "$cyc: evidence: XO held by: $evxo1"
-	[ "$rpmh" = 0 ] || ev_pmsg "$cyc: evidence: rpmh: $evrpmh"
+	if [ "$rpmh" = 1 ]; then
+		ev_pmsg "$cyc: evidence: rpmh: $evrpmh"
+		ev_pmsg "$cyc: evidence: XO at entry: $evxoe; $(roles)"
+		# The whole flush as well, for a run whose terminal went away (one
+		# over Wi-Fi, which the sleep takes down): in pieces, at most eight.
+		ev_pmsg_pieces "$cyc: evidence: rpmh sleep set" "$evrpmhf" 8
+	fi
 	[ "$sleep_mode" != s2idle ] || ev_pmsg "$cyc: evidence: s2idle: $s2pmsg"
+}
+
+# TEXT to pmsg in pieces of 240 characters, "PREFIX (I/N): ...", at most MAX
+# of them, the last saying how much was left out.
+ev_pmsg_pieces() { # PREFIX TEXT MAX
+	[ -e /dev/pmsg0 ] || return 0
+	printf '%s\n' "$2" | awk -v p="$1" -v max="$3" '
+		{ t = t $0 }
+		END {
+			n = int((length(t) + 239) / 240)
+			for (i = 1; i <= n && i <= max; i++) {
+				s = substr(t, (i - 1) * 240 + 1, 240)
+				if (i == max && n > max) s = substr(s, 1, 200) " (" length(t) - (max - 1) * 240 - 200 " more on the terminal)"
+				printf "%s (%d/%d): %s\n", p, i, n, s
+			}
+		}' 2>/dev/null | while IFS= read -r evl; do ev_pmsg "$evl"; done
 }
 
 # The failure lines of a kernel log excerpt: the UFS ones, the block layer's
@@ -2939,6 +3116,21 @@ run_from_ram() { # CONFIG
 		evn=$(grep -c '^0x' "$ramdir/cmd-db")
 		say "rpmh: the tracepoint rpmh_send_msg is on until the restart; the command DB names ${evn:-0} RPMh addresses"
 		progress "rpmh: tracepoint on, ${evn:-0} addresses named"
+		# The clock tracepoints with it; one that does not take is said, and
+		# the run goes on without the clock trace.
+		if [ "${clk_trace:-0}" = 1 ]; then
+			for evf in $clk_events; do
+				printf 1 2>/dev/null > "$evf"
+				[ "$(ev_val "$evf")" = 1 ] || clk_trace=0
+			done
+			if [ "$clk_trace" = 1 ]; then
+				say "rpmh: the clk_prepare and clk_unprepare tracepoints are on until the restart too (XO at each sleep's entry)"
+			else
+				say "rpmh: a clock tracepoint did not go on ($clk_events): no clock trace, the XO line says so"
+			fi
+		else
+			say "rpmh: no clk_prepare and clk_unprepare tracepoints to turn on ($clk_events): no clock trace"
+		fi
 	fi
 	# Nothing recorded or given up since the checks before the run (minutes
 	# ago with release-floor's settling): an error saved by now would be in
@@ -3052,6 +3244,10 @@ run_from_ram() { # CONFIG
 			verdict "SLEEP-TEST RESULT: ABORTED$mword at $cyc, before its sleep ($why); $passes passed before it${an:+; $an and tried again}; floor $floor; kernel $kernel$optnote"
 			finish healthy
 		fi
+		# rpmh: the trace emptied right before the attempt's clock read, so
+		# that it holds what follows that read (ev_xo_entry) and the
+		# attempt's RPMh commands (ev_rpmh).
+		[ "$rpmh" = 0 ] || : 2>/dev/null > "$trace_dir/trace"
 		ev_before "$sfx"
 		ok0=$(stat_of success) fail0=$(stat_of fail)
 		a0=$(count_of aosd) x0=$(count_of cxsd) d0=$(count_of ddr)
@@ -3609,7 +3805,7 @@ fi
 # rpmh: the tracepoint there and writable, and tracing on, or the trace
 # would stay empty.  The command DB names the addresses; without it they
 # stay numbers (the header says so).
-rpmh_was=
+rpmh_was= clk_trace=0 clk_was=
 if [ "$rpmh" = 1 ]; then
 	[ -e "$rpmh_event" ] && [ -w "$rpmh_event" ] ||
 		refuse "rpmh needs the RPMh tracepoint ($rpmh_event): tracefs, and a kernel with CONFIG_FTRACE (the kit's kernels have both)"
@@ -3623,6 +3819,17 @@ if [ "$rpmh" = 1 ]; then
 	[ "$tclk" = local ] ||
 		refuse "rpmh: the trace clock is ${tclk:-unknown} ($trace_dir/trace_clock), not local, the kernel log's: echo local | sudo tee $trace_dir/trace_clock, or run without rpmh"
 	rpmh_was=$(cat "$rpmh_event" 2>/dev/null)
+	# The clock tracepoints, when the kernel has both writable (no refusal
+	# without them: the XO line then says there is no clock trace).
+	clk_trace=1 clk_was=
+	for evf in $clk_events; do
+		if [ -e "$evf" ] && [ -w "$evf" ]; then
+			clk_was="$clk_was $(cat "$evf" 2>/dev/null)"
+		else
+			clk_trace=0
+		fi
+	done
+	clk_was=${clk_was# }
 fi
 # The first resume with a filesystem frozen from userspace logs one kernel
 # warning (fs/super.c:1919, may_unfreeze: the suspend's own thaw finds no
@@ -4014,7 +4221,7 @@ sync
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for v in stamp ramdir part disk cycles seconds hold aborts dry rootsrc rootname floor armed kernel mount_cmd ufs_host \
 	pci_remove pci_keep pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note sw_set sw_ret \
-	rpmh rpmh_was guard_state sensors_stop pwrdn_seen; do
+	rpmh rpmh_was clk_trace clk_was guard_state sensors_stop pwrdn_seen; do
 	eval "printf '%s=%s\n' $v \"\$(q \"\$$v\")\""
 done > "$ramdir/run.conf"
 say 'the run goes on from RAM in a session of its own: it ends with a restart even if this terminal goes away'
