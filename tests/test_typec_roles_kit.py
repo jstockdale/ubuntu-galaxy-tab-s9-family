@@ -10172,7 +10172,7 @@ class ScriptsTest(unittest.TestCase):
                                    "setup_clocks repeats: power-on",
                                    "qcom_stats.debug_cxpc_violators",
                                    "the AOP's CXPC monitor is on for this suspend",
-                                   "runtime PM put failed in fsgen enable unwind", "Unable to prepare iface clk"])
+                                   "runtime PM put failed in fsgen disable", "Unable to prepare iface clk"])
         # Revision 12's four: the CXPC log's switch as the kernel keeps it
         # (a module_param_cb() of its patch alone) and the line each suspend
         # with it logs; the VA macro's and the DSI PHY's error messages.

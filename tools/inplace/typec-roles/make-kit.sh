@@ -215,8 +215,10 @@ hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
 # Its pcie_0_gdsc's power states and genpd flags are two bytes of a table:
 # the power domain check below is for them.  Then revision 12: the CXPC
 # log's switch, as the kernel keeps it, and the line each suspend with it
-# logs; the VA macro's message for a runtime PM put that failed in its
-# fsgen unwind (upstream's, in no other driver); and the DSI PHY's message
+# logs; the VA macro's message for a runtime PM put that failed when its
+# fsgen clock is disabled (upstream's, in no other driver; the one of the
+# enable path's unwind is no use here, the compiler drops that branch
+# because va_macro_mclk_enable() cannot fail); and the DSI PHY's message
 # for an AHB clock it could not prepare.
 new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait_ms try_snk_wait_until
 	'VDM in progress, DATA_ROLE_SWAP not started' 'Data role swap ended with the role unchanged'
@@ -234,7 +236,7 @@ new_strings=('Requesting DFP before discovery' sink_host_swap try_snk_extra_wait
 	pcie_qcom.debug_root_port_d3
 	'Failed to power on PHY: %pe' 'power-up sequence entry' 'setup_clocks repeats: power-on'
 	qcom_stats.debug_cxpc_violators "the AOP's CXPC monitor is on for this suspend"
-	'runtime PM put failed in fsgen enable unwind' 'Unable to prepare iface clk')
+	'runtime PM put failed in fsgen disable' 'Unable to prepare iface clk')
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
