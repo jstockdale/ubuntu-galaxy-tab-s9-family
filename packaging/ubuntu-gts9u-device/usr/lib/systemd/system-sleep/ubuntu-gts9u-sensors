@@ -19,33 +19,97 @@
 # Type-C roles kit's revision 10 run 6 and revision 11 run 5); with the DSP
 # quiet the DDR stayed in its low-power mode for the whole sleep.  Neither
 # keeps anything across the sleep: libssc cannot reconnect a QMI client after
-# the DSP's power collapse, so the resume restarts the proxy anyway, and a
-# systemd suspend stops the sensor protection domain's file server already
-# (its unit's Conflicts=suspend.target), though in no order with the sleep
-# itself.  Here both stop synchronously, the client first, before
-# systemd-sleep writes /sys/power/state.  Only where the resume path below
-# can bring the proxy back (ubuntu-gts9u-sensors-resume needs ssccli).
+# the DSP's power collapse, so the resume restarts the proxy anyway.  Stock
+# Android keeps its sensor daemons and tells the DSP instead (an SMP2P bit
+# the mainline kernel does not have), and its framework has closed these two
+# streams at screen-off already.
 #
-# After the sleep ubuntu-gts9u-sensors-resume attaches the protection domain
+# The order: the resume unit first, so that it cannot start the proxy again,
+# then the client, then the protection domain's file server, each stopped
+# before the next and all before systemd-sleep writes /sys/power/state.  A
+# systemctl suspend stops the file server itself as well (its unit's
+# Conflicts=suspend.target), in the suspend transaction and in no order with
+# this hook: on the SM-X910's journal that stop ended just before this hook
+# ran in every one of 68 sleeps, so there the file server goes a fraction of
+# a second before the proxy, and the stop below only waits for it.  rtcwake,
+# sleep-test.sh and anything else that goes around the transaction leave it
+# to this hook.
+#
+# Nothing here may hold the sleep up or fail it.  systemd-sleep runs the hooks
+# in this directory in parallel and writes /sys/power/state when the last one
+# has returned, and systemd-suspend.service has no start timeout of its own,
+# so a stop that hangs would keep the tablet awake with its screen off.  Each
+# systemctl call therefore waits STOP_WAIT seconds at most: one still running
+# then is left to systemd, which goes on with the job (the timeout ends only
+# the waiting client), and the sleep goes on.  The stops take well under a
+# second on both tablets (their journals, 2026-11).  A failure is logged and
+# never returned: the hook exits 0.
+#
+# Only where the resume path below can bring the clients back: the resume
+# unit loads (it is not masked or missing) and ssccli, its
+# ConditionPathExists=, is there (libssc ships it, and the device package
+# depends on libssc).  Elsewhere the hook leaves everything as it is, and
+# says so.
+#
+# After the sleep, also one the kernel refused (systemd-sleep runs post all
+# the same), ubuntu-gts9u-sensors-resume attaches the protection domain
 # again, waits for a real accelerometer sample and starts the proxy with a
-# fresh client: auto-rotation and auto-brightness come back with it.
+# fresh client: auto-rotation and auto-brightness come back with it, 14 to 15
+# s after the resume on the SM-X910 (59 resumes, 2026-11-07 to 16).  Its
+# failed state and start count are reset first: systemd refuses a unit's
+# sixth start within 10 s (its default start limit), and quick sleeps in a
+# row came close to that (five in 7 s on 2026-11-08 there); a refused start
+# would leave the sensors off until a later resume.  --no-block: the resume
+# must not wait for it.
+#
+# The second argument (suspend, hibernate, hybrid-sleep,
+# suspend-then-hibernate) changes nothing: whatever the sleep, the clients
+# stop before it and come back after it.
 #
 # Both boards, the SM-X910 and the SM-X710: the same DSP, sensor stack and
 # units.  tools/inplace/typec-roles/sleep-test.sh sensors=hook runs this
-# hook's pre step for a sleep that rtcwake drives itself.
+# hook's pre step for a sleep that rtcwake drives itself, and knows this hook
+# by the text "systemctl stop iio-sensor-proxy.service": keep it as it is.
 SSCCLI=/usr/bin/ssccli
+RESUME=ubuntu-gts9u-sensors-resume.service
+STOP_WAIT=10
+
+say() { echo "ubuntu-gts9u-sensors: $*" >&2; }
+
+# bounded CMD...: run a systemctl call, waiting STOP_WAIT seconds at most;
+# say what did not work, and go on whatever happened.
+bounded() {
+	timeout -k 2 "$STOP_WAIT" "$@" > /dev/null 2>&1
+	rc=$?
+	case $rc in
+	0) ;;
+	124|137) say "$*: still running after ${STOP_WAIT}s; going on, systemd finishes it" ;;
+	*) say "$*: status $rc" ;;
+	esac
+	return 0
+}
+
+# can_resume: the resume unit can run, so the clients will come back.
+can_resume() {
+	[ -x "$SSCCLI" ] &&
+		[ "$(timeout -k 2 "$STOP_WAIT" systemctl show -p LoadState --value "$RESUME" 2>/dev/null)" = loaded ]
+}
 
 case "${1-}" in
 	pre)
-		systemctl stop ubuntu-gts9u-sensors-resume.service 2>/dev/null || true
-		if [ -x "$SSCCLI" ]; then
-			systemctl stop iio-sensor-proxy.service 2>/dev/null || true
-			systemctl stop hexagonrpcd-adsp-sensorspd.service 2>/dev/null || true
+		if can_resume; then
+			bounded systemctl stop ubuntu-gts9u-sensors-resume.service
+			bounded systemctl stop iio-sensor-proxy.service
+			bounded systemctl stop hexagonrpcd-adsp-sensorspd.service
+		else
+			say "$RESUME cannot run here (no $SSCCLI, or the unit does not load): the sensor clients stay as they are"
 		fi
 		;;
 	post)
-		systemctl restart --no-block \
-			ubuntu-gts9u-sensors-resume.service || true
+		if can_resume; then
+			bounded systemctl reset-failed ubuntu-gts9u-sensors-resume.service
+			bounded systemctl restart --no-block ubuntu-gts9u-sensors-resume.service
+		fi
 		;;
 esac
 exit 0
