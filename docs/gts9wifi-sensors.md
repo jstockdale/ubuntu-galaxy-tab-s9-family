@@ -98,15 +98,68 @@ sleep 30 to 50 times a second.  On the X710 a 30 s suspend counted about
 1,500 of the DSP's wakes with them open, and none with `iio-sensor-proxy` and
 `hexagonrpcd-adsp-sensorspd` stopped first (Type-C kit revision 10 run 6 and
 revision 11 run 5, 2026-11-23).  So the device package's system-sleep hook
-`/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors` stops both before every
-`systemctl suspend`, the proxy first, synchronously, and after the resume
-restarts `ubuntu-gts9u-sensors-resume`, which attaches the sensor protection
-domain again, waits for a real accelerometer sample and starts the proxy with
-a fresh client (it had to be restarted after a resume anyway: libssc cannot
-reconnect a QMI client after the DSP's power collapse).  Auto-rotation and
-auto-brightness come back with it.  Both boards; the proxy is stopped only
-where `ssccli`, which the resume unit needs, is installed.  The Type-C kit's
-`sleep-test.sh sensors=hook` runs the hook's pre step for its rtcwake sleeps.
+`/usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors` stops, before every
+system sleep, `ubuntu-gts9u-sensors-resume` (so that it cannot start the proxy
+again), then the proxy, then the file server, each before the next, and
+after the sleep resets and restarts `ubuntu-gts9u-sensors-resume`, which
+attaches the sensor protection domain again, waits for a real accelerometer
+sample and starts the proxy with a fresh client (it had to be restarted after
+a resume anyway: libssc cannot reconnect a QMI client after the DSP's power
+collapse).  Auto-rotation and auto-brightness come back with it.  Both boards.
+
+How it behaves:
+
+* **Bounded.**  systemd-sleep runs the hooks in parallel and suspends only
+  when the last one has returned, and `systemd-suspend.service` has no start
+  timeout, so each `systemctl` call in the hook waits 10 s at most.  A stop
+  still running then is left to systemd (the job goes on) and the sleep goes
+  on.  The stops take under a second: the file server and the resume unit in
+  milliseconds on the X910 (68 sleeps), the proxy, which is killed with
+  SIGKILL, in 0.2 to 0.3 s on the X710.  A failure is logged in the journal
+  of `systemd-suspend.service` (`ubuntu-gts9u-sensors: ...`) and never fails
+  the sleep.
+* **Only where the clients can come back:** the resume unit loads and
+  `ssccli`, its condition, is installed (libssc ships it; both test units
+  have it).  Elsewhere the hook leaves everything as it is, and says so.
+* **On a `systemctl suspend`** the file server's own unit stops it as well
+  (`Conflicts=suspend.target`), in the suspend transaction and in no order
+  with the hook: on the X910's journal that stop ended just before the hook
+  ran in all 68 sleeps, so there the file server goes a fraction of a second
+  before the proxy.  rtcwake and the Type-C kit's sleep test go around the
+  transaction, and there the hook alone stops it, after the proxy.
+* **After the sleep**, also one the kernel refused (the post step runs all
+  the same), the resume took 14 to 15 s from "System returned from sleep" to
+  "SSC ready after attempt 1" on the X910 (59 resumes, 2026-11-07 to 16; once
+  70 s, when something stopped the recovery halfway): 2 s before the unit
+  starts, 10 s for the fresh attach to settle, then the first sample.  A
+  following sleep stops a recovery still running, and the next resume starts
+  it again.
+* **A recovery that fails is tried again** after 30 s, three starts at most
+  in 15 minutes (`Restart=on-failure`, `StartLimitBurst=3`); the hook resets
+  that count before each resume's restart.  No recovery has failed by itself
+  in the journals read on 2026-11-24 (118 runs on both tablets, all ready at
+  the first attempt), so the retry has not run on hardware.
+* With the old hook the proxy ran through the sleep and crashed (SIGSEGV)
+  0.3 to 0.9 s after 21 of the X910's 64 returns, before the resume unit
+  replaced it; with the proxy stopped first that cannot happen.
+
+The Type-C kit's `sleep-test.sh sensors=hook` runs the hook's pre step for
+its rtcwake sleeps, and knows the hook by the text `systemctl stop
+iio-sensor-proxy.service`.  [`tools/inplace/sensors-hook`](../tools/inplace/sensors-hook/README.md)
+puts the hook and the resume unit on a tablet whose device package cannot be
+upgraded yet.
+
+Stock Android does not stop its sensor daemons (`sscrpcd`, the sensors HAL)
+for a suspend.  Its kernel tells the DSP that the application processor is
+going to sleep, through an SMP2P bit (`smp2p_sleepstate.c`, the `sleepstate`
+entry of the ADSP's SMP2P node); mainline has no such driver, so the SSC
+always takes the AP for awake.  libssc asks for wakeup delivery for every
+stream and no batching.  Android's framework also releases the rotation and
+light sensors at screen-off, before the AP sleeps.  Stopping only the proxy
+should close every stream by itself (each SSC client is a QRTR socket of its
+own, which the kernel closes with the process); keeping the file server
+across the sleep would save the fresh attach and its 10 s, but whether the
+DSP stays quiet with it attached has not been measured.
 
 ## Checking it
 
@@ -120,6 +173,8 @@ monitor-sensor --accel --light          # in the tablet's own session; Ctrl-C to
 # over SSH polkit refuses monitor-sensor's claim; read the properties instead:
 gdbus introspect --system --dest net.hadess.SensorProxy \
 	--object-path /net/hadess/SensorProxy --only-properties
+journalctl -b -t systemd-sleep          # every sleep, and what the sensors hook said
+journalctl -b -u ubuntu-gts9u-sensors-resume   # each recovery, retries included
 ```
 
 `ubuntu-gts9u-sensors-resume` should log `SSC ready after attempt N`.  GNOME
