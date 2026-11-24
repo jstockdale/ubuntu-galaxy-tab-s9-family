@@ -46,6 +46,10 @@ apply_sm8550_sleep_fixes=${APPLY_SM8550_SLEEP_FIXES:-0}
 # together or not at all.
 apply_pcie0_gdsc_off=${APPLY_SM8550_PCIE0_GDSC_OFF:-0}
 apply_pcie0_gdsc_guard=${APPLY_SM8550_PCIE0_GDSC_GUARD:-0}
+# Test builds until it has run on hardware: the VA macro's LPASS votes,
+# which keep the audio DSP's LPASS powered through a system sleep (see
+# lpass-va-macro-pm-clock-framework.patch below).
+apply_va_macro_pm_clk=${APPLY_LPASS_VA_MACRO_PM_CLK:-0}
 
 validate_bool() {
 	case "$2" in
@@ -84,6 +88,7 @@ fi
 # (kit revision 11 as first prepared); the guard is for that GDSC alone.
 # Each is refused without the other, here, before the tree is touched.
 validate_bool APPLY_SM8550_PCIE0_GDSC_GUARD "$apply_pcie0_gdsc_guard"
+validate_bool APPLY_LPASS_VA_MACRO_PM_CLK "$apply_va_macro_pm_clk"
 if [ "$apply_pcie0_gdsc_off" != "$apply_pcie0_gdsc_guard" ]; then
 	echo 'APPLY_SM8550_PCIE0_GDSC_OFF=1 and APPLY_SM8550_PCIE0_GDSC_GUARD=1 go together: without the guard genpd collapses pcie_0_gdsc under a PCIe host that keeps its link (the boot'"'"'s panel cycle), and the guard is for pcie_0_gdsc PWRSTS_OFF_ON' >&2
 	exit 1
@@ -607,6 +612,30 @@ if [ "$DEVICE" = gts9wifi ]; then
 fi
 apply_unless 'sc8280xp_snd_startup' \
 	sound/soc/qcom/sc8280xp.c set-mi2s-codec-dai-format.patch
+# lpass-va-macro-pm-clock-framework.patch, upstream eb667d0fbdd3 (v7.3-rc1),
+# with APPLY_LPASS_VA_MACRO_PM_CLK=1: the VA macro, the one LPASS macro both
+# tablets bind, takes its LPASS_HW_MACRO and LPASS_HW_DCODEC votes (q6prm
+# clocks that ask the audio DSP to keep the LPASS core hardware on) at
+# probe and keeps them for the life of the driver in v7.2-rc3; with the
+# PM clock framework they go at its runtime suspend, 100 ms after its last
+# use.  It changes the VA macro's runtime behaviour, not only its system
+# sleep: test builds until it has run on hardware.  No board gate.
+# Strictly, and refused for a build without it in a tree that carries it.
+va_macro_patch=lpass-va-macro-pm-clock-framework.patch
+va_macro_marker='ret = pm_clk_suspend(dev);'
+if [ "$apply_va_macro_pm_clk" = 1 ]; then
+	if grep -qF "$va_macro_marker" "$kernel_tree/sound/soc/codecs/lpass-va-macro.c"; then
+		# Reject a marker-only or partially edited copy.
+		patch --dry-run --reverse --force --fuzz=0 -d "$kernel_tree" -p1 \
+			< "$pat/$va_macro_patch"
+	else
+		patch --forward --batch --fuzz=0 --no-backup-if-mismatch -d "$kernel_tree" -p1 \
+			< "$pat/$va_macro_patch"
+	fi
+elif grep -qF "$va_macro_marker" "$kernel_tree/sound/soc/codecs/lpass-va-macro.c"; then
+	echo "$va_macro_patch remains in this source tree; use a fresh KERNEL_WORKTREE/KERNEL_BUILD_DIR for a build without APPLY_LPASS_VA_MACRO_PM_CLK=1." >&2
+	exit 1
+fi
 apply_unless 'ret != -ENODEV && ret != -EPROBE_DEFER' \
 	drivers/gpu/drm/msm/dp/dp_display.c \
 	msm-dp-allow-unresolved-usbc-bridge.patch
