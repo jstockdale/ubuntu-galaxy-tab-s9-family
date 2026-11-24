@@ -15,7 +15,9 @@ root port go to D3hot, and a fix for the UFS PHY's power reference, which
 lost the storage at a resume, with a diagnostic of it (below, "Revision
 11"), and since revision 12 the AOP's log of what keeps CX from collapsing
 in a sleep and two fixes for clocks that kept XO voted through every sleep
-(below, "Revision 12"). Everything the hang-log kit
+(below, "Revision 12"), and since revision 13 the console's and the
+Bluetooth UART's clocks released in every sleep, the last two that held XO
+at revision 12's first sleep (below, "Revision 13"). Everything the hang-log kit
 set stays: the same configuration, the same DTB, the same ramoops region
 and sysctl drop-in.
 
@@ -338,8 +340,9 @@ without the fix the next sleep's resume loses the UFS; `OK` (0);
 again with the tablet idle. Run it with the camera off (each camera PHY on
 the same rail asks up to 38 mA while it streams).
 
-**Revision 12** (written 2026-11-24, not built yet) is revision 11 plus
-three kernel patches, for what revision 11's runs left (below, "Revision
+**Revision 12** (built 2026-11-24 from 0d3ed8a, kernel build ID
+530d06f4c804, on squirtle from 08:45 that day; its first run below,
+"Revision 12: results") is revision 11 plus three kernel patches, for what revision 11's runs left (below, "Revision
 11: results"): every sleep came back and none reached AOSS sleep or CX
 collapse; in run 5 the DDR was in self-refresh and the audio DSP asleep for
 the whole sleep, so XO's shutdown, which comes before CX collapse, was what
@@ -398,6 +401,49 @@ a run. What else holds XO is not Linux's to fix in this kit: the USB
 controller's and PHY's clocks while the PC's cable is in (a run without the
 cable tells), and whatever the AOP's log names.
 
+**Revision 13** (written 2026-11-24, not built yet) is revision 12 plus one
+upstream fix and a change to the CXPC log's diagnostic, for what revision
+12's first sleep showed (below, "Revision 12: results"): at the sleep's
+entry the clock trace found XO voted by two clocks alone, the console UART's
+`gcc_qupv3_wrap1_s7_clk` (uart7, `serial@a9c000`, `ttyMSM0`) and the
+Bluetooth UART's `gcc_qupv3_wrap2_s6_clk` (uart14, `serial@898000`), every
+other clock that held XO awake having been unprepared by its driver; and the
+CXPC log's region held no CXPC log:
+- `kernel/patches/qcom-geni-serial-force-suspend-in-system-sleep.patch`,
+  upstream d0cd9c8d0fd5 (v7.3-rc1) with its fix 3098c989bd38 (v7.3-rc6)
+  folded in, with `APPLY_GENI_SERIAL_FORCE_SUSPEND=1`. On 7.2-rc3 a geni
+  UART in use holds a runtime PM reference, the console's from its
+  registration on, the Bluetooth UART's from the moment hci_qca opens it,
+  and the serial core's power-off at suspend drops it with
+  `pm_runtime_put_sync()`, which cannot suspend a device that the PM core
+  holds itself for the whole system sleep (`device_prepare()`): the port's
+  clock, its QUP bandwidth and its CX vote stayed on through every sleep.
+  The patch force-suspends the port at the end of its suspend callback and
+  force-resumes it first at its resume, as mainline does since 7.3.
+  **Every system suspend runs it, the boot's panel cycle included**, on
+  both UARTs. The console prints nothing while the devices are suspended
+  anyway (every console is suspended from before the devices' suspend to
+  after their resume), and hci_qca sends nothing while it is suspended (it
+  suspends before the UART and resumes after it); the Bluetooth UART's
+  interrupt is masked by the serial core before the clocks go off and
+  unmasked after they are back, the order the Bluetooth UART's interrupt
+  patch relies on. A tty whose wakeup is enabled would keep its port
+  running through the suspend and lose its clock all the same (mainline's
+  behaviour too): `ttyMSM0`'s is disabled, and `verify.sh` checks it. A
+  Bluetooth that does not answer after a sleep, or a console that stays
+  silent after one, would be this patch (below, "Revision 13: the runs");
+- `kernel/patches/qcom-stats-cxpc-violators-diagnostic.patch` changed: its
+  lines are decoded only under a CXPC header (mode `0xcc`, a time shift
+  below 32); any other gives `cxpc violators: summary: not a CXPC log (mode
+  ...)`. The region is logged raw around each suspend (`cxpc violators: raw
+  ...`, 16 kernel lines of 16 words: right before the message to the AOP,
+  right after it and after the suspend, each one that differs from the one
+  before it in full), and a third debugfs file shows it raw,
+  `qcom_stats/cxpc_violators_raw`. What the region holds, and whether the
+  message changes it, is what the next run settles.
+
+Not in revision 13, as in revision 12: the root port's D3hot by default.
+
 `sleep-test.sh` is new in revision 8: deep sleeps with every disk
 filesystem frozen, so that a resume that loses the storage costs a restart
 and nothing else. It also runs on revision 7's kernel, for a baseline
@@ -446,6 +492,12 @@ without a sleep.
   twenty-three patches, eighteen files (`qcom_stats.c`,
   `lpass-va-macro.c`, the codecs' `Kconfig`, `dsi_phy.c` and `dsi_phy.h`
   the new ones), and those five differ against revision 11's tree.
+  Revision 13 adds
+  `kernel/patches/qcom-geni-serial-force-suspend-in-system-sleep.patch`
+  and changes the CXPC log's patch: twenty-four patches, nineteen files
+  (`qcom_geni_serial.c` the new one; the hang-log build's has the Bluetooth
+  UART's interrupt patch, as every SM-X710 build), and two differ against
+  revision 12's tree, `qcom_stats.c` and `qcom_geni_serial.c`.
   `make-kit.sh` checks that, and that the configuration and the DTB are
   byte for byte the hang-log build's. The fix's line numbers are those of
   files with the lane clock fix, which goes on top of it, so it goes in 31
@@ -460,7 +512,7 @@ without a sleep.
   its build directory, which is archived in the key registry. The hang-log
   kit has another key; revisions 2 to 7 of this kit were built in one
   directory and share theirs, revision 8 is built in that directory as
-  well, and revisions 9 to 12 in directories of their own given that key
+  well, and revisions 9 to 13 in directories of their own given that key
   (below, "Build"). The patches
   add fields to `tcpc_dev` and `tcpm_port`, and the kernel has no
   `MODVERSIONS`; a new key is what marks a module of another build, and
@@ -497,7 +549,8 @@ without a sleep.
   revision 10's three upstream fixes and revision 11's UFS PHY power
   reference fix have no switch; `rollback.sh` is the way back. Revision
   11's `pcie_0_gdsc` has the debug switch below, until the next restart;
-  its guard has none, and neither have revision 12's two clock fixes.
+  its guard has none, and neither have revision 12's two clock fixes and
+  revision 13's UART fix.
 - **Four debug switches** (revision 9), each read as its power domains are,
   at every boot as the kernel's table has them: off, but `debug_pcie0_off`
   on from revision 11; since revision 11 a fifth that says how they booted,
@@ -548,7 +601,7 @@ git worktree add --detach $X/source <commit>
 DEVICE=gts9wifi UBUNTU_WORKDIR=$HOME/ubuntu-gts9u TMPDIR=$HOME/ubuntu-gts9u/tmp \
   APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 APPLY_SM8550_SLEEP_FIXES=1 \
   APPLY_SM8550_PCIE0_GDSC_OFF=1 APPLY_SM8550_PCIE0_GDSC_GUARD=1 \
-  APPLY_LPASS_VA_MACRO_PM_CLK=1 APPLY_DSI_PHY_AHB_RELEASE=1 \
+  APPLY_LPASS_VA_MACRO_PM_CLK=1 APPLY_DSI_PHY_AHB_RELEASE=1 APPLY_GENI_SERIAL_FORCE_SUSPEND=1 \
   KERNEL_WORKTREE=$X/linux-src-gts9wifi KERNEL_BUILD_DIR=$X/linux-gts9wifi \
   KERNEL_OUT_DIR=$HOME/ubuntu-gts9u/out/kernel-gts9wifi-typec \
   bash $X/source/scripts/build-mainline-kernel.sh
@@ -580,8 +633,13 @@ refused before anything is done. Without `APPLY_LPASS_VA_MACRO_PM_CLK=1` or
 `APPLY_DSI_PHY_AHB_RELEASE=1` the VA macro or the DSI PHY is 7.2-rc3's, and
 `make-kit.sh` refuses the build (its message is not in the image, and the
 build tree does not carry the patch); a tree that carries either is refused
-for a build without its variable. `APPLY_SM8550_ROOT_PORT_D3` stays unset
-for this kit (`make-kit.sh` names it left out).
+for a build without its variable. Without
+`APPLY_GENI_SERIAL_FORCE_SUSPEND=1` the geni UART driver is 7.2-rc3's (with
+the SM-X710's Bluetooth UART interrupt patch), and `make-kit.sh` refuses
+the build (its suspend callback calls no `pm_runtime_force_suspend()`); a
+tree that carries the patch is refused for a build without the variable.
+`APPLY_SM8550_ROOT_PORT_D3` stays unset for this kit (`make-kit.sh` names
+it left out).
 
 Revisions 2 to 8 were built in one directory, `build-typec`, which holds
 their module key. Revision 9 was built from scratch in a directory of its
@@ -598,9 +656,13 @@ built the same way, in `build-r11`, its `certs` given that key from
 `build-r10` (`~/ubuntu-gts9u/tmp/kit-r11/build-r11.sh` on the build host,
 which stops if the build makes a key of its own), on 2026-11-23 from commit
 2c707f4: kernel build ID `df3a9340c136b9399b4fc5bc19473a221a64309f`, the
-same module key. Revision 12 is to be built the same way, in `build-r12`,
-its `certs` given that key from `build-r11`, with the two variables of
-revision 12 added.
+same module key. Revision 12 was built the same way, in `build-r12`, its
+`certs` given that key from `build-r11`, with the two variables of revision
+12 added, on 2026-11-24 from commit 0d3ed8a: kernel build ID
+`530d06f4c80411074f122038bdecb13c3db789ef`, the same module key, `boot.img`
+sha256 `9bca1427d84dc351ec0b050ae52fc43bf874af279f19e7386edcfb5688c572ec`.
+Revision 13 is to be built the same way, in `build-r13`, its `certs` given
+that key from `build-r12`, with `APPLY_GENI_SERIAL_FORCE_SUSPEND=1` added.
 
 The build archives its module key in the registry
 (`scripts/kernel-key-registry.sh`); `make-kit.sh` refuses a build whose key is
@@ -637,7 +699,16 @@ files (each comes out again with no fuzz), that the image has the CXPC
 switch's name and its line and the two fixes' messages, and that `vmlinux`
 has the CXPC log's handler and notifier and the DSI PHY's system sleep
 callbacks; with `HANG_SCRATCH` its replay puts the three on the hang-log
-tree's files, which have none of them.
+tree's files, which have none of them. For revision 13 it checks that the
+UART patch is whole in the build tree's `qcom_geni_serial.c` (it comes out
+again with no fuzz, from over the Bluetooth UART's interrupt patch), that
+`qcom_geni_serial_suspend()` in the build's `vmlinux` calls
+`pm_runtime_force_suspend()` and `qcom_geni_serial_resume()`
+`pm_runtime_force_resume()` (the patch adds no string; both callbacks are
+functions of their own, in the driver's `dev_pm_ops`), and that the image
+has the CXPC log's raw line and its raw file's name and `vmlinux` the raw
+file's show function; with `HANG_SCRATCH` the hang-log build's callbacks
+call neither, and its tree has the interrupt patch and not the UART one.
 `SOURCE` in the kit records the checkout, the revision and which of the
 checks ran; `REVISION` holds the revision number.
 
@@ -697,7 +768,10 @@ over revision 10, which squirtle has had since 2026-11-23 11:37 (installed
 by its own `install.sh` over revision 9, which recorded both), and over
 every earlier revision. Revision 12 installs the same way over revision 11,
 which squirtle has run since 2026-11-23 23:06, and over every earlier
-revision.
+revision. Revision 13 installs the same way over revision 12, which squirtle
+has run since 2026-11-24 08:45, over revision 11, and over every earlier
+revision: `install.sh` knows revisions 8 and later by the record each
+install leaves on the tablet, so its upgrade path is unchanged.
 
 `rollback.sh` writes boot and the module tree back first and syncs. If it
 stops after that, it says that the hang-log kernel and its modules are back
@@ -750,6 +824,16 @@ modules it probably refuses (revision 12 adds types to the kernel: the CXPC
 log's, the DSI PHY's new fields); then copy revision 11's kit back into
 `~/typec-roles` and run its `install.sh` (an upgrade over an image the
 record knows), and reboot.
+
+From revision 13, the way back to revision 12 in one step, the same way:
+`~/ubuntu-gts9u/backups/typec-roles-kit-r12/boot.img` (sha256
+`9bca1427d84dc351ec0b050ae52fc43bf874af279f19e7386edcfb5688c572ec`), `adb
+push`ed to `/tmp/boot-r12.img`, checked with `sha256sum` and written with
+`dd if=/tmp/boot-r12.img of=/dev/block/by-name/boot bs=4M`. That boot runs
+revision 12's kernel with revision 13's module tree, whose modules it
+probably refuses (revision 13 adds functions to the kernel, and with them
+entries to its BTF); then copy revision 12's kit back into `~/typec-roles`,
+run its `install.sh` and reboot.
 
 ## The sleep test
 
@@ -1504,7 +1588,8 @@ and, in runs 2 and 5, `disp_cc_mdss_ahb_clk 0/1` (prepared, not enabled);
 in runs 1, 3 and 4 the display's clocks were enabled as well
 (`disp_cc_mdss_ahb_clk 4/4` and the byte, pixel and MDP clocks).
 
-**Revision 12: the runs** (none has run; the kernel is not built yet). Each
+**Revision 12: the runs** (written before the kernel was built; steps 1 and
+2 have run, below, "Revision 12: results", steps 3 and 4 have not). Each
 in a boot of its own, without touching the screen, each sleep-test command
 after the check of its checksum, as for revision 11. `sensors=stop` keeps
 the audio DSP's sensor wakes out of every run, as in revision 11's run 5.
@@ -1558,6 +1643,100 @@ the audio DSP's sensor wakes out of every run, as in revision 11's run 5.
    the last flush before the sleep; `cxpc` and the clock trace as in step
    2. No deep sleep with `root-port-d3` has run yet: a tablet that does not
    come back is that, and the record says how far it got.
+
+**Revision 12: results** (2026-11-24, squirtle; logs
+`squirtle-verify-r12-20261124.log` and `squirtle-sleep-r12-1-s2idle-cable-20261124.log`
+with its pstore directory, in the backups):
+1. Step 1: installed over revision 11 at 08:45 with one command and one
+   reboot. The boot's panel cycle ran and the screen came back as on
+   revision 11; `verify.sh`: 27 `ok`, no `FAIL` (`running the kit's kernel
+   (build ID 530d06f4c804, revision 12)`, `debug switch
+   qcom_stats.debug_cxpc_violators = N (off)`, the guard held in the panel
+   cycle, the Wi-Fi back after it). The microphone: sound capture works in
+   use (it picks up the voice); the level meter in Settings was not
+   confirmed. The dim screen after a test's restart is userspace's
+   (systemd-backlight restores the 81 of 2047 it saved, the boot clamps
+   that to 102, and a run's `sysrq b` restart never saves a new value), not
+   the kernel's or revision 12's.
+2. Step 2, 09:53 (`mode=s2idle pci=keep root-port-d3 rpmh cxpc
+   sensors=stop`, on the cable): SHALLOW (s2idle), asleep 31.4 s, woken by
+   the RTC, the UFS read back as before, `aosd +0 cxsd +0 ddr +1` (the DDR
+   in its low-power mode for the whole 31.4 s, `adsp +0`); the PCIe host
+   powered down with the Wi-Fi bound and came back. The sets were flushed
+   at the sleep's entry, 16 commands (`the last of 1 flushes before the
+   sleep at 2542.543543 (at 2542.543544, the sleep's entry, ...)`), with
+   `xo.lvl`, `cx.lvl (active 0x0)` and `mx.lvl` left out: XO held at its
+   vote. The clock trace: `XO still voted at the entry to the sleep, held
+   by: gcc_qupv3_wrap1_s7_clk, gcc_qupv3_wrap2_s6_clk`, the console's UART
+   and the Bluetooth UART; every other clock that held XO before the sleep
+   (the DSI PHY's AHB clock, all of USB's, PCIe's, the inline crypto
+   engine's, the GPU's AHB clock, the `tcsr` clock references) was
+   unprepared in the suspend: the DSI PHY patch did its part. Revision 13
+   is for the two UARTs. The `cxpc violators` lines (26, `mode 0xdb`,
+   `every 16 ms`, `time shift 50`, `flush 1`, the same DRVs in every line)
+   were not a CXPC log: the region's header is not one, and its lines are
+   32-bit words, not a byte per requester (revision 13 logs it raw). The
+   `XO held by` read before the sleep still counted `bi_tcxo itself 1`, a
+   direct consumer of XO, which the trace cannot see while the two UART
+   clocks keep XO prepared (below, "Revision 13: the runs").
+
+**Revision 13: the runs** (written before the kernel was built). Each in a
+boot of its own, without touching the screen, each sleep-test command after
+the check of its checksum. The UART patch runs in every suspend, the boot's
+panel cycle first:
+
+1. **Install and check.** Copy the kit over revision 12's in
+   `~/typec-roles`, `sudo sh ~/typec-roles/install.sh` (an upgrade: one
+   command, one reboot), `sudo reboot`, then, a minute after the boot, `sh
+   ~/typec-roles/verify.sh` and `sudo sh ~/typec-roles/verify.sh`. Expected:
+   revision 12's checks with the kit's kernel (revision 13), `ok   Bluetooth
+   after this boot's first suspend: hci0, no disabled interrupt and no HCI
+   command timeout` and `ok   console ttyMSM0: wakeup disabled ...`. Then
+   Bluetooth in use (a scan, or a paired device), and the serial console if
+   it is wired: it prints the boot's panel cycle's resume as before.
+
+   | What you see | What it means |
+   | --- | --- |
+   | `FAIL an interrupt was disabled or a Bluetooth command timed out this boot` | the Bluetooth UART did not come back from the panel cycle: keep `journalctl -k -b > ~/r13-bt.txt`, then `sudo sh ~/bt-uart/suspend-bt.sh recover` for the boot, and go back to revision 12 (above, "From revision 13, the way back to revision 12") |
+   | no `hci0` at all | the same, or its firmware load failed (the log's `Bluetooth: hci0:` lines say which) |
+   | the tablet restarts by itself 20 to 40 s into every boot | a fault in the panel cycle: TWRP, back to revision 12 the same way, and the panic's record from `/var/lib/ubuntu-gts9u/pstore` after that boot |
+2. **Bluetooth through twenty suspends**, the bt-uart kit's test (in
+   `~/bt-uart`), with Bluetooth on and scanning:
+
+   ```sh
+   sudo sh ~/bt-uart/suspend-bt.sh platform 20
+   ```
+
+   Each cycle is a `pm_test=platform` suspend, which runs every device's
+   suspend and resume and with them the UART's force suspend and force
+   resume; the test checks after each that the UART's interrupt was not
+   disabled and that the controller answers an HCI command. `RESULT: PASS,
+   20 platform cycles` is Bluetooth surviving the change; `RESULT: FAIL at
+   cycle ...` names the cycle, and its line why, and `sudo sh ~/bt-uart/suspend-bt.sh recover` brings Bluetooth
+   back for that boot.
+3. **What holds XO and CX now, on the cable**, revision 12's step 2:
+
+   ```sh
+   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 rpmh cxpc sensors=stop hold=60 restart-ok
+   ```
+
+   | What you see | What it means |
+   | --- | --- |
+   | `evidence: UART clocks at the entry to the sleep (clock trace): a9c000.serial (console, ...): unprepared in the suspend at T, prepared again at T'; 898000.serial (Bluetooth, ...): unprepared ...` | the fix works: both clocks off before the sleep, back after it |
+   | `... prepared through the sleep's entry` for either | the fix did not take for that port (`make-kit.sh` checked the code is in the kernel; keep the log) |
+   | `evidence: after: UARTs: ...; Bluetooth: no disabled interrupt and no HCI command timeout in this cycle's kernel lines` | Bluetooth came back from the sleep |
+   | `XO free at the entry to the sleep` and `cxsd +0` | Linux left XO free: the `cxpc raw` lines and the AOP are what is left |
+   | `XO still voted ..., held by: bi_tcxo itself (...)` | a direct consumer of XO still prepared: the trace's `clk_prepare: bi_tcxo` and `clk_unprepare: bi_tcxo` lines in the run's log say which moment, `XO held by` before the sleep how many |
+   | `XO still voted ..., held by:` other clocks | the next ones to look at, named |
+   | `cxsd +1` (and `aosd +1`) | the depth no run on this port has reached |
+
+   The `cxpc raw` evidence lines are the AOP's region as it was right
+   before the message, right after it and after the suspend: the next
+   decoder is made from them. One restart.
+4. **The same without the USB cable**, over Wi-Fi, as revision 12's step 3:
+   the USB clocks gone from the holders, and what is left is the SoC's.
+5. **A deep sleep**, step 3's command without `mode=s2idle` (revision 12's
+   step 4, which has not run either).
 
 `fstrim.timer` (weekly) would, if it fired during a run, send discards to
 the read-only disk, which the block layer logs as a write and the run
@@ -1623,12 +1802,22 @@ nothing):
   +1, mx +0, ...`: `cx +1` is Linux voting CX off, level 0, in every RPMh
   set at the end of the noirq phase; `+0` is a domain that genpd kept on),
   the clocks that keep XO voted as read right after the wake (`after: XO
-  held by:`), with `rpmh` the sets Linux handed the RPMh hardware for the
-  sleep (`rpmh sleep set`, below), the same clock counts (`after:
-  clocks`), the same power domains, and the cycle's kernel lines (the PM
-  core's, the CPUs', the storage's, USB's, PCIe's, the DSPs', warnings and
-  errors; at most 150, without the Wi-Fi's per-packet lines and the
-  hung-task reports).
+  held by:`), since revision 13's script the two UARTs and Bluetooth
+  (`after: UARTs: a9c000.serial (console): runtime active,
+  gcc_qupv3_wrap1_s7_clk prepared 1; ttyMSM0 wakeup disabled; 898000.serial
+  (Bluetooth): ...; hci0; Bluetooth: no disabled interrupt and no HCI
+  command timeout in the kernel lines of this cycle`, or the first such
+  line), with `rpmh` the sets Linux handed the RPMh hardware for the
+  sleep (`rpmh sleep set`, below) and the UARTs' clocks at the sleep's entry
+  (`UART clocks at the entry to the sleep (clock trace): a9c000.serial
+  (console, gcc_qupv3_wrap1_s7_clk): unprepared in the suspend at T,
+  prepared again at T'; ...`; `prepared through the sleep's entry` is a
+  clock that held XO, revision 12's kernel's), the same clock counts
+  (`after: clocks`), the same power domains, and the cycle's kernel lines
+  (the PM core's, the CPUs', the storage's, USB's, PCIe's, the DSPs',
+  Bluetooth's, warnings and errors; at most 150, without the Wi-Fi's
+  per-packet lines, the hung-task reports and the CXPC log's raw lines,
+  which `cxpc` lists apart).
 
 The clock counts are for revision 10's UFS fix: with it, ufshcd enables
 the UFS host's clocks once while UFS works and not while it idles, so
@@ -1953,7 +2142,13 @@ name the ones in force (`options: none` without them).
   cycle's kernel lines, and `evidence: cxpc violators (the AOP log; ...):
   N lines, K of them CXPC enter or exit; DRVs: ...`, also in pmsg. Before
   anything is frozen the run reads the log as the AOP left it and every
-  requester's DDR vote into the record. Refused on a kernel without the
+  requester's DDR vote into the record. Revision 12's first run read a
+  region that is not a CXPC log; on revision 13's kernel the lines are
+  decoded only under a CXPC header (`summary: not a CXPC log (mode ...)`
+  otherwise), the region is logged raw around each sleep (`evidence: cxpc
+  raw: ...` lines, at most 50, apart from the other kernel lines), and the
+  run reads it raw before anything is frozen too
+  (`qcom_stats/cxpc_violators_raw`). Refused on a kernel without the
   switch, and with `dry`.
 - **`rpmh`** (`ro`; revision 11's script and later, any kit kernel): what of Linux's
   own votes stands in the way of XO shutdown, CX collapse and AOSS sleep
@@ -2166,7 +2361,8 @@ again, up to three per attach; the verdict is still the roles.
    `debug switches at boot ... pcie0 Y, pcie0phy N, usb N`, the root port's
    switch `N`, the PCIe power domain's guard in the boot's first suspend,
    the panel cycle, and the Wi-Fi after it (above, "Revision 11: the runs",
-   step 1).
+   step 1). On revision 13 also Bluetooth after the panel cycle and the
+   console's tty wakeup (above, "Revision 13: the runs", step 1).
 2. `sudo sh ~/typec-roles/verify.sh dock 10` with each powered dock. Note
    whether the battery charges; near 100 % it reports `Full` and no current.
    Keep a dock's own charger plugged in: without it the dock has no power

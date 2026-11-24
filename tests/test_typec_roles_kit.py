@@ -160,9 +160,12 @@ CXPC_SWITCH = "qcom_stats/parameters/debug_cxpc_violators"
 # Revision 12's two fixes for clocks that kept XO voted through a sleep
 # (APPLY_LPASS_VA_MACRO_PM_CLK=1, APPLY_DSI_PHY_AHB_RELEASE=1), and the
 # sources they change.
-XO_PATCHES = ["lpass-va-macro-pm-clock-framework.patch", "msm-dsi-phy-release-ahb-clock-in-system-sleep.patch"]
+XO_PATCHES = ["lpass-va-macro-pm-clock-framework.patch", "msm-dsi-phy-release-ahb-clock-in-system-sleep.patch",
+              # Revision 13's: the two UARTs' clocks (APPLY_GENI_SERIAL_FORCE_SUSPEND=1).
+              "qcom-geni-serial-force-suspend-in-system-sleep.patch"]
 VA_MACRO = "sound/soc/codecs/lpass-va-macro"
 DSI_PHY = "drivers/gpu/drm/msm/dsi/phy/dsi_phy"
+GENI_SERIAL = "drivers/tty/serial/qcom_geni_serial"
 # Revision 11's pcie_0_gdsc, behind APPLY_SM8550_PCIE0_GDSC_OFF, and the line
 # it gives that domain, by which the build script and make-kit.sh know it.
 GDSC_PATCHES = ["gcc-sm8550-pcie0-gdsc-off-in-suspend.patch"]
@@ -224,8 +227,9 @@ def kit_patches(text):
 
 
 def xo_files_of(text):
-    """make-kit.sh's files of each of revision 12's two XO fixes."""
-    names = {"va_macro": VA_MACRO, "dsi_phy": DSI_PHY}
+    """make-kit.sh's files of each of revision 12's two XO fixes and
+    revision 13's UART one."""
+    names = {"va_macro": VA_MACRO, "dsi_phy": DSI_PHY, "geni": GENI_SERIAL}
     words = shlex.split(re.search(r"^xo_files=\((.*?)\)$", text, re.M).group(1))
     return [[re.sub(r"\$(\w+)", lambda m: names[m.group(1)], f) for f in word.split()] for word in words]
 
@@ -10373,7 +10377,20 @@ class ScriptsTest(unittest.TestCase):
                                    "setup_clocks repeats: power-on",
                                    "qcom_stats.debug_cxpc_violators",
                                    "the AOP's CXPC monitor is on for this suspend",
-                                   "runtime PM put failed in fsgen disable", "Unable to prepare iface clk"])
+                                   "runtime PM put failed in fsgen disable", "Unable to prepare iface clk",
+                                   "cxpc violators: raw %s +0x%03x: ", "cxpc_violators_raw"])
+        # Revision 13's two, the CXPC log's: the format of its raw lines (in
+        # the function every report calls first) and its raw file's name,
+        # each the CXPC patch's alone.  The UART patch adds no string (the
+        # disassembly check is for it).
+        cxpc_added = added_lines(CXPC_PATCH)[f"{QCOM_STATS}.c"]
+        self.assertEqual(len([a for a in cxpc_added if f'pr_info("{strings[32]}%08x ' in a]), 1)
+        self.assertEqual(len([a for a in cxpc_added if f'debugfs_create_file("{strings[33]}", 0400, ' in a]), 1)
+        for line in strings[32:34]:
+            with self.subTest(line):
+                self.assertEqual([p.name for p in (REPO / "kernel/patches").glob("*.patch") if line in p.read_text()],
+                                 [CXPC_PATCH])
+        self.assertFalse([a for a in added_lines(XO_PATCHES[2])[f"{GENI_SERIAL}.c"] if '"' in a])
         # Revision 12's four: the CXPC log's switch as the kernel keeps it
         # (a module_param_cb() of its patch alone) and the line each suspend
         # with it logs; the VA macro's and the DSI PHY's error messages.
@@ -10517,7 +10534,7 @@ class ScriptsTest(unittest.TestCase):
         # the way the build script applies them; the root port's default-on
         # patch is in no kit.
         self.assertEqual(xo_files_of(text), [[f"{VA_MACRO}.c", "sound/soc/codecs/Kconfig"],
-                                             [f"{DSI_PHY}.c", f"{DSI_PHY}.h"]])
+                                             [f"{DSI_PHY}.c", f"{DSI_PHY}.h"], [f"{GENI_SERIAL}.c"]])
         for name, files in zip(xo, xo_files_of(text)):
             with self.subTest(name):
                 self.assertEqual(sorted(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / name).read_text(),
@@ -10527,6 +10544,8 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn(f"\ndsi_ahb_patch={xo[1]}\n", build_text)
         self.assertEqual(build_text.count('< "$pat/$va_macro_patch"'), 2)
         self.assertEqual(build_text.count('< "$pat/$dsi_ahb_patch"'), 2)
+        self.assertIn(f"\ngeni_fs_patch={xo[2]}\n", build_text)
+        self.assertEqual(build_text.count('< "$pat/$geni_fs_patch"'), 2)
         self.assertNotIn("APPLY_SM8550_ROOT_PORT_D3=1", text)
         self.assertIn("left out: kernel/patches/pcie-qcom-root-port-d3-in-system-suspend.patch", text)
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text().replace("\\\n", " ")
@@ -10604,13 +10623,13 @@ class ScriptsTest(unittest.TestCase):
         self.assertEqual(changed, {f"{TCPM_DIR}/tcpm.c", "include/linux/usb/tcpm.h", f"{GCC}.c",
                                    f"{DWC3}.c", f"{QMP}.c", f"{RPMHPD}.c", f"{PHYMUX}.c", f"{GMU}.c",
                                    f"{UFS_QCOM}.c", f"{UFS_QCOM}.h", f"{QCOM_STATS}.c", f"{VA_MACRO}.c",
-                                   "sound/soc/codecs/Kconfig", f"{DSI_PHY}.c", f"{DSI_PHY}.h"})
+                                   "sound/soc/codecs/Kconfig", f"{DSI_PHY}.c", f"{DSI_PHY}.h", f"{GENI_SERIAL}.c"})
         self.assertEqual(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / UNPARK).read_text(), re.M),
                          [f"{QMP_PCIE}.c"])
         self.assertEqual(" ".join(patched.split()),
                          '"$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$qmp.c" '
                          '"$rpmhpd.c" "$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c" '
-                         '"$qcom_stats.c" "$va_macro.c" sound/soc/codecs/Kconfig "$dsi_phy.c" "$dsi_phy.h"')
+                         '"$qcom_stats.c" "$va_macro.c" sound/soc/codecs/Kconfig "$dsi_phy.c" "$dsi_phy.h" "$geni.c"')
         self.assertIn("\ntcpm_dir=drivers/usb/typec/tcpm\n", text)
         self.assertIn("\ngcc=drivers/clk/qcom/gcc-sm8550\n", text)
         self.assertIn("\ndwc3=drivers/usb/dwc3/dwc3-qcom\n", text)
@@ -10618,11 +10637,11 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn(f"\nrpmhpd={RPMHPD}\n", text)
         for name, value in (("phymux", PHYMUX), ("qmp_pcie", QMP_PCIE), ("gmu", GMU), ("ufs_qcom", UFS_QCOM),
                             ("pcie_qcom", PCIE_QCOM), ("qcom_stats", QCOM_STATS), ("va_macro", VA_MACRO),
-                            ("dsi_phy", DSI_PHY)):
+                            ("dsi_phy", DSI_PHY), ("geni", GENI_SERIAL)):
             self.assertIn(f"\n{name}={value}\n", text)
         self.assertIn(f"\nunpark={UNPARK}\n", text)
         self.assertIn('fix_files=("$phymux.c" "$gmu.c" "$ufs_qcom.c")\n', text)
-        self.assertIn("\nrevision=12\n", text)
+        self.assertIn("\nrevision=13\n", text)
         # The build tree has to carry each fix whole and not the unpark
         # patch; the hang-log tree none of the fixes and the unpark patch.
         self.assertIn('die "the build tree\'s $f does not carry ${fix_patches[$i]} whole"', text)
@@ -10643,14 +10662,15 @@ class ScriptsTest(unittest.TestCase):
             self.assertIn(parm, text)
         self.assertIn("for f in gcc_sm8550_debug_set gcc_sm8550_debug_get gcc_sm8550_debug_boot_get "
                       "rpmhpd_debug_ret_floor_set \\\n\tqcom_pcie_debug_rp_d3_set qcom_pcie_pd_notify "
-                      "qcom_stats_vx_set qcom_stats_vx_pm_notify \\\n\tdsi_phy_suspend_late dsi_phy_resume_early; do",
-                      text)
+                      "qcom_stats_vx_set qcom_stats_vx_pm_notify \\\n\tdsi_phy_suspend_late dsi_phy_resume_early "
+                      "qcom_stats_vx_raw_show; do", text)
         # Revision 12's four: the CXPC log's set handler and PM notifier,
         # the DSI PHY's system sleep callbacks, each its patch's.
         for f, patch, target in (("qcom_stats_vx_set", CXPC_PATCH, f"{QCOM_STATS}.c"),
                                  ("qcom_stats_vx_pm_notify", CXPC_PATCH, f"{QCOM_STATS}.c"),
                                  ("dsi_phy_suspend_late", XO_PATCHES[1], f"{DSI_PHY}.c"),
-                                 ("dsi_phy_resume_early", XO_PATCHES[1], f"{DSI_PHY}.c")):
+                                 ("dsi_phy_resume_early", XO_PATCHES[1], f"{DSI_PHY}.c"),
+                                 ("qcom_stats_vx_raw_show", CXPC_PATCH, f"{QCOM_STATS}.c")):
             self.assertTrue([a for a in added_lines(patch)[target] if a.startswith(f"static int {f}(")], f)
         # Each of those functions is the debug patch's, and revision 11's
         # two the PCIe host patches': the root port switch's handler and the
@@ -10671,6 +10691,47 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn('die "the build tree\'s ${xo_files[$i]} do not carry ${xo_patches[$i]} whole"', text)
         self.assertIn('die "the hang-log tree carries revision 12\'s VA macro or DSI PHY change already"', text)
         self.assertIn('\tfor p in "${xo_patches[@]}"; do\n', text)
+        # Revision 13's UART one the same way, the hang-log tree with the
+        # SM-X710's interrupt patch and without it; and its disassembly check
+        # (it adds no string): both callbacks, named in the driver's
+        # dev_pm_ops, call the force functions, the hang-log build's neither.
+        self.assertIn('die "the hang-log tree\'s $geni.c carries revision 13\'s UART change already, or not the '
+                      'Bluetooth UART interrupt patch"', text)
+        self.assertIn("grep -qF 'Serve the interrupt even once uart_suspend_port()' \"$hang_tree/$geni.c\"", text)
+        self.assertIn('branches_of "$build/vmlinux" qcom_geni_serial_suspend > "$tmp/geni.suspend.calls"', text)
+        self.assertIn('grep -qx uart_suspend_port "$tmp/geni.suspend.calls" && grep -qx pm_runtime_force_suspend '
+                      '"$tmp/geni.suspend.calls" ||', text)
+        self.assertIn('grep -qx uart_resume_port "$tmp/geni.resume.calls" && grep -qx pm_runtime_force_resume '
+                      '"$tmp/geni.resume.calls" ||', text)
+        self.assertIn('\t\t! grep -qx pm_runtime_force_suspend "$tmp/geni.suspend.hang.calls" &&\n', text)
+        geni = added_lines(XO_PATCHES[2])[f"{GENI_SERIAL}.c"]
+        self.assertIn("\treturn pm_runtime_force_suspend(dev);", geni)
+        self.assertIn("\t\tret = pm_runtime_force_resume(dev);", geni)
+        self.assertIn('echo "geni UART callbacks: $geni_check"', text)
+
+    def test_the_disassembly_check_finds_calls_and_tail_branches_by_name(self):
+        """branches_of() keeps what a function calls (bl) or branches to
+        (b, a tail call) by name, not its branches within itself (b.ne to
+        FUNCTION+0x54) nor indirect ones."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        fn = re.search(r"^branches_of\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+        listing = ("ffff800080d39a7c <qcom_geni_serial_suspend>:\n"
+                   "ffff800080d39ab8:      \tb.ne\t0xffff800080d39ad0 <qcom_geni_serial_suspend+0x54>\n"
+                   "ffff800080d39ac4:      \tbl\t0xffff800080c26e78 <geni_icc_set_tag>\n"
+                   "ffff800080d39ad8:      \tbl\t0xffff800080cf1b98 <uart_suspend_port>\n"
+                   "ffff800080d39b00:      \tblr\tx8\n"
+                   "ffff800080d39b04:      \tb\t0xffff800080d10000 <pm_runtime_force_suspend>\n"
+                   "ffff800080d39b08:      \tret\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = pathlib.Path(tmp) / "llvm-objdump"
+            tool.write_text("#!/bin/sh\ncat <<'EOF'\n" + listing + "EOF\n")
+            tool.chmod(0o755)
+            result = subprocess.run(["bash", "-c", fn + 'branches_of vmlinux qcom_geni_serial_suspend'],
+                                    capture_output=True, text=True,
+                                    env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["geni_icc_set_tag", "pm_runtime_force_suspend", "uart_suspend_port"])
+
     def test_every_changed_source_is_required_dated_and_compared(self):
         """The kit's changes to the kernel tree are the patched files and the
         driver.  Each source is required, its object is dated against it,
@@ -10681,7 +10742,7 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         names = {"tcpm_dir": TCPM_DIR, "gcc": GCC, "dwc3": DWC3, "qmp": QMP, "rpmhpd": RPMHPD,
                  "phymux": PHYMUX, "qmp_pcie": QMP_PCIE, "gmu": GMU, "ufs_qcom": UFS_QCOM, "pcie_qcom": PCIE_QCOM,
-                 "qcom_stats": QCOM_STATS, "va_macro": VA_MACRO, "dsi_phy": DSI_PHY}
+                 "qcom_stats": QCOM_STATS, "va_macro": VA_MACRO, "dsi_phy": DSI_PHY, "geni": GENI_SERIAL}
 
         def expand(word):
             return re.sub(r"\$\{?(\w+)\}?", lambda match: names[match.group(1)], word)
@@ -10714,10 +10775,14 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn(f"{DSI_PHY}.o:{DSI_PHY}.h", objects)
         self.assertIn("sound/soc/codecs/Kconfig", patched)
         # The guard's proof stays its marker and the date of its object; the
-        # one disassembler is calls_of(), for the UFS PHY's calibration
-        # (revision 8) and the PCIe PHY's power-on (revision 10).
-        self.assertEqual(text.count("llvm-objdump -d"), 1)
-        self.assertIn('llvm-objdump -d --no-show-raw-insn --disassemble-symbols="$2" "$1"', text)
+        # disassemblers are calls_of(), for the UFS PHY's calibration
+        # (revision 8) and the PCIe PHY's power-on (revision 10), and
+        # branches_of(), for the geni UART's callbacks (revision 13).
+        self.assertEqual(text.count("llvm-objdump -d"), 2)
+        self.assertEqual(text.count('llvm-objdump -d --no-show-raw-insn --disassemble-symbols="$2" "$1"'), 2)
+        self.assertEqual(re.findall(r'branches_of "\$build/vmlinux" (\w+)', text),
+                         ["qcom_geni_serial_suspend", "qcom_geni_serial_resume"])
+        self.assertIn(f"{GENI_SERIAL}.o:{GENI_SERIAL}.c", objects)
         self.assertEqual(re.findall(r'calls_of "\$build/vmlinux" (\w+)', text),
                          ["qmp_ufs_phy_calibrate", "qmp_pcie_enable"])
 
@@ -11056,6 +11121,7 @@ class ScriptsTest(unittest.TestCase):
                  f"tree/{QCOM_STATS}.c": 100, f"build/{QCOM_STATS}.o": 200,
                  f"tree/{VA_MACRO}.c": 100, f"build/{VA_MACRO}.o": 200,
                  f"tree/{DSI_PHY}.c": 100, f"tree/{DSI_PHY}.h": 100, f"build/{DSI_PHY}.o": 200,
+                 f"tree/{GENI_SERIAL}.c": 100, f"build/{GENI_SERIAL}.o": 200,
                  f"build/{TCPM_DIR}/sm5714_usbpd.o": 200, "build/vmlinux": 300,
                  "build/arch/arm64/boot/Image.gz": 400, "out/Image.gz": 400}
         files.update(ages)
@@ -11071,7 +11137,7 @@ class ScriptsTest(unittest.TestCase):
                  'die() { echo "$*" >&2; exit 1; }\ntree=$1/tree build=$1/build out=$1/out\n'
                  f'tcpm_dir={TCPM_DIR}\ngcc={GCC}\ndwc3={DWC3}\nqmp={QMP}\nrpmhpd={RPMHPD}\n'
                  f'phymux={PHYMUX}\nqmp_pcie={QMP_PCIE}\ngmu={GMU}\nufs_qcom={UFS_QCOM}\npcie_qcom={PCIE_QCOM}\n'
-                 f'qcom_stats={QCOM_STATS}\nva_macro={VA_MACRO}\ndsi_phy={DSI_PHY}\n'
+                 f'qcom_stats={QCOM_STATS}\nva_macro={VA_MACRO}\ndsi_phy={DSI_PHY}\ngeni={GENI_SERIAL}\n'
                  + objects.group(0) + "\n"
                  + gate.group(0),
                  "gate", tmp], capture_output=True, text=True)
@@ -11115,6 +11181,10 @@ class ScriptsTest(unittest.TestCase):
                                            stale % (QCOM_STATS, QCOM_STATS + ".c")),
             "no lpass-va-macro object": ({f"build/{VA_MACRO}.o": None}, stale % (VA_MACRO, VA_MACRO + ".c")),
             "dsi_phy.h changed since": ({f"tree/{DSI_PHY}.h": 250}, stale % (DSI_PHY, DSI_PHY + ".h")),
+            # Revision 13: the geni UART driver.
+            "qcom_geni_serial.c changed since": ({f"tree/{GENI_SERIAL}.c": 250},
+                                                 stale % (GENI_SERIAL, GENI_SERIAL + ".c")),
+            "no qcom_geni_serial object": ({f"build/{GENI_SERIAL}.o": None}, stale % (GENI_SERIAL, GENI_SERIAL + ".c")),
             # The driver includes the header too.
             "the driver's object alone is old": (
                 {f"build/{driver}.o": 50, f"tree/{driver}.c": 40}, stale % (driver, header)),
@@ -11168,7 +11238,7 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         kit = sum(kit_patches(text), [])
         self.assertEqual(sorted(set(re.findall(r"`kernel/patches/([^`]+)`", readme))), sorted(kit))
-        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (23, 5))
+        self.assertEqual((len(kit), len([name for name in kit if name.startswith("tcpm-")])), (24, 5))
         self.assertIn("and the UFS PHY's two (revision 8): nine patches, five of them to TCPM. Revision 9 adds the "
                       "two debug patches above: eleven patches. Revision 10 adds the three upstream fixes and the "
                       "second UFS PHY diagnostic, fifteen patches, and leaves out `unpark-pcie0-pipe-mux.patch`, "
@@ -11278,7 +11348,9 @@ class ScriptsTest(unittest.TestCase):
                      # Revision 12: what it is, what it changes outside a
                      # sleep and in the panel cycle, what it leaves out, how
                      # it is built and installed, and its runs.
-                     "**Revision 12** (written 2026-11-24, not built yet) is revision 11 plus three kernel patches",
+                     "**Revision 12** (built 2026-11-24 from 0d3ed8a, kernel build ID 530d06f4c804, on squirtle "
+                     "from 08:45 that day; its first run below, \"Revision 12: results\") is revision 11 plus three "
+                     "kernel patches",
                      "**This changes the VA macro outside system sleep too**",
                      "**Every system suspend runs it, the boot's panel cycle included**",
                      "Not in revision 12: `pcie-qcom-root-port-d3-in-system-suspend.patch` "
@@ -11287,11 +11359,41 @@ class ScriptsTest(unittest.TestCase):
                      "`kernel/patches/lpass-va-macro-pm-clock-framework.patch` and "
                      "`kernel/patches/msm-dsi-phy-release-ahb-clock-in-system-sleep.patch`: twenty-three patches, "
                      "eighteen files",
-                     "APPLY_LPASS_VA_MACRO_PM_CLK=1 APPLY_DSI_PHY_AHB_RELEASE=1 \\",
+                     "APPLY_LPASS_VA_MACRO_PM_CLK=1 APPLY_DSI_PHY_AHB_RELEASE=1 APPLY_GENI_SERIAL_FORCE_SUSPEND=1 \\",
                      "Revision 12 installs the same way over revision 11, which squirtle has run since 2026-11-23 "
                      "23:06, and over every earlier revision.",
                      "From revision 12, the way back to revision 11 in one step",
-                     "**Revision 12: the runs** (none has run; the kernel is not built yet).",
+                     "**Revision 12: the runs** (written before the kernel was built; steps 1 and 2 have run, "
+                     "below, \"Revision 12: results\", steps 3 and 4 have not).",
+                     # What ran on revision 12, from its logs, and the
+                     # microphone as the owner reported it.
+                     "**Revision 12: results** (2026-11-24, squirtle;",
+                     "`verify.sh`: 27 `ok`, no `FAIL`",
+                     "The microphone: sound capture works in use (it picks up the voice); the level meter in "
+                     "Settings was not confirmed.",
+                     "not the kernel's or revision 12's.",
+                     "`XO still voted at the entry to the sleep, held by: gcc_qupv3_wrap1_s7_clk, "
+                     "gcc_qupv3_wrap2_s6_clk`",
+                     # Revision 13: what it is, what it changes, how it is
+                     # built and installed, the way back, and its runs.
+                     "**Revision 13** (written 2026-11-24, not built yet) is revision 12 plus one upstream fix and a "
+                     "change to the CXPC log's diagnostic",
+                     "upstream d0cd9c8d0fd5 (v7.3-rc1) with its fix 3098c989bd38 (v7.3-rc6) folded in, with "
+                     "`APPLY_GENI_SERIAL_FORCE_SUSPEND=1`.",
+                     "**Every system suspend runs it, the boot's panel cycle included**, on both UARTs.",
+                     "`qcom_stats/cxpc_violators_raw`. What the region holds, and whether the message changes it, is "
+                     "what the next run settles.",
+                     "Revision 13 adds `kernel/patches/qcom-geni-serial-force-suspend-in-system-sleep.patch` and "
+                     "changes the CXPC log's patch: twenty-four patches, nineteen files",
+                     "Revision 13 is to be built the same way, in `build-r13`, its `certs` given that key from "
+                     "`build-r12`, with `APPLY_GENI_SERIAL_FORCE_SUSPEND=1` added.",
+                     "Revision 13 installs the same way over revision 12, which squirtle has run since 2026-11-24 "
+                     "08:45, over revision 11, and over every earlier revision",
+                     "From revision 13, the way back to revision 12 in one step, the same way: "
+                     "`~/ubuntu-gts9u/backups/typec-roles-kit-r12/boot.img` (sha256 "
+                     "`9bca1427d84dc351ec0b050ae52fc43bf874af279f19e7386edcfb5688c572ec`)",
+                     "**Revision 13: the runs** (written before the kernel was built).",
+                     "   sudo sh ~/bt-uart/suspend-bt.sh platform 20\n",
                      "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 "
                      "rpmh cxpc sensors=stop hold=60 restart-ok\n",
                      "- **`cxpc`** (`ro`; revision 12's kernel)",
@@ -11318,7 +11420,10 @@ class ScriptsTest(unittest.TestCase):
                       "this kit changes nothing there", "New in this revision are",
                       "**On the SM-X710 the previous revision of the kit is installed",
                       "not done yet: `verify.sh dock` and `swap` on a kit kernel",
-                      "The data role fault has not been seen on it", "Not on the SM-X710 for now"):
+                      "The data role fault has not been seen on it", "Not on the SM-X710 for now",
+                      # Revision 12 was built, installed and run (2026-11-24).
+                      "**Revision 12** (written 2026-11-24, not built yet)",
+                      "(none has run; the kernel is not built yet)"):
             self.assertNotIn(stale, readme)
         # What the SM-X710 showed.
         self.assertIn("That is the SM-X910's fault, seen once here: the reason revision 7 carries the "
