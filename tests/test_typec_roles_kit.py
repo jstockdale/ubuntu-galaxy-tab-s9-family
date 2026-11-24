@@ -3043,6 +3043,29 @@ class VerifyTest(FakeTablet):
                 self.assertIn(said, result.stdout)
                 self.assertNotIn("guard did not hold", result.stdout)
 
+    def test_a_ufs_failure_shows_revision_11_s_ufs_qcom_lines_with_it(self):
+        """verify.sh takes the same diagnostic lines as sleep-test.sh: with a
+        failure its listing has revision 11's ufs-qcom lines too, the counts
+        at a power-up sequence's entry, a failed sequence and a setup_clocks
+        repeat; without a failure they are not listed."""
+        diag = {name: re.search(r"^ufs_diag='([^']*)'$", (KIT_SRC / name).read_text(), re.M).group(1)
+                for name in ("verify.sh", "sleep-test.sh")}
+        self.assertEqual(diag["verify.sh"], diag["sleep-test.sh"])
+        self.boot_kit()
+        self.journal_add("kernel: PM: suspend entry (deep)\nkernel: " + UFS_REPEAT + "\nkernel: "
+                         + UFS_COUNTS.format(count=2) + "\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(UFS_REPEAT, result.stdout)
+        self.journal_add(UFS_PWRUP + "\n" + "\n".join(UFS_TIMEOUT) + "\nkernel: " + UFS_COUNTS_FAILED + "\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL the UFS PHY or host failed to come up this boot (4 lines; ", result.stdout)
+        listing = result.stdout[result.stdout.index("FAIL the UFS PHY or host failed"):]
+        for line in (UFS_REPEAT, UFS_COUNTS.format(count=2), UFS_COUNTS_FAILED):
+            with self.subTest(line):
+                self.assertIn("kernel: " + line + "\n", listing)
+
     def test_checks_see_the_ufs_phy_through_the_diagnostic_s_lines(self):
         """Revision 8: the PCS reset logs nothing; on the kit's kernel the
         diagnostic logs each calibration of the UFS PHY.  A calibration that
@@ -10901,7 +10924,8 @@ class ScriptsTest(unittest.TestCase):
                      "`PCIe came back (no host failure line)`",
                      # Revision 11: what it is, its guard, why its first boot is
                      # safe, and its runs.
-                     "**Revision 11** (written 2026-11-23, not built yet) is revision 10 plus `pcie_0_gdsc`, the "
+                     "**Revision 11** (built 2026-11-23, kernel build ID df3a9340c136, on squirtle from 23:06 that "
+                     "day; five runs, below, \"Revision 11: results\") is revision 10 plus `pcie_0_gdsc`, the "
                      "PCIe host's power domain, collapsed in a system suspend in which the host has powered itself "
                      "down and kept on while the host keeps its link (a guard), and a debug switch that lets the "
                      "PCIe root port go to D3hot in a system suspend.",
@@ -10909,9 +10933,18 @@ class ScriptsTest(unittest.TestCase):
                      "`APPLY_SM8550_PCIE0_GDSC_OFF=1` and `APPLY_SM8550_PCIE0_GDSC_GUARD=1`",
                      "With the guard the panel cycle keeps the domain on by construction: the root port is in D0 "
                      "then, the host keeps its link, and the root port's switch cannot be set before the system "
-                     "is up. That has not run either",
+                     "is up. On squirtle's first boot of revision 11 (2026-11-23 23:06) the panel cycle logged `the "
+                     "link was kept, and its power domain stayed on`",
                      "| `/sys/module/pcie_qcom/parameters/debug_root_port_d3` (revision 11) | `N` | `root-port-d3` |",
-                     "**Revision 11: the runs** (none has run; the kernel is not built yet).",
+                     "**Revision 11: the runs** (written before the kernel was built; what ran is below, "
+                     "\"Revision 11: results\").",
+                     # What ran: the five runs, from their logs.
+                     "**Revision 11: results** (2026-11-23, squirtle, steps 2 to 6 above, one 30 s cycle each,",
+                     "no run logged a `setup_clocks repeated` line: the power reference fix held in all five.",
+                     "The `rpmh sleep set: no flush before the sleep` lines of runs 1, 4 and 5 were the test's "
+                     "mistake, not the kernel's",
+                     "on revision 11, with this patch, 3 times of 3 with the host powered down, once with the root "
+                     "port removed and twice with it in D3hot",
                      "1. **Install and check.**",
                      "No drop-in is needed: the guard keeps `pcie_0_gdsc` on in the boot's panel cycle by "
                      "construction",

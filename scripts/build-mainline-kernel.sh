@@ -487,9 +487,10 @@ apply_unless 'Retention across system suspend, as on sm8650' \
 # a system suspend, and GENPD_FLAG_ACTIVE_WAKEUP, so that genpd leaves it on
 # for a device of it on the awake path, which the guard's other half below
 # makes of a PCIe host that keeps its link.  On the SM-X710 a sleep with the
-# PCIe host powered down (its root port removed) and the interconnect floor
-# released returned only with that GDSC collapsed (kit revisions 9 and 10:
-# 7 of 7 with it, 0 of 8 without).  Upstream keeps it in retention
+# PCIe host powered down (its root port removed, or in D3hot through kit
+# revision 11's switch) and the interconnect floor released returned only
+# with that GDSC collapsed (kit revisions 9 to 11: 12 of 12 with it, 0 of 8
+# without).  Upstream keeps it in retention
 # (967e011013ed) because a host that keeps its link through the suspend
 # loses its controller when the GDSC collapses, and on this port every
 # suspend that keeps the Wi-Fi, the boot's panel cycle included, keeps the

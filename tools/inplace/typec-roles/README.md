@@ -172,7 +172,9 @@ The inline crypto engine's driver keeps its core clock and the UFS AHB
 clock enabled from its probe on, which no upstream commit changes:
 `gcc_ufs_phy_ice_core_clk`, under XO, stays enabled with revision 10 too.
 
-**Revision 11** (written 2026-11-23, not built yet) is revision 10 plus
+**Revision 11** (built 2026-11-23, kernel build ID df3a9340c136, on
+squirtle from 23:06 that day; five runs, below, "Revision 11: results") is
+revision 10 plus
 `pcie_0_gdsc`, the PCIe host's power domain, collapsed in a system suspend
 in which the host has powered itself down and kept on while the host keeps
 its link (a guard), and a debug switch that lets the PCIe root port go to
@@ -194,7 +196,9 @@ tablets' builds get them (no board check):
   interconnect floor released the sleep came back 9 times of 9 with it
   (twice without the storage, revision 9's run 3 and revision 10's run 5:
   the UFS PHY's power reference, below) and 0 times of 8 without it
-  (revisions 7, 9 and 10). Nothing else changes:
+  (revisions 7, 9 and 10); on revision 11, with this patch, 3 times of 3
+  with the host powered down, once with the root port removed and twice
+  with it in D3hot (below, "Revision 11: results"). Nothing else changes:
   `pcie_0_phy_gdsc`, the PCIe1 and USB domains keep their states;
 - the guard, in two halves. The same patch gives the domain's genpd
   `GENPD_FLAG_ACTIVE_WAKEUP` (one line more in `pcie_0_gdsc`'s entry), and
@@ -269,9 +273,12 @@ predicted outcome, read from the source and two reports, was a Wi-Fi lost
 until the next boot, or a panic at every boot. With the guard the panel
 cycle keeps the domain on by construction: the root port is in D0 then,
 the host keeps its link, and the root port's switch cannot be set before
-the system is up. That has not run either: `verify.sh` checks the guard's
-line of the boot's first suspend and the Wi-Fi after it, and "Revision 11:
-the runs" (below) says what each outcome means.
+the system is up. On squirtle's first boot of revision 11 (2026-11-23
+23:06) the panel cycle logged `the link was kept, and its power domain
+stayed on`, and ath11k loaded its firmware again after it
+(`squirtle-r11-first-boot-kernel-20261123.txt` in the backups). `verify.sh`
+checks the guard's line of the boot's first suspend and the Wi-Fi after it,
+and "Revision 11: the runs" (below) says what each outcome means.
 
 **Revision 11 also fixes the UFS PHY's power reference**, in every build of
 both tablets: no build variable and no board check, so a default build
@@ -1166,7 +1173,8 @@ collapse still did not come. And the three upstream fixes do not cure the
 hang itself (run 4): with the root port removed, `pcie_0_gdsc` still has to
 be let off (`gdsc=pcie0`) for the sleep to return.
 
-**Revision 11: the runs** (none has run; the kernel is not built yet). In
+**Revision 11: the runs** (written before the kernel was built; what ran is
+below, "Revision 11: results"). In
 this order, each in a boot of its own (every run ends in a restart),
 undocked on the PC's USB cable, without touching the screen, and each
 sleep-test command after the check of its checksum:
@@ -1334,6 +1342,67 @@ panel cycle would then power the host down and up as well, at every boot:
 a link training more in it (0.27 s in revision 10's resumes, up to 3.7 s
 before the link wait gives up), and the Wi-Fi's firmware load that ath11k
 does after every suspend already.
+
+**Revision 11: results** (2026-11-23, squirtle, steps 2 to 6 above, one
+30 s cycle each, run over SSH on the PC's USB cable, 10.42.0.2; logs
+`squirtle-sleep-r11-*-20261123.log` and their pstore directories in the
+backups). Every run came back from its sleep and
+ended in its restart with every disk filesystem frozen and the storage read
+back as before, every verdict with `switches: pcie0 Y, pcie0phy N, usb N,
+cxmx N` and `at boot: pcie0 Y`. Each resume's UFS PHY power-up logged
+`power-up sequence entry: PHY power_count 1 ... host reference held` and a
+calibration entry with `PWRDN 0x1`, and no run logged a `setup_clocks
+repeated` line: the power reference fix held in all five.
+1. 23:10, step 2 (`mode=s2idle pci=remove rpmh`): SHALLOW (s2idle), asleep
+   31.2 s, woken by the RTC. The host's suspend logged `Timeout waiting for L2
+   entry! LTSSM: 0x11` (no device behind the removed port), then at the
+   resume `the host powered down, and genpd powered its power domain off` and
+   `PCIe Gen.2 x1 link up`. genpd powered off `cx +1`, `pcie_0_gdsc +1`,
+   `pcie_0_phy_gdsc +1`; `aosd +0 cxsd +0 ddr +1275`, 28.1 s of the DDR in
+   its low-power mode (0xd4), `adsp +1462` in 31.5 s.
+2. 23:23, step 3 (`pci=keep`, deep): SHALLOW. No link-up line: the host kept
+   its link, `the link was kept, and its power domain stayed on`, and the
+   Wi-Fi was back (`ath11k firmware loads 1`); genpd `cx +0`,
+   `pcie_0_gdsc +0`; `aosd +0 cxsd +0 ddr +0`, the DDR 30.1 s at 200 MHz
+   without its low-power mode, `adsp +1046` in 33.5 s.
+3. 23:37, step 4 (`pm_test=platform pci=keep root-port-d3`, the floor held):
+   PM-TEST platform. `Timeout waiting for L2 entry! LTSSM: 0x12`, then `the
+   host powered down, and genpd powered its power domain off`, `PCIe Gen.2 x1
+   link up`, and the Wi-Fi back (`ath11k_pci D0 5.0 GT/s PCIe; no Wi-Fi
+   failure line; ath11k firmware loads 1`): the root port's switch's first
+   use.
+4. 23:42, step 5 (`mode=s2idle pci=keep root-port-d3 rpmh`): SHALLOW
+   (s2idle), asleep 30.4 s, woken by the RTC: run 3's PCIe lines, the host
+   down with the Wi-Fi bound, the link up 0.27 s into the resume (`noirq
+   resume of devices complete after 274.527 msecs`), the Wi-Fi back with
+   one firmware load; genpd `cx +1`, `pcie_0_gdsc +1`; `aosd +0 cxsd +0 ddr
+   +1261`, 27.5 s in low power, `adsp +1542` in 32.6 s. The depth of run 1
+   with the Wi-Fi kept.
+5. 23:58, step 6 (run 4's options with `sensors=stop`): SHALLOW (s2idle),
+   asleep 30.9 s: run 4's PCIe and Wi-Fi lines, and `adsp +0` with the
+   audio DSP asleep for 34.1 s, its interrupts `ipcc_0 +2, aoss-qmp +2`,
+   `ddr +1` with the DDR in its low-power mode for all 30.9 s, and still
+   `aosd +0 cxsd +0`. After its stop iio-sensor-proxy read `failed`
+   (systemctl stop status 0).
+
+So on revision 11 the PCIe host powers down with the Wi-Fi bound and comes
+back with it through the root port's D3hot (3 of 3, one of them at
+pm_test), the guard keeps the domain on under a kept link (run 2 and the
+first boot's panel cycle), the sleep came back every time, and the storage
+with it. No run reached AOSS sleep or CX collapse. Run 5 had the DDR in
+self-refresh and the audio DSP asleep for the whole sleep, so what is
+missing there is XO's shutdown, which comes before CX collapse; revision
+12 is for what holds XO and CX (below). The `rpmh sleep set: no flush
+before the sleep` lines of runs 1, 4 and 5 were the test's mistake, not the
+kernel's: in a suspend-to-idle the last CPU flushes the sleep set at the
+sleep's entry, within the same microsecond as `Timekeeping suspended`'s
+stamp, which the test took for after it (its `rpmh` reads this right from
+revision 12's `sleep-test.sh` on). Before each sleep, awake, `XO held by`
+listed the USB controller's clocks (the PC's cable), the PCIe host's, three
+serial engines, the inline crypto engine's core clock, `tcsr_*_clkref_en`
+and, in runs 2 and 5, `disp_cc_mdss_ahb_clk 0/1` (prepared, not enabled);
+in runs 1, 3 and 4 the display's clocks were enabled as well
+(`disp_cc_mdss_ahb_clk 4/4` and the byte, pixel and MDP clocks).
 
 `fstrim.timer` (weekly) would, if it fired during a run, send discards to
 the read-only disk, which the block layer logs as a write and the run

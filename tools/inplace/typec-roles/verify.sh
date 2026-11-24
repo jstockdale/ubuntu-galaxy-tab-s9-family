@@ -497,9 +497,12 @@ fi
 # logs a line at every calibration, from inside the function that now resets
 # the PCS on every SM8550 PHY: on the kit's kernel those lines are what can
 # be seen of the change, and make-kit.sh checked on the build that this
-# calibration has no board check.  On any other kernel nothing tells.
+# calibration has no board check.  On any other kernel nothing tells.  The
+# lines shown with a failure are sleep-test.sh's ufs_diag: revisions 8 and
+# 10's UFS PHY diagnostics, and revision 11's ufs-qcom one (the counts at a
+# power-up sequence's entry, a failed sequence, a setup_clocks repeat).
 ufs_fail='phy initialization timed-out|Failed to calibrate PHY|Enabling the controller failed|Host init failed|ufshcd_wl_resume failed'
-ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET|power-up write: PWRDN'
+ufs_diag='calibration entry: SW_RESET|after the PCS_READY timeout: SW_RESET|PCS_READY .*SERDES_START|1 s after SERDES_START: SW_RESET|power-up write: PWRDN|power-up sequence entry: PHY power_count|power-up sequence failed, before phy_exit|setup_clocks repeated a PHY power-'
 # The PCIe host and its PHY log two of those failures in the same words
 # ("qcom-pcie 1c00000.pcie: Host init failed: -16", "qcom-qmp-pcie-phy
 # 1c06000.phy: phy initialization timed-out"): their lines are the PCIe

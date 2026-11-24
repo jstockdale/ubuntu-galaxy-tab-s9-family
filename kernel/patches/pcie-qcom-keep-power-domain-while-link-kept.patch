@@ -49,7 +49,7 @@ gcc-sm8550-pcie0-gdsc-off-in-suspend.patch gives pcie_0_gdsc.
 
 Why.  pcie_0_gdsc PWRSTS_OFF_ON (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch)
 is what the SM-X710's sleeps with the PCIe host powered down needed (kit
-revisions 9 and 10: 7 of 7 with it collapsed, 0 of 8 without), and it
+revisions 9 to 11: 12 of 12 with it collapsed, 0 of 8 without), and it
 collapsed the domain under a host that kept its link as well: every
 suspend with the Wi-Fi bound, the boot's panel cycle among them.  967e011013ed
 upstream keeps the PCIe GDSCs in retention for that reason.  With the guard
