@@ -421,7 +421,9 @@ param_is try_snk_extra_wait_ms 600
 # (gcc-sm8550-pcie0-gdsc-off-in-suspend.patch) boots with pcie_0_gdsc
 # PWRSTS_OFF_ON: its switch reads Y, the others N, and debug_boot_state
 # says so ("pcie0 Y, pcie0phy N, usb N").  Revision 11 adds a sixth, the
-# root port's (pcie-qcom-debug-root-port-d3.patch), N at every boot.  On the
+# root port's (pcie-qcom-debug-root-port-d3.patch), N at every boot, and
+# revision 12 a seventh, the AOP's CXPC log
+# (qcom-stats-cxpc-violators-diagnostic.patch), N at every boot.  On the
 # kit's kernel each has to be there and read as it boots: sleep-test.sh
 # changes them for a run only, and every run ends in a restart.  Another
 # kernel may have none (revision 8 and before), or boot with every one N
@@ -438,7 +440,8 @@ for sw in gcc_sm8550.debug_pcie0_off:/sys/module/gcc_sm8550/parameters/debug_pci
 	gcc_sm8550.debug_pcie0_phy_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off:N \
 	gcc_sm8550.debug_usb_off:/sys/module/gcc_sm8550/parameters/debug_usb_off:N \
 	rpmhpd.debug_ret_floor:/sys/module/rpmhpd/parameters/debug_ret_floor:N \
-	pcie_qcom.debug_root_port_d3:/sys/module/pcie_qcom/parameters/debug_root_port_d3:N; do
+	pcie_qcom.debug_root_port_d3:/sys/module/pcie_qcom/parameters/debug_root_port_d3:N \
+	qcom_stats.debug_cxpc_violators:/sys/module/qcom_stats/parameters/debug_cxpc_violators:N; do
 	name=${sw%%:*} rest=${sw#*:}
 	file=${rest%:*} boot=${rest##*:}
 	v=$(cat "$file" 2>/dev/null)
@@ -458,7 +461,7 @@ if [ -z "$want" ] || [ "$id" != "$want" ]; then
 	if [ -n "$sw_others" ]; then
 		note "debug switches of the running kernel, which is not the kit's:$sw_others${b:+ (at boot: $b)}"
 	else
-		note 'the running kernel is not the kit'"'"'s and offers no debug switches (the kernels of revisions 9 to 11 have them, the root port'"'"'s from revision 11)'
+		note 'the running kernel is not the kit'"'"'s and offers no debug switches (the kernels of revisions 9 to 12 have them, the root port'"'"'s from revision 11, the CXPC log'"'"'s from revision 12)'
 	fi
 fi
 

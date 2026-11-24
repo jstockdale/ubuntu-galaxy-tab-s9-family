@@ -43,7 +43,7 @@
 # suspend and resume (console_suspend N), at a cost: read the risks below
 # first.  gdsc=LIST (pcie0, pcie0phy and usb, comma-separated; with
 # pci=remove only), gdsc-ret=pcie0 and cxmx=ret set the kernel's debug
-# switches (the kernels of revisions 9 to 11) right before the freeze, until
+# switches (the kernels of revisions 9 to 12) right before the freeze, until
 # the restart: the PCIe and USB GDSCs collapse in the sleep instead of
 # staying on, pcie_0_gdsc stays on (in retention) where revision 11 lets it
 # collapse, and the CX and MX votes stay at RETENTION or above.  Every run
@@ -412,7 +412,7 @@
 #     past which the run ends with NO-SLEEP (s2idle).  A cycle in which no
 #     CPU entered its s2idle state and no such wakeup explains it FAILs.
 #   - gdsc=LIST, gdsc-ret=pcie0 and cxmx=ret (ro and dry; the kernels of
-#     revisions 9 to 11): the kernel's debug switches, run-time module
+#     revisions 9 to 12): the kernel's debug switches, run-time module
 #     parameters that nothing but root's write changes
 #     (gcc-sm8550-gdsc-debug-switches.patch, rpmhpd-debug-retention-floor.patch):
 #       pcie0     gcc_sm8550 debug_pcie0_off: pcie_0_gdsc OFF_ON (Y), not RET_ON (N)
@@ -522,6 +522,13 @@
 #     it), so start it by hand only knowing that.  Auto-rotation and
 #     auto-brightness are off until then.  The options name it in every
 #     RESULT line.
+#   - sensors=hook (ro): the same stop the way a systemctl suspend makes it,
+#     through the device package's system-sleep hook ($sensors_hook pre
+#     suspend), which stops the sensors' resume unit, then iio-sensor-proxy
+#     and hexagonrpcd-adsp-sensorspd, each before the next; the same checks
+#     after it.  Refused where the hook does not stop iio-sensor-proxy (a
+#     device package before that hook): sensors=stop then.  Nothing runs
+#     its post; the restart brings them back.
 #   - rpmh (ro): what of Linux's own votes stands in the way of XO shutdown,
 #     CX collapse and AOSS sleep (cxsd, aosd), from the commands that
 #     rpmh-rsc writes to the application processor's RSC (the tracepoint
@@ -3778,7 +3785,7 @@ for swn in $sw_set $sw_ret; do
 	[ -e "$swf" ] && [ -w "$swf" ] && continue
 	[ "$swn" != cxpc ] ||
 		refuse "cxpc needs the CXPC violators switch ($swf): the kernels of kit revision 12 have it (sh ~/typec-roles/verify.sh says which kernel runs)"
-	refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 to 11 have it, revision 11's alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"
+	refuse "this kernel does not offer the debug switch $swn ($swf): the kernels of kit revisions 9 to 12 have it, those of revisions 11 and 12 alone the root port's (sh ~/typec-roles/verify.sh says which kernel runs)"
 done
 # Each switch as it booted (sw_boot): N, but pcie0 Y on revision 11's
 # kernel.  One that reads otherwise was written since the boot.
