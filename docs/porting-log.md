@@ -10278,3 +10278,119 @@ patch of its own); whether ufs-qcom's host reset (`GCC_UFS_PHY_BCR`) also
 resets the PHY's PCS; the race's rate; the 2026-11-21 failure and the
 SM-X910's of September, which fit this and were not checked; and when to
 drop the PCS reset.
+
+### Kit revisions 11 and 12 on squirtle: every sleep comes back, and two UARTs are XO's last holders (2026-11-23 and 24)
+
+Revision 11 (kernel build ID df3a9340c136, on squirtle from 2026-11-23
+23:06) ran five 30 s sleeps that day (its README, "Revision 11: results"):
+every one came back with the storage, each resume's UFS PHY power-up
+logging the power reference held, the PCIe host powered down with the
+Wi-Fi bound and back through the root port's D3hot three times of three,
+and the guard keeping `pcie_0_gdsc` on under a kept link. None reached AOSS
+sleep or CX collapse; in run 5 the DDR was in self-refresh and the audio
+DSP asleep for the whole sleep.
+
+Revision 12 was built on 2026-11-24 from 0d3ed8a (kernel build ID
+`530d06f4c80411074f122038bdecb13c3db789ef`, `boot.img` sha256
+`9bca1427d84dc351ec0b050ae52fc43bf874af279f19e7386edcfb5688c572ec`, the
+module key of revisions 1 to 11) and installed over revision 11 at 08:45
+with one command and one reboot. The boot's panel cycle ran with the DSI
+PHY's AHB clock released and the screen came back; `verify.sh` gave 27
+`ok` and no `FAIL`. The microphone, with the VA macro on the PM clock
+framework: sound capture works in use (it picks up the voice); the level
+meter in Settings was not confirmed. The dim screen after a test's restart
+is userspace's: systemd-backlight restores the 81 of 2047 it saved, the
+boot clamps that to 102, and the run's `sysrq b` restart never saves a new
+value; not the kernel's and not revision 12's.
+
+Its first sleep (09:53, suspend-to-idle, 30 s, on the PC's cable, `pci=keep
+root-port-d3 rpmh cxpc sensors=stop`): back, the UFS read back as before,
+`aosd +0 cxsd +0 ddr +1`, the DDR in its low-power mode for the whole 31.4
+s. The RPMh sets were flushed at the sleep's entry (16 commands) with
+`xo.lvl`, `cx.lvl` (active 0) and `mx.lvl` left out, so XO stayed at its
+vote. The clock trace answered what held it: `XO still voted at the entry
+to the sleep, held by: gcc_qupv3_wrap1_s7_clk, gcc_qupv3_wrap2_s6_clk`,
+the debug UART (uart7, the console `ttyMSM0`) and the Bluetooth UART
+(uart14); every other clock that held XO awake was unprepared in the
+suspend, the DSI PHY's AHB clock among them (revision 12's patch doing its
+part), USB's, PCIe's, the inline crypto engine's, the GPU's AHB clock and
+the `tcsr` clock references. The AOP's CXPC log printed 26 lines that are
+not a CXPC log (below). Log:
+`backups/squirtle-sleep-r12-1-s2idle-cable-20261124.log`.
+
+### Kit revision 13: the two UARTs released in system sleep, and the CXPC log's region raw, written, not built (2026-11-24)
+
+Why the UARTs hold their clocks (7.2-rc3, read in the source): both ports
+are in use, and in use a geni UART holds one runtime PM reference, taken
+by the serial core's power state `UART_PM_STATE_ON` through the driver's
+`.pm` callback (`qcom_geni_serial_pm()`, `pm_runtime_resume_and_get()`):
+the console's from `uart_configure_port()`, which leaves a console port on,
+the Bluetooth UART's from `uart_port_startup()` when hci_qca opens it
+through serdev. At system suspend `qcom_geni_serial_suspend()` calls
+`uart_suspend_port()`, which (with `console_suspend` Y and the tty's wakeup
+disabled, both read on squirtle) stops the port, masks its interrupt and
+sets the state OFF, and `qcom_geni_serial_pm()` drops the reference with
+`pm_runtime_put_sync()`. But `device_prepare()` took a reference of the PM
+core's own for the whole transition (`pm_runtime_get_noresume()`,
+drivers/base/power/main.c), so the count stays above 0, the runtime suspend
+callback never runs, and `geni_se_resources_off()` never unprepares the
+`se` clock; `device_suspend_late()` then disables runtime PM with the port
+active. The port's QUP bandwidth vote and its CX performance vote stay
+too. Samsung's driver never sleeps with either: its HS UARTs are powered
+by the Bluetooth HAL's vote and a still-active one fails the suspend
+(`-EBUSY` in `suspend_noirq`), and an always-on-clock port is
+force-suspended in `.suspend`; its X710 DTB has no geni console at all.
+
+Mainline fixed it in v7.3-rc1, d0cd9c8d0fd5 ("serial: qcom-geni: add force
+suspend/resume to system sleep callbacks"), and 3098c989bd38 (v7.3-rc6)
+fixed the unbalanced `pm_runtime_enable()` it left for a console with
+`no_console_suspend`; v7.4-rc4 has both unchanged. The later rework
+(aee1f94dab13, removing the `.pm` callback, v7.3-rc1) and the two fixes it
+needed (2de1066dc859, e95442c31ae6) are not taken: with the callback kept,
+`uart_resume_port()`'s power-on is what brings the console back.
+`kernel/patches/qcom-geni-serial-force-suspend-in-system-sleep.patch` is
+the two, folded, behind `APPLY_GENI_SERIAL_FORCE_SUSPEND=1`, both boards
+(the Ultra has the same two UARTs, WCN7850 behind the Bluetooth one), with
+or without the SM-X710's Bluetooth UART interrupt patch (another function;
+the interrupt is masked by `shutdown()` before the clocks go off and
+unmasked by `startup()` after they are back). Nothing writes to an
+unclocked engine: every console is suspended from before the devices'
+suspend to after their resume, and hci_qca queues without sending from its
+suspend (before the UART's) to its resume (after it). Compiled for arm64
+with `W=1`, no warning; the object's suspend callback calls
+`pm_runtime_force_suspend()` and its resume `pm_runtime_force_resume()`.
+Not built into a kernel, not run.
+
+The CXPC log: the decode was Samsung's own (`sys_pm_vx.c`
+`read_vx_data()`: the type and size in the first word, duration, shift and
+flush in the second, then per line a time word and a byte per requester in
+words); what it read was not a log in that format. The header said mode
+`0xdb` (Samsung's decoder knows `0xaa`, `0xcc`, `0xdd`), 16 ms, shift 50,
+flush 1, for a message that asked for cxpc, 1000 ms, flush 10; in every
+line the requesters at byte 0 of the six words (TZ, SECPROC, GPU, TME_HW,
+WLAN BB, DDR AUX) were set and the bytes around them mostly 0, i.e. 32-bit
+words with small values; rebuilt from the printed bytes, the region holds
+runs of repeated words and word pairs (`0x0b` six times, then `0x1f4` and
+`0x66` alternating, `0x1020`, `0x1202`, ...) and words like `0x58a2c1e5`
+that grow from one to the next. Whether the AOP wrote it in answer to the
+message (before the message the region's first or second word was 0: "no
+log"), and what it is, cannot be told from the decoded lines. Revision 13's
+diagnostic decodes only under a CXPC header (`summary: not a CXPC log`
+otherwise) and logs the region raw right before the message, right after it
+and after the suspend, and `sleep-test.sh cxpc` reads it raw before
+anything is frozen; the next run settles it.
+
+`sleep-test.sh` now says, from the clock trace, whether each UART's clock
+was unprepared before the sleep and when it was prepared again, and after
+each sleep whether Bluetooth lost its interrupt or its controller; the raw
+CXPC lines are their own evidence lines. `verify.sh` checks Bluetooth after
+the boot's first suspend (the panel cycle) and the console's tty wakeup.
+The same patch drops the Bluetooth UART's QUP2 bandwidth vote, which its
+interconnect tag kept in the sleep set (the flush had no `QUP2` command:
+its sleep vote equalled its wake vote; inferred). What could still hold XO
+or CX once the UARTs let go, from run 1's evidence alone, is in the r13
+report (`backups/kit-r13-prep-2026-11-24.md`): XO's own consumer counted
+before the sleep (`bi_tcxo itself 1`, by the counts the USB PHY's reference
+clock, which goes with the PHY's other clocks in the suspend: inferred),
+`mx.lvl` left out of the sleep set with no vote in the trace, and the other
+requesters, which only the AOP can name.

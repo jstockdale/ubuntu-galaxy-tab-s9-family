@@ -614,6 +614,19 @@ revision 9)", below). Revision 10 adds the second diagnostic above, and
 revision 11 the fix of the PHY power reference and its diagnostic ("The PHY
 power reference (2026-11-23)", above).
 
+Revision 11's five sleeps (2026-11-23, suspend-to-idle and deep, one with
+`pm_test=platform`) and revision 12's first (2026-11-24 09:53,
+suspend-to-idle, kernel build ID 530d06f4c804) all came back with the
+storage: each resume's power-up logged `power-up sequence entry: PHY
+power_count 1 ... host reference held` and a calibration entry with `PWRDN
+0x1`, no run logged a `setup_clocks repeated` line, and the userdata read
+matched every time (the kit's README, "Revision 11: results" and
+"Revision 12: results"). None reached AOSS sleep or CX collapse. Revision
+13 (written 2026-11-24, not built) changes nothing on the storage's path:
+it releases the console's and the Bluetooth UART's clocks in system sleep
+(upstream d0cd9c8d0fd5) and logs the AOP's CXPC region raw; the sleep
+test's protection is the same.
+
 The sleep test also has experiment options, each off unless given (the
 kit's README, "The experiment options", has the details and the risks):
 
