@@ -1006,6 +1006,25 @@ sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [m
      [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok
 ```
 
+**Both boards (2026-11-25).** The same script runs on the SM-X910 too,
+packed by its Type-C kit from revision 8 on
+([`../typec-roles-ultra/README.md`](../typec-roles-ultra/README.md)). It
+reads the board from the running DT and differs there in three things,
+each read on the tablets: the Wi-Fi's driver it judges (`ath12k_wifi7_pci`
+for `ath11k_pci`), the touch controller's interrupt it names in an aborted
+attempt (`goodix-berlin` for `fts1ba90a`), and the interconnect floor: that
+board has no late release, so every boot holds it and `release-floor`
+releases it in the run itself, by the late release's own rule (the
+providers that wait for the two unbound bandwidth monitors alone, all or
+none; refused when anything else holds one back), and the boot after the
+run holds it again. A run there also refuses to start with Bluetooth and
+Wi-Fi both off. On the SM-X710 nothing changes. A new option, `pmic`, for
+both boards and off unless given: PMK8550's SDAM (the power-on and the
+over-current logs) read before the run and after each sleep, read only,
+each cycle's evidence saying whether they changed and a new over-current
+entry getting its own `SLEEP-TEST PMIC:` line. Nothing of the SM-X910's
+side has run on a tablet.
+
 Each run freezes every disk filesystem and **ends with a restart of the
 tablet** (`sysrq b`), whatever happens: `restart-ok` says that is fine, and
 without it nothing is done. One exception, always before any sleep: a
@@ -1030,8 +1049,8 @@ log, a new SSH login. Reading works: `sh ~/typec-roles/sleep-test.sh status`
 
 In order:
 
-1. It refuses, with nothing changed, unless it runs as root on an SM-X710,
-   `/sys/power/mem_sleep` offers `deep` (with `mode=s2idle` instead:
+1. It refuses, with nothing changed, unless it runs as root on an SM-X710
+   or an SM-X910, `/sys/power/mem_sleep` offers `deep` (with `mode=s2idle` instead:
    `/sys/power/state` offers `freeze` and a cpuidle state of cpu0 has an
    s2idle entry; `mem_sleep` is neither needed nor touched), the RTC can
    wake the tablet, userdata is a partition of a writable UFS LUN,
@@ -1039,7 +1058,8 @@ In order:
    resume with a filesystem
    frozen logs one kernel warning, and writers waiting on the frozen disk
    are reported as hung tasks after 60 s: either would otherwise panic the
-   tablet in the middle of the run), the root filesystem is writable, ext4
+   tablet in the middle of the run; the SM-X910's kernel has no hung task
+   detector, so no `hung_task_panic`, and the record says so), the root filesystem is writable, ext4
    has recorded no error on it (`/sys/fs/ext4/<dev>/errors_count` is 0 and
    `dumpe2fs -h` says `clean`; otherwise it needs `e2fsck -f` from recovery
    first), every writable disk filesystem is ext4 (exfat, the SD card's,

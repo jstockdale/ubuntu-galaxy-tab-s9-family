@@ -1,10 +1,11 @@
 #!/bin/sh
-# Deep sleeps of the SM-X710 with every disk filesystem frozen, to test
-# whether the UFS storage comes back, without risking the data on it.
+# Deep sleeps of the SM-X710 or the SM-X910 with every disk filesystem
+# frozen, to test whether the UFS storage comes back, without risking the
+# data on it.
 #   sudo sh ~/typec-roles/sleep-test.sh ro [CYCLES] [SECONDS] [release-floor] [hold=S] [aborts=N]
 #        [pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]
 #        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]
-#        [cxpc] [sensors=stop|sensors=hook] restart-ok
+#        [cxpc] [sensors=stop|sensors=hook] [pmic] restart-ok
 #   sudo sh ~/typec-roles/sleep-test.sh dry [release-floor] [hold=S] [pci=remove] [mode=s2idle]
 #        [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok
 #   sh ~/typec-roles/sleep-test.sh status
@@ -68,7 +69,8 @@
 #     userdata partition, kernel.panic_on_warn and kernel.hung_task_panic 0
 #     (the first resume with a filesystem frozen logs one kernel warning,
 #     below, and writers that wait on a frozen filesystem are reported as
-#     hung tasks after 60 s), a root filesystem with no recorded error
+#     hung tasks after 60 s; a kernel without the hung task detector, the
+#     SM-X910's, has no hung_task_panic), a root filesystem with no recorded error
 #     (ext4's error count 0 and state clean), no writable disk filesystem
 #     but ext4 ones (those are frozen; exfat and the like cannot be: unmount
 #     them first), none of them mounted where /proc/1/mounts has to escape
@@ -233,9 +235,18 @@
 # ext4_freeze) flushes the journal, clears needs_recovery, keeps
 # orphan_present while the orphan file holds entries, and records no error;
 # thawing undoes it (ext4_unfreeze).
-# Not for the SM-X910: it has its own RAM-root harness
-# (scripts/diagnostics/kernel10-ramroot-test), and this one knows the
-# SM-X710's partitions, units and interconnect floor only.
+# Both boards (2026-11-25).  The SM-X710 and the SM-X910 have the same
+# partitions and root, the same two UARTs, the same PCIe0 topology and the
+# same sleep path; what differs, by a read on each tablet, is the Wi-Fi's PCI
+# driver (ath11k_pci, ath12k_wifi7_pci), the touch controller's IRQ
+# (fts1ba90a, goodix-berlin) and how the interconnect floor is released
+# (below); board_table has them.  On the SM-X910 a run (ro) also refuses to
+# start with Bluetooth and Wi-Fi both off (neither rfkill unblocked): what it
+# is for there first is whether PM8550 L15B, which feeds the radio chip's
+# I/O, holds through a whole-SoC sleep with a radio on.  On the SM-X710 that
+# is settled (Type-C kit revision 14's run 1), and its runs are as before.
+# The SM-X910's older RAM-root harness is
+# scripts/diagnostics/kernel10-ramroot-test.
 #
 # The interconnect floor.  ubuntu-gts9u-icc-late-release releases it about
 # 45 s into a boot.  It holds it while /etc/ubuntu-gts9u/icc-hold exists, and
@@ -249,6 +260,15 @@
 # writable disk clears its marker: the boot after a run in a boot that
 # released the floor holds it once.  The run says so; the next run then needs
 # release-floor.  The breaker itself is left as it is.
+# The SM-X910 has no late release (that unit and its helper are the
+# SM-X710's), so every boot there holds the floor.  There release-floor
+# writes "1" to state_synced itself, by the helper's rule (icc_plan): every
+# interconnect provider that has not synced and waits for nothing but the two
+# DDR bandwidth monitors, with no driver bound, all of them or none, and
+# never rpmhpd, gcc or gpu_cc.  It is refused when anything else holds one
+# back (the crypto engine, on a kernel without
+# kernel/dts/gts9u-sync-state.dtso), and while icc-hold exists.  The boot
+# after the run holds the floor again: no loop breaker is needed there.
 #
 # The experiment options (2026-11-22), each off unless given; the run's
 # header line, its pmsg start line and every RESULT line name the ones in
@@ -603,6 +623,19 @@
 #     raw:" evidence lines, at most cxpc_raw_max), and the run reads it raw
 #     before anything is frozen too (qcom_stats/cxpc_violators_raw).
 #     Refused on a kernel without the switch, and with dry.
+#   - pmic (ro): the PMIC's own records, read only.  PMK8550's SDAM from
+#     0x7000 to 0x75ff, through the regmap's debugfs file of SPMI device
+#     0-00 (pmic_regs): the power-on log (what caused each reset and
+#     power-on) and, at 0x7076, the over-current log (three two-byte
+#     entries; 12 cf on the SM-X710 was PM8550's LDO15, L15B, which reset
+#     it in a deep sleep 5 times of 5).  Read once before anything is frozen
+#     (into the record and the run's directory) and after each sleep: each
+#     cycle's evidence says whether either changed, and a new over-current
+#     entry gets a SLEEP-TEST PMIC line of its own.  Nothing is written:
+#     not the SDAM, not the over-current log, not the PON spare register.
+#     A reset leaves no read after it: read the records as root in the next
+#     boot.  Refused where the file is not there or does not read as
+#     "7000: 00" lines, and with dry.
 set -u
 export LC_ALL=C
 umask 022
@@ -613,7 +646,11 @@ __ram) ;;
 *) kit=$(cd "$(dirname "$0")" && pwd) ;;
 esac
 base=/run/gts9u-sleep-test
-board=samsung,gts9wifi
+# The board (the header, "Both boards"): an SM-X710's values until
+# board_table, in the part on the disk, reads the running DT; the part in
+# RAM gets them from run.conf.
+board=samsung,gts9wifi board_name=SM-X710 wifi_drv=ath11k_pci wifi_word=ath11k touch_irq=fts1ba90a
+floor_by=unit radios_needed=0
 part=/dev/disk/by-partlabel/userdata
 rtc=rtc0
 # The system's root, from the run's own mount namespace and RAM root: the
@@ -748,7 +785,8 @@ pcie_down_re='[0-9a-f]+\.pcie: (PM: )?(Link failed to come up|Host init failed|f
 # the link (pci_power_up(), drivers/pci/pci.c), ath11k or MHI said a resume
 # step failed (ath11k_warn()/ath11k_err() lines of drivers/net/wireless/ath/
 # ath11k/core.c and pci.c, MHI's), or the root port reported an error.
-wifi_fail_re='Unable to change power state from [A-Za-z0-9]+ to D0, device inaccessible|ath11k_pci [0-9a-f:.]+: .*(failed|timeout|link down)|mhi mhi[0-9]+: .*(fail|[Ee]rror|timeout|not in valid state|Did not enter)|pcieport [0-9a-f:.]+: AER: '
+# ath12k's driver, the SM-X910's, logs as ath12k_wifi7_pci: either board's.
+wifi_fail_re='Unable to change power state from [A-Za-z0-9]+ to D0, device inaccessible|(ath11k_pci|ath12k_wifi7_pci) [0-9a-f:.]+: .*(failed|timeout|link down)|mhi mhi[0-9]+: .*(fail|[Ee]rror|timeout|not in valid state|Did not enter)|pcieport [0-9a-f:.]+: AER: '
 # ath11k's two lines for a country setting its firmware turned down
 # (ath11k_reg_handle_chan_list(), reg.c: "Failed to set the requested
 # Country regulatory setting"; ath11k_reg_chan_list_event(), wmi.c: "failed
@@ -759,16 +797,18 @@ wifi_fail_re='Unable to change power state from [A-Za-z0-9]+ to D0, device inacc
 # twice each, with the function back in D0, the firmware loaded again and
 # the SSH session over the Wi-Fi carrying on).  They are a note; with no
 # other line of wifi_fail_re, the function and its firmware say whether the
-# Wi-Fi came back (wifi_back).
-wifi_note_re='ath11k_pci [0-9a-f:.]+: (Failed to set the requested Country regulatory setting|failed to process regulatory info -?[0-9]+)'
+# Wi-Fi came back (wifi_back).  ath12k has the first of the two
+# (ath12k/reg.c).
+wifi_note_re='(ath11k_pci|ath12k_wifi7_pci) [0-9a-f:.]+: (Failed to set the requested Country regulatory setting|failed to process regulatory info -?[0-9]+)'
 # A line about the UFS or its disk (storage_lines) that says something
 # failed (this, without case) is never an aborted attempt, whatever it is:
 # a UFS device that refused to suspend, too.  "timing out command" and
 # "rejecting I/O to offline device" are the SCSI layer's (scsi_lib.c).
 storage_bad_re='fail|error|err[ =:]|timed?[ -]?out|timing out|abort|offline|rejecting'
-# The SM-X710's touch controller (samsung_fts1ba90a), by its IRQ's name in
-# /proc/interrupts: its double tap wakes the tablet.
-touch_irq=fts1ba90a
+# The touch controller, by its IRQ's name in /proc/interrupts (touch_irq,
+# board_table): its double tap wakes the tablet.  The SM-X710's is
+# samsung_fts1ba90a ("fts1ba90a"), the SM-X910's the Goodix Berlin
+# ("goodix-berlin"), both on msmgpio 25.
 # The pause before an aborted attempt's cycle is tried again.
 abort_pause=5
 # How long a freeze or a thaw may take (fsfreeze; the disk part synced just
@@ -891,7 +931,7 @@ ev_domains='^(cx|mx|mxc|mmcx|lcx|lmx|gfx|ebi|ufs_|usb|pcie|mdss|power-domain-clu
 # and not the Wi-Fi's per-packet noise, the CPUs' feature lines or the
 # hung-task reports of writers waiting on the frozen disk, nor the CXPC
 # log's raw region (its own evidence lines; cxpc_raw).
-ev_kernel='PM: |cxpc violators|psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110|nobody cared|Disabling IRQ|Bluetooth'
+ev_kernel='PM: |cxpc violators|psci|CPU[0-9]+( is up|: Booted| killed)|non-boot CPUs|Timekeeping|[Ww]ake|ufs|qmp|calibrat|SW_RESET|PCS_READY|SERDES|sd 0:|scsi|I/O error|EXT4|dwc3|xhci|usb [0-9]|typec|tcpm|PCIe|pcie|L2|LTSSM|mhi|ath11k|ath12k|remoteproc|q6v5|smp2p|ipcc|glink|rpmh|gdsc|genpd|icc|interconnect|qcom_stats|aoss|regulator|clk|WARNING|BUG|Freezing|Restarting|Filesystems sync|fail|error|timed? ?out|-110|nobody cared|Disabling IRQ|Bluetooth'
 ev_kernel_skip='msdu_done|SANITY CHECK|blocked for more than|hung_task_timeout_secs|Tainted:|cxpc violators: raw '
 ev_klines=150
 # How to reach TWRP from a running or looping tablet (docs/porting-log.md,
@@ -1266,6 +1306,119 @@ floor_state() {
 	fi
 }
 
+# The board (the header, "Both boards"), from the running DT's root
+# compatible, and what differs, each read on the tablet on 2026-11-25: the
+# Wi-Fi function's driver (/sys/bus/pci/devices/0000:01:00.0/driver), the
+# touch controller's IRQ (/proc/interrupts, msmgpio 25), whether the device
+# package releases the interconnect floor (floor_by unit: its
+# ubuntu-gts9u-icc-late-release, gated to the SM-X710) or only a run does
+# (run), and whether a run needs a radio on (radios_needed).  Fails on any
+# other board, which keeps the SM-X710's values.
+board_table() {
+	case " $(tr '\0' ' ' < /proc/device-tree/compatible 2>/dev/null) " in
+	*" samsung,gts9wifi "*) ;;
+	*" samsung,gts9uwifi "*)
+		board=samsung,gts9uwifi board_name=SM-X910 wifi_drv=ath12k_wifi7_pci wifi_word=ath12k
+		touch_irq=goodix-berlin floor_by=run radios_needed=1 ;;
+	*) return 1 ;;
+	esac
+}
+
+# A radio on: an rfkill of TYPE (bluetooth, wlan) that is unblocked (state
+# 1; 0 is blocked by software, 2 by hardware).
+radio_on() { # TYPE
+	for rf in /sys/class/rfkill/rfkill*; do
+		[ "$(cat "$rf/type" 2>/dev/null)" = "$1" ] && [ "$(cat "$rf/state" 2>/dev/null)" = 1 ] && return 0
+	done
+	return 1
+}
+
+# The SM-X910's release (floor_by run; the header): the interconnect
+# providers ubuntu-gts9u-icc-late-release would release, by its rule.  Sets
+# icc_eligible (their sysfs paths) and icc_blocked (why one cannot be, each
+# "NAME waits for CONSUMER(STATUS);").  Only managed links hold sync_state()
+# back, and an active one is satisfied ("not tracked" is an unmanaged one);
+# the only consumers allowed are the two DDR bandwidth monitors, with no
+# driver bound.  rpmhpd, gcc and gpu_cc are never in it.
+icc_plan() {
+	icc_eligible= icc_blocked=
+	for ip in /sys/bus/platform/devices/*; do
+		[ -e "$ip/state_synced" ] && [ -e "$ip/of_node/#interconnect-cells" ] || continue
+		case ${ip##*/} in
+		17a00000.rsc:power-controller|100000.clock-controller|3d90000.clock-controller) continue ;;
+		esac
+		is=
+		read -r is < "$ip/state_synced" 2>/dev/null
+		[ "$is" != 1 ] || continue
+		iok= ibad=
+		for il in "$ip"/consumer:*; do
+			[ -e "$il" ] || continue
+			ist=
+			read -r ist < "$il/status" 2>/dev/null
+			case ${ist:-unknown} in active|'not tracked') continue ;; esac
+			ic=$(readlink -f "$il/consumer" 2>/dev/null)
+			icn=${ic##*/}
+			case $icn in
+			24091000.pmu|240b6400.pmu)
+				if [ ! -e "$ic/driver" ] && tr '\0' '\n' < "$ic/of_node/compatible" 2>/dev/null | grep -q bwmon; then
+					iok="$iok $icn"
+					continue
+				fi ;;
+			esac
+			ibad="$ibad ${icn:-${il##*/consumer:}}(${ist:-unknown})"
+		done
+		if [ -n "$ibad" ]; then
+			icc_blocked="$icc_blocked ${ip##*/} waits for$ibad;"
+		elif [ -z "$iok" ]; then
+			icc_blocked="$icc_blocked ${ip##*/} reads state_synced ${is:-?} with no unbound consumer;"
+		else
+			icc_eligible="$icc_eligible $ip"
+		fi
+	done
+}
+
+# pmic (the header): PMK8550's SDAM, 0x7000 to 0x75ff, in the regmap's
+# debugfs lines ("7000: 00", nine bytes each), read only.  pmic_read OUT
+# fails unless all 0x600 lines came, the first one 0x7000's.  pmic_ocp
+# FILE: the over-current log's three two-byte entries, "12cf 0000 0000".
+pmic_regs=/sys/kernel/debug/regmap/0-00/registers
+pmic_read() { # OUT
+	dd if="$pmic_regs" bs=9 skip=$((0x7000)) count=$((0x600)) status=none > "$1" 2>/dev/null &&
+		awk 'NR == 1 && $1 != "7000:" { bad = 1 } END { exit bad || NR != 1536 }' "$1"
+}
+pmic_ocp() { # FILE
+	awk '$1 ~ /^707[6-9ab]:$/ { v = v $2; if (++n % 2 == 0 && n < 6) v = v " " } END { print v }' "$1"
+}
+# After a sleep (CYC SFX): the records again, against the last read; a
+# new over-current entry gets a line of its own.  pmic_last is the last
+# read's file.
+pmic_after() { # CYC SFX
+	[ "$pmic_given" = 1 ] || return 0
+	if ! pmic_read "$ramdir/pmic-$2"; then
+		say "$1: evidence: PMIC: $pmic_regs did not read after the sleep"
+		return 0
+	fi
+	pa1=$(pmic_ocp "$ramdir/pmic-$2")
+	if [ -z "$pmic_last" ]; then
+		say "$1: evidence: PMIC: over-current log $pa1 (no read before the run to compare with)"
+		pmic_last=$ramdir/pmic-$2
+		return 0
+	fi
+	pa0=$(pmic_ocp "$pmic_last")
+	pas=changed
+	[ "$(sha256sum < "$pmic_last")" != "$(sha256sum < "$ramdir/pmic-$2")" ] || pas=unchanged
+	if [ "$pa0" = "$pa1" ]; then
+		pan="over-current log $pa1 (unchanged)"
+	else
+		pan="over-current log $pa1 (was $pa0: a NEW ENTRY)"
+	fi
+	say "$1: evidence: PMIC: $pan; SDAM 0x7000-0x75ff $pas since the read before"
+	ev_pmsg "$1: evidence: PMIC: $pan; SDAM $pas"
+	[ "$pa0" = "$pa1" ] ||
+		verdict "SLEEP-TEST PMIC: $1: the PMIC logged a new over-current entry ($pa0 -> $pa1; 12cf is PM8550's LDO15, L15B): after the run, read its power-on and over-current logs as root"
+	pmic_last=$ramdir/pmic-$2
+}
+
 # The interconnect nodes still at the floor's vote (INT_MAX), or n/a when
 # the summary cannot be read.  grep -c prints 0 and fails when there is
 # none: a "|| echo n/a" after it printed a second line, "n/a", under the 0.
@@ -1632,17 +1785,18 @@ pcie_down() {
 
 # Did the Wi-Fi come back, as the bus and the cycle's kernel lines (K) show
 # it rather than by a line of its own: its function on the bus with
-# ath11k_pci bound and in D0, and its firmware loaded again in K (ath11k
-# loads it at the resume of each sleep it powered the chip down for).
+# the board's driver (wifi_drv: ath11k_pci, ath12k_wifi7_pci) bound and in
+# D0, and its firmware loaded again in K (ath11k and ath12k load it at the
+# resume of each sleep they powered the chip down for).
 wifi_back() { # K
 	wbd=
 	for wbp in "$pci_devs"/*; do
 		[ -e "$wbp/driver" ] || continue
 		wbr=$(readlink "$wbp/driver" 2>/dev/null)
-		[ "${wbr##*/}" = ath11k_pci ] || continue
+		[ "${wbr##*/}" = "$wifi_drv" ] || continue
 		[ "$(ev_val "$wbp/power_state")" != D0 ] || wbd=1
 	done
-	[ -n "$wbd" ] && grep -q 'ath11k_pci .*fw_version' "$1"
+	[ -n "$wbd" ] && grep -q "$wifi_drv .*fw_version" "$1"
 }
 
 pcie_down_end() {
@@ -1650,7 +1804,7 @@ pcie_down_end() {
 		pdown=$(grep -E "$pcie_down_re|$wifi_fail_re|$guard_bad_re" "$k" | grep -vE "$wifi_note_re" |
 			awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
 		[ -n "$pdown" ] ||
-			pdown="no Wi-Fi function in D0 with ath11k_pci bound, or no firmware load in this cycle's kernel lines; ath11k said: $(grep -E "$wifi_note_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')"
+			pdown="no Wi-Fi function in D0 with $wifi_drv bound, or no firmware load in this cycle's kernel lines; $wifi_word said: $(grep -E "$wifi_note_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')"
 		verdict "SLEEP-TEST RESULT: PCIE-DOWN$mword after $cyc: with the PCI devices kept, the PCIe host or the Wi-Fi did not come back ($pdown), and a later suspend would meet a controller that lost its registers under its link, so the run ends here; $passes of $cycles cycles came back with the UFS readable; floor $floor; kernel $kernel$optnote"
 		verdict 'NEXT: no further sleep in this boot: the restart brings the PCIe host and the Wi-Fi back; the wifi and pcie evidence and the kernel lines of that cycle say what failed (README, "Revision 11: the runs")'
 	else
@@ -2618,10 +2772,10 @@ ev_after() { # SFX K
 	# lines (wifi_note_re) are a note, the first and how many.
 	evwifi=$(grep -E "$wifi_fail_re" "$2" 2>/dev/null | grep -vE "$wifi_note_re" |
 		awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
-	evfw=$(grep -c 'ath11k_pci .*fw_version' "$2" 2>/dev/null)
+	evfw=$(grep -c "$wifi_drv .*fw_version" "$2" 2>/dev/null)
 	evnote=$(grep -E "$wifi_note_re" "$2" 2>/dev/null | awk '{sub(/^\[[^]]*\] /, ""); if (!n++) f = $0}
 		END {if (n) printf "%s (%d line%s of the firmware turning a country setting down: not a failure line)", f, n, n == 1 ? "" : "s"}')
-	evwifi="$(ev_pci_state); ${evwifi:-no Wi-Fi failure line}${evnote:+; note: $evnote}; ath11k firmware loads ${evfw:-0}"
+	evwifi="$(ev_pci_state); ${evwifi:-no Wi-Fi failure line}${evnote:+; note: $evnote}; $wifi_word firmware loads ${evfw:-0}"
 	evgpd=$(ev_genpd_offs_delta "$ramdir/ev-gpd-$1.0" "$ramdir/ev-gpd-$1.1" full)
 	evdsp=$(ev_irq_dsp_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1")
 	evxo1=$(ev_xo_holders "$ramdir/ev-clk-$1.1")
@@ -3293,6 +3447,9 @@ finish() { # healthy|failed
 	if [ "$armed" = 1 ]; then
 		verdict "NEXT: the boot after this restart holds the interconnect floor once (loop breaker: this boot released it and cannot record a clean stop with its disk frozen); give the next run release-floor"
 	fi
+	if [ "$released_here" = 1 ]; then
+		verdict "NEXT: the boot after this restart holds the interconnect floor again (the $board_name releases it only in a run); give the next run release-floor"
+	fi
 	if [ -n "$prot_bad" ]; then
 		verdict "NEXT: the protection failed in this run ($prot_bad): after the restart run sh ~/typec-roles/verify.sh, and before any other sleep test check the root with e2fsck -fn from recovery; no sleeps until it is understood"
 	fi
@@ -3547,6 +3704,7 @@ run_from_ram() { # CONFIG
 		[ -z "$prot_why" ] || prot_bad=$prot_why
 		sleep "$settle"
 		read_check "$sfx"
+		pmic_after "$cyc" "$sfx"
 		sleep 2
 		dmesg > "$ramdir/kmsg.all" 2>/dev/null
 		k=$ramdir/kmsg-$sfx
@@ -3759,7 +3917,7 @@ fi
 # ------------------------------------------------------ before: the disk ---
 cycles=3 seconds=30 hold=300 aborts=5 release=0 confirmed=0 numbers=0 dry=0 mode= aborts_given=0
 pci_remove=0 pci_keep=0 pm_test= trace= sleep_mode= sw_set= sw_ret= gdsc_given=0 cxmx_given=0 ret_given=0 rpmh=0
-rpd3_given=0 sensors_stop=0 sensors_opt= cxpc_given=0
+rpd3_given=0 sensors_stop=0 sensors_opt= cxpc_given=0 pmic_given=0 released_here=0 pmic_last=
 for a in "$@"; do
 	case $a in
 	ro|dry)
@@ -3834,6 +3992,9 @@ for a in "$@"; do
 		sensors_stop=1
 		[ "$a" != sensors=hook ] || sensors_stop=hook ;;
 	sensors=*) echo "$me: sensors=stop and sensors=hook are the sensors= options, not '$a'" >&2; usage ;;
+	pmic)
+		[ "$pmic_given" = 0 ] || { echo "$me: one pmic at most" >&2; usage; }
+		pmic_given=1 ;;
 	*)
 		num "$a" || { echo "$me: unknown argument '$a'" >&2; usage; }
 		numbers=$((numbers + 1))
@@ -3852,6 +4013,7 @@ if [ "$dry" = 1 ]; then
 	[ "$cxpc_given" = 0 ] || { echo "$me: dry sleeps not at all: cxpc is for the AOP's log of a sleep" >&2; usage; }
 	[ "$rpd3_given" = 0 ] || { echo "$me: dry sleeps not at all: root-port-d3 is for the sleeps of a pci=keep run" >&2; usage; }
 	[ "$sensors_stop" = 0 ] || { echo "$me: dry sleeps not at all: $sensors_opt is for the audio DSP's wakes in a sleep" >&2; usage; }
+	[ "$pmic_given" = 0 ] || { echo "$me: dry sleeps not at all: pmic is for the PMIC's records around a sleep" >&2; usage; }
 	cycles=0
 else
 	[ "$cycles" -ge 1 ] && [ "$cycles" -le 10 ] || { echo "$me: CYCLES is 1 to 10, not $cycles" >&2; usage; }
@@ -3908,6 +4070,7 @@ done
 [ "$cxpc_given" = 0 ] || options="$options cxpc"
 [ "$rpmh" = 0 ] || options="$options rpmh"
 [ "$sensors_stop" = 0 ] || options="$options $sensors_opt"
+[ "$pmic_given" = 0 ] || options="$options pmic"
 options=${options# }
 options=${options:-none}
 
@@ -3927,9 +4090,9 @@ adsp_units() {
 refuse() { printf '%s\n' "$me: REFUSED: $*; nothing was changed" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || refuse 'run it with sudo'
-# The SM-X710 only: see the header.
-tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null | grep -qx "$board" ||
-	refuse "this is not an SM-X710 ($board); the SM-X910 has scripts/diagnostics/kernel10-ramroot-test"
+# An SM-X710 or an SM-X910: see the header.
+board_table ||
+	refuse 'this is neither an SM-X710 (samsung,gts9wifi) nor an SM-X910 (samsung,gts9uwifi)'
 [ "$confirmed" = 1 ] ||
 	refuse 'the run ends with a restart of the tablet in any case: add restart-ok to say that is fine'
 if [ "$sleep_mode" = s2idle ]; then
@@ -4107,8 +4270,11 @@ fi
 # warning (fs/super.c:1919, may_unfreeze: the suspend's own thaw finds no
 # freeze of its own), and a writer that waits on the frozen disk for
 # hung_task_timeout_secs is reported as a hung task: neither may panic the
-# tablet in the middle of a run.
+# tablet in the middle of a run.  A kernel without the hung task detector
+# (the SM-X910's: CONFIG_DETECT_HUNG_TASK is not set there, the SM-X710's
+# fragment sets it) has no hung_task_panic and reports nothing.
 for p in panic_on_warn hung_task_panic; do
+	[ "$p" != hung_task_panic ] || [ -e "/proc/sys/kernel/$p" ] || continue
 	pv=$(cat "/proc/sys/kernel/$p" 2>/dev/null)
 	[ "$pv" = 0 ] ||
 		refuse "kernel.$p is ${pv:-unreadable}, not 0: a frozen disk gives a kernel warning at the first resume and hung tasks after a minute, and either would panic the tablet in the middle of the run (sudo sysctl kernel.$p=0)"
@@ -4220,7 +4386,26 @@ floor=$(floor_state)
 if [ "$release" = 1 ] && [ "$floor" != released ]; then
 	[ ! -e "$icc_hold" ] ||
 		refuse "$icc_hold exists: the floor is held on purpose; remove that file yourself (sudo rm $icc_hold) and run again, or run without release-floor"
-	[ -x "$icc_helper" ] || refuse "no $icc_helper on this tablet: the floor cannot be released the documented way"
+	if [ "$floor_by" = unit ]; then
+		[ -x "$icc_helper" ] || refuse "no $icc_helper on this tablet: the floor cannot be released the documented way"
+	else
+		icc_plan
+		[ -z "$icc_blocked" ] && [ -n "$icc_eligible" ] ||
+			refuse "release-floor: the $board_name's floor is released by the run itself, by the late release's rule, and here it cannot be:${icc_blocked:- no unsynced interconnect provider that waits for the unbound bandwidth monitors alone}"
+	fi
+fi
+# The SM-X910 (radios_needed): a radio on, the header says why.  A dry run
+# sleeps not at all.
+if [ "$radios_needed" = 1 ] && [ "$dry" = 0 ] && ! radio_on bluetooth && ! radio_on wlan; then
+	refuse "Bluetooth and Wi-Fi are both off (no rfkill of either unblocked): on the $board_name a run is first for PM8550 L15B, which feeds the radio chip's I/O, through a whole-SoC sleep with a radio on; turn Bluetooth on (rfkill unblock bluetooth) and run again"
+fi
+# pmic: the regmap's debugfs file has to read as PMK8550's SDAM lines.
+if [ "$pmic_given" = 1 ]; then
+	pmic_ok=1
+	pmic_read /run/gts9u-sleep-test.pmic-check || pmic_ok=0
+	rm -f /run/gts9u-sleep-test.pmic-check
+	[ "$pmic_ok" = 1 ] ||
+		refuse "pmic: $pmic_regs does not read as PMK8550's SDAM, 0x600 lines from \"7000: \" (no SPMI device 0-00 regmap in debugfs, or another layout): the PMIC's records cannot be read this way here"
 fi
 
 # ---------------------------------------------- before: prepare the run ---
@@ -4361,13 +4546,29 @@ fi
 	fi
 	echo "kernel: $(uname -r) $(uname -v), build ID $kernel; the kit's: ${kit_id:-none}, revision $(cat "$kit/REVISION" 2>/dev/null || echo '7 or earlier')$([ "$kernel" = "$kit_id" ] || echo ' (not running: a baseline run)')"
 	echo "boot $(cat /proc/sys/kernel/random/boot_id), up $(cut -d' ' -f1 /proc/uptime)s"
+	[ -e /proc/sys/kernel/hung_task_panic ] ||
+		echo "hung tasks: this kernel has no hung task detector (no kernel.hung_task_panic): a writer waiting on the frozen disk is not reported"
 	echo "userdata: $dev on /dev/$disk (SCSI host $ufs_host); the read: the first $read_count x $read_bs, O_DIRECT"
 	echo "mem_sleep $(cat /sys/power/mem_sleep), suspend_stats success $(stat_of success) fail $(stat_of fail); freeze_filesystems $(cat /sys/power/freeze_filesystems 2>/dev/null || echo n/a), sync_on_suspend $(cat /sys/power/sync_on_suspend 2>/dev/null || echo n/a)"
 	echo "qcom_stats: aosd $(count_of aosd) cxsd $(count_of cxsd) ddr $(count_of ddr)$([ -r "$qstats/aosd" ] || echo ' (not readable: the depth cannot be judged)')"
 	[ "$sleep_mode" != s2idle ] ||
 		echo "mode=s2idle: rtcwake -m freeze (/sys/power/state: $(cat /sys/power/state 2>/dev/null)), mem_sleep not used; $(s2idle_summary)"
-	echo "interconnect floor: $floor; record: $(tr '\n' ' ' < "$icc_state" 2>/dev/null)"
-	echo "  last release log line: $(tail -n 1 "$icc_log" 2>/dev/null)"
+	if [ "$floor_by" = unit ]; then
+		echo "interconnect floor: $floor; record: $(tr '\n' ' ' < "$icc_state" 2>/dev/null)"
+		echo "  last release log line: $(tail -n 1 "$icc_log" 2>/dev/null)"
+	else
+		echo "interconnect floor: $floor; the $board_name has no late release (release-floor releases it in the run$([ "$release" = 1 ] && echo ': this one does' || echo ': not this one'))"
+	fi
+	[ "$radios_needed" = 0 ] || echo "radios: Bluetooth $(radio_on bluetooth && echo on || echo off), Wi-Fi $(radio_on wlan && echo on || echo off) (rfkill)"
+	if [ "$pmic_given" = 1 ]; then
+		if pmic_read "$ramdir/pmic-before"; then
+			pmic_last=$ramdir/pmic-before
+			cp "$ramdir/pmic-before" "$logs/pmic-before"
+			echo "PMIC: over-current log (0x7076) $(pmic_ocp "$ramdir/pmic-before"); SDAM 0x7000-0x75ff in $logs/pmic-before (the power-on log: decode it on the host)"
+		else
+			echo "PMIC: $pmic_regs did not read now: no records before the run"
+		fi
+	fi
 	[ ! -e "$icc_hold" ] || echo "  $icc_hold exists"
 	echo "INT_MAX nodes: $(intmax_nodes)"
 	echo "Type-C: $(roles), USB devices $(usb_count); charger: $(charger)"
@@ -4466,7 +4667,7 @@ if [ "$sensors_stop" != 0 ]; then
 fi
 
 if [ "$floor" != released ]; then
-	if [ "$release" = 1 ]; then
+	if [ "$release" = 1 ] && [ "$floor_by" = unit ]; then
 		say "interconnect floor $floor; releasing it: systemctl restart $icc_unit"
 		systemctl restart "$icc_unit" >> "$ramdir/log" 2>&1
 		floor=$(floor_state)
@@ -4477,6 +4678,27 @@ if [ "$floor" != released ]; then
 			stop "the floor could not be released ($(sed -n 's/^reason=//p' "$icc_state" 2>/dev/null))"
 		fi
 		say "interconnect floor released ($(tail -n 1 "$icc_log" 2>/dev/null)); 60 s to settle"
+		sleep 60
+		say "INT_MAX nodes now: $(intmax_nodes)"
+	elif [ "$release" = 1 ]; then
+		# The SM-X910 (the header): the late release's rule, here.  The plan
+		# again, as nothing may have changed since the checks but the time.
+		icc_plan
+		[ -z "$icc_blocked" ] && [ -n "$icc_eligible" ] ||
+			{ cp "$ramdir/log" "$logs/log"; own; stop "the floor cannot be released now:${icc_blocked:- no provider to release}"; }
+		say "interconnect floor $floor; the $board_name has no late release: releasing it here, state_synced of$(for ip in $icc_eligible; do printf ' %s' "${ip##*/}"; done) (each waits for the unbound bandwidth monitors alone)"
+		printf '%s\n' "gts9u sleep-test: $stamp releasing the interconnect floor:$(for ip in $icc_eligible; do printf ' %s' "${ip##*/}"; done)" >> /dev/kmsg 2>/dev/null
+		for ip in $icc_eligible; do
+			printf 1 > "$ip/state_synced" 2>> "$ramdir/log"
+		done
+		released_here=1
+		floor=$(floor_state)
+		if [ "$floor" != released ]; then
+			cp "$ramdir/log" "$logs/log"
+			own
+			stop "the floor could not be released (a provider still reads state_synced 0 after the write)"
+		fi
+		say "interconnect floor released; 60 s to settle"
 		sleep 60
 		say "INT_MAX nodes now: $(intmax_nodes)"
 	else
@@ -4519,7 +4741,8 @@ sync
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for v in stamp ramdir part disk cycles seconds hold aborts dry rootsrc rootname floor armed kernel mount_cmd ufs_host \
 	pci_remove pci_keep pm_test trace options printk_was suspend_was pm_test_delay sleep_mode debug_note sw_set sw_ret \
-	rpmh rpmh_was clk_trace clk_was guard_state sensors_stop pwrdn_seen cxpc_given; do
+	rpmh rpmh_was clk_trace clk_was guard_state sensors_stop pwrdn_seen cxpc_given \
+	board board_name wifi_drv wifi_word touch_irq floor_by radios_needed released_here pmic_given pmic_last; do
 	eval "printf '%s=%s\n' $v \"\$(q \"\$$v\")\""
 done > "$ramdir/run.conf"
 say 'the run goes on from RAM in a session of its own: it ends with a restart even if this terminal goes away'

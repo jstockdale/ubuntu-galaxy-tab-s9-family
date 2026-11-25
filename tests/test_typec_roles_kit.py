@@ -270,6 +270,9 @@ PREFIXES = (
     "/sys/class/bluetooth", "/sys/class/tty/",
     # Revision 14: L15B's regulator (verify.sh).
     "/sys/class/regulator/",
+    # 2026-11-25: sleep-test.sh's radios (the SM-X910's refusal) and its pmic
+    # option.
+    "/sys/class/rfkill/", "/sys/kernel/debug/regmap/",
 )
 
 STUBS = {
@@ -4195,6 +4198,8 @@ switches >> "$T/switches-at-sleep"
 # suspend stops there and nothing sleeps.
 case $(cat "$F/sys/power/pm_test") in freezer|devices|platform|processors|core) pt=1 ;; *) pt= ;; esac
 s=$T/cycle-$n
+# The PMIC's records as this sleep leaves them (sleep-test.sh pmic).
+[ ! -e "$s/pmic" ] || cp "$s/pmic" "$F/sys/kernel/debug/regmap/0-00/registers"
 if [ -e "$s/log" ]; then cat "$s/log" >> "$F/dev/kmsg"
 elif [ -n "$pt" ] && [ -n "$frz" ]; then printf '[  700.000000] PM: suspend entry (s2idle)\n[  700.200000] PM: suspend debug: Waiting for 5 second(s).\n[  705.300000] PM: suspend exit\n' >> "$F/dev/kmsg"
 elif [ -n "$pt" ]; then printf '[  700.000000] PM: suspend entry (deep)\n[  700.200000] suspend debug: Waiting for 5 second(s).\n[  705.300000] PM: suspend exit\n' >> "$F/dev/kmsg"
@@ -4282,6 +4287,9 @@ for a; do
 done
 case $inf in
 /dev/zero) exit 0 ;;
+# The PMIC's regmap lines (sleep-test.sh pmic): read as the kernel's file
+# reads, by offset.
+"$F/sys/kernel/debug/regmap/0-00/registers") exec /usr/bin/dd "$@" ;;
 "$F/dev/disk/by-partlabel/userdata")
 	case " $* " in *" iflag=direct "*) ;; *) echo "dd read userdata without O_DIRECT: $*" >> "$T/violations" ;; esac
 	if [ -e "$T/storage-dead" ]; then
@@ -6530,8 +6538,10 @@ exit 0
 
         cases = {
             "run it with sudo": lambda: (self.bin / "id").write_text("#!/bin/sh\necho 1000\n"),
-            "this is not an SM-X710": lambda: (self.root / "proc/device-tree/compatible").write_bytes(
-                b"samsung,gts9uwifi\0qcom,sm8550\0"),
+            # Since 2026-11-25 the SM-X910 is the script's other board; a
+            # third one is refused.
+            "this is neither an SM-X710 (samsung,gts9wifi) nor an SM-X910 (samsung,gts9uwifi)": lambda: (
+                self.root / "proc/device-tree/compatible").write_bytes(b"samsung,gts9pwifi\0qcom,sm8550\0"),
             "offers no deep": lambda: (self.root / "sys/power/mem_sleep").write_text("[s2idle]\n"),
             "offers no mem": lambda: (self.root / "sys/power/state").write_text("freeze\n"),
             "a pm_test level is selected": lambda: (self.root / "sys/power/pm_test").write_text(
@@ -6579,8 +6589,12 @@ exit 0
             "kernel.panic_on_warn is 1, not 0: a frozen disk gives a kernel warning at the first resume and "
             "hung tasks after a minute, and either would panic the tablet in the middle of the run": lambda: (
                 self.root / "proc/sys/kernel/panic_on_warn").write_text("1\n"),
+            # A file that reads empty; a kernel without the file has no hung
+            # task detector (the SM-X910's kit tests run without it).
             "kernel.hung_task_panic is unreadable, not 0": lambda: (
-                self.root / "proc/sys/kernel/hung_task_panic").unlink(),
+                self.root / "proc/sys/kernel/hung_task_panic").write_text(""),
+            "kernel.hung_task_panic is 1, not 0": lambda: (
+                self.root / "proc/sys/kernel/hung_task_panic").write_text("1\n"),
             # errors=panic, among the options or as the superblock's default.
             "/media/stick (/dev/sdg2) runs with errors=panic: an ext4 error during the run would panic the "
             "tablet; give it errors=remount-ro first (sudo mount -o remount,errors=remount-ro "
@@ -7199,7 +7213,9 @@ exit 0
                     "sensors=", "sensors=start", "sensors=stop sensors=stop", "dry sensors=stop", "sensors",
                     "sensors=stop sensors=hook", "sensors=hook sensors=hook", "sensors=Hook",
                     # Revision 12's cxpc: once, and no sleep in dry.
-                    "cxpc cxpc", "dry cxpc", "cxpc=1"):
+                    "cxpc cxpc", "dry cxpc", "cxpc=1",
+                    # 2026-11-25's pmic: once, and no sleep in dry.
+                    "pmic pmic", "dry pmic", "pmic=1"):
             with self.subTest(bad):
                 result = self.run_test(*bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
@@ -7207,7 +7223,7 @@ exit 0
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] restart-ok", result.stderr)
                 self.assertIn("[pci=remove|pci=keep] [pm_test=LEVEL] [trace|trace=live] [mode=s2idle]\n"
                               "       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] [cxmx=ret] [root-port-d3] [rpmh]\n"
-                              "       [cxpc] [sensors=stop|sensors=hook] restart-ok", result.stderr)
+                              "       [cxpc] [sensors=stop|sensors=hook] [pmic] restart-ok", result.stderr)
                 self.assert_nothing_done()
 
     # Revision 9's debug switches (gdsc=, cxmx=ret): run-time module
@@ -7609,7 +7625,7 @@ exit 0
                 result = self.run_test("ro", *bad.split(), "restart-ok")
                 self.assertEqual(result.returncode, 2, self.out)
                 self.assertIn("[trace|trace=live] [mode=s2idle]\n       [gdsc=pcie0,pcie0phy,usb] [gdsc-ret=pcie0] "
-                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [cxpc] [sensors=stop|sensors=hook] restart-ok", result.stderr)
+                              "[cxmx=ret] [root-port-d3] [rpmh]\n       [cxpc] [sensors=stop|sensors=hook] [pmic] restart-ok", result.stderr)
                 self.assert_nothing_done()
                 if "pm_test=" in bad:
                     level = bad.split("pm_test=")[1].split()[0]
