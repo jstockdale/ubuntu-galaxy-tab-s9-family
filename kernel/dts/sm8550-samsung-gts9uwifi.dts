@@ -579,15 +579,26 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
-		/* NXP PTN3222 eUSB2 1.8 V rail. */
+		/*
+		 * NXP PTN3222 eUSB2 1.8 V rail, and the WCN7850 PMU's I/O rail
+		 * (vddio).  Held in HPM, as on sm8550-qrd and sm8550-mtp: no
+		 * regulator-allow-set-load.  The repeater declares its 55 mA
+		 * only while its PHY is up and the PMU declares none, so a
+		 * system sleep voted this LDO to LPM with Bluetooth on, and
+		 * once the whole SoC slept (XO off) the PMIC's over-current
+		 * protection on L15B reset the tablet about 1 s in (measured
+		 * on the SM-X710, whose L15B has the same two consumers,
+		 * 2026-11-24: 5 of 5; the same sleep held in HPM, or with
+		 * Bluetooth off, went deep).  This board's builds compile the
+		 * pinned baseline DTS (scripts/build-mainline-kernel.sh,
+		 * fingerprint_baseline), so this reaches the SM-X910 only once
+		 * that pin moves.
+		 */
 		vreg_l15b_1p8: ldo15 {
 			regulator-name = "vreg_l15b_1p8";
 			regulator-min-microvolt = <1800000>;
 			regulator-max-microvolt = <1800000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
-			regulator-allow-set-load;
-			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
-						   RPMH_REGULATOR_MODE_HPM>;
 		};
 
 		/*

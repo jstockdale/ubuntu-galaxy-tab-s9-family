@@ -10163,6 +10163,72 @@ echo "$2" > "$D/sys/class/regulator/$RAIL/requested_microamps"
         self.assertIn('if [ -e "$r/$phy-vdda-phy" ]; then', code)
 
 
+class L15bHpmTest(unittest.TestCase):
+    """Revision 14's device-tree change, on both boards: PM8550 LDO15
+    (vreg_l15b_1p8, the eUSB2 repeater's 1.8 V and the WCN PMU's I/O rail)
+    held in HPM, with no regulator-allow-set-load and no
+    regulator-allowed-modes, as sm8550-qrd and sm8550-mtp describe it."""
+
+    BOARDS = (("gts9wifi", "qcom,wcn6855-pmu"), ("gts9uwifi", "qcom,wcn7850-pmu"))
+
+    @staticmethod
+    def node(dts, head):
+        """The node that starts with the line HEAD, to its closing line."""
+        start = dts.index(head)
+        indent = head[:len(head) - len(head.lstrip("\t"))]
+        return dts[start:dts.index(f"\n{indent}}};\n", start)]
+
+    def test_both_boards_hold_l15b_in_hpm(self):
+        for board, _ in self.BOARDS:
+            with self.subTest(board):
+                dts = (REPO / f"kernel/dts/sm8550-samsung-{board}.dts").read_text()
+                self.assertEqual(dts.count("vreg_l15b_1p8: ldo15 {"), 1)
+                ldo15 = self.node(dts, "\t\tvreg_l15b_1p8: ldo15 {\n")
+                self.assertEqual(ldo15.splitlines()[1:], [
+                    '\t\t\tregulator-name = "vreg_l15b_1p8";',
+                    "\t\t\tregulator-min-microvolt = <1800000>;",
+                    "\t\t\tregulator-max-microvolt = <1800000>;",
+                    "\t\t\tregulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;"])
+                # In the PM8550 ("b") regulators of the application
+                # processor's RSC.
+                pmic = self.node(dts, "\tregulators-0 {\n")
+                self.assertIn('\t\tqcom,pmic-id = "b";\n', pmic)
+                self.assertIn(ldo15, pmic)
+                # The other LDOs that may drop to LPM are not changed here.
+                self.assertEqual(dts.count("\t\t\tregulator-allow-set-load;\n"), 3)
+
+    def test_both_boards_give_l15b_the_same_two_consumers(self):
+        """The repeater's vdd1v8 and the WCN PMU's vddio, on each board."""
+        for board, pmu in self.BOARDS:
+            with self.subTest(board):
+                dts = (REPO / f"kernel/dts/sm8550-samsung-{board}.dts").read_text()
+                users = re.findall(r"^\t+([a-z0-9]+-supply) = <&vreg_l15b_1p8>;$", dts, re.M)
+                self.assertEqual(sorted(users), ["vdd1v8-supply", "vddio-supply"])
+                repeater = self.node(dts, "\teusb2_repeater: redriver@4f {\n")
+                self.assertIn('\t\tcompatible = "nxp,ptn3222";\n', repeater)
+                self.assertIn("\t\tvdd1v8-supply = <&vreg_l15b_1p8>;\n", repeater)
+                head = re.search(r"^\t(wcn[0-9]+_pmu: wcn[0-9]+-pmu \{)\n", dts, re.M).group(0)
+                wcn = self.node(dts, head)
+                self.assertIn(f'\t\tcompatible = "{pmu}";\n', wcn)
+                self.assertIn("\t\tvddio-supply = <&vreg_l15b_1p8>;\n", wcn)
+
+    def test_the_reference_boards_hold_l15b_in_hpm_too(self):
+        """sm8550-qrd and sm8550-mtp in the pinned kernel checkout; the HDK
+        has the set-load form these boards had."""
+        source = kernel_source()
+        if source is None:
+            self.skipTest("no pinned kernel checkout")
+        for board, set_load in (("qrd", False), ("mtp", False), ("hdk", True)):
+            with self.subTest(board):
+                dts = subprocess.run(["git", "-C", str(source), "show",
+                                      f"HEAD:arch/arm64/boot/dts/qcom/sm8550-{board}.dts"],
+                                     check=True, capture_output=True, text=True).stdout
+                ldo15 = self.node(dts, "\t\tvreg_l15b_1p8: ldo15 {\n")
+                self.assertIn("regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;", ldo15)
+                self.assertEqual("regulator-allow-set-load;" in ldo15, set_load)
+                self.assertEqual("regulator-allowed-modes" in ldo15, set_load)
+
+
 class ScriptsTest(unittest.TestCase):
     def test_scripts_parse(self):
         for name, shell in (("install.sh", "sh"), ("rollback.sh", "sh"), ("verify.sh", "sh"),
