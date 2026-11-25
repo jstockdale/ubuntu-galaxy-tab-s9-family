@@ -10865,3 +10865,68 @@ the SM-X910 would reset without it is not known, and it cannot be confirmed
 there yet: the SM-X910 reaches no whole-SoC sleep while its RPMh power
 domains have not synced. It is to ship in a later SM-X910 kernel, with the
 deep-sleep work that kernel needs anyway.
+
+### SM-X910 deep-sleep groundwork: the hand-off, ramoops and kit revision 8, written, not built (2026-11-25)
+
+What the SM-X910 lacks of the SM-X710's deep sleep, made the SM-X710's way
+where the hardware is the same; written and compiled on the build host, in no
+kernel, and run on no tablet. The report, with the evidence for each item,
+the measured build deltas, the tests and the staged hardware plan, is
+`backups/ultra-deep-sleep-groundwork-2026-11-25.md`.
+
+**The hand-off.** blastoise's kernel log (read 2026-11-25) names the
+SM-X710's `sync_state()` blockers: `aaf0000.clock-controller` (no driver) for
+rpmhpd and gcc, `3d6a000.gmu` for gcc and gpu_cc, `1dfa000.crypto` and the
+bandwidth monitors `24091000.pmu` and `240b6400.pmu` for the interconnects.
+The default SM-X910 build gets the SM-X710's answers:
+- `CONFIG_SM_VIDEOCC_8550=y`, so rpmhpd syncs at boot;
+- `kernel/dts/gts9u-sync-state.dtso`, applied by the board helper at
+  `core_initcall` because the pinned DTB cannot carry it: gcc under CX
+  (`power-domains = <&rpmhpd 0>`), `post-init-providers = <&gcc>, <&gpucc>`
+  on the GMU and the crypto engine disabled. fw_devlink parses a node's
+  suppliers once, when the soc@0 subtree's first device is added at
+  `arch_initcall_sync` (v7.2-rc3, `drivers/base/core.c`), so the overlay is
+  in place exactly as the SM-X710's DTB properties are. gcc under CX comes
+  first because once rpmhpd syncs, the UFS's 403 MHz ICE clock needs a real
+  CX vote (2026-11-07 above); with it, `ufshcd-drop-opp-votes-in-system-suspend.patch`
+  and `dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch` now apply
+  on both boards, their `gts9wifi` gate (its reason: no CX parent) removed;
+- the bandwidth monitors stay driverless, the SM-X710's effective state (it
+  ships the module and blacklists it); the floor is released at run time.
+
+**Sleep counters and a persistent log.** `CONFIG_QCOM_STATS=y`; and
+`kernel/dts/gts9u-ramoops.dtso` makes the pinned DTB's own carve-out
+`sec-pmsg@880900000` the SM-X710's ramoops region (same zones, ECC 96), with
+its `CONFIG_PSTORE_FTRACE=y` and no `CONFIG_PSTORE_COMPRESS`.
+
+**Measured on the host** (this tree's build script, patch and configuration
+sections only, on copies of the pinned v7.2-rc3 tree): a default
+`DEVICE=gts9uwifi` tree differs from 2644b7a's by the helper, its generated
+header, the two new blobs, `ufshcd.c` and `dwc3-qcom.c`, and its
+configuration by exactly the four lines above; its DTB and module list are
+unchanged. A default `DEVICE=gts9wifi` tree differs by the helper and the
+blobs only (its image by the helper object: an Ultra-only branch and
+init-only data). `scripts/test-performance-overlay.sh` applies the overlays
+to the pinned DTB and, given the SM-X710's DTB, checks that the properties
+resolve to its values.
+
+**The sleep test on both boards.** `tools/inplace/typec-roles/sleep-test.sh`
+keys a small table on the compatible: the Wi-Fi driver (`ath11k_pci`,
+`ath12k_wifi7_pci`), the touch interrupt (`fts1ba90a`, `goodix-berlin`) and
+how the floor is released (the SM-X710's device-package unit, or on the
+SM-X910 by the run itself with the same rule). On the SM-X910 it refuses a
+run with Bluetooth and the Wi-Fi both off; on both, `pmic` reads the PMIC's
+reset and over-current records before and after (read only).
+
+**Kit revision 8** (`tools/inplace/typec-roles-ultra`): built with the SM-X710
+kit's eight `APPLY_*` switches (`make-kit.sh` refuses a build without them),
+packs the shared sleep test, and `verify.sh` checks the hand-off and ramoops
+lines, `/dev/pmsg0`, the live properties, the providers' `sync_state`,
+`qcom_stats`, the debug switches, Bluetooth and the L15B line. It installs
+over revision 7 with one command and one reboot.
+
+Not established: anything on the SM-X910 that depends on the RPMh rails held
+at their highest level (the cameras, the NPU and the fingerprint stack are
+its own; the SM-X710 has run synced since 2026-11-07); the WCN7850's link
+after a sleep with the root port in D3hot; and whether the SM-X910 resets in
+a deep sleep with Bluetooth on without L15B held in HPM.

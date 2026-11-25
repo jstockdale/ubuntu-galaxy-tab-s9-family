@@ -767,8 +767,61 @@ Still open:
   SM-X910 resets without it is not known, and it cannot be confirmed there
   yet: the SM-X910 cannot reach a whole-SoC sleep while its RPMh power
   domains have not synced (until they do, rpmhpd votes them at their highest
-  level in the sleep set too);
+  level in the sleep set too). What it needs for that is written, not run:
+  [SM-X910 groundwork](#deep-sleep-groundwork-on-the-sm-x910-2026-11-25);
 - the AOP's CXPC log, which no run has decoded.
+
+### Deep-sleep groundwork on the SM-X910 (2026-11-25)
+
+Written and compiled on 2026-11-25; none of it has run on the SM-X910, and
+none of it is in a kernel or a kit yet. It is what the SM-X910 lacks of the
+SM-X710's deep sleep above, made the SM-X710's way wherever the hardware is
+the same:
+
+- The SoC's hand-off. blastoise's kernel log names the same `sync_state()`
+  blockers the SM-X710 had: the video clock controller (`aaf0000`, no driver)
+  for rpmhpd and gcc, the GMU (`3d6a000`) for gcc and gpu_cc, the crypto
+  engine (`1dfa000`) and the two bandwidth monitors for the interconnects.
+  The default SM-X910 build now builds the video clock controller in
+  (`CONFIG_SM_VIDEOCC_8550=y`), so rpmhpd syncs at boot as it has on the
+  SM-X710 since 2026-11-07, and the board helper applies the SM-X710's three
+  other board DTS changes to the live tree as an overlay
+  (`kernel/dts/gts9u-sync-state.dtso`, the pinned DTB cannot carry them): gcc
+  under CX, the GMU's post-init providers and the crypto engine disabled
+  ([performance notes](performance.md#bootloader-compatible-implementation)).
+  gcc under CX is what keeps the UFS's 403 MHz CX vote real once rpmhpd
+  syncs (porting log, 2026-11-07); with it, the SM-X710's two patches that
+  drop the UFS's and the USB's CX votes in a system sleep now apply on both
+  boards. The bandwidth monitors stay driverless, as on the SM-X710 (whose
+  module is shipped and blacklisted); the interconnect's floor is kept at
+  boot and released only at run time ([interconnect notes](gts9wifi-interconnect.md)).
+- `CONFIG_QCOM_STATS=y`, the SM-X710's setting, for the sleep counters.
+- ramoops on the carve-out the SM-X910's pinned DTB already reserves
+  (`sec-pmsg@880900000`), with the SM-X710's layout and ECC, by a second
+  overlay (`kernel/dts/gts9u-ramoops.dtso`), and the SM-X710's two pstore
+  settings (`CONFIG_PSTORE_FTRACE=y`, no `CONFIG_PSTORE_COMPRESS`).
+- The Type-C kit's sleep test (`tools/inplace/typec-roles/sleep-test.sh`)
+  now runs on both boards: a table keyed by the compatible names each
+  board's Wi-Fi driver and touch interrupt, and on the SM-X910, whose
+  `ubuntu-gts9u-icc-late-release` unit is the SM-X710's only, the run
+  releases the interconnect floor itself by the same rule (`release-floor`).
+  On the SM-X910 it refuses to run with Bluetooth and the Wi-Fi both off (the
+  open question there is L15B with a radio on), and on both boards it reads
+  the PMIC's reset and over-current records before and after a run when
+  given `pmic` (read only).
+- The SM-X910's Type-C kit's revision 8 (`tools/inplace/typec-roles-ultra`):
+  the X710 kit's sleep switches in its build, the shared sleep test packed,
+  and first-boot checks for the hand-off, ramoops, `qcom_stats`, the debug
+  switches, Bluetooth and the L15B line. It installs over revision 7 with one
+  command and one reboot.
+
+The kit's README ("Revision 8") has what it changes, what its first boot
+risks, the way back and the build command. Not
+established: whether anything on the SM-X910 that the SM-X710 does not have
+(the cameras enabled at boot, the NPU, the fingerprint stack) depends on the
+RPMh rails held at their highest level; whether the WCN7850's PCIe link comes
+back after a sleep with the root port in D3hot; whether the SM-X910 resets in
+a deep sleep with Bluetooth on without L15B held in HPM.
 
 ### Protecting the storage in a sleep test
 

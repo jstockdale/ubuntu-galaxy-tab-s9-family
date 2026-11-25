@@ -61,16 +61,36 @@ The appended-only test was rolled back to the original boot image.
 `kernel/dts/gts9u-performance.dtso` only the GPU OPP node and the UFS inline
 crypto engine clock (the `ufshc@1d84000` clock list and three UFS `opp-hz`
 values), and `kernel/dts/gts9-family.dtso` only `wakeup-source` on
-`/soc@0/usb@a600000` (both boards). `scripts/stage-performance-overlay.sh`
-embeds all three, 8-byte aligned, in a small built-in board helper,
+`/soc@0/usb@a600000` (both boards). Two more, Ultra-only, make the SM-X710's
+other board DTS changes that the pinned DTB cannot carry (since 2026-11-25,
+written and compiled, not yet in a kernel that has run on the Ultra):
+`kernel/dts/gts9u-sync-state.dtso` puts gcc under CX
+(`power-domains = <&rpmhpd 0>` on `clock-controller@100000`), gives the GMU
+`post-init-providers = <&gcc>, <&gpucc>` and disables the unused crypto
+engine `crypto@1dfa000`, the three changes that let the SoC's providers
+reach `sync_state` ([resume notes](resume-recovery.md#deep-sleep-groundwork-on-the-sm-x910-2026-11-25));
+`kernel/dts/gts9u-ramoops.dtso` makes the existing no-map carve-out
+`/reserved-memory/sec-pmsg@880900000` a `ramoops` region with ECC 96, as the
+SM-X710's hang-log kit did. `scripts/stage-performance-overlay.sh` embeds all
+five, 8-byte aligned, in a small built-in board helper,
 `kernel/drivers/gts9u-performance.c`. Its `core_initcall` applies the
 overlays to Linux's live tree, after OF initialization and before cpufreq and
-DRM can consume their OPP tables. The CPU overlay runs for
-`samsung,gts9uwifi` and `samsung,gts9wifi`, the GPU and UFS ICE overlay only
-for `samsung,gts9uwifi` (see [SM-X710](#sm-x710-gts9wifi)). No firmware RPC,
-memory ownership change, Gunyah hook, reserved-memory modification or
-bootloader DT replacement occurs. The full Ultra board DTS also records the
-OPPs for a future unpinned build.
+DRM can consume their OPP tables and before the platform devices are created
+and fw_devlink reads their suppliers (`arch_initcall_sync`). The CPU and
+family overlays run for `samsung,gts9uwifi` and `samsung,gts9wifi`, the GPU
+and UFS ICE, sync-state and ramoops overlays only for `samsung,gts9uwifi`
+(see [SM-X710](#sm-x710-gts9wifi)); the SM-X710's own DTB has the same
+changes, so the two Ultra overlays add nothing that board lacks. Each logs
+one line when it applies: `gts9u-performance: SoC hand-off: gcc under CX,
+GMU post-init providers, crypto engine disabled` and `gts9u-performance:
+ramoops in the pmsg carve-out at 0x880900000`. No firmware RPC, memory
+ownership change, Gunyah hook or bootloader DT replacement occurs; the
+ramoops overlay changes only the compatible and record sizes of a
+reserved-memory node that already exists, not its address, size or
+`no-map`. `scripts/test-performance-overlay.sh` applies all but the family
+overlay to the pinned DTB on the host and checks their targets
+([CPU and GPU checks](#cpu-and-gpu-checks)). The full Ultra board DTS also
+records the OPPs for a future unpinned build.
 
 The same `core_initcall` makes one more early fix, on both boards and before
 the overlays: PM8550 L15B (`vreg_l15b_1p8`, the eUSB2 repeater's 1.8 V and
@@ -79,7 +99,7 @@ resets in its deep sleeps with Bluetooth on
 ([resume notes](resume-recovery.md#deep-sleep-on-the-sm-x710-2026-11-24-and-25)).
 That fix removes two properties of `/soc@0/rsc@17a00000/regulators-0/ldo15`,
 `regulator-allow-set-load` and `regulator-allowed-modes`, and an overlay can
-only add or replace properties, so it is C, not a fourth overlay. The helper
+only add or replace properties, so it is C, not another overlay. The helper
 acts only if the node's parent is `qcom,pm8550-rpmh-regulators` and its
 `regulator-name` is `vreg_l15b_1p8` (a node that is missing or is not that
 one is left alone), removes the two with `of_remove_property()` (their
@@ -101,7 +121,8 @@ others, and the overlays remain for the boot lifetime. The L15B step neither
 needs the overlays nor stops them, and each failure logs its own line.
 `CONFIG_OF_OVERLAY=y` is already required by the port's Gunyah integration.
 It must be built in; loading this helper after the GPU/cpufreq drivers or
-the RPMh regulators probe would be too late.
+the RPMh regulators probe, or on the Ultra after the platform devices are
+created, would be too late.
 
 Two cpufreq fixes are also needed in this kernel:
 
@@ -325,9 +346,17 @@ bash scripts/test-performance-overlay.sh /path/to/validated-base.dtb
 ```
 
 This checks OPP properties, repeat application and staging, and that every
-other node/property is unchanged by the OPP overlays. The family overlay
-(`gts9-family.dtso`, USB `wakeup-source`) is not exercised by this test. No
-device is written by that test.
+other node/property is unchanged by the overlays. On the Ultra's DTB it also
+checks the sync-state and ramoops overlays' properties; given an SM-X710 DTB
+as a second argument, it checks that they resolve to the SM-X710 DTB's values
+(gcc's and the GMU's providers by node path):
+
+```sh
+bash scripts/test-performance-overlay.sh /path/to/validated-base.dtb /path/to/sm8550-samsung-gts9wifi.dtb
+```
+
+The family overlay (`gts9-family.dtso`, USB `wakeup-source`) is not exercised
+by this test. No device is written by that test.
 
 On the tablet (the audit script is not packaged; copy
 `scripts/gts9u-frequency-audit.py` over first):

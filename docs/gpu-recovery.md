@@ -144,7 +144,10 @@ controller in (`CONFIG_SM_VIDEOCC_8550=y`), so rpmhpd syncs at boot and the
 write-check battery loses 0 of 296 frames (168 to 197 with rpmhpd held). The
 root cause, the fix and the check are in the
 [X710 display notes](gts9wifi-display.md). The Ultra has the same
-sync_state blockers but shows no loss; porting the fix there is queued. Late
+sync_state blockers but shows no loss; the fix and the SM-X710's other
+hand-off changes are written and compiled for it (2026-11-25,
+[resume notes](resume-recovery.md#deep-sleep-groundwork-on-the-sm-x910-2026-11-25)),
+in no kernel that has run there yet. Late
 GMU `GX_BW_PERF_VOTE` answers like the ones above were also seen on the X710
 while rpmhpd was held; whether they persist with it synced is not checked
 yet.

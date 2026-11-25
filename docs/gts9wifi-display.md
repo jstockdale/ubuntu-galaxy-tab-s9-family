@@ -196,9 +196,11 @@ on that command line only: left in `~/.config/environment.d` or a
 gnome-shell drop-in, it made Chrome's ANGLE/Vulkan GPU process fail
 ("Internal Vulkan error (-8)") on 2026-11-07.
 
-The Ultra has the same sync_state blockers but shows no loss; porting the fix
-there is queued.  The rest of this section is the 2026-11-06 record of what
-was ruled out first.
+The Ultra has the same sync_state blockers but shows no loss; the fix is
+written and compiled for it, with this board's other hand-off changes, in no
+kernel that has run there yet ([resume notes](resume-recovery.md#deep-sleep-groundwork-on-the-sm-x910-2026-11-25)).
+The rest of this section is the 2026-11-06 record of what was ruled out
+first.
 
 ### What was known on 2026-11-06
 
