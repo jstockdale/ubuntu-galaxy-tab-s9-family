@@ -11589,15 +11589,14 @@ class ScriptsTest(unittest.TestCase):
                       "\t\t! grep -q 'Retention across system suspend, as on sm8650' "
                       "\"$hang_tree/$gcc.c\" ||\n\t\tdie ", text)
         build = (REPO / "scripts/build-mainline-kernel.sh").read_text()
-        hook = ("\tapply_unless 'dwc3_qcom_set_pstate' \\\n\t\tdrivers/usb/dwc3/dwc3-qcom.c \\\n"
-                "\t\tdwc3-qcom-drop-required-opps-vote-in-system-suspend.patch\n")
+        hook = ("\napply_unless 'dwc3_qcom_set_pstate' \\\n\tdrivers/usb/dwc3/dwc3-qcom.c \\\n"
+                "\tdwc3-qcom-drop-required-opps-vote-in-system-suspend.patch\n")
         self.assertEqual(build.count(hook), 1)
-        # In the SM-X710's gate: that board's build applies it, the SM-X910's
-        # does not.
+        # Every build applies it, the SM-X710's as before (its hang-log tree
+        # has it) and since 2026-11-25 the SM-X910's: in no board gate.
         before = build[:build.index(hook)]
         gate = before.rindex("\nif ")
-        self.assertTrue(before[gate:].startswith('\nif [ "$DEVICE" = gts9wifi ]; then\n'))
-        self.assertNotIn("\nfi\n", before[gate:])
+        self.assertIn("\nfi\n", before[gate:])
         self.assertIn('\tllvm-objcopy -O binary --only-section=.data "$1" "$tmp/gcc.hang.data"\n', text)
         self.assertIn('\tgdsc_table_check "$HANG_SCRATCH/linux-gts9wifi/$gcc.o" "$build/$gcc.o" || exit 1\n', text)
         # The four bytes, each named by its domain and member (pahole).

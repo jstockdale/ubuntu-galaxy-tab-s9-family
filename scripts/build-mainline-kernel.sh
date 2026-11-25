@@ -245,7 +245,10 @@ fi
 # Hardware patches, each guarded so re-running is idempotent
 # ---------------------------------------------------------------------------
 
-# Keep the ABL-facing DTB pinned; Linux adds Galaxy CPU/GPU OPPs before probe.
+# Keep the ABL-facing DTB pinned; before any device probes, Linux holds PM8550
+# L15B in HPM and applies the early board overlays: the Galaxy CPU OPP and USB
+# wakeup on both boards, and on the Ultra the GPU OPP, the UFS ICE clock, the
+# sync_state hand-off and ramoops (kernel/drivers/gts9u-performance.c).
 bash "$repo/scripts/stage-performance-overlay.sh" "$kernel_tree"
 
 apply_unless() {
@@ -374,15 +377,15 @@ fi
 # genpd drops performance votes on runtime suspend only.  The UFS host is
 # runtime-active at every SM8550 system suspend and dwc3 never runtime
 # suspends, so both kept their CX votes through the sleep once the GCC GDSCs
-# reach CX (gts9wifi DTS).  Both drop them with their clocks.  SM-X710 only:
-# the SM-X910's GDSCs have no CX parent, and neither patch has run on it.
-if [ "$DEVICE" = gts9wifi ]; then
-	apply_unless 'ufshcd_opp_drop_votes' \
-		drivers/ufs/core/ufshcd.c ufshcd-drop-opp-votes-in-system-suspend.patch
-	apply_unless 'dwc3_qcom_set_pstate' \
-		drivers/usb/dwc3/dwc3-qcom.c \
-		dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch
-fi
+# reach CX: the SM-X710's DTS puts gcc under CX, and on the SM-X910, whose
+# DTB is pinned, kernel/dts/gts9u-sync-state.dtso does the same since
+# 2026-11-25.  Both drop them with their clocks.  Both boards: they ran on
+# the SM-X710 from 2026-11-08 on, and not yet on the SM-X910.
+apply_unless 'ufshcd_opp_drop_votes' \
+	drivers/ufs/core/ufshcd.c ufshcd-drop-opp-votes-in-system-suspend.patch
+apply_unless 'dwc3_qcom_set_pstate' \
+	drivers/usb/dwc3/dwc3-qcom.c \
+	dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch
 bash "$repo/scripts/stage-gpu-recovery-experiment.sh" "$kernel_tree"
 apply_unless 'Late-created SM-X910 DSP endpoints' \
 	drivers/mailbox/qcom-ipcc.c ipcc-reserve-gts9u-runtime-channels.patch

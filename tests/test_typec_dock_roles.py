@@ -194,16 +194,17 @@ class Dwc3GuardTests(unittest.TestCase):
         mine = [hook for hook in hooks() if hook[2] == DWC3_GUARD[1]]
         self.assertEqual(mine, [(DWC3_GUARD[0], DWC3_C, DWC3_GUARD[1])])
         # The guard is for both tablets and follows the power domain patch.
-        # On the SM-X710 the opps patch, gated to that board, changes the
-        # file first; on the SM-X910 nothing else patches the file.
+        # The opps patch changes the file first, on both tablets since
+        # 2026-11-25 (the SM-X910's gcc is under CX through
+        # gts9u-sync-state.dtso); it was gated to the SM-X710 before.
         self.assertTrue((PATCHES / DWC3_OPPS[1]).is_file())
-        self.assertNotIn(DWC3_OPPS[1], [name for _, _, name in hooks()])
-        for board, before in (("gts9wifi", [DWC3_OPPS[1]]), ("gts9uwifi", [])):
+        self.assertIn((DWC3_OPPS[0], DWC3_C, DWC3_OPPS[1]), hooks())
+        for board in ("gts9wifi", "gts9uwifi"):
             with self.subTest(board):
                 order = board_hooks(board)
                 guard = order.index(mine[0])
                 on_file = [name for _, target, name in order if target == DWC3_C]
-                self.assertEqual(on_file, before + [DWC3_GUARD[1]])
+                self.assertEqual(on_file, [DWC3_OPPS[1], DWC3_GUARD[1]])
                 self.assertEqual(order[guard - 1], (GDSC[0], GCC_C, GDSC[1]))
 
     def test_the_marker_is_this_patch_s_alone(self):
@@ -882,18 +883,14 @@ class Dwc3GuardAppliedTests(unittest.TestCase):
             cls.source[board] = (tree / DWC3_C).read_text()
 
     def test_it_applies_without_fuzz(self):
-        # On the SM-X710 the opps patch above the function moves the hunk by
-        # its four added lines; on the SM-X910 it is exact.
-        self.assertIn(DWC3_OPPS[1], self.log["gts9wifi"])
-        self.assertNotIn(DWC3_OPPS[1], self.log["gts9uwifi"])
+        # The opps patch above the function moves the hunk by its four added
+        # lines, on both tablets since 2026-11-25.
         for board in self.BOARDS:
             with self.subTest(board):
+                self.assertIn(DWC3_OPPS[1], self.log[board])
                 log = self.log[board][DWC3_GUARD[1]]
                 self.assertNotIn("fuzz", log)
-                if DWC3_OPPS[1] in self.log[board]:
-                    self.assertEqual(re.findall(r"offset -?\d+ lines?", log), ["offset 4 lines"])
-                else:
-                    self.assertNotIn("offset", log)
+                self.assertEqual(re.findall(r"offset -?\d+ lines?", log), ["offset 4 lines"])
 
     def test_the_hcd_is_checked_before_the_root_hub_is_read(self):
         for board in self.BOARDS:

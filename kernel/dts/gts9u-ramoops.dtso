@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/dts-v1/;
+/plugin/;
+
+/*
+ * A persistent kernel log on the Ultra: the SM-X710's ramoops region
+ * (sm8550-samsung-gts9wifi.dts, sec_pmsg_mem), made here because the
+ * Ultra's ABL-facing DTB is pinned.  That DTB reserves the same carve-out,
+ * Samsung's pstore pmsg ring, at the same address and size, no-map, and
+ * nothing in Linux uses it; this makes it the ramoops backend with the
+ * SM-X710's layout.  Applied by Linux at core_initcall, never by Samsung
+ * ABL: the memory was reserved from the flat DTB long before, and
+ * of_platform_default_populate_init() (arch_initcall_sync) creates the
+ * ramoops device for a /reserved-memory child with this compatible.
+ *
+ * Zones, in ramoops' order: three 256 KiB oops/panic records
+ * (uncompressed, config-gts9uwifi.fragment), the 1 MiB console, 128 KiB of
+ * pmsg (/dev/pmsg0, the sleep test's markers) and 128 KiB of ftrace (off
+ * unless pstore.record_ftrace=1).  ECC 96: on the SM-X710 every reset
+ * decayed 7 to 20 % of the region's bytes (the DTS comment has the
+ * numbers), and ECC 96 corrects 48 bytes per block.
+ */
+/ {
+	fragment@0 {
+		target-path = "/reserved-memory/sec-pmsg@880900000";
+		__overlay__ {
+			compatible = "ramoops";
+			record-size = <0x40000>;
+			console-size = <0x100000>;
+			pmsg-size = <0x20000>;
+			ftrace-size = <0x20000>;
+			ecc-size = <96>;
+		};
+	};
+};

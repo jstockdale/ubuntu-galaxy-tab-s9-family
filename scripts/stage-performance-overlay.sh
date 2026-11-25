@@ -10,15 +10,18 @@ command -v python3 >/dev/null
 install -m0644 "$repo/kernel/drivers/gts9u-performance.c" "$target/gts9u-performance.c"
 # gts9-* applies to every family board, gts9u-* to the Ultra only; the
 # board split itself lives in gts9u-performance.c.
-for overlay in gts9u-performance gts9-performance gts9-family; do
+for overlay in gts9u-performance gts9u-sync-state gts9u-ramoops gts9-performance gts9-family; do
 	dtc -I dts -O dtb -o "$target/$overlay.dtbo" "$repo/kernel/dts/$overlay.dtso"
 done
 python3 - "$target" <<'PY'
 from pathlib import Path
 import sys
 target = Path(sys.argv[1])
-lines = ['/* Generated from kernel/dts/gts9u-performance.dtso, gts9-performance.dtso and gts9-family.dtso. */']
+lines = ['/* Generated from kernel/dts/gts9u-performance.dtso, gts9u-sync-state.dtso,',
+         ' * gts9u-ramoops.dtso, gts9-performance.dtso and gts9-family.dtso. */']
 for name, symbol in (('gts9u-performance', 'gts9u_performance_overlay'),
+                     ('gts9u-sync-state', 'gts9u_sync_state_overlay'),
+                     ('gts9u-ramoops', 'gts9u_ramoops_overlay'),
                      ('gts9-performance', 'gts9_performance_overlay'),
                      ('gts9-family', 'gts9_family_overlay')):
     data = (target / f'{name}.dtbo').read_bytes()
@@ -33,6 +36,9 @@ lines.append('')
 (target / 'gts9u-performance-overlay.h').write_text('\n'.join(lines))
 PY
 # The port already enables OF_OVERLAY for Gunyah. Do not silently build this
-# as a module: that would run after the CPU and GPU have consumed their OPPs.
+# as a module: that would run after the CPU and GPU have consumed their OPPs,
+# the RPMh regulators have read L15B's node, and on the Ultra the platform
+# devices and fw_devlink have read the nodes its sync_state and ramoops
+# overlays change.
 grep -q '^obj-$(CONFIG_OF_OVERLAY) += gts9u-performance.o$' "$target/Makefile" ||
     printf '\nobj-$(CONFIG_OF_OVERLAY) += gts9u-performance.o\n' >> "$target/Makefile"

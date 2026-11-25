@@ -140,6 +140,16 @@ CONFIG_PSTORE=y
 CONFIG_PSTORE_RAM=y
 CONFIG_PSTORE_CONSOLE=y
 CONFIG_PSTORE_PMSG=y
+# The ramoops backend is the SM-X710's region and layout, Samsung's pmsg
+# carve-out that the pinned DTB reserves on this board too, made a ramoops
+# device by kernel/dts/gts9u-ramoops.dtso (2026-11-25), and these two lines
+# are the SM-X710's (config-gts9wifi.fragment): an ftrace zone, recording only
+# with pstore.record_ftrace=1 on the command line, and records kept
+# uncompressed.  On the SM-X710 every reset decays 7 to 20 % of the region's
+# bytes; a deflated oops/panic record is unreadable from the first block ECC
+# cannot repair, a plain one stays legible.
+CONFIG_PSTORE_FTRACE=y
+# CONFIG_PSTORE_COMPRESS is not set
 
 # Adreno 740 GPU bring-up.  gpucc built-in gives the GPU SMMU (3da0000) and the
 # GMU their clocks so they stop failing probe with -110.  drm/msm is built-in
@@ -268,6 +278,36 @@ CONFIG_GUNYAH_IOEVENTFD=y
 # Rust is not needed for the bring-up kernel and would couple the build to a
 # newer toolchain than Ubuntu 24.04 currently ships.
 # CONFIG_RUST is not set
+
+# --- SoC hand-off (sync_state), as on the SM-X710 ---------------------------
+# The RPMh power-domain, clock and interconnect providers keep what the
+# bootloader left on until every consumer the device tree names has bound a
+# driver.  Until then rpmhpd votes CX, MX, MMCX and MXC at their highest corner
+# in the sleep set as well as the active one, and every interconnect node,
+# DDR included, holds an INT_MAX vote, so the SoC can never reach CX collapse,
+# AOSS sleep or DDR low power.  On blastoise (2026-11-21) rpmhpd waited for the
+# video clock controller (aaf0000), an =m driver this port never shipped, gcc
+# for it and the GMU, gpu_cc for the GMU, aggre2 and mc_virt for the crypto
+# engine, and gem_noc and mc_virt for the two DDR bandwidth monitors.  The
+# video clock controller is built in here, as on the SM-X710; the GMU, the
+# crypto engine and gcc's CX parent, which the SM-X710 has in its board DTS,
+# come from kernel/dts/gts9u-sync-state.dtso, as this board's DTB is pinned.
+# The bandwidth monitors stay without a driver (=m in the base configuration
+# and in no payload; the SM-X710 ships the module and blacklists it), so the
+# interconnect keeps its boot vote until it is released at run time: released
+# at boot, about 13 s in, it hung the SM-X710's boot-time pm_test=platform
+# cycle every time.  Holding rpmhpd and gcc back for an A/B boot,
+# initcall_blacklist=video_cc_sm8550_driver_init, needs a command line, which
+# on this board only vendor_boot carries.  Not run on this board yet.
+CONFIG_SM_VIDEOCC_8550=y
+
+# SoC sleep statistics in /sys/kernel/debug/qcom_stats: aosd (AOSS sleep),
+# cxsd (CX collapse) and ddr from the AOP message RAM (sram@c3f0000), plus the
+# per-subsystem SMEM records, as on the SM-X710.  The base configuration has
+# it =m, which this port never shipped: the sleep-stats hook and the sleep
+# test read nothing without it.  The files are 0400, which integrity lockdown
+# still lets root read.
+CONFIG_QCOM_STATS=y
 
 # PMK8550 RTC, as on the SM-X710 (config-gts9wifi.fragment): the alarm that
 # wakes a timed suspend (rtcwake, systemd WakeSystem= timers).  Under

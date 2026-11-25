@@ -3,7 +3,9 @@
  * Samsung's bootloader needs the byte-identical, validated base DTB. Add the
  * SM8550-AC OPPs, and on the Ultra the UFS ICE clock, after that handoff,
  * before any of their consumers can probe. On both boards, also take out of
- * the live tree the two properties that let PM8550 L15B leave HPM.
+ * the live tree the two properties that let PM8550 L15B leave HPM. On the
+ * Ultra, also make the SM-X710's board DTS changes for the SoC's sync_state
+ * hand-off and its ramoops region, which its pinned DTB cannot carry.
  * The CPU driver still checks its hardware LUT and supplies the real voltage;
  * the GPU entry comes from the X910's stock power-level table, not an OC.
  */
@@ -135,6 +137,28 @@ static int __init gts9u_performance_init(void)
 			  "Galaxy GPU OPP and UFS ICE clock");
 	if (!err)
 		pr_info("gts9u-performance: registered Galaxy 719 MHz GPU OPP and UFS ICE clock scaling\n");
+	ret = ret ?: err;
+
+	/*
+	 * Two more of the SM-X710's board DTS changes, for the same reason,
+	 * each in place before the platform devices are created and fw_devlink
+	 * reads their suppliers, at arch_initcall_sync.  gcc under CX, the
+	 * GMU's post-init providers and the crypto engine disabled go in one
+	 * transaction: with the video clock controller built in, rpmhpd syncs
+	 * whatever happens here, and only gcc under CX passes the UFS votes to
+	 * CX then.  The pinned DTB has every target (checked on the host by
+	 * scripts/test-performance-overlay.sh).
+	 */
+	err = gts9u_apply(gts9u_sync_state_overlay,
+			  sizeof(gts9u_sync_state_overlay), "SoC hand-off");
+	if (!err)
+		pr_info("gts9u-performance: SoC hand-off: gcc under CX, GMU post-init providers, crypto engine disabled\n");
+	ret = ret ?: err;
+
+	err = gts9u_apply(gts9u_ramoops_overlay, sizeof(gts9u_ramoops_overlay),
+			  "ramoops");
+	if (!err)
+		pr_info("gts9u-performance: ramoops in the pmsg carve-out at 0x880900000\n");
 	return ret ?: err;
 }
 /* qcom-cpufreq-hw registers at postcore; OF platform devices appear later. */

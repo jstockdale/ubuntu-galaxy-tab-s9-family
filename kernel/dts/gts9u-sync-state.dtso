@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/dts-v1/;
+/plugin/;
+
+/*
+ * The SoC hand-off (sync_state) on the Ultra: the three changes of the
+ * SM-X710's board DTS (sm8550-samsung-gts9wifi.dts, &gcc, &gmu and
+ * &crypto) that let its RPMh power domains, gcc and gpu_cc sync at boot,
+ * made here because the Ultra's ABL-facing DTB is pinned.  Applied by
+ * Linux at core_initcall, never by Samsung ABL: before
+ * of_platform_default_populate_init() (arch_initcall_sync) creates the
+ * platform devices and fw_devlink reads their suppliers
+ * (fw_devlink_parse_fwtree(), from device_add() of soc@0), so every one of
+ * them sees the edited nodes, as on the SM-X710 they see its DTB.
+ *
+ * With CONFIG_SM_VIDEOCC_8550=y (config-gts9uwifi.fragment) the video clock
+ * controller binds, and these are what kept rpmhpd, gcc and gpu_cc from
+ * sync_state() on blastoise (kernel log, 2026-11-21: "sync_state() pending
+ * due to" aaf0000.clock-controller, 3d6a000.gmu and 1dfa000.crypto).  The
+ * two DDR bandwidth monitors still hold gem_noc and mc_virt, so the
+ * interconnect keeps its boot vote until it is released at run time, as on
+ * the SM-X710 (an early release hung its boot's pm_test cycle).
+ *
+ * No preprocessor runs on this file: RPMHPD_CX is 0
+ * (dt-bindings/power/qcom,rpmhpd.h).
+ */
+/ {
+	fragment@0 {
+		/*
+		 * gcc's GDSCs (UFS, PCIe, USB) under CX, as the SM-X710's &gcc:
+		 * without a parent a GDSC passes the CX levels of the UFS and PCIe
+		 * OPPs and the USB required-opps to no rail, and once rpmhpd syncs
+		 * nothing else would keep CX up for the UFS at 300 MHz and its
+		 * inline crypto engine at 403 MHz (gts9u-performance.dtso).  gcc
+		 * attaches to CX when it probes; nothing under apps_rsc uses a gcc
+		 * clock, so the new link to rpmhpd makes no cycle.  The UFS and USB
+		 * drivers drop their votes in system sleep
+		 * (ufshcd-drop-opp-votes-in-system-suspend.patch and
+		 * dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch).
+		 */
+		target-path = "/soc@0/clock-controller@100000";
+		__overlay__ {
+			power-domains = <&rpmhpd 0>;
+		};
+	};
+
+	fragment@1 {
+		/*
+		 * The GMU never binds a driver of its own (the Adreno driver takes
+		 * its clocks, domains and registers), so fw_devlink would wait for
+		 * it for good and gcc and gpucc would never sync.  As post-init
+		 * providers the two links are FWLINK_FLAG_IGNORE ones, which
+		 * fw_devlink drops without making a device link.
+		 */
+		target-path = "/soc@0/gmu@3d6a000";
+		__overlay__ {
+			post-init-providers = <&gcc>, <&gpucc>;
+		};
+	};
+
+	fragment@2 {
+		/*
+		 * The crypto engine: no driver here (CONFIG_CRYPTO_DEV_QCE=m, not
+		 * shipped), and bound it would hold its DDR path in the sleep set
+		 * for good.  Disabled, it is no consumer of aggre2 and mc_virt.
+		 * Not yet populated at core_initcall, so no device goes away.
+		 */
+		target-path = "/soc@0/crypto@1dfa000";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+};
