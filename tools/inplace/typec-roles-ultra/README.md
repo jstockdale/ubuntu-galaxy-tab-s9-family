@@ -3,9 +3,10 @@
 This kit goes on top of release v1.2.5. It carries the kernel changes for
 powered USB-C docks described in
 [`docs/usb-c-dock-roles.md`](../../../docs/usb-c-dock-roles.md), so that they
-can be tested on a tablet before a release carries them. It is a test
-vehicle, not an install or update path: a release kernel is built from
-committed code.
+can be tested on a tablet before a release carries them, and since
+revision 8 (below, "Revision 8") what the SM-X710 sleeps deeply with. It is
+a test vehicle, not an install or update path: a release kernel is built
+from committed code.
 
 **Why.** A powered dock should leave the tablet as power sink and USB host,
 also when the tablet boots with the dock attached. On the SM-X910 two docks
@@ -69,9 +70,10 @@ yet**, and neither has a real sleep with the dock attached.
   every SM8550 PHY, which changes nothing at run time on this tablet
   ([`docs/resume-recovery.md`](../../../docs/resume-recovery.md#sm-x710-gts9wifi)).
   `make-kit.sh` checks all of that, that the UFS PHY's calibration in the
-  new `vmlinux` no longer asks which board it runs on, and that the
-  configuration, the DTB and the fingerprint layers are byte for byte the
-  release build's.
+  new `vmlinux` no longer asks which board it runs on, and that the DTB and
+  the fingerprint layers are byte for byte the release build's, and up to
+  revision 7 the configuration too (revision 8 changes four lines of it,
+  below).
 - **boot** holds the new kernel. **vendor_boot is not written**: it carries
   the DTB, which did not change. `install.sh` checks that it still holds the
   release's image.
@@ -130,6 +132,87 @@ detail):
   that costs in sleep, and whether the USB host survives a real sleep with
   it, has not been measured.
 
+**Revision 8 (2026-11-25): the deep-sleep groundwork. Written and checked on
+the host; no kernel has been built for it, no kit packed, nothing of it has
+run on an SM-X910.** It brings this board what the SM-X710's kit revision 14
+reached its first whole-SoC deep sleeps with (2026-11-24 and 25,
+[`docs/resume-recovery.md`](../../../docs/resume-recovery.md#deep-sleep-on-the-sm-x710-2026-11-24-and-25)).
+The kernel is this checkout's `gts9uwifi` build, which since 2026-11-25 has
+the first five items below in every build, built with the SM-X710 kit's
+switches (below, "Build"); the DTB, vendor_boot, the fingerprint layers and
+the module list stay the release's:
+- **The configuration**, the release's with four lines changed (`make-kit.sh`
+  allows these and nothing else, `config_changes`):
+  `CONFIG_SM_VIDEOCC_8550=y` (the video clock controller binds, so rpmhpd and
+  gcc can reach `sync_state()` at boot), `CONFIG_QCOM_STATS=y` (the sleep
+  counts in `/sys/kernel/debug/qcom_stats`), `CONFIG_PSTORE_FTRACE=y` and no
+  `CONFIG_PSTORE_COMPRESS` (the SM-X710's pstore lines, with ramoops below).
+  The DDR bandwidth monitors stay without a driver, as on the SM-X710 (there
+  the module is shipped and blacklisted): the interconnect keeps its boot vote
+  until a sleep test releases it (`release-floor`). Released at boot it hung
+  the SM-X710's boot cycle.
+- **The early helper** (`kernel/drivers/gts9u-performance.c`): L15B held in
+  HPM (its line `gts9u-performance: L15B held in HPM: 2 of its DTB properties
+  dropped`), and two more overlays, the SM-X710's board DTS changes this
+  board's pinned DTB cannot carry: `kernel/dts/gts9u-sync-state.dtso` (gcc
+  under CX, the GMU's post-init providers, the crypto engine disabled; its
+  line `gts9u-performance: SoC hand-off: gcc under CX, GMU post-init
+  providers, crypto engine disabled`) and `kernel/dts/gts9u-ramoops.dtso`
+  (ramoops on Samsung's pmsg carve-out, the SM-X710's layout, ECC 96; its line
+  `gts9u-performance: ramoops in the pmsg carve-out at 0x880900000`).
+- The UFS and USB CX votes dropped in system sleep
+  (`ufshcd-drop-opp-votes-in-system-suspend.patch` and
+  `dwc3-qcom-drop-required-opps-vote-in-system-suspend.patch`, in
+  `kernel/patches/`), on both boards since gcc is under CX here too.
+- ufs-qcom's UFS PHY power reference fix (`ufs-qcom-track-phy-power-state-gts9u.patch`,
+  every build since 2026-11-23): without it the SM-X710 lost the storage at a
+  resume.
+- The SM-X710 kit's sleep patches, the same files and switches: `pcie_0_gdsc`
+  collapsed in a sleep in which the PCIe host powered down, with its guard,
+  and the root port's debug switch (`root-port-d3` of the sleep test); the
+  three SM8550 sleep fixes (the PIPE clock mux revert, so without
+  `unpark-pcie0-pipe-mux.patch`, the GPU RSC's stale votes, ufs-qcom's lane
+  clocks); the three XO fixes (the geni UARTs force-suspended, the DSI PHY's
+  AHB clock, the VA macro's LPASS votes); the debug switches (the GDSCs, the
+  RPMh retention floor, the AOP's CXPC log); the UFS PHY's two diagnostics
+  and ufs-qcom's count diagnostic. Each was checked on this board's tree: it
+  applies strictly to a `gts9uwifi` tree, and the objects compile with the
+  release build's flags, without a diagnostic.
+- **The kit ships the SM-X710 kit's `sleep-test.sh` and
+  `ufs-phy-power-check.sh`**, which know both boards since 2026-11-25. On this
+  board `sleep-test.sh release-floor` releases the interconnect floor in the
+  run itself (no late release here), a run refuses to start with Bluetooth
+  and Wi-Fi both off (it is first for L15B with a radio on), and the `pmic`
+  option reads the PMIC's power-on and over-current logs before and after
+  each sleep, read only. The X710 kit's README, "The sleep test", has the
+  rest, which is the same on both boards.
+- **`install.sh` and `rollback.sh` work as before** (only `install.sh`'s
+  header comment changed): revision 8 installs over revision 7, or over the
+  release, with one command and one reboot, and `rollback.sh` returns to the
+  release. vendor_boot is not written. Before copying revision 8 to a tablet
+  that runs revision 7, move revision 7's kit aside
+  (`mv ~/typec-roles ~/typec-roles-r7`) instead of copying over it: its
+  `install.sh`, run over revision 8, is the one-command way back to
+  revision 7.
+- **`verify.sh`** adds revision 8's checks, each a FAIL on revision 8's
+  kernel (the kit's `REVISION`) and a note on any other: the helper's two
+  lines, ramoops (its line and `/dev/pmsg0`), the running DT the overlay
+  leaves, rpmhpd, gcc and gpu_cc `state_synced` 1 (with what holds one back,
+  from the kernel's `sync_state() pending` lines), `qcom_stats` bound, the
+  debug switches as they boot, the PCIe guard's line in the boot's panel
+  cycle, Bluetooth and the console's tty, and the L15B step's line, which
+  revision 8's kernel must log. The interconnect floor and the sensors' sleep
+  hook (device 2.75, or the `sensors-hook` kit) are notes.
+
+What revision 8 risks on its first boot, and the way back if it does not
+come up, are in the deep-sleep groundwork report
+(`~/ubuntu-gts9u/backups/ultra-deep-sleep-groundwork-2026-11-25.md`,
+sections 3 and 8): rpmhpd syncing at boot is new on this board, and a boot
+that does not come up needs TWRP and revision 7's `boot.img`
+(`~/ubuntu-gts9u/backups/typec-roles-ultra-kit-r7/boot.img`, sha256
+`f81161f20d148a8e649bc240cddcb82b8898a1af0558f2346643ece0b15190fc`), then
+revision 7's `install.sh` as an upgrade.
+
 ## Build (host)
 
 The kernel inputs are the release's plus the change, so build from the
@@ -139,6 +222,9 @@ release's kernel inputs with the change on top, in a new object tree.
 U=/path/to/scratch/build-typec-ultra     # on the external drive, no spaces
 git worktree add --detach $U/source <commit>
 DEVICE=gts9uwifi UBUNTU_WORKDIR=$HOME/ubuntu-gts9u TMPDIR=$HOME/ubuntu-gts9u/tmp \
+  APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1 APPLY_SM8550_SLEEP_FIXES=1 \
+  APPLY_SM8550_PCIE0_GDSC_OFF=1 APPLY_SM8550_PCIE0_GDSC_GUARD=1 \
+  APPLY_LPASS_VA_MACRO_PM_CLK=1 APPLY_DSI_PHY_AHB_RELEASE=1 APPLY_GENI_SERIAL_FORCE_SUSPEND=1 \
   KERNEL_WORKTREE=$U/linux-src-gts9uwifi KERNEL_BUILD_DIR=$U/linux-gts9uwifi \
   KERNEL_OUT_DIR=$HOME/ubuntu-gts9u/out/kernel-gts9uwifi-typec \
   bash $U/source/scripts/build-mainline-kernel.sh
@@ -150,15 +236,27 @@ BASE_SCRATCH=/path/to/scratch/build \
   $HOME/ubuntu-gts9u/backups/typec-roles-ultra-kit
 ```
 
-The build archives its module key in the registry
+The `APPLY_*` variables are revision 8's, the SM-X710 kit's set
+(`APPLY_SM8550_ROOT_PORT_D3` stays unset: the root port's D3hot is the
+sleep test's `root-port-d3`, off at every boot); revisions 1 to 7 were built
+without them. The build archives its module key in the registry
 (`scripts/kernel-key-registry.sh`); `make-kit.sh` refuses a build whose key is
 not there. Run `make-kit.sh` from the checkout that was built: it compares
-the build tree with that checkout's driver and patches. With `BASE_SCRATCH`
-it also compares the whole kernel source tree with the release build's
-(the objects that the module builds leave in the tree aside), and the
-compiled power domain table with the release build's: the two power-state
-values and nothing else.
-`SOURCE` in the kit records the checkout and which of the two checks ran.
+the build tree with that checkout's driver, early helper, patches and stage
+scripts, and refuses a build without one of revision 8's changes (the image
+has to hold every string of `new_strings` and `deep_strings`, none of which
+the release image has). With `BASE_SCRATCH` it also compares the whole kernel
+source tree with the release build's (the objects that the module builds
+leave in the tree aside): it replays every patch on the release tree's files
+in the build's order (`build_order`), with `unpark-pcie0-pipe-mux.patch`
+taken out, the two stage scripts on top, and twenty-two files and two
+overlay blobs may differ, by exactly that; and the compiled power domain
+table with the release build's: four bytes and nothing else (the two USB
+domains, `pcie_0_gdsc`'s power states and its genpd flag). It also checks,
+in `vmlinux`, the UFS PHY's calibration, the PIPE clock mux, the PCIe PHY's
+power-on, the geni UART's sleep callbacks and the debug switches.
+`SOURCE` in the kit records the checkout, the build's switches and which of
+the checks ran; `REVISION` the revision (8; revisions 1 to 7 had none).
 
 ## Install, check, roll back (tablet)
 
@@ -300,11 +398,11 @@ tree at boot and logs a `gts9u-performance: L15B` line; the bootloader's
 copy, `/sys/firmware/fdt`, keeps both. With that line `verify.sh` checks
 that the running DT's ldo15 has neither property and that the regulator
 reads `normal` (HPM), and fails on the kit's kernel if not. Without it, as
-on every revision so far (1 to 7), it prints a note and checks nothing:
-`make-kit.sh` does not yet require the step in a new kernel. Whether the
-SM-X910 needs the step has not been measured, and it cannot be yet: this
-board reaches no whole-SoC sleep while its RPMh power domains have not
-synced.
+on revisions 1 to 7, it prints a note and checks nothing; revision 8's
+`make-kit.sh` requires the step in its kernel, and on that kernel a missing
+line is a FAIL. Whether the SM-X910 needs the step has not been measured,
+and it cannot be yet: this board reaches no whole-SoC sleep while its RPMh
+power domains have not synced, which revision 8 is to change.
 
 ## Physical checks still to run (owner)
 

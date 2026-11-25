@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import unittest
+import importlib.util
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -58,6 +59,10 @@ PREFIXES = (
     "/sys/kernel/notes", "/sys/class/power_supply/", "/sys/class/typec/",
     "/sys/kernel/debug/usb/", "/sys/bus/usb/devices/", "/sys/module/sm5714_usbpd/parameters",
     "/dev/kmsg", "/sys/class/regulator/",
+    # Revision 8's checks (verify.sh).
+    "/sys/bus/platform/", "/sys/module/gcc_sm8550/", "/sys/module/rpmhpd/", "/sys/module/pcie_qcom/",
+    "/sys/module/qcom_stats/", "/sys/class/bluetooth/", "/sys/class/tty/", "/usr/lib/systemd/system-sleep/",
+    "/dev/pmsg0",
 )
 
 STUBS = {
@@ -443,6 +448,19 @@ def pinned(script, name):
 
 def constant(script, name):
     return re.search(rf"^{name}=(\S+)$", (KIT_SRC / script).read_text(), re.M).group(1)
+
+
+def kit_paths(text):
+    """make-kit.sh's path variables (tcpm_dir=..., gcc=...), by name."""
+    names = {}
+    for name, value in re.findall(r"^([a-z_0-9]+)=((?:drivers|sound|include)/[A-Za-z0-9_./-]+)$", text, re.M):
+        names[name] = value
+    return names
+
+
+def kit_expand(word, names):
+    """WORD with make-kit.sh's $name and ${name} put in."""
+    return re.sub(r"\$\{?(\w+)\}?", lambda match: names[match.group(1)], word)
 
 
 def kernel_source():
@@ -2034,12 +2052,13 @@ class VerifyTest(FakeTablet):
                 result = self.run_script("verify.sh")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("FAIL cannot read this boot's kernel log (journalctl -k -b): the "
-                              "module key, the module failures, the USB host controller and L15B "
-                              "were not checked\n", result.stdout)
+                              "module key, the module failures, the USB host controller, L15B and "
+                              "revision 8's kernel-log checks were not checked\n", result.stdout)
                 self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
                 for claim in ("the kernel trusts", "Loaded X.509", "no module was refused",
                               "symbol failures this boot", "the USB host controller did not die",
-                              "the USB host controller died", "DT: L15B"):
+                              "the USB host controller died", "DT: L15B", "kernel log: gts9u-performance",
+                              "ramoops:", "PCIe power domain guard", "Bluetooth:"):
                     self.assertNotIn(claim, result.stdout)
                 # What does not need the log is still checked.
                 self.assertIn("ok   2 modules, all signed with the kit's key", result.stdout)
@@ -2139,6 +2158,161 @@ class VerifyTest(FakeTablet):
         reg.mkdir(parents=True, exist_ok=True)
         (reg / "name").write_text("vreg_l15b_1p8\n")
         (reg / "opmode").write_text(mode + "\n")
+
+    # Revision 8's kernel as blastoise is to boot it: the early helper's
+    # lines, ramoops, the DT the overlay leaves, rpmhpd, gcc and gpu_cc
+    # synced, the interconnect held, qcom_stats bound, the debug switches as
+    # they boot, the guard's line of the panel cycle, Bluetooth and the
+    # console's tty, the sensors' hook of device 2.75.
+    R8_LINES = ("gts9u-performance: SoC hand-off: gcc under CX, GMU post-init providers, crypto engine disabled",
+                "gts9u-performance: ramoops in the pmsg carve-out at 0x880900000",
+                "ramoops: using 0x200000@0x880900000, ecc: 96",
+                "qcom-pcie 1c00000.pcie: system sleep: the link was kept, and its power domain stayed on",
+                "PM: suspend exit")
+
+    def boot_kit_r8(self):
+        self.boot_kit()
+        (self.kit / "REVISION").write_text("8\n")
+        self.l15b()
+        self.journal_add("".join(f"blastoise kernel: {line}\n" for line in (L15B_STEP,) + self.R8_LINES))
+        F = self.root
+        (F / "dev/pmsg0").write_text("")
+        dt = F / "proc/device-tree/soc@0"
+        for node, prop, value in (("clock-controller@100000", "power-domains", b"\0\0\0\x3a\0\0\0\0"),
+                                  ("gmu@3d6a000", "post-init-providers", b"\0\0\0\x3b\0\0\0\x41"),
+                                  ("crypto@1dfa000", "status", b"disabled\0")):
+            (dt / node).mkdir(parents=True, exist_ok=True)
+            (dt / node / prop).write_bytes(value)
+        devices = F / "sys/bus/platform/devices"
+        for d, synced in (("17a00000.rsc:power-controller", "1"), ("100000.clock-controller", "1"),
+                          ("3d90000.clock-controller", "1"), ("24100000.interconnect", "0"),
+                          ("interconnect-1", "0"), ("1700000.interconnect", "1")):
+            (devices / d / "of_node").mkdir(parents=True, exist_ok=True)
+            (devices / d / "state_synced").write_text(synced + "\n")
+            if d.endswith("interconnect") or d.startswith("interconnect"):
+                (devices / d / "of_node/#interconnect-cells").write_bytes(b"\0\0\0\x01")
+        (F / "sys/bus/platform/drivers/qcom_stats/c3f0000.sram").mkdir(parents=True)
+        for path, value in (("gcc_sm8550/parameters/debug_pcie0_off", "Y"),
+                            ("gcc_sm8550/parameters/debug_pcie0_phy_off", "N"),
+                            ("gcc_sm8550/parameters/debug_usb_off", "N"), ("rpmhpd/parameters/debug_ret_floor", "N"),
+                            ("pcie_qcom/parameters/debug_root_port_d3", "N"),
+                            ("qcom_stats/parameters/debug_cxpc_violators", "N")):
+            (F / "sys/module" / path).parent.mkdir(parents=True, exist_ok=True)
+            (F / "sys/module" / path).write_text(value + "\n")
+        (F / "sys/class/bluetooth/hci0").mkdir(parents=True)
+        (F / "sys/class/tty/ttyMSM0/power").mkdir(parents=True)
+        (F / "sys/class/tty/ttyMSM0/power/wakeup").write_text("disabled\n")
+        hook = F / "usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors"
+        hook.parent.mkdir(parents=True)
+        hook.write_text("systemctl stop ubuntu-gts9u-sensors-resume.service iio-sensor-proxy.service\n")
+
+    def test_revision_8_s_checks_pass_on_its_kernel(self):
+        self.boot_kit_r8()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("FAIL", result.stdout)
+        for said in ("ok   kernel log: gts9u-performance: SoC hand-off: gcc under CX, GMU post-init providers, "
+                     "crypto engine disabled",
+                     "ok   kernel log: gts9u-performance: ramoops in the pmsg carve-out at 0x880900000",
+                     "ok   ramoops: 0x200000@0x880900000, ECC 96, and its pmsg device",
+                     "ok   DT: gcc under CX (power-domains), the GMU's post-init-providers, crypto@1dfa000 disabled",
+                     "ok   sync_state: rpmhpd, gcc and gpu_cc synced at boot",
+                     "note interconnect floor: held (unsynced: 24100000.interconnect interconnect-1), as every boot "
+                     "of this board holds it until sleep-test.sh release-floor",
+                     "ok   qcom_stats: bound to c3f0000.sram",
+                     "ok   debug switch gcc_sm8550.debug_pcie0_off = Y, as it boots",
+                     "ok   debug switch qcom_stats.debug_cxpc_violators = N, as it boots",
+                     "ok   PCIe power domain guard: in this boot's first suspend (the panel cycle) the host kept its "
+                     "link and pcie_0_gdsc stayed on",
+                     "ok   Bluetooth: hci0, no disabled interrupt and no HCI command timeout this boot",
+                     "ok   console ttyMSM0: wakeup disabled",
+                     "ok   the sensors' sleep hook stops iio-sensor-proxy",
+                     f"ok   DT: L15B (vreg_l15b_1p8) held in HPM"):
+            with self.subTest(said):
+                self.assertIn(said, result.stdout)
+        self.assertIn("all checks passed", result.stdout)
+
+    def test_each_of_revision_8_s_checks_fails_on_its_kernel_and_is_a_note_on_another(self):
+        """A FAIL on revision 8's own kernel, a note on any other (revision 7
+        and the release have none of it); a guard that did not hold or a
+        Bluetooth UART's interrupt disabled is a FAIL on any kernel."""
+        # self.root is looked up at each call: every subtest has a fresh fake.
+        def drop_line(text):
+            return lambda: (self.root / "journal").write_text(
+                "".join(l for l in (self.root / "journal").read_text().splitlines(True) if text not in l))
+
+        cases = {
+            "no hand-off line": (drop_line("SoC hand-off"), 'no "gts9u-performance: SoC hand-off: gcc under CX'),
+            "no ramoops line": (drop_line("ramoops in the pmsg"), 'no "gts9u-performance: ramoops in the pmsg'),
+            "no ramoops": (drop_line("ramoops: using"), "no ramoops on 0x880900000 with ECC 96"),
+            "no pmsg": (lambda: (self.root / "dev/pmsg0").unlink(), "no ramoops on 0x880900000 with ECC 96"),
+            "gcc not under CX": (lambda: (self.root / "proc/device-tree/soc@0/clock-controller@100000/power-domains").unlink(),
+                                 "DT: gcc has no power-domains"),
+            "crypto enabled": (lambda: (self.root / "proc/device-tree/soc@0/crypto@1dfa000/status").write_bytes(b"okay\0"),
+                               "DT: gcc has no power-domains"),
+            "rpmhpd unsynced": (lambda: [(self.root / "sys/bus/platform/devices/17a00000.rsc:power-controller/state_synced")
+                                         .write_text("0\n"),
+                                         self.journal_add("blastoise kernel: qcom-rpmhpd 17a00000.rsc:power-controller: "
+                                                          "sync_state() pending due to aaf0000.clock-controller\n")],
+                                "sync_state: not synced: 17a00000.rsc:power-controller; "
+                                "17a00000.rsc:power-controller waits for aaf0000.clock-controller"),
+            "qcom_stats unbound": (lambda: (self.root / "sys/bus/platform/drivers/qcom_stats/c3f0000.sram").rmdir(),
+                                   "qcom_stats: no device bound"),
+            "a debug switch set": (lambda: (self.root / "sys/module/pcie_qcom/parameters/debug_root_port_d3").write_text("Y\n"),
+                                   "debug switch pcie_qcom.debug_root_port_d3 is Y, expected N at boot"),
+            "no guard line": (drop_line("system sleep:"),
+                              "PCIe power domain guard: this boot's first suspend logged no \"system sleep:\" line"),
+            "no Bluetooth": (lambda: (self.root / "sys/class/bluetooth/hci0").rmdir(), "no Bluetooth controller"),
+            "tty wakeup on": (lambda: (self.root / "sys/class/tty/ttyMSM0/power/wakeup").write_text("enabled\n"),
+                              "console ttyMSM0: wakeup not disabled"),
+            "no L15B step": (drop_line("L15B held"), "DT: L15B (vreg_l15b_1p8) not checked: this kernel has no L15B step"),
+        }
+        for kernel in ("its", "another"):
+            for name, (make, message) in cases.items():
+                with self.subTest(kernel=kernel, case=name):
+                    FakeTablet.setUp(self)
+                    VerifyTest.setUp(self)
+                    self.boot_kit_r8()
+                    make()
+                    if kernel == "another":
+                        self.running(NEWER_BUILD_ID)
+                    result = self.run_script("verify.sh")
+                    word = "FAIL" if kernel == "its" else "note"
+                    self.assertIn(f"{word} {message}", result.stdout)
+                    if kernel == "its":
+                        self.assertEqual(result.returncode, 1)
+                    else:
+                        # The build ID's own FAIL, and nothing of revision 8's.
+                        self.assertNotIn(f"FAIL {message}", result.stdout)
+        for name, line, message in (
+                ("the guard did not hold", "qcom-pcie 1c00000.pcie: system sleep: the link was kept, but genpd "
+                                           "powered its power domain off",
+                 "FAIL the PCIe power domain guard did not hold this boot"),
+                ("an interrupt disabled", "irq 196: nobody cared (try booting with the \"irqpoll\" option)",
+                 "FAIL an interrupt was disabled or a Bluetooth command timed out this boot:")):
+            for kernel in ("its", "another"):
+                with self.subTest(kernel=kernel, case=name):
+                    FakeTablet.setUp(self)
+                    VerifyTest.setUp(self)
+                    self.boot_kit_r8()
+                    self.journal_add(f"blastoise kernel: {line}\n")
+                    if kernel == "another":
+                        self.running(NEWER_BUILD_ID)
+                    result = self.run_script("verify.sh")
+                    self.assertIn(message, result.stdout)
+
+    def test_revision_7_and_the_release_get_notes_alone_from_revision_8_s_checks(self):
+        """The kit without REVISION (revisions 1 to 7): every check of
+        revision 8 that fails is a note, also on the kit's own kernel."""
+        self.boot_kit()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        for message in ("no \"gts9u-performance: SoC hand-off", "DT: gcc has no power-domains",
+                        "sync_state: not synced", "qcom_stats: no device bound",
+                        "the sensors' sleep hook does not stop iio-sensor-proxy"):
+            with self.subTest(message):
+                self.assertIn(f"note {message}", result.stdout)
+                self.assertNotIn(f"FAIL {message}", result.stdout)
 
     def test_verify_checks_that_the_kernel_s_l15b_step_held_it_in_hpm(self):
         """A kernel with the L15B step: the step's line, and the running DT
@@ -2318,15 +2492,17 @@ class UfsGateTest(unittest.TestCase):
 
     def flows(self, tmp):
         """The UFS PHY driver as builds leave it: the release's (SERDES, then
-        the SM-X910-only reset), the new one (SERDES, the stage script), the
-        SM-X710 kit's (the new one and the diagnostic), and the new one with
-        the old form's marker left in a comment."""
+        the SM-X910-only reset), a default build's (SERDES, the stage
+        script), this kit's since revision 8 and the SM-X710 kit's (the new
+        one and both diagnostics, APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1 with
+        APPLY_SM8550_SLEEP_FIXES=1), the new one with the first diagnostic
+        alone, and the kit's with the old form's marker left in a comment."""
         source = subprocess.run(["git", "-C", str(kernel_source()), "show",
                                  f"HEAD:{QMP}.c"], check=True, capture_output=True, text=True).stdout
         legacy = re.search(r"<<'LEGACY_PCS_RESET'\n(.*?\n)LEGACY_PCS_RESET\n",
                            (REPO / "scripts/stage-ufs-resume-experiment.sh").read_text(), re.S).group(1)
         trees = {}
-        for name in ("release", "new", "diagnostic", "stale-marker"):
+        for name in ("release", "new", "diagnostic", "kit", "stale-marker"):
             root = tmp / name
             (root / QMP).parent.mkdir(parents=True)
             (root / f"{QMP}.c").write_text(source)
@@ -2339,9 +2515,13 @@ class UfsGateTest(unittest.TestCase):
             else:
                 subprocess.run(["bash", str(REPO / "scripts/stage-ufs-resume-experiment.sh"), str(root)],
                                check=True, capture_output=True)
-            if name == "diagnostic":
+            if name in ("diagnostic", "kit", "stale-marker"):
                 subprocess.run(["patch", "-s", "--fuzz=0", "-d", str(root), "-p1"],
                                input=(REPO / "kernel/patches/qmp-ufs-pcs-state-diagnostic.patch").read_text(),
+                               check=True, text=True)
+            if name in ("kit", "stale-marker"):
+                subprocess.run(["patch", "-s", "--fuzz=0", "-d", str(root), "-p1"],
+                               input=(REPO / "kernel/patches/qmp-ufs-pwrdn-readback-diagnostic.patch").read_text(),
                                check=True, text=True)
             if name == "stale-marker":
                 with (root / f"{QMP}.c").open("a") as source_file:
@@ -2352,20 +2532,20 @@ class UfsGateTest(unittest.TestCase):
     def defined(self):
         """make-kit.sh's own definitions of the names the checks use."""
         return "".join(re.search(rf"^{name}=.*\n", self.text, re.M).group(0)
-                       for name in ("qmp", "pcs_patch", "pcs_legacy_marker", "qmp_diag_marker"))
+                       for name in ("qmp", "pcs_patch", "pcs_legacy_marker", "qmp_diag_marker", "ufs_patches"))
 
     @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
     def test_the_build_tree_has_to_carry_the_pcs_reset_whole_and_nothing_else(self):
         start = self.text.index('mkdir -p "$tmp/ufs/${qmp%/*}"')
-        end = self.text.index("or the UFS PHY diagnostic\"\n") + len("or the UFS PHY diagnostic\"\n")
+        end = self.text.index("or a diagnostic beside the two\"\n") + len("or a diagnostic beside the two\"\n")
         check = self.text[start:end]
+        pwrdn = "does not carry qmp-ufs-pwrdn-readback-diagnostic.patch whole"
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
             trees = self.flows(tmp)
-            for name, message in (("new", None),
-                                  ("release", f"does not carry {PCS_PATCH} whole"),
-                                  ("diagnostic", "carries the SM-X910-only PCS reset or the UFS PHY diagnostic"),
-                                  ("stale-marker", "carries the SM-X910-only PCS reset or the UFS PHY diagnostic")):
+            for name, message in (("kit", None), ("new", pwrdn), ("release", pwrdn), ("diagnostic", pwrdn),
+                                  ("stale-marker", "carries the SM-X910-only PCS reset, or a diagnostic beside "
+                                                   "the two")):
                 with self.subTest(name):
                     work = tmp / f"work-{name}"
                     work.mkdir()
@@ -2382,20 +2562,21 @@ class UfsGateTest(unittest.TestCase):
     @unittest.skipUnless(kernel_source(), "no pinned kernel checkout")
     def test_the_tree_comparison_replays_the_stage_script_on_the_release_tree_s_file(self):
         start = self.text.index("\t# The UFS PHY driver as the build changes it: the release build gave the")
-        end = self.text.index("with this checkout's stage script run on it\"\n", start) + len(
-            "with this checkout's stage script run on it\"\n")
+        end = self.text.index("with this checkout's stage script and diagnostics on it\"\n", start) + len(
+            "with this checkout's stage script and diagnostics on it\"\n")
         replay = self.text[start:end]
+        other = "is not the release tree's with this checkout's stage script and diagnostics on it"
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
             trees = self.flows(tmp)
             for name, base, tree, message in (
-                    ("the release tree and a default build", "release", "new", None),
-                    ("a base tree with the new reset", "new", "new",
+                    ("the release tree and this kit's build", "release", "kit", None),
+                    ("a base tree with the new reset", "new", "kit",
                      "is not the one with the SM-X910-only PCS reset"),
-                    ("a base tree with the diagnostic", "diagnostic", "diagnostic",
+                    ("a base tree with the diagnostic", "diagnostic", "kit",
                      "is not the one with the SM-X910-only PCS reset"),
-                    ("a build tree with the diagnostic", "release", "diagnostic",
-                     "is not the release tree's with this checkout's stage script run on it")):
+                    ("a default build's tree", "release", "new", other),
+                    ("a build tree with one diagnostic", "release", "diagnostic", other)):
                 with self.subTest(name):
                     work = tmp / f"replay-{base}-{tree}"
                     (work / "src").mkdir(parents=True)
@@ -2407,7 +2588,7 @@ class UfsGateTest(unittest.TestCase):
                     if message is None:
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual((work / "src" / f"{QMP}.c").read_text(),
-                                         (trees["new"] / f"{QMP}.c").read_text())
+                                         (trees["kit"] / f"{QMP}.c").read_text())
                     else:
                         self.assertEqual(result.returncode, 1, result.stderr)
                         self.assertIn(message, result.stderr)
@@ -2472,17 +2653,54 @@ class ScriptsTest(unittest.TestCase):
                 self.assertEqual(len(re.findall(
                     rf"^apply_unless '[^']+'\s+\S+\s+{re.escape(name)}\s*$", build, re.M)), 1)
         # Each file a patch changes is one the kit compares with the release's.
-        patched = re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1)
-        changed = set()
-        for name in names:
-            changed.update(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / name).read_text(),
-                                      re.M))
-        self.assertEqual(changed, {"drivers/usb/typec/tcpm/tcpm.c", "include/linux/usb/tcpm.h",
-                                   "drivers/clk/qcom/gcc-sm8550.c", "drivers/usb/dwc3/dwc3-qcom.c"})
-        self.assertEqual(patched, '"$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c"')
+        paths = kit_paths(text)
+        patched = {kit_expand(word, paths) for word in shlex.split(
+            re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1))}
         self.assertIn("\ntcpm_dir=drivers/usb/typec/tcpm\n", text)
         self.assertIn("\ngcc=drivers/clk/qcom/gcc-sm8550\n", text)
         self.assertIn("\ndwc3=drivers/usb/dwc3/dwc3-qcom\n", text)
+        # Revision 8: every patch the replay applies, in the build's order.
+        order = [kit_expand(word, {}) if "$" not in word else word for word in shlex.split(
+            re.search(r"^build_order=\((.*?)\)$", text, re.M | re.S).group(1))]
+        arrays = {name: shlex.split(re.search(rf"^{name}=\((.*?)\)$", text, re.M | re.S).group(1))
+                  for name in ("cx_patches", "ufs_qcom_patches", "gdsc_patches", "pcie_patches", "debug_patches",
+                               "fix_patches", "ufs_patches", "xo_patches")}
+        expanded = []
+        for word in order:
+            whole = re.fullmatch(r'"\$\{(\w+)\[@\]\}"', f'"{word}"') or re.fullmatch(r"\$\{(\w+)\[@\]\}", word)
+            one = re.fullmatch(r"\$\{(\w+)\[(\d)\]\}", word)
+            if whole:
+                expanded += arrays[whole.group(1)]
+            elif one:
+                expanded.append(arrays[one.group(1)][int(one.group(2))])
+            else:
+                expanded.append(word)
+        self.assertEqual(sorted(expanded), sorted(set(expanded)))
+        # The kit's own seven, every revision-8 patch but the UFS PHY's two
+        # diagnostics (replayed with the stage script), and nothing else.
+        self.assertEqual(set(expanded), set(names) | {n for name, ns in arrays.items() if name != "ufs_patches"
+                                                     for n in ns})
+        # The build's order: where it applies each patch, by the forms the
+        # build script applies one in (apply_unless, a NAME_patch= of a
+        # strict block, the debug switches' FILE:PATCH list, sleep_fix, or
+        # a patch read from $pat), lines joined, comments left out.
+        code = [line.strip() for line in (REPO / "scripts/build-mainline-kernel.sh").read_text()
+                .replace("\\\n", " ").splitlines() if not line.lstrip().startswith("#")]
+        at = {}
+        for patch_name in expanded:
+            form = re.compile(r"(^apply_unless .*\s|^\w+_patch=|^for \w+ in .*:|^sleep_fix .*\s|\$pat/)"
+                              + re.escape(patch_name))
+            hits = [(number, match.end()) for number, line in enumerate(code)
+                    for match in [form.search(line)] if match]
+            self.assertTrue(hits, patch_name)
+            at[patch_name] = hits[0]
+        self.assertEqual(sorted(expanded, key=at.__getitem__), expanded)
+        # And the unpark patch, which the replay takes out of the release
+        # tree's PCIe PHY driver.
+        changed = set()
+        for name in expanded + arrays["ufs_patches"] + [constant("make-kit.sh", "unpark")]:
+            changed.update(re.findall(r"^\+\+\+ b/(\S+)", (REPO / "kernel/patches" / name).read_text(), re.M))
+        self.assertEqual(changed, patched | {paths["qmp"] + ".c"})
 
     def test_every_changed_source_is_required_dated_and_compared(self):
         """The kit's changes to the kernel tree are the patched files, the
@@ -2492,39 +2710,141 @@ class ScriptsTest(unittest.TestCase):
         dwc3-qcom guard adds no string to the image: the marker in the build
         tree's source and the date of its object are its proof."""
         text = (KIT_SRC / "make-kit.sh").read_text()
-        names = {"tcpm_dir": TCPM_DIR, "gcc": GCC, "dwc3": DWC3, "qmp": QMP}
+        names = kit_paths(text)
 
         def expand(word):
-            return re.sub(r"\$\{?(\w+)\}?", lambda match: names[match.group(1)], word)
+            return kit_expand(word, names)
 
         patched = [expand(word) for word in shlex.split(
             re.search(r"^patched=\((.*?)\)$", text, re.M | re.S).group(1))]
         driver = f"{TCPM_DIR}/sm5714_usbpd.c"
-        staged = f"{QMP}.c"
+        staged = [f"{QMP}.c", f"{names['helper']}.c", f"{names['helper']}-overlay.h"]
         want = re.search(r'^\tsort > "\$tmp/trees\.want" <<EOF\n(.*?)^EOF$', text, re.M | re.S)
         self.assertEqual(sorted(expand(word) for word in want.group(1).split()),
-                         sorted(patched + [driver, staged]))
+                         sorted(patched + [driver] + staged))
         objects = [expand(pair) for pair in shlex.split(
             re.search(r"^objects=\((.*?)\)$", text, re.M | re.S).group(1))]
         required = text[text.index('for f in "$mkbootimg"'):]
         required = required[:required.index("; do\n")]
         self.assertIn('"${patched[@]/#/$tree/}"', required)
         self.assertIn('"$tree/$qmp.c"', required)
-        for source in patched + [driver, staged]:
-            if source.endswith(".c"):
-                with self.subTest(source):
-                    self.assertIn(f"{source[:-2]}.o:{source}", objects)
-                    variable = next(f"${name}" for name, value in names.items()
-                                    if source.startswith(value))
-                    obj = source[:-2].replace(names[variable[1:]], variable) + ".o"
+        self.assertIn('"$tree/$helper.c" "$tree/$helper-overlay.h"', required)
+        for source in patched + [driver] + staged:
+            with self.subTest(source):
+                stem = source.rsplit(".", 1)[0]
+                if source.endswith(".c"):
+                    self.assertIn(f"{stem}.o:{source}", objects)
+                    variable = max((name for name, value in names.items() if stem == value
+                                    or stem.startswith(value + "/")), key=lambda name: len(names[name]))
+                    obj = stem.replace(names[variable], f"${variable}", 1) + ".o"
                     self.assertIn(f'"$build/{obj}"', required)
+                elif not source.endswith("Kconfig"):
+                    # A header: dated against the object that includes it.
+                    self.assertTrue([pair for pair in objects if pair.endswith(f":{source}")], source)
         self.assertIn("grep -q 'no hcd and no root hub' \"$tree/$dwc3.c\" ||\n"
                       "\tdie 'the build tree does not carry the dwc3-qcom guard'", text)
-        # One disassembly, of the UFS PHY's calibration (UfsGateTest).
+        # The disassemblies: the UFS PHY's calibration (UfsGateTest), the
+        # clock controller's symbols (the power domain table), and what the
+        # PCIe PHY's power-on and the UART's sleep callbacks call.
         self.assertEqual(re.findall(r"^.*llvm-objdump.*$", text, re.M), [
             "for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git "
-            "llvm-objcopy llvm-objdump; do",
-            "\tllvm-objdump -d --no-show-raw-insn --disassemble-symbols=qmp_ufs_phy_calibrate \"$1\" |"])
+            "llvm-objcopy llvm-objdump llvm-nm pahole dtc; do",
+            '\tllvm-objdump -t "$2" > "$tmp/gcc.new.syms"',
+            "\tllvm-objdump -d --no-show-raw-insn --disassemble-symbols=qmp_ufs_phy_calibrate \"$1\" |",
+            '\tllvm-objdump -d --no-show-raw-insn --disassemble-symbols="$2" "$1" |'])
+
+    def config_gate(self, base, new):
+        """Run make-kit.sh's configuration check on two stand-in configs."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        block = re.search(r"^conf\(\) \{ # CONFIG.*?^\texit 1\n\}\n", text, re.M | re.S)
+        self.assertIsNotNone(block)
+        changes = re.search(r"^config_changes=\(.*?\)$", text, re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, body in (("base/config", base), ("out/config", new)):
+                pathlib.Path(tmp, name).parent.mkdir(parents=True, exist_ok=True)
+                pathlib.Path(tmp, name).write_text(body)
+            return subprocess.run(["bash", "-c", 'set -euo pipefail; export LC_ALL=C\n'
+                                   'die() { echo "$*" >&2; exit 1; }\n'
+                                   f'base={tmp}/base out={tmp}/out tmp={tmp}\n' + changes + "\n" + block.group(0)],
+                                  capture_output=True, text=True)
+
+    def test_the_configuration_differs_by_the_fragment_s_four_lines_alone(self):
+        """Revision 8's kernel is the release's configuration with the four
+        lines of config-gts9uwifi.fragment of 2026-11-25 (an olddefconfig of
+        this checkout gives exactly these, nothing derived); any other change,
+        or one of them missing, stops the kit.  Each change's old value is
+        the base configuration's, its new one the fragment's."""
+        base = ("CONFIG_A=y\nCONFIG_PSTORE_COMPRESS=y\n# CONFIG_PSTORE_FTRACE is not set\nCONFIG_QCOM_STATS=m\n"
+                "CONFIG_SM_VIDEOCC_8550=m\nCONFIG_Z=m\n")
+        new = ("CONFIG_A=y\n# CONFIG_PSTORE_COMPRESS is not set\nCONFIG_PSTORE_FTRACE=y\nCONFIG_QCOM_STATS=y\n"
+               "CONFIG_SM_VIDEOCC_8550=y\nCONFIG_Z=m\n")
+        self.assertEqual(self.config_gate(base, new).returncode, 0)
+        for name, other in (("one more", new + "CONFIG_NEW=y\n"), ("one gone", new.replace("CONFIG_Z=m\n", "")),
+                            ("one of the four missing", new.replace("CONFIG_QCOM_STATS=y", "CONFIG_QCOM_STATS=m")),
+                            ("a derived change", new.replace("CONFIG_A=y", "CONFIG_A=m"))):
+            with self.subTest(name):
+                result = self.config_gate(base, other)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("does not differ from the release kernel's in config_changes alone", result.stderr)
+        self.assertEqual(self.config_gate(base, base).returncode, 1)
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        changes = [line.split("\t") for line in shlex.split(
+            re.search(r"^config_changes=\((.*?)\)$", text, re.M | re.S).group(1))]
+        self.assertEqual([c[0] for c in changes], sorted(c[0] for c in changes))
+        fragment = (REPO / "kernel/config/config-gts9uwifi.fragment").read_text().splitlines()
+        mainline = (REPO / "kernel/config/config-mainline.aarch64").read_text().splitlines()
+
+        def value(lines, symbol):
+            for line in lines:
+                if line.startswith(symbol + "="):
+                    return line.split("=", 1)[1]
+                if line == f"# {symbol} is not set":
+                    return "n"
+            return "n"
+
+        for symbol, old, new_value in changes:
+            with self.subTest(symbol):
+                self.assertEqual(value(mainline, symbol), old)
+                self.assertEqual(value(fragment, symbol), new_value)
+
+    def test_the_kit_ships_the_x710_kit_s_sleep_test_and_ufs_check(self):
+        """One sleep test for both boards: the SM-X710 kit's file, packed
+        as it is, with the UFS PHY check; and the kit says its revision."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        shipped = re.search(r"^files=\((.*?)\)$", text, re.M | re.S).group(1).split()
+        for name in ("sleep-test.sh", "ufs-phy-power-check.sh", "REVISION"):
+            self.assertIn(name, shipped)
+        self.assertIn('install -m 0644 "$repo/tools/inplace/typec-roles/sleep-test.sh" \\\n'
+                      '\t"$repo/tools/inplace/typec-roles/ufs-phy-power-check.sh" "$kit/"\n', text)
+        self.assertIn('printf \'%s\\n\' "$revision" > "$kit/REVISION"\n', text)
+        self.assertEqual(constant("make-kit.sh", "revision"), "8")
+        self.assertFalse((KIT_SRC / "sleep-test.sh").exists())
+
+    def test_revision_8_s_strings_are_their_sources_own(self):
+        """deep_strings: each is in this checkout's helper, a patch's added
+        lines, or (the video clock controller's driver name) the pinned
+        kernel; none is in the release's sources of the Type-C patches."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        strings = shlex.split(re.search(r"^deep_strings=\((.*?)\)$", text, re.M | re.S).group(1))
+        self.assertEqual(len(strings), len(set(strings)))
+        helper = (REPO / "kernel/drivers/gts9u-performance.c").read_text()
+        added = "\n".join(line for patch in (REPO / "kernel/patches").glob("*.patch")
+                          for lines in added_lines(patch.name).values() for line in lines)
+        kernel = kernel_source()
+        for s in strings:
+            with self.subTest(s):
+                if s == "video_cc-sm8550":
+                    if kernel is None:
+                        continue
+                    source = subprocess.run(["git", "-C", str(kernel), "show",
+                                             "HEAD:drivers/clk/qcom/videocc-sm8550.c"],
+                                            check=True, capture_output=True, text=True).stdout
+                    self.assertIn(f'.name = "{s}"', source)
+                elif s.startswith("gts9u-performance:"):
+                    self.assertIn(s, helper)
+                else:
+                    plain = s.split(".", 1)[1] if re.fullmatch(r"[a-z0-9_]+\.[a-z0-9_]+", s) else s
+                    self.assertIn(plain, added + helper)
 
     def test_the_stopgap_is_the_same_service_everywhere(self):
         self.assertEqual(constant("install.sh", "stopgap"), "typec-sink-host.service")
@@ -2573,11 +2893,14 @@ class ScriptsTest(unittest.TestCase):
 
     def test_tree_comparison_passes_over_a_backup_patch_kept_and_no_other(self):
         """The build script's patch(1) keeps FILE.orig when a hunk goes in at
-        an offset, as the dwc3-qcom guard does on the SM-X710's tree.  That
-        backup is in the new tree alone and is the release tree's file, and
-        what was passed over is said on the console and in SOURCE.  Anything
-        else called .orig still has to show: one with other content, one of
-        a file the kit's patches do not change, one both trees have and one
+        an offset, as the dwc3-qcom guard does over the CX-vote patch and
+        ufs-qcom's power reference fix under the lane clock fix.  That
+        backup is in the new tree alone and is the file as it was right
+        before that patch: the one the replay recorded then, or else the
+        release tree's; what was passed over is said on the console and in
+        SOURCE.  Anything else called .orig still has to show: one with
+        other content (also one the replay recorded otherwise), one of a
+        file the kit's patches do not change, one both trees have and one
         that only the release tree has."""
         text = (KIT_SRC / "make-kit.sh").read_text()
         block = re.search(r'^\tbackups=\n\tfor f in "\$\{patched\[@\]\}"; do\n.*?^\tdone\n',
@@ -2598,8 +2921,19 @@ class ScriptsTest(unittest.TestCase):
             (new / "clk/gcc.c.orig").write_text("not the file of old\n")
             (new / "usb/other.c.orig").write_text("usb/other.c of old\n")
             (old / "include/tcpm.h.orig").write_text("include/tcpm.h of old\n")
+            # A file the replay recorded right before the patch that kept
+            # its backup (the dwc3-qcom guard over the CX-vote patch): the
+            # backup has to be that, not the release tree's file; and one
+            # recorded that the backup is not.
+            for tree, tag in ((old, "old"), (new, "new")):
+                (tree / "usb/dwc3.c").write_text("usb/dwc3.c of %s\n" % tag)
+            (pathlib.Path(tmp, "orig/usb")).mkdir(parents=True)
+            (pathlib.Path(tmp, "orig/usb/dwc3.c")).write_text("usb/dwc3.c of old, with the CX patch\n")
+            (new / "usb/dwc3.c.orig").write_text("usb/dwc3.c of old, with the CX patch\n")
+            (pathlib.Path(tmp, "orig/clk")).mkdir(parents=True)
+            (pathlib.Path(tmp, "orig/clk/gcc.c")).write_text("recorded, and not the backup\n")
             script = ('set -euo pipefail; base_tree=$1 tree=$2 tmp=$3\n'
-                      'patched=(usb/glue.c clk/gcc.c usb/tcpm.c include/tcpm.h)\n'
+                      'patched=(usb/glue.c clk/gcc.c usb/tcpm.c include/tcpm.h usb/dwc3.c)\n'
                       'diff -rq "$base_tree" "$tree" > "$tmp/trees.diff" || :\n'
                       + block.group(0) +
                       'cat "$tmp/trees.diff"; echo "backups:$backups"\n'
@@ -2611,15 +2945,14 @@ class ScriptsTest(unittest.TestCase):
         self.assertEqual(sorted(result.stdout.splitlines()), sorted([
             "Files %s and %s differ" % (old / name, new / name)
             for name in ("usb/glue.c", "clk/gcc.c", "usb/tcpm.c", "include/tcpm.h",
-                         "usb/other.c", "usb/tcpm.c.orig")
+                         "usb/other.c", "usb/tcpm.c.orig", "usb/dwc3.c")
         ] + [
             "Only in %s: gcc.c.orig" % (new / "clk"),
             "Only in %s: other.c.orig" % (new / "usb"),
             "Only in %s: tcpm.h.orig" % (old / "include"),
-            "backups: glue.c.orig",
-            "sources: passed over glue.c.orig, the release tree's file as patch(1) kept it",
-            "source check: compared; passed over, a copy of the release tree's file "
-            "that patch(1) kept: glue.c.orig",
+            "backups: glue.c.orig dwc3.c.orig",
+            "sources: passed over glue.c.orig dwc3.c.orig, the file as patch(1) kept it",
+            "source check: compared; passed over, a copy of the file that patch(1) kept: glue.c.orig dwc3.c.orig",
         ]), result.stderr)
         # Nothing passed over: nothing said, and the source check as it was.
         quiet = subprocess.run(["bash", "-c", 'set -euo pipefail; backups= source_check=compared\n'
@@ -2627,6 +2960,44 @@ class ScriptsTest(unittest.TestCase):
                                capture_output=True, text=True)
         self.assertEqual((quiet.returncode, quiet.stdout), (0, "source check: compared\n"),
                          quiet.stderr)
+
+    def test_tree_comparison_passes_over_the_new_overlays_blobs_and_no_other(self):
+        """Revision 8's two overlays are new: the release tree has no blob of
+        either, the build tree has both (each compared with what this
+        checkout's stage script makes, before the tree comparison).  Their
+        "Only in" lines are passed over; another blob in the new tree alone,
+        and an existing overlay's blob that differs, still show."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        overlays = re.search(r"^overlays=\(([^)]*)\)$", text, re.M).group(1).split()
+        new_overlays = re.search(r"^new_overlays=\(([^)]*)\)$", text, re.M).group(1).split()
+        # The release v1.2.5 tree's stage script embedded the other three.
+        self.assertEqual(new_overlays, ["gts9u-sync-state", "gts9u-ramoops"])
+        self.assertTrue(set(new_overlays) < set(overlays), overlays)
+        for o in new_overlays:
+            self.assertTrue((REPO / "kernel/dts" / f"{o}.dtso").is_file(), o)
+        block = re.search(r'^\tfor o in "\$\{new_overlays\[@\]\}"; do\n.*?^\tdone\n', text, re.M | re.S)
+        self.assertIsNotNone(block)
+        with tempfile.TemporaryDirectory() as tmp:
+            old, new = pathlib.Path(tmp, "old"), pathlib.Path(tmp, "new")
+            for tree, tag in ((old, "old"), (new, "new")):
+                (tree / "drivers/soc/qcom").mkdir(parents=True)
+                for o in ("gts9u-performance", "gts9-performance", "gts9-family"):
+                    (tree / f"drivers/soc/qcom/{o}.dtbo").write_text(
+                        tag if o == "gts9u-performance" else "same\n")
+            for o in new_overlays + ["gts9u-other"]:
+                (new / f"drivers/soc/qcom/{o}.dtbo").write_text("new\n")
+            script = ('set -euo pipefail; base_tree=$1 tree=$2 tmp=$3\n'
+                      'new_overlays=(%s)\n' % " ".join(new_overlays) +
+                      'diff -rq "$base_tree" "$tree" > "$tmp/trees.diff" || :\n'
+                      + block.group(0) + 'cat "$tmp/trees.diff"\n')
+            result = subprocess.run(["bash", "-c", script, "overlays", str(old), str(new), tmp],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        qcom = "drivers/soc/qcom"
+        self.assertEqual(sorted(result.stdout.splitlines()), sorted([
+            "Files %s and %s differ" % (old / qcom / "gts9u-performance.dtbo", new / qcom / "gts9u-performance.dtbo"),
+            "Only in %s: gts9u-other.dtbo" % (new / qcom),
+        ]), result.stderr)
 
     def power_domain_gate(self, source):
         """Run make-kit.sh's check for the USB power domain patch on SOURCE."""
@@ -2763,14 +3134,13 @@ class ScriptsTest(unittest.TestCase):
                          text, re.M | re.S)
         self.assertIsNotNone(objects)
         self.assertIsNotNone(gate)
+        names = kit_paths(text)
         # The sources, the objects compiled from them, vmlinux, the image.
-        files = {f"tree/{GCC}.c": 100, f"tree/{TCPM_DIR}/tcpm.c": 100,
-                 f"tree/{TCPM_DIR}/sm5714_usbpd.c": 100, "tree/include/linux/usb/tcpm.h": 100,
-                 f"tree/{DWC3}.c": 100, f"build/{DWC3}.o": 200,
-                 f"tree/{QMP}.c": 100, f"build/{QMP}.o": 200,
-                 f"build/{GCC}.o": 200, f"build/{TCPM_DIR}/tcpm.o": 200,
-                 f"build/{TCPM_DIR}/sm5714_usbpd.o": 200, "build/vmlinux": 300,
-                 "build/arch/arm64/boot/Image.gz": 400, "out/Image.gz": 400}
+        files = {"build/vmlinux": 300, "build/arch/arm64/boot/Image.gz": 400, "out/Image.gz": 400}
+        for pair in shlex.split(objects.group(0)[len("objects=("):-1]):
+            obj, source = kit_expand(pair, names).split(":")
+            files[f"tree/{source}"] = 100
+            files[f"build/{obj}"] = 200
         files.update(ages)
         with tempfile.TemporaryDirectory() as tmp:
             for name, age in files.items():
@@ -2782,7 +3152,7 @@ class ScriptsTest(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-c", 'set -euo pipefail; export LC_ALL=C\n'
                  'die() { echo "$*" >&2; exit 1; }\ntree=$1/tree build=$1/build out=$1/out\n'
-                 f'tcpm_dir={TCPM_DIR}\ngcc={GCC}\ndwc3={DWC3}\nqmp={QMP}\n' + objects.group(0) + "\n"
+                 + "".join(f"{name}={value}\n" for name, value in names.items()) + objects.group(0) + "\n"
                  + gate.group(0),
                  "gate", tmp], capture_output=True, text=True)
             return result.returncode, result.stdout, result.stderr.replace(tmp, "TMP")
@@ -2816,6 +3186,19 @@ class ScriptsTest(unittest.TestCase):
                                                   stale % (GCC, GCC + ".c")),
             "vmlinux linked after the image": ({"build/vmlinux": 450},
                                                "Image.gz is older than vmlinux\n"),
+            # Revision 8's: the early helper and its generated header, ufshcd,
+            # a header of the XO fixes.
+            "the helper changed since": ({"tree/drivers/soc/qcom/gts9u-performance.c": 250},
+                                         stale % ("drivers/soc/qcom/gts9u-performance",
+                                                  "drivers/soc/qcom/gts9u-performance.c")),
+            "its overlays changed since": ({"tree/drivers/soc/qcom/gts9u-performance-overlay.h": 250},
+                                           stale % ("drivers/soc/qcom/gts9u-performance",
+                                                    "drivers/soc/qcom/gts9u-performance-overlay.h")),
+            "ufshcd.c changed since": ({"tree/drivers/ufs/core/ufshcd.c": 250},
+                                       stale % ("drivers/ufs/core/ufshcd", "drivers/ufs/core/ufshcd.c")),
+            "dsi_phy.h changed since": ({"tree/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h": 250},
+                                        stale % ("drivers/gpu/drm/msm/dsi/phy/dsi_phy",
+                                                 "drivers/gpu/drm/msm/dsi/phy/dsi_phy.h")),
         }
         for name, (ages, message) in cases.items():
             with self.subTest(name):
@@ -2877,17 +3260,580 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn("**no `DR_SWAP_SEND` was cut short by a Soft Reset**", readme)
         self.assertNotIn("none was sent into a discovery", readme.replace("*", ""))
         self.assertIn("A run in which no plug-in got a verdict fails.", readme)
-        # The L15B check judges only a kernel that logs the step, and no
-        # revision so far has one.
+        # The L15B check judges only a kernel that logs the step, revisions
+        # 1 to 7 have none, and revision 8's has to.
         self.assertIn("With that line `verify.sh` checks that the running DT's ldo15 has neither "
                       "property and that the regulator reads `normal` (HPM), and fails on the kit's "
-                      "kernel if not. Without it, as on every revision so far (1 to 7), it prints a "
-                      "note and checks nothing: `make-kit.sh` does not yet require the step in a new "
-                      "kernel.", readme)
+                      "kernel if not. Without it, as on revisions 1 to 7, it prints a note and checks "
+                      "nothing; revision 8's `make-kit.sh` requires the step in its kernel, and on that "
+                      "kernel a missing line is a FAIL.", readme)
+        # Revision 8: what it is, and that nothing of it has run.
+        self.assertIn("**Revision 8 (2026-11-25): the deep-sleep groundwork. Written and checked on the host; "
+                      "no kernel has been built for it, no kit packed, nothing of it has run on an SM-X910.**",
+                      readme)
+        for name in ("APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1", "APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1",
+                     "APPLY_SM8550_SLEEP_FIXES=1", "APPLY_SM8550_PCIE0_GDSC_OFF=1", "APPLY_SM8550_PCIE0_GDSC_GUARD=1",
+                     "APPLY_LPASS_VA_MACRO_PM_CLK=1", "APPLY_DSI_PHY_AHB_RELEASE=1",
+                     "APPLY_GENI_SERIAL_FORCE_SUSPEND=1"):
+            with self.subTest(name):
+                self.assertIn(name, (KIT_SRC / "README.md").read_text())
+                self.assertIn(name, text)
+        self.assertIn("`f81161f20d148a8e649bc240cddcb82b8898a1af0558f2346643ece0b15190fc`", readme)
         for said in ("until the reboot the running kernel can load no module it has not loaded yet",
                      "while the kit is installed: rollback.sh first, then upgrade "
                      "ubuntu-gts9u-device or ubuntu-gts9u-hardware"):
             self.assertIn(f"say '{said}'", install)
+
+
+
+def dts_node(text, head):
+    """The DTS node that starts with the line HEAD (its indent included), up
+    to its closing line."""
+    start = text.index(head)
+    indent = head[:len(head) - len(head.lstrip("\t"))]
+    return text[start:text.index(f"\n{indent}}};\n", start)]
+
+
+def dts_props(block):
+    """The properties set directly in a DTS block (not in its child nodes):
+    name -> value as written, a value of None for a boolean one."""
+    found, depth = {}, 0
+    for line in block.splitlines()[1:]:
+        s = line.strip()
+        if s.endswith("{"):
+            depth += 1
+            continue
+        if s.startswith("}"):
+            depth -= 1
+            continue
+        if depth or not s.endswith(";") or s.startswith(("/*", "*")):
+            continue
+        name, _, value = s[:-1].partition(" = ")
+        found[name] = value or None
+    return found
+
+
+class DeepSleepGroundworkTest(unittest.TestCase):
+    """The SM-X910's share of what lets the SM-X710 sleep deeply (2026-11-25):
+    the X710's configuration lines in the Ultra's fragment; its three board
+    DTS changes for the SoC's sync_state hand-off and its ramoops node in two
+    Ultra-only early overlays, since the Ultra's DTB is pinned; the early
+    helper applying them on the Ultra alone, each on its own; and the UFS and
+    USB CX-vote patches in every build."""
+
+    FRAGMENTS = {b: REPO / f"kernel/config/config-{b}.fragment" for b in ("gts9wifi", "gts9uwifi")}
+    DTS = {b: REPO / f"kernel/dts/sm8550-samsung-{b}.dts" for b in ("gts9wifi", "gts9uwifi")}
+    SYNC = REPO / "kernel/dts/gts9u-sync-state.dtso"
+    RAMOOPS = REPO / "kernel/dts/gts9u-ramoops.dtso"
+    HELPER = REPO / "kernel/drivers/gts9u-performance.c"
+    STAGE = REPO / "scripts/stage-performance-overlay.sh"
+
+    @staticmethod
+    def fragments(dtso):
+        """{target-path: {property: value}} of an overlay source."""
+        text = dtso.read_text()
+        found = {}
+        for match in re.finditer(r"^\tfragment@\d+ \{\n", text, re.M):
+            block = dts_node(text, match.group(0))
+            target = re.search(r'^\t\ttarget-path = "([^"]+)";$', block, re.M).group(1)
+            # dts_node() leaves out the closing line, which the inner one needs.
+            overlay = dts_node(block + "\n", "\t\t__overlay__ {\n")
+            found[target] = dts_props(overlay)
+        return found
+
+    def test_the_ultra_fragment_has_the_x710_s_sleep_lines(self):
+        """The video clock controller built in (rpmhpd and gcc sync), the
+        sleep statistics built in, and the X710's two pstore lines for its
+        ramoops region: each once in both fragments.  The bandwidth monitors
+        are the one deviation: the X710 ships the module (and its rootfs
+        blacklists it), the Ultra ships none; both leave the two PMUs without
+        a driver, the interconnect at its boot vote."""
+        for line in ("CONFIG_SM_VIDEOCC_8550=y", "CONFIG_QCOM_STATS=y", "CONFIG_PSTORE_FTRACE=y",
+                     "# CONFIG_PSTORE_COMPRESS is not set"):
+            for board, path in self.FRAGMENTS.items():
+                with self.subTest(line=line, board=board):
+                    self.assertEqual(path.read_text().splitlines().count(line), 1)
+        ultra = self.FRAGMENTS["gts9uwifi"].read_text()
+        self.assertNotIn("CONFIG_QCOM_ICC_BWMON", "\n".join(
+            l for l in ultra.splitlines() if not l.startswith("#")))
+        self.assertIn("CONFIG_QCOM_ICC_BWMON=m", self.FRAGMENTS["gts9wifi"].read_text().splitlines())
+        # The base configuration has bwmon =m: what the payload check keys on
+        # is the fragments, so no module comes of it on the Ultra.
+        self.assertIn("CONFIG_QCOM_ICC_BWMON=m",
+                      (REPO / "kernel/config/config-mainline.aarch64").read_text().splitlines())
+        build = (REPO / "scripts/build-mainline-kernel.sh").read_text()
+        self.assertRegex(build, r'\n\t+case " \$\{requested_m\[\*\]\} " in\n\t+\*" \$symbol "\*\) ;;\n'
+                                r'\t+\*\) continue ;;\n')
+
+    def test_the_sync_state_overlay_is_the_x710_dts_s_three_changes(self):
+        """gcc under CX, the GMU's post-init providers and the crypto engine
+        disabled: the X710 DTS's &gcc, &gmu and &crypto, value for value
+        (RPMHPD_CX is 0), at the paths those labels name in sm8550.dtsi."""
+        found = self.fragments(self.SYNC)
+        self.assertEqual(found, {
+            "/soc@0/clock-controller@100000": {"power-domains": "<&rpmhpd 0>"},
+            "/soc@0/gmu@3d6a000": {"post-init-providers": "<&gcc>, <&gpucc>"},
+            "/soc@0/crypto@1dfa000": {"status": '"disabled"'},
+        })
+        x710 = self.DTS["gts9wifi"].read_text()
+        self.assertEqual(dts_props(dts_node(x710, "&gcc {\n")), {"power-domains": "<&rpmhpd RPMHPD_CX>"})
+        self.assertEqual(dts_props(dts_node(x710, "&gmu {\n")), {"post-init-providers": "<&gcc>, <&gpucc>"})
+        self.assertEqual(dts_props(dts_node(x710, "&crypto {\n")), {"status": '"disabled"'})
+        # Not in the Ultra's working-copy DTS: the overlay is its one source.
+        ultra = self.DTS["gts9uwifi"].read_text()
+        for label in ("&gcc {", "&gmu {", "&crypto {"):
+            self.assertNotIn(f"\n{label}\n", ultra)
+        kernel = kernel_source()
+        if kernel is None:
+            self.skipTest("no pinned kernel checkout")
+        show = lambda path: subprocess.run(["git", "-C", str(kernel), "show", f"HEAD:{path}"],
+                                           check=True, capture_output=True, text=True).stdout
+        self.assertRegex(show("include/dt-bindings/power/qcom,rpmhpd.h"), r"\n#define RPMHPD_CX\t+0\n")
+        dtsi = show("arch/arm64/boot/dts/qcom/sm8550.dtsi")
+        soc = dts_node(dtsi, "\tsoc: soc@0 {\n")
+        for label, node in (("gcc", "clock-controller@100000"), ("gpucc", "clock-controller@3d90000"),
+                            ("gmu", "gmu@3d6a000"), ("crypto", "crypto@1dfa000")):
+            with self.subTest(label):
+                self.assertEqual(dtsi.count(f"\t{label}: {node} {{\n"), 1)
+                self.assertIn(f"\n\t\t{label}: {node} {{\n", soc)
+        self.assertEqual(dtsi.count("\trpmhpd: power-controller {\n"), 1)
+        self.assertIn("\t\t\trpmhpd: power-controller {\n", dts_node(dtsi, "\t\tapps_rsc: rsc@17a00000 {\n"))
+        # Upstream gives crypto no status (enabled), gcc no power-domains,
+        # and the GMU no post-init-providers: the overlay adds each.
+        self.assertNotIn("status", dts_props(dts_node(dtsi, "\t\tcrypto: crypto@1dfa000 {\n")))
+        self.assertNotIn("power-domains", dts_props(dts_node(dtsi, "\t\tgcc: clock-controller@100000 {\n")))
+        self.assertNotIn("post-init-providers", dts_props(dts_node(dtsi, "\t\tgmu: gmu@3d6a000 {\n")))
+
+    def test_the_ramoops_overlay_is_the_x710_dts_s_node_on_the_same_carve_out(self):
+        """The X710 DTS's ramoops node, property for property, on the
+        carve-out the Ultra's pinned DTS reserves at the same address and
+        size, no-map, without a compatible."""
+        found = self.fragments(self.RAMOOPS)
+        self.assertEqual(list(found), ["/reserved-memory/sec-pmsg@880900000"])
+        x710 = dts_props(dts_node(self.DTS["gts9wifi"].read_text(), "\t\tsec_pmsg_mem: sec-pmsg@880900000 {\n"))
+        reg = x710.pop("reg")
+        self.assertIn("no-map", x710)
+        del x710["no-map"]
+        self.assertEqual(found["/reserved-memory/sec-pmsg@880900000"], x710)
+        self.assertEqual(x710["compatible"], '"ramoops"')
+        build = (REPO / "scripts/build-mainline-kernel.sh").read_text()
+        pin = re.search(r"^fingerprint_baseline=([0-9a-f]{40})$", build, re.M).group(1)
+        if not (REPO / ".git").exists() or not shutil.which("git"):
+            self.skipTest("not a git checkout")
+        pinned_dts = subprocess.run(["git", "-C", str(REPO), "show", f"{pin}:kernel/dts/sm8550-samsung-gts9uwifi.dts"],
+                                    check=True, capture_output=True, text=True).stdout
+        ultra = dts_props(dts_node(pinned_dts, "\t\tsec_pmsg_mem: sec-pmsg@880900000 {\n"))
+        self.assertEqual(ultra, {"reg": reg, "no-map": None})
+        # Inside /reserved-memory, where of_platform_default_populate_init()
+        # makes a ramoops device of it.
+        self.assertIn("\t\tsec_pmsg_mem: sec-pmsg@880900000 {\n", dts_node(pinned_dts, "\treserved-memory {\n"))
+
+    def test_the_overlays_compile_and_resolve_only_these_labels(self):
+        """Each compiles with dtc (as the stage script runs it) and refers to
+        the base tree through these labels alone, which /__symbols__ of the
+        pinned DTB resolves (scripts/test-performance-overlay.sh checks that
+        on the DTB itself)."""
+        if not shutil.which("dtc"):
+            self.skipTest("no dtc")
+        with tempfile.TemporaryDirectory() as tmp:
+            for dtso, labels in ((self.SYNC, ["gcc", "gpucc", "rpmhpd"]), (self.RAMOOPS, [])):
+                with self.subTest(dtso.name):
+                    out = pathlib.Path(tmp) / (dtso.stem + ".dtbo")
+                    run = subprocess.run(["dtc", "-I", "dts", "-O", "dtb", "-o", str(out), str(dtso)],
+                                         capture_output=True, text=True)
+                    self.assertEqual((run.returncode, run.stderr), (0, ""))
+                    back = subprocess.run(["dtc", "-I", "dtb", "-O", "dts", str(out)],
+                                          check=True, capture_output=True, text=True).stdout
+                    fixups = re.search(r"\t__fixups__ \{\n(.*?)\n\t\};", back, re.S)
+                    names = sorted(re.findall(r"^\t\t([a-z_]+) = ", fixups.group(1), re.M)) if fixups else []
+                    self.assertEqual(names, labels)
+
+    def test_the_helper_applies_them_on_the_ultra_alone_each_on_its_own(self):
+        """After the board gate's "if (!ultra) return ret;", the Ultra's
+        three overlays in turn, each its own transaction, each logging one
+        line when it applied and its error kept; the stage script stages
+        the two new ones under the names the helper uses."""
+        source = self.HELPER.read_text()
+        init = source[source.index("static int __init gts9u_performance_init(void)\n{\n"):]
+        init = init[:init.index("\n}\n") + 3]
+        gate = init.index("\tif (!ultra)\n\t\treturn ret;\n")
+        calls = [(m.start(), m.group(1)) for m in re.finditer(r"\terr = gts9u_apply\((\w+),\s+sizeof\(\1\),", init)]
+        self.assertEqual([name for at, name in calls if at > gate],
+                         ["gts9u_performance_overlay", "gts9u_sync_state_overlay", "gts9u_ramoops_overlay"])
+        self.assertEqual(len(calls), 5)
+        for name, line in (("gts9u_sync_state_overlay",
+                            "gts9u-performance: SoC hand-off: gcc under CX, GMU post-init providers, "
+                            "crypto engine disabled"),
+                           ("gts9u_ramoops_overlay", "gts9u-performance: ramoops in the pmsg carve-out at 0x880900000")):
+            with self.subTest(name):
+                block = init[init.index(f"\terr = gts9u_apply({name},"):]
+                block = block[:min(block.index(end) for end in ("\tret = ret ?: err;\n", "\treturn ret ?: err;\n")
+                                   if end in block)]
+                self.assertIn(f'\tif (!err)\n\t\tpr_info("{line}\\n");\n', block)
+                self.assertEqual(source.count(line), 1)
+        # Neither is applied before the gate, and the last one's error is
+        # what the initcall returns with the others'.
+        self.assertTrue(init.rstrip().endswith("return ret ?: err;\n}"))
+        stage = self.STAGE.read_text()
+        self.assertIn("for overlay in gts9u-performance gts9u-sync-state gts9u-ramoops gts9-performance "
+                      "gts9-family; do\n", stage)
+        for dtso, symbol in (("gts9u-sync-state", "gts9u_sync_state_overlay"),
+                             ("gts9u-ramoops", "gts9u_ramoops_overlay")):
+            self.assertIn(f"('{dtso}', '{symbol}'),", stage)
+            self.assertTrue((REPO / f"kernel/dts/{dtso}.dtso").is_file())
+
+    def test_the_cx_vote_patches_are_in_every_build(self):
+        """With gcc under CX on both boards the UFS and USB drivers drop
+        their CX votes in system sleep on both: the two hooks are in no board
+        gate, in the order the X710 has always applied them."""
+        build = (REPO / "scripts/build-mainline-kernel.sh").read_text()
+        hooks = ("\napply_unless 'ufshcd_opp_drop_votes' \\\n"
+                 "\tdrivers/ufs/core/ufshcd.c ufshcd-drop-opp-votes-in-system-suspend.patch\n"
+                 "apply_unless 'dwc3_qcom_set_pstate' \\\n\tdrivers/usb/dwc3/dwc3-qcom.c \\\n"
+                 "\tdwc3-qcom-drop-required-opps-vote-in-system-suspend.patch\n")
+        self.assertEqual(build.count(hooks), 1)
+        before = build[:build.index(hooks)]
+        self.assertIn("\nfi\n", before[before.rindex("\nif "):])
+
+
+
+def x710_kit_tests():
+    """The SM-X710 kit's test module, loaded under a name of its own: its
+    sleep-test.sh fakes are what the SM-X910's runs of the same script use."""
+    spec = importlib.util.spec_from_file_location("typec_roles_kit_tests_for_the_ultra",
+                                                  REPO / "tests/test_typec_roles_kit.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+X710 = x710_kit_tests()
+
+
+def own_tests_only(cls):
+    """A subclass of a test case that runs its own tests, not the ones it
+    inherits (unittest takes only callable test attributes)."""
+    for name in dir(cls):
+        if name.startswith("test") and name not in vars(cls):
+            setattr(cls, name, None)
+    return cls
+
+
+# The SM-X910's touch controller as blastoise's /proc/interrupts shows it
+# (2026-11-25; counts made up), and the kernel lines of a double tap that
+# aborts a suspend on the way down, the SM-X710's of 2026-11-22 with this
+# board's IRQ and driver.
+ULTRA_INTERRUPTS = X710.INTERRUPTS.replace(
+    "199:          9          0          0          0          0          0          0          0   msmgpio  25 Level     fts1ba90a\n",
+    "201:          9          0          0          0          0          0          0          0   msmgpio  25 Level     goodix-berlin\n")
+ULTRA_TOUCH_ABORT = X710.TOUCH_ABORT.replace("IRQ 199", "IRQ 201").replace(
+    "samsung_fts1ba90a 9-0049: double tap to wake", "goodix-berlin-i2c 3-005d: double tap")
+ULTRA_TOUCH_HINT = "IRQ 201 (goodix-berlin, the touchscreen: do not touch the screen during the run)"
+
+
+@own_tests_only
+class UltraSleepTestTest(X710.SleepTestTest):
+    """tools/inplace/typec-roles/sleep-test.sh, which the SM-X910 kit ships
+    since revision 8, on a fake SM-X910: the compatible, the Wi-Fi function
+    with ath12k_wifi7_pci, the Goodix touch controller, both radios on, and
+    the interconnect floor held, as every boot there holds it (no late
+    release on this board): gem_noc and mc_virt wait for the two bandwidth
+    monitors alone.  What is the same on both boards is the SM-X710 kit's
+    tests'; these are what the SM-X910 does otherwise, and the pmic
+    option."""
+
+    PROVIDERS = (("24100000.interconnect", "240b6400.pmu", b"qcom,sm8550-cpu-bwmon\0qcom,sdm845-bwmon\0"),
+                 ("interconnect-1", "24091000.pmu", b"qcom,sm8550-llcc-bwmon\0qcom,sc7280-llcc-bwmon\0"))
+
+    def setUp(self):
+        super().setUp()
+        F = self.root
+        (F / "proc/device-tree/compatible").write_bytes(b"samsung,gts9uwifi\0qcom,sm8550\0")
+        # The SM-X710's late release is not on this board, nor its records.
+        for path in ("usr/libexec/ubuntu-gts9u-icc-late-release", "var/lib/ubuntu-gts9u/icc-release.pending",
+                     "run/ubuntu-gts9u/icc-release", "var/log/ubuntu-gts9u-icc-release.log"):
+            (F / path).unlink()
+        # No hung task detector in this board's kernel (the release's
+        # configuration: CONFIG_DETECT_HUNG_TASK is not set; blastoise has
+        # no /proc/sys/kernel/hung_task_panic, 2026-11-25).
+        (F / "proc/sys/kernel/hung_task_panic").unlink()
+        for provider, pmu, compatible in self.PROVIDERS:
+            d = F / "sys/bus/platform/devices" / provider
+            (d / "state_synced").write_text("0\n")
+            self.consumer(provider, pmu, compatible)
+        self.radios("1", "1")
+
+    def consumer(self, provider, name, compatible, status="available", driver=False):
+        """A device link from PROVIDER to the consumer NAME, as sysfs shows
+        it: consumer:platform:NAME with its status and a link to the device,
+        whose node has COMPATIBLE."""
+        dev = self.root / "sys/devices/platform/soc@0" / name
+        (dev / "of_node").mkdir(parents=True, exist_ok=True)
+        (dev / "of_node/compatible").write_bytes(compatible)
+        if driver:
+            (dev / "driver").mkdir(exist_ok=True)
+        link = self.root / "sys/bus/platform/devices" / provider / f"consumer:platform:{name}"
+        link.mkdir()
+        (link / "status").write_text(status + "\n")
+        (link / "consumer").symlink_to(dev)
+
+    def radios(self, bluetooth, wlan):
+        """The two rfkill switches, blastoise's names: STATE 1 unblocked,
+        0 blocked."""
+        for i, (name, kind, state) in enumerate((("hci0", "bluetooth", bluetooth), ("phy0", "wlan", wlan))):
+            r = self.root / f"sys/class/rfkill/rfkill{i}"
+            r.mkdir(parents=True, exist_ok=True)
+            for attr, value in (("name", name), ("type", kind), ("state", state)):
+                (r / attr).write_text(value + "\n")
+
+    def synced(self):
+        return [(self.root / "sys/bus/platform/devices" / p / "state_synced").read_text().strip()
+                for p, _, _ in self.PROVIDERS]
+
+    def wifi_bound(self):
+        """The fake bus's Wi-Fi function with ath12k_wifi7_pci bound, in D0."""
+        paths = self.pci_tree()
+        driver = self.root / "sys/bus/pci/drivers/ath12k_wifi7_pci"
+        driver.mkdir(parents=True)
+        (paths["0000:01:00.0"] / "driver").symlink_to(os.path.relpath(driver, paths["0000:01:00.0"]))
+        return paths
+
+    def test_release_floor_releases_the_floor_in_the_run_and_the_run_sleeps(self):
+        """No late release on the SM-X910: release-floor writes "1" to
+        state_synced of the two providers that wait for the unbound
+        bandwidth monitors alone, before anything is frozen, and nothing
+        else; the run sleeps with the floor released, and says that the
+        next boot holds it again."""
+        result = self.run_test("ro", "1", "release-floor", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertEqual(self.synced(), ["1", "1"])
+        self.assertIn("interconnect floor held; the SM-X910 has no late release: releasing it here, state_synced "
+                      "of 24100000.interconnect interconnect-1 (each waits for the unbound bandwidth monitors alone)",
+                      self.out)
+        self.assertIn("SLEEP-TEST cycle 1/1: PASS: deep (aosd +1 cxsd +1 ddr +1), resumed, the UFS read back as "
+                      "before; floor released", self.out)
+        self.assertIn("NEXT: the boot after this restart holds the interconnect floor again (the SM-X910 releases "
+                      "it only in a run); give the next run release-floor", self.out)
+        self.assertNotIn("loop breaker", self.out)
+        self.assertNotIn("restart", self.read("systemctl.calls"))
+        self.assertIn("gts9u sleep-test: ", (self.root / "dev/kmsg").read_text())
+        self.assertIn("releasing the interconnect floor: 24100000.interconnect interconnect-1",
+                      (self.root / "dev/kmsg").read_text())
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        before = (logs / "before").read_text()
+        self.assertIn("interconnect floor: held; the SM-X910 has no late release (release-floor releases it in "
+                      "the run: this one does)", before)
+        self.assertIn("radios: Bluetooth on, Wi-Fi on (rfkill)", before)
+        self.assertIn("hung tasks: this kernel has no hung task detector (no kernel.hung_task_panic): a writer "
+                      "waiting on the frozen disk is not reported", before)
+        # rpmhpd, gcc and gpu_cc are never written, whatever they read.
+        self.assertEqual((self.root / "sys/bus/platform/devices/17a00000.rsc:power-controller/state_synced")
+                         .read_text(), "1\n")
+
+    def test_a_kernel_with_the_hung_task_detector_needs_its_panic_off(self):
+        """The same check as the SM-X710's where the file is there: 0 runs
+        with no hung-task line in the record, anything else is refused."""
+        (self.root / "proc/sys/kernel/hung_task_panic").write_text("0\n")
+        result = self.run_test("ro", "1", "release-floor", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("SLEEP-TEST cycle 1/1: PASS: deep", self.out)
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertNotIn("hung tasks:", (logs / "before").read_text())
+        fresh_fake(self)
+        (self.root / "proc/sys/kernel/hung_task_panic").write_text("1\n")
+        result = self.run_test("ro", "1", "release-floor", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("REFUSED: kernel.hung_task_panic is 1, not 0", self.out)
+        self.assertEqual(self.read("rtcwake.calls"), "")
+
+    def test_without_release_floor_the_floor_stays_held_and_every_verdict_says_so(self):
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertEqual(self.synced(), ["0", "0"])
+        self.assertIn("THE INTERCONNECT FLOOR IS held: this run cannot reach the depth of the 2026-11-21 failure",
+                      self.out)
+        self.assertIn("floor held", self.out)
+        self.assertNotIn("holds the interconnect floor again", self.out)
+
+    def test_release_floor_is_refused_while_anything_else_holds_a_provider_back(self):
+        """The late release's rule: all or nothing, the bandwidth monitors
+        alone, without a driver.  The crypto engine of a kernel without
+        gts9u-sync-state.dtso, a bandwidth monitor with a driver bound, or
+        a consumer of another compatible at a monitor's name, each stops
+        the run before anything is done; icc-hold too."""
+        cases = {
+            "the crypto engine": (lambda: self.consumer("interconnect-1", "1dfa000.crypto",
+                                                        b"qcom,sm8550-qce\0qcom,qce\0"),
+                                  "interconnect-1 waits for 1dfa000.crypto(available);"),
+            "a monitor with its driver": (
+                lambda: (self.root / "sys/devices/platform/soc@0/240b6400.pmu/driver").mkdir(),
+                "24100000.interconnect waits for 240b6400.pmu(available);"),
+            "another device at a monitor's name": (
+                lambda: (self.root / "sys/devices/platform/soc@0/24091000.pmu/of_node/compatible").write_bytes(
+                    b"qcom,something-else\0"),
+                "interconnect-1 waits for 24091000.pmu(available);"),
+            "icc-hold": (lambda: (self.root / "etc/ubuntu-gts9u/icc-hold").touch(),
+                         "exists: the floor is held on purpose"),
+        }
+        for name, (make, message) in cases.items():
+            with self.subTest(name):
+                fresh_fake(self)
+                make()
+                before = self.manifest()
+                result = self.run_test("ro", "1", "release-floor", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("REFUSED", self.out)
+                self.assertIn(message, self.out)
+                self.assertEqual(self.synced(), ["0", "0"])
+                self.assertEqual(self.read("rtcwake.calls"), "")
+                self.assertEqual(self.manifest(), before)
+
+    def test_both_radios_off_is_refused_on_the_sm_x910_alone(self):
+        """What a run is for there first: L15B through a whole-SoC sleep
+        with a radio on.  Either radio on is enough; a dry run sleeps not at
+        all; the SM-X710 runs as before."""
+        self.radios("0", "0")
+        result = self.run_test("ro", "1", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("REFUSED: Bluetooth and Wi-Fi are both off (no rfkill of either unblocked): on the SM-X910 "
+                      "a run is first for PM8550 L15B", self.out)
+        self.assertEqual(self.read("rtcwake.calls"), "")
+        for name, radios, args in (("Bluetooth on", ("1", "0"), ("ro", "1")), ("Wi-Fi on", ("0", "1"), ("ro", "1")),
+                                   ("dry", ("0", "0"), ("dry",))):
+            with self.subTest(name):
+                fresh_fake(self)
+                self.radios(*radios)
+                self.run_test(*args, "restart-ok", "hold=0")
+                self.assertNotIn("REFUSED", self.out)
+                self.assertNotIn("radios", self.out.replace("radios: Bluetooth", ""))
+        with self.subTest("the SM-X710"):
+            fresh_fake(self, ultra=False)
+            self.radios("0", "0")
+            result = self.run_test("ro", "1", "restart-ok", "hold=0")
+            self.assertNotIn("REFUSED", self.out)
+            self.assertNotIn("radios:", self.out)
+            self.assertIn("SLEEP-TEST cycle 1/1: PASS", self.out)
+
+    def test_the_wifi_judged_is_the_board_s_own(self):
+        """ath12k_wifi7_pci, the SM-X910's: its firmware's load, its country
+        line a note, its failure line a PCIE-DOWN."""
+        country = "ath12k_wifi7_pci 0000:01:00.0: Failed to set the requested Country regulatory setting"
+        fw = ("ath12k_wifi7_pci 0000:01:00.0: fw_version 0x1103006c fw_build_timestamp 2026-03-06 09:10 "
+              "fw_build_id QC_IMAGE_VERSION_STRING=WLAN.HMT.1.1.c7-00108")
+        lost = "ath12k_wifi7_pci 0000:01:00.0: failed to resume core: -110"
+
+        def cycle(*lines):
+            return ("[  100.000000] PM: suspend entry (deep)\n[  100.000005] Timekeeping suspended for 30.002 "
+                    "seconds\n" + "".join(f"[  100.00001{i}] {line}\n" for i, line in enumerate(lines))
+                    + "[  101.000009] PM: suspend exit\n")
+
+        self.wifi_bound()
+        self.r11_switches()
+        self.cycle(1, log=cycle(country, fw))
+        result = self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("0000:01:00.0 ath12k_wifi7_pci D0 -; no Wi-Fi failure line; note: " + country
+                      + " (1 line of the firmware turning a country setting down: not a failure line); ath12k "
+                      "firmware loads 1\n", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles", self.out)
+        fresh_fake(self)
+        self.wifi_bound()
+        self.r11_switches()
+        self.cycle(1, log=cycle(country))
+        self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
+        self.assertIn("Wi-Fi did not come back (no Wi-Fi function in D0 with ath12k_wifi7_pci bound, or no firmware "
+                      f"load in this cycle's kernel lines; ath12k said: {country})", self.out)
+        fresh_fake(self)
+        self.wifi_bound()
+        self.r11_switches()
+        self.cycle(1, log=cycle(lost, fw))
+        self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
+        self.assertIn(f"SLEEP-TEST RESULT: PCIE-DOWN after cycle 1/2: with the PCI devices kept, the PCIe host or the "
+                      f"Wi-Fi did not come back ({lost})", self.out)
+
+    def test_a_double_tap_on_the_way_down_is_named_by_the_board_s_touch_irq(self):
+        (self.root / "proc/interrupts").write_text(ULTRA_INTERRUPTS)
+        self.touch_abort(1, log=ULTRA_TOUCH_ABORT, irq=201)
+        result = self.run_test("ro", "2", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn(f"ABORTED: the kernel gave up the suspend before the tablet slept (rtcwake 1, suspend_stats "
+                      f"success +0 fail +1): a wakeup from {ULTRA_TOUCH_HINT}", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles resumed with the UFS readable, 2 of them deep; 1 "
+                      "attempt aborted before the sleep (IRQ 201 (goodix-berlin, the touchscreen) once) and tried "
+                      "again; floor held", self.out)
+
+    def registers(self, ocp=(0, 0, 0, 0, 0, 0), pon=0):
+        """The regmap's debugfs lines of SPMI device 0-00, every register
+        0x0000 to 0xffff: the over-current log's six bytes at 0x7076, and
+        PON as the byte at 0x7010 (a stand-in for the power-on log)."""
+        values = {0x7076 + i: b for i, b in enumerate(ocp)}
+        values[0x7010] = pon
+        return "".join(f"{a:04x}: {values.get(a, 0):02x}\n" for a in range(0x10000))
+
+    def test_pmic_reads_the_records_before_and_after_each_sleep_and_writes_none(self):
+        """Read only: the record before the run, and each cycle's evidence;
+        a new over-current entry gets its own line.  The fake file is what
+        the kernel's regmap debugfs file gives, read by offset."""
+        regs = self.root / "sys/kernel/debug/regmap/0-00/registers"
+        regs.parent.mkdir(parents=True)
+        regs.write_text(self.registers())
+        (self.root / "dev/pmsg0").write_text("")
+        self.cycle(1)
+        (self.tmp / "cycle-1/pmic").write_text(self.registers(pon=1))
+        self.cycle(2)
+        (self.tmp / "cycle-2/pmic").write_text(self.registers(ocp=(0x12, 0xcf, 0, 0, 0, 0), pon=1))
+        result = self.run_test("ro", "2", "pmic", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assert_read_only_rules()
+        self.assertIn("cycle 1/2: evidence: PMIC: over-current log 0000 0000 0000 (unchanged); SDAM 0x7000-0x75ff "
+                      "changed since the read before", self.out)
+        self.assertIn("cycle 2/2: evidence: PMIC: over-current log 12cf 0000 0000 (was 0000 0000 0000: a NEW ENTRY); "
+                      "SDAM 0x7000-0x75ff changed since the read before", self.out)
+        self.assertIn("SLEEP-TEST PMIC: cycle 2/2: the PMIC logged a new over-current entry (0000 0000 0000 -> 12cf "
+                      "0000 0000; 12cf is PM8550's LDO15, L15B): after the run, read its power-on and over-current "
+                      "logs as root", self.out)
+        self.assertEqual(self.out.count("SLEEP-TEST PMIC:"), 1)
+        self.assertIn("SLEEP-TEST PMIC: cycle 2/2", (self.root / "dev/pmsg0").read_text())
+        (logs,) = (self.kit / "logs").glob("*-sleep")
+        self.assertIn("PMIC: over-current log (0x7076) 0000 0000 0000; SDAM 0x7000-0x75ff in", (logs / "before").read_text())
+        self.assertEqual(len((logs / "pmic-before").read_text().splitlines()), 0x600)
+        self.assertTrue((logs / "pmic-before").read_text().startswith("7000: 00\n"))
+        # Every read of the file: from 0x7000, 0x600 lines of 9 bytes, never
+        # a write (the dd stub logs any of= as a violation).
+        reads = [c for c in self.read("dd.calls").splitlines() if "regmap" in c]
+        self.assertEqual(len(reads), 4)
+        for call in reads:
+            self.assertEqual(call, f"if={regs} bs=9 skip=28672 count=1536 status=none")
+        self.assertIn("options: pmic", self.out)
+
+    def test_pmic_is_refused_where_the_records_cannot_be_read(self):
+        """No file; lines of another width; and the same layout from another
+        first register, where the read by offset gives 0x600 whole lines,
+        0x7100's on: only the first line's address tells it apart."""
+        shifted = "".join(f"{a:04x}: 00\n" for a in range(0x100, 0x10000))
+        for name, content in (("no regmap", None), ("another layout", "00000: 00\n" * 10),
+                              ("another first register", shifted)):
+            with self.subTest(name):
+                fresh_fake(self)
+                if content is not None:
+                    regs = self.root / "sys/kernel/debug/regmap/0-00/registers"
+                    regs.parent.mkdir(parents=True)
+                    regs.write_text(content)
+                result = self.run_test("ro", "1", "pmic", "restart-ok", "hold=0")
+                self.assertEqual(result.returncode, 1, self.out)
+                self.assertIn("REFUSED: pmic: ", self.out)
+                self.assertIn("does not read as PMK8550's SDAM, 0x600 lines from \"7000: \"", self.out)
+                self.assertEqual(self.read("rtcwake.calls"), "")
+
+
+def fresh_fake(case, ultra=True):
+    """A fresh fake for another subtest: the SM-X910's, or with ULTRA false
+    the SM-X710 kit's own."""
+    if ultra:
+        case.setUp()
+    else:
+        X710.SleepTestTest.setUp(case)
 
 
 if __name__ == "__main__":

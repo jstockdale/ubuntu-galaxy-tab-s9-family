@@ -368,12 +368,22 @@ want=$(cat "$kit/BUILD_ID" 2>/dev/null)
 	bad "build ID $id, the kit's is ${want:-unknown}"
 tr '\0' '\n' < /proc/device-tree/compatible | grep -qx 'samsung,gts9uwifi' && ok 'this is an SM-X910' ||
 	bad 'this is not an SM-X910'
+# Revision 8, the deep-sleep groundwork (README, "Revision 8"): what the
+# SM-X710 kit's revision 14 sleeps deeply with.  On the kit's own kernel from
+# revision 8 on (the kit's REVISION) a check that fails is a FAIL; on any
+# other kernel it is a note, as revisions 1 to 7 and the release have none of
+# it.  Reads only, no root.
+r8=0
+[ -n "$want" ] && [ "$id" = "$want" ] && [ "$(cat "$kit/REVISION" 2>/dev/null)" -ge 8 ] 2>/dev/null && r8=1
+r8_bad() { if [ "$r8" = 1 ]; then bad "$*"; else note "$*"; fi; }
 findmnt -no OPTIONS / | tr ',' '\n' | grep -qx rw && ok 'root is rw' || bad 'root is not rw'
 
 k=$(journalctl -k -b --no-pager -q 2>/dev/null)
-# Four checks below read this boot's kernel log; without it none can pass.
+# Four checks below read this boot's kernel log, and revision 8's that do
+# (the early helper's lines, ramoops, the PCIe guard, Bluetooth); without it
+# none can pass.
 [ -n "$k" ] || bad "cannot read this boot's kernel log (journalctl -k -b): the module key, the module" \
-	'failures, the USB host controller and L15B were not checked'
+	'failures, the USB host controller, L15B and revision 8'"'"'s kernel-log checks were not checked'
 key=$(cat "$kit/KEY_ID" 2>/dev/null)
 if [ -n "$k" ]; then
 	printf '%s\n' "$k" | grep -q "Loaded X.509 cert .*: ${key:-none}" &&
@@ -455,7 +465,9 @@ if [ -n "$k" ]; then
 	l15_step=$(printf '%s\n' "$k" | sed -n 's/^.*\(gts9u-performance: L15B.*\)$/\1/p' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
 	l15_dt=
 	if [ -z "$l15_step" ]; then
-		note "DT: L15B (vreg_l15b_1p8) not checked: this kernel has no L15B step (no \"gts9u-performance: L15B\" line this boot), and with the pinned DTB L15B may drop to LPM in a sleep (it reads ${l15_mode:-no mode} now)"
+		# From revision 8 on the kit's kernel has the step, and then its
+		# missing line is a FAIL.
+		r8_bad "DT: L15B (vreg_l15b_1p8) not checked: this kernel has no L15B step (no \"gts9u-performance: L15B\" line this boot), and with the pinned DTB L15B may drop to LPM in a sleep (it reads ${l15_mode:-no mode} now)"
 	elif [ "$l15_name" != vreg_l15b_1p8 ]; then
 		l15_dt="no vreg_l15b_1p8 node at $l15 ($l15_step)"
 	elif ! printf '%s\n' "$l15_step" | grep -q '^gts9u-performance: L15B held in HPM'; then
@@ -475,6 +487,103 @@ if [ -n "$k" ]; then
 		fi
 	fi
 fi
+# Revision 8's checks (r8 and r8_bad, above).
+if [ -n "$k" ]; then
+	# The early helper's two Ultra overlays: the SM-X710's board DTS changes
+	# for the SoC's sync_state hand-off, and its ramoops region.
+	for line in 'gts9u-performance: SoC hand-off: gcc under CX, GMU post-init providers, crypto engine disabled' \
+		'gts9u-performance: ramoops in the pmsg carve-out at 0x880900000'; do
+		printf '%s\n' "$k" | grep -qF "$line" && ok "kernel log: $line" ||
+			r8_bad "no \"$line\" line this boot (kernel/drivers/gts9u-performance.c)"
+	done
+	# ramoops on that carve-out, with the SM-X710's ECC, and its pmsg.
+	if printf '%s\n' "$k" | grep -qF 'ramoops: using 0x200000@0x880900000, ecc: 96' && [ -e /dev/pmsg0 ]; then
+		ok 'ramoops: 0x200000@0x880900000, ECC 96, and its pmsg device (the sleep test'"'"'s records survive a reset)'
+	else
+		r8_bad 'no ramoops on 0x880900000 with ECC 96, or no pmsg device: nothing of a run that never comes back survives the reset'
+	fi
+fi
+# The running DT as that overlay leaves it.
+dt=/proc/device-tree/soc@0
+if [ -e "$dt/clock-controller@100000/power-domains" ] && [ -e "$dt/gmu@3d6a000/post-init-providers" ] &&
+	[ "$(tr -d '\0' < "$dt/crypto@1dfa000/status" 2>/dev/null)" = disabled ]; then
+	ok 'DT: gcc under CX (power-domains), the GMU'"'"'s post-init-providers, crypto@1dfa000 disabled'
+else
+	r8_bad 'DT: gcc has no power-domains, the GMU no post-init-providers, or crypto@1dfa000 is not disabled'
+fi
+# sync_state: the RPMh power domains, gcc and gpu_cc synced at boot (the
+# video clock controller built in, the overlay above).  What holds one back
+# is in the kernel's "sync_state() pending due to" lines.
+unsynced=
+for d in 17a00000.rsc:power-controller 100000.clock-controller 3d90000.clock-controller; do
+	[ "$(cat "/sys/bus/platform/devices/$d/state_synced" 2>/dev/null)" = 1 ] || unsynced="$unsynced $d"
+done
+if [ -z "$unsynced" ]; then
+	ok 'sync_state: rpmhpd, gcc and gpu_cc synced at boot'
+else
+	r8_bad "sync_state: not synced:$unsynced$([ -z "$k" ] || printf '%s\n' "$k" | sed -n 's/^.* \([^ ]*\): sync_state() pending due to \(.*\)$/; \1 waits for \2/p' | tr -d '\n')"
+fi
+# The interconnect keeps its boot vote until a run releases it (the sleep
+# test's release-floor): released at boot it hung the SM-X710's boot cycle.
+icc_held=
+for d in /sys/bus/platform/devices/*; do
+	[ -e "$d/state_synced" ] && [ -e "$d/of_node/#interconnect-cells" ] || continue
+	[ "$(cat "$d/state_synced" 2>/dev/null)" = 1 ] || icc_held="$icc_held ${d##*/}"
+done
+note "interconnect floor: $([ -n "$icc_held" ] && echo "held (unsynced:$icc_held), as every boot of this board holds it until sleep-test.sh release-floor" || echo released)"
+# The SoC sleep statistics, built in: what tells a deep sleep.
+set -- /sys/bus/platform/drivers/qcom_stats/*.sram
+[ -e "$1" ] && ok "qcom_stats: bound to ${1##*/} (/sys/kernel/debug/qcom_stats, root)" ||
+	r8_bad 'qcom_stats: no device bound to the qcom_stats driver: no sleep counts'
+# The debug switches of the SM-X710 kit's build, each as it boots: only a
+# sleep test changes them, until its restart.
+for sw in gcc_sm8550.debug_pcie0_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_off:Y \
+	gcc_sm8550.debug_pcie0_phy_off:/sys/module/gcc_sm8550/parameters/debug_pcie0_phy_off:N \
+	gcc_sm8550.debug_usb_off:/sys/module/gcc_sm8550/parameters/debug_usb_off:N \
+	rpmhpd.debug_ret_floor:/sys/module/rpmhpd/parameters/debug_ret_floor:N \
+	pcie_qcom.debug_root_port_d3:/sys/module/pcie_qcom/parameters/debug_root_port_d3:N \
+	qcom_stats.debug_cxpc_violators:/sys/module/qcom_stats/parameters/debug_cxpc_violators:N; do
+	name=${sw%%:*} rest=${sw#*:}
+	v=$(cat "${rest%:*}" 2>/dev/null)
+	[ "$v" = "${rest##*:}" ] && ok "debug switch $name = $v, as it boots" ||
+		r8_bad "debug switch $name is ${v:-missing}, expected ${rest##*:} at boot"
+done
+if [ -n "$k" ]; then
+	# The PCIe power domain's guard in the boot's first suspend (the panel
+	# cycle): the host kept its link, and pcie_0_gdsc stayed on.  One that
+	# did not hold is a FAIL on any kernel.
+	gfirst=$(printf '%s\n' "$k" | sed -n 's/^.*\.pcie: system sleep: \(.*\)$/\1/p' | head -n 1)
+	if printf '%s\n' "$k" | grep -qF 'system sleep: the link was kept, but genpd powered its power domain off'; then
+		bad 'the PCIe power domain guard did not hold this boot: genpd powered the domain off under a link the host kept'
+	elif [ "$gfirst" = 'the link was kept, and its power domain stayed on' ]; then
+		ok 'PCIe power domain guard: in this boot'"'"'s first suspend (the panel cycle) the host kept its link and pcie_0_gdsc stayed on'
+	elif printf '%s\n' "$k" | grep -q 'PM: suspend exit'; then
+		r8_bad "PCIe power domain guard: this boot's first suspend logged ${gfirst:-no \"system sleep:\" line of the PCIe host}"
+	else
+		note 'no suspend has run yet this boot (the panel cycle runs about 22 s in): the PCIe guard was not checked'
+	fi
+	# The two geni UARTs, powered down in every system suspend: after the
+	# first one, no interrupt disabled and no HCI command timed out, and the
+	# Bluetooth controller there.
+	bt_dead='nobody cared|Disabling IRQ #|hci[0-9]+: (command 0x[0-9a-f]+ tx timeout|Opcode 0x[0-9a-f]+ failed: -110)'
+	if printf '%s\n' "$k" | grep -qE "$bt_dead"; then
+		bad 'an interrupt was disabled or a Bluetooth command timed out this boot:'
+		printf '%s\n' "$k" | grep -E "$bt_dead" | head -n 5
+	elif [ -e /sys/class/bluetooth/hci0 ]; then
+		ok 'Bluetooth: hci0, no disabled interrupt and no HCI command timeout this boot'
+	else
+		r8_bad 'no Bluetooth controller (/sys/class/bluetooth/hci0)'
+	fi
+fi
+case $(cat /sys/class/tty/ttyMSM0/power/wakeup 2>/dev/null) in
+disabled) ok 'console ttyMSM0: wakeup disabled (its UART powers down in system suspend)' ;;
+*) r8_bad 'console ttyMSM0: wakeup not disabled: uart_suspend_port() then leaves its UART running, and the force suspend powers it down all the same' ;;
+esac
+# What a confirming sleep needs besides the kernel: the sensors' sleep hook
+# of device 2.75 (or the sensors-hook kit), which stops iio-sensor-proxy.
+grep -q 'iio-sensor-proxy' /usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors 2>/dev/null &&
+	ok 'the sensors'"'"' sleep hook stops iio-sensor-proxy (sleep-test.sh sensors=hook can run)' ||
+	note 'the sensors'"'"' sleep hook does not stop iio-sensor-proxy (device 2.72 or before): install tools/inplace/sensors-hook before a confirming sleep (sleep-test.sh sensors=hook refuses without it)'
 # The stopgap writes the data role from userspace and would collide with the
 # kernel's own request.
 if systemctl is-active --quiet typec-sink-host 2>/dev/null ||
