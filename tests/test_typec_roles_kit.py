@@ -268,6 +268,8 @@ PREFIXES = (
     # Revision 13: the Bluetooth controller and the console's tty (verify.sh,
     # sleep-test.sh's UART evidence).
     "/sys/class/bluetooth", "/sys/class/tty/",
+    # Revision 14: L15B's regulator (verify.sh).
+    "/sys/class/regulator/",
 )
 
 STUBS = {
@@ -1013,6 +1015,35 @@ class FakeTablet(unittest.TestCase):
         self.seal()
         return boot
 
+    def vendor_boot_kit(self, image=None):
+        """The kit as revision 14's lays it out: a vendor_boot.img of its own
+        (a stand-in for the hang-log kit's image with another DTB), in its
+        SHA256SUMS; IMAGE, or new random bytes.  Returns the image."""
+        image = os.urandom(SIZE) if image is None else image
+        (self.kit / "vendor_boot.img").write_bytes(image)
+        (self.kit / "REVISION").write_text("14\n")
+        self.seal()
+        return image
+
+    def l15b(self, set_load=False, mode="normal"):
+        """PM8550 LDO15 as the running DT and the regulator's sysfs show it:
+        revision 14's node (no regulator-allow-set-load or
+        regulator-allowed-modes), or with SET_LOAD the hang-log kit's; MODE
+        is its opmode."""
+        node = self.root / "proc/device-tree/soc@0/rsc@17a00000/regulators-0/ldo15"
+        if node.exists():
+            shutil.rmtree(node)
+        node.mkdir(parents=True)
+        (node / "regulator-name").write_bytes(b"vreg_l15b_1p8\0")
+        (node / "regulator-initial-mode").write_bytes(bytes.fromhex("00000003"))
+        if set_load:
+            (node / "regulator-allow-set-load").write_bytes(b"")
+            (node / "regulator-allowed-modes").write_bytes(bytes.fromhex("0000000100000003"))
+        reg = self.root / "sys/class/regulator/regulator.21"
+        reg.mkdir(parents=True, exist_ok=True)
+        (reg / "name").write_text("vreg_l15b_1p8\n")
+        (reg / "opmode").write_text(mode + "\n")
+
     def boot_kit_kernel(self, build_id):
         """A boot of the kernel BUILD_ID with the kit's module key, the
         hang-log kit's configuration and ramoops, and the switches as built:
@@ -1020,7 +1051,13 @@ class FakeTablet(unittest.TestCase):
         boots with them (pcie0 on, the others off); the PCIe link up, and
         revision 10's power-up write line before the calibration entry; the
         Bluetooth controller and the console's tty with its wakeup off, as
-        squirtle has them."""
+        squirtle has them.  The kit is installed: boot (and vendor_boot, if
+        the kit has an image for it) holds its images, and the DT has
+        revision 14's L15B."""
+        self.part("boot").write_bytes((self.kit / "boot.img").read_bytes())
+        if (self.kit / "vendor_boot.img").exists():
+            self.part("vendor_boot").write_bytes((self.kit / "vendor_boot.img").read_bytes())
+        self.l15b()
         self.running(build_id)
         (self.root / "sys/class/bluetooth/hci0").mkdir(parents=True, exist_ok=True)
         (self.root / "sys/class/tty/ttyMSM0/power").mkdir(parents=True, exist_ok=True)
@@ -1361,8 +1398,10 @@ class UpgradeHelpers:
         super().setUp()
         self.backup = self.root / BACKUP
         # The revision the kit directory holds: its module marker, boot
-        # image and kernel.
+        # image and kernel; and its vendor_boot.img, or None for a kit
+        # without one (vendor_boot then holds the hang-log kit's).
         self.expected = ("new", self.new_boot, NEW_BUILD_ID)
+        self.expected_vb = None
 
     def install_recorded(self):
         """A revision that records what it writes (this one, by a first
@@ -1376,17 +1415,20 @@ class UpgradeHelpers:
 
     def assert_installed(self):
         marker, boot, build_id = self.expected
+        vb = self.expected_vb
         self.assertEqual(self.part("boot").read_bytes(), boot)
-        self.assertEqual(self.part("vendor_boot").read_bytes(), self.hang_vendor_boot)
+        self.assertEqual(self.part("vendor_boot").read_bytes(), self.hang_vendor_boot if vb is None else vb)
         self.assertEqual(self.tree(), {n: f"{marker} {n}\n" for n in MODULES})
         # The way back is what the first install saved, as it saved it.
         self.assertEqual((self.backup / "boot-hang-log.img").read_bytes(), self.hang_boot)
         self.assertEqual(self.tree(self.backup / f"modules-{RELEASE}"),
                          {n: f"hang {n}\n" for n in MODULES})
+        if vb is not None:
+            self.assertEqual((self.backup / "vendor_boot-hang-log.img").read_bytes(), self.hang_vendor_boot)
         self.assertEqual(self.backup.stat().st_mode & 0o777, 0o700)
         self.assertEqual([p.name for p in (self.root / "usr/lib/modules").iterdir()], [RELEASE])
         self.assertEqual((self.backup / "revisions").read_text().splitlines()[-1],
-                         f"{sha(boot)} {build_id}")
+                         f"{sha(boot)} {build_id}" + ("" if vb is None else f" {sha(vb)}"))
         self.assertFalse((self.backup / "upgrading").exists())
         self.assertTrue((self.backup / "complete").exists())
 
@@ -2109,6 +2151,272 @@ class UpgradeTest(UpgradeHelpers, FakeTablet):
         self.assertIn("all checks passed", result.stdout)
 
 
+class VendorBootTest(UpgradeHelpers, FakeTablet):
+    """Revision 14: a kit with a vendor_boot.img of its own (the hang-log
+    kit's image with another DTB).  install.sh saves the hang-log kit's
+    vendor_boot once, before anything is written, writes vendor_boot and then
+    boot, and records the image; rollback.sh puts the hang-log kit's back."""
+
+    def written(self, result):
+        """The partitions in the order the run wrote them, from its log."""
+        return re.findall(r"typec-roles install: (boot|vendor_boot) written and read back", result.stdout)
+
+    def test_a_first_install_saves_vendor_boot_writes_it_before_boot_and_rollback_puts_it_back(self):
+        self.expected_vb = self.vendor_boot_kit()
+        self.step_commands()
+        result = self.run_script("install.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_installed()
+        self.assertEqual(self.written(result), ["vendor_boot", "boot"])
+        self.assertIn(f"vendor_boot saved to {self.backup}", result.stdout)
+        self.assertEqual(sorted(p.name for p in self.backup.iterdir()),
+                         ["boot-hang-log.img", "complete", f"modules-{RELEASE}", "revisions",
+                          "vendor_boot-hang-log.img"])
+        self.assertEqual((self.backup / "revisions").read_text(),
+                         f"{sha(self.new_boot)} {NEW_BUILD_ID} {sha(self.expected_vb)}\n")
+        # The copy is on the disk (a sync after it) before vendor_boot is
+        # written, and vendor_boot before boot.
+        steps = self.steps()
+        part = self.root / "dev/disk/by-partlabel"
+        copy = next(i for i, (c, a) in enumerate(steps)
+                    if c == "dd" and a.startswith(f"if={part}/vendor_boot of={self.backup}/vendor_boot-hang-log.img"))
+        write_vb = next(i for i, (c, a) in enumerate(steps) if c == "dd" and f"of={part}/vendor_boot " in a)
+        write_boot = next(i for i, (c, a) in enumerate(steps) if c == "dd" and f"of={part}/boot " in a)
+        self.assertTrue(any(c == "sync" for c, _ in steps[copy:write_vb]))
+        self.assertLess(write_vb, write_boot)
+        self.assert_rolled_back()
+
+    def test_an_installed_revision_is_upgraded_to_one_with_vendor_boot_in_place(self):
+        """Squirtle on revision 13: a revision that records what it writes,
+        installed and booted, vendor_boot the hang-log kit's.  Revision 14
+        over it is one install: vendor_boot saved and written, boot written,
+        both in the record; again, it changes nothing; rollback.sh goes
+        back to the hang-log kit, vendor_boot included."""
+        self.install_recorded()
+        self.expected_vb = self.vendor_boot_kit()
+        result = self.run_script("install.sh")
+        self.assert_upgraded(result, self.new_boot)
+        self.assertEqual(self.written(result), ["vendor_boot", "boot"])
+        self.assertEqual((self.backup / "revisions").read_text(),
+                         f"{sha(self.new_boot)} {NEW_BUILD_ID}\n"
+                         f"{sha(self.newer_boot)} {NEWER_BUILD_ID} {sha(self.expected_vb)}\n")
+        for running in (NEW_BUILD_ID, NEWER_BUILD_ID):
+            with self.subTest(running=running):
+                self.running(running)
+                before = self.state()
+                result = self.run_script("install.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("STOP: this revision of the Type-C roles kit is already installed "
+                              f"({self.backup}); nothing was changed", result.stdout)
+                self.assertEqual(self.state(), before)
+        self.assert_rolled_back()
+
+    def test_revision_7_is_upgraded_to_a_kit_with_vendor_boot_in_place(self):
+        self.install_r7()
+        self.expected_vb = self.vendor_boot_kit()
+        self.assert_upgraded(self.run_script("install.sh"), self.r7_boot)
+        self.assert_rolled_back()
+
+    def test_vendor_boot_put_back_by_hand_is_written_again(self):
+        """The hang-log kit's vendor_boot written back from TWRP, boot left:
+        the same revision runs again as an upgrade and writes vendor_boot
+        alone; the saved copy is not made again."""
+        self.install_recorded()
+        self.expected_vb = self.vendor_boot_kit()
+        self.assert_upgraded(self.run_script("install.sh"), self.new_boot)
+        self.running(NEWER_BUILD_ID)
+        self.part("vendor_boot").write_bytes(self.hang_vendor_boot)
+        result = self.run_script("install.sh")
+        self.assertNotIn("already installed", result.stdout)
+        self.assertNotIn("vendor_boot saved", result.stdout)
+        self.assert_upgraded(result, self.newer_boot)
+        self.assertEqual(self.written(result), ["vendor_boot", "boot"])
+
+    def test_a_later_revision_writes_its_own_vendor_boot_and_one_without_puts_the_hang_log_kit_s_back(self):
+        self.install_recorded()
+        first_vb = self.expected_vb = self.vendor_boot_kit()
+        self.assert_upgraded(self.run_script("install.sh"), self.new_boot)
+        self.running(NEWER_BUILD_ID)
+        # The revision after it, with another DTB: vendor_boot holds an image
+        # of the record, and the copy made by the first one stays.
+        boot = self.newer_kit("newest", NEWEST_BUILD_ID)
+        self.expected = ("newest", boot, NEWEST_BUILD_ID)
+        self.expected_vb = self.vendor_boot_kit()
+        result = self.run_script("install.sh")
+        self.assert_upgraded(result, self.newer_boot)
+        self.assertNotIn("vendor_boot saved", result.stdout)
+        self.assertEqual((self.backup / "revisions").read_text().splitlines()[-2:],
+                         [f"{sha(self.newer_boot)} {NEWER_BUILD_ID} {sha(first_vb)}",
+                          f"{sha(boot)} {NEWEST_BUILD_ID} {sha(self.expected_vb)}"])
+        self.running(NEWEST_BUILD_ID)
+        # A kit without a vendor_boot.img: the hang-log kit's image goes back,
+        # from the copy.
+        (self.kit / "vendor_boot.img").unlink()
+        self.seal()
+        self.expected_vb = None
+        result = self.run_script("install.sh")
+        self.assert_upgraded(result, boot)
+        self.assertEqual(self.written(result), ["vendor_boot", "boot"])
+        self.assert_rolled_back()
+
+    def test_upgrade_refusals_about_vendor_boot_change_nothing(self):
+        cases = {
+            "an image of no revision": (
+                "vendor_boot does not hold the hang-log kit, nor an image of this kit's ({other}); nothing was "
+                "changed", lambda: self.part("vendor_boot").write_bytes(self.other)),
+            "the copy of the hang-log kit's gone": (
+                "the hang-log vendor_boot image saved in {backup} is missing or changed; nothing was changed",
+                lambda: (self.backup / "vendor_boot-hang-log.img").unlink()),
+            "the copy of the hang-log kit's changed": (
+                "the hang-log vendor_boot image saved in {backup} is missing or changed; nothing was changed",
+                lambda: (self.backup / "vendor_boot-hang-log.img").write_bytes(os.urandom(SIZE))),
+            "a vendor_boot.img not of the partition's size": (
+                "vendor_boot.img is not the partition size",
+                lambda: ((self.kit / "vendor_boot.img").write_bytes(os.urandom(SIZE // 2)), self.seal())),
+        }
+        for name, (message, damage) in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                self.install_recorded()
+                self.expected_vb = self.vendor_boot_kit()
+                self.assert_upgraded(self.run_script("install.sh"), self.new_boot)
+                self.running(NEWER_BUILD_ID)
+                # The revision after it, with another vendor_boot.img.
+                self.newer_kit("newest", NEWEST_BUILD_ID)
+                self.vendor_boot_kit()
+                self.other = os.urandom(SIZE)
+                damage()
+                before = self.state()
+                result = self.run_script("install.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(message.format(other=sha(self.other), backup=self.backup), result.stdout)
+                self.assertNotIn("ended early", result.stdout)
+                self.assertEqual(self.state(), before)
+
+    def test_a_first_install_refuses_vendor_boot_of_another_kit(self):
+        self.vendor_boot_kit()
+        self.part("vendor_boot").write_bytes(os.urandom(SIZE))
+        before = self.state()
+        result = self.run_script("install.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("vendor_boot does not hold the hang-log kit", result.stdout)
+        self.assertEqual(self.state(), before)
+        self.assertFalse(self.backup.exists())
+
+    def test_rollback_refuses_a_vendor_boot_it_cannot_put_back(self):
+        for name, damage, message in (
+                ("an image this kit did not write", lambda: (
+                    self.part("vendor_boot").write_bytes(os.urandom(SIZE)),
+                    (self.backup / "vendor_boot-hang-log.img").unlink()),
+                 "vendor_boot holds an image this kit did not write"),
+                ("the copy changed", lambda: (self.backup / "vendor_boot-hang-log.img").write_bytes(os.urandom(SIZE)),
+                 "the saved hang-log vendor_boot image is changed; nothing was changed")):
+            with self.subTest(name):
+                self.setUp()
+                self.expected_vb = self.vendor_boot_kit()
+                self.assertEqual(self.run_script("install.sh").returncode, 0)
+                damage()
+                before = self.state()
+                result = self.run_script("rollback.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+                self.assertNotIn("ended early", result.stdout)
+                self.assertEqual(self.state(), before)
+
+    def test_rollback_of_a_kit_that_never_wrote_vendor_boot_leaves_it(self):
+        """Revisions up to 13 saved no copy: vendor_boot holds the hang-log
+        kit's image, and rollback.sh leaves it as it is."""
+        self.install_r7()
+        before = self.part("vendor_boot").read_bytes()
+        self.assert_rolled_back()
+        self.assertEqual(self.part("vendor_boot").read_bytes(), before)
+
+    def test_the_saved_boot_set_s_vendor_boot_follows_install_and_rollback(self):
+        saved = self.saved_set(self.hang_boot)
+        (saved / "vendor_boot.img").write_bytes(self.hang_vendor_boot)
+        self.expected_vb = self.vendor_boot_kit()
+        result = self.run_script("install.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((saved / "vendor_boot.img").read_bytes(), self.expected_vb)
+        self.assertEqual((self.backup / "saved-set-vendor_boot.img").read_bytes(), self.hang_vendor_boot)
+        self.assertIn("saved Ubuntu boot set: vendor_boot.img updated", result.stdout)
+        result = self.run_script("rollback.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("saved Ubuntu boot set: vendor_boot.img restored (from saved-set-vendor_boot.img)",
+                      result.stdout)
+        self.assertEqual((saved / "vendor_boot.img").read_bytes(), self.hang_vendor_boot)
+        self.assertEqual((saved / "boot.img").read_bytes(), self.hang_boot)
+        # An empty copy (a power failure right after install.sh): the
+        # hang-log kit's image, from the backup's copy of vendor_boot.
+        self.setUp()
+        saved = self.saved_set(self.hang_boot)
+        (saved / "vendor_boot.img").write_bytes(self.hang_vendor_boot)
+        self.vendor_boot_kit()
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        (self.backup / "saved-set-vendor_boot.img").write_bytes(b"")
+        result = self.run_script("rollback.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("saved Ubuntu boot set: vendor_boot.img restored (from vendor_boot-hang-log.img)",
+                      result.stdout)
+        self.assertEqual((saved / "vendor_boot.img").read_bytes(), self.hang_vendor_boot)
+
+    def test_verify_checks_both_partitions_with_root(self):
+        self.expected_vb = self.vendor_boot_kit()
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.boot_kit_kernel(NEW_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"ok   boot holds the kit's boot.img ({sha(self.new_boot)[:12]})\n", result.stdout)
+        self.assertIn(f"ok   vendor_boot holds the kit's vendor_boot.img ({sha(self.expected_vb)[:12]})\n",
+                      result.stdout)
+        # vendor_boot as before the install, with the kit's kernel running
+        # (revision 14's kernel is revision 13's): a FAIL.
+        self.part("vendor_boot").write_bytes(self.hang_vendor_boot)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"FAIL vendor_boot holds {sha(self.hang_vendor_boot)}, not the kit's vendor_boot.img "
+                      f"({sha(self.expected_vb)}): install.sh has not run, or did not finish\n", result.stdout)
+        self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+        # Another kernel: a note.
+        self.running(NEWER_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertIn(f"note vendor_boot holds {sha(self.hang_vendor_boot)}, not the kit's vendor_boot.img", result.stdout)
+        # Without root: a note that says how.
+        (self.bin / "id").write_text("#!/bin/sh\necho 1000\n")
+        result = self.run_script("verify.sh")
+        self.assertIn(f"note boot and vendor_boot are root's: sudo sh {self.kit}/verify.sh checks that they hold "
+                      "the kit's images\n", result.stdout)
+        self.assertNotIn("holds the kit's", result.stdout)
+
+    def test_verify_checks_that_the_running_dt_holds_l15b_in_hpm(self):
+        self.boot_kit_kernel(NEW_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   DT: L15B (vreg_l15b_1p8) held in HPM: no regulator-allow-set-load or "
+                      "regulator-allowed-modes, and it reads normal (revision 14's DTB)\n", result.stdout)
+        node = "/proc/device-tree/soc@0/rsc@17a00000/regulators-0/ldo15"
+        for name, kwargs, said in (
+                ("the DTB before revision 14", {"set_load": True, "mode": "idle"},
+                 "DT: L15B (vreg_l15b_1p8) may drop to LPM: its node has regulator-allow-set-load or "
+                 "regulator-allowed-modes, as before revision 14 (it reads idle now)"),
+                ("revision 14's node, the regulator in LPM", {"mode": "idle"},
+                 "DT: L15B's node is revision 14's, but the regulator reads idle (its opmode), not normal (HPM)")):
+            with self.subTest(name):
+                self.l15b(**kwargs)
+                result = self.run_script("verify.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"FAIL {said}\n", result.stdout)
+                self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+                # On another kernel it is a note.
+                self.running(NEWER_BUILD_ID)
+                result = self.run_script("verify.sh")
+                self.assertIn(f"note {said}\n", result.stdout)
+                self.running(NEW_BUILD_ID)
+        shutil.rmtree(self.root / node.lstrip("/"))
+        result = self.run_script("verify.sh")
+        self.assertIn(f"FAIL DT: no vreg_l15b_1p8 node at {self.root}{node}\n", result.stdout)
+
+
 class StoppedRunTest(UpgradeHelpers, FakeTablet):
     """A run stopped at each of its steps (STEP_COMMANDS): killed before it,
     as a power cut or a kill stops it, or with that step's command failing.
@@ -2293,6 +2601,83 @@ class StoppedRunTest(UpgradeHelpers, FakeTablet):
                                       again.stdout)
                         self.assert_on_the_hang_log_kit()
                     self.assertEqual((boot_set / "boot.img").read_bytes(), self.hang_boot)
+
+    # Revision 14: the same for a kit with a vendor_boot.img of its own,
+    # from a revision that recorded what it wrote (squirtle on revision 13),
+    # with a saved boot set that has a vendor_boot.img.
+
+    def test_an_upgrade_with_vendor_boot_stopped_at_any_step_is_finished_by_install_and_undone_by_rollback(self):
+        self.install_recorded()
+        boot_set = self.saved_set(self.new_boot)
+        (boot_set / "vendor_boot.img").write_bytes(self.hang_vendor_boot)
+        self.expected_vb = self.vendor_boot_kit()
+        self.step_commands()
+        prepared, steps = self.full_run("install.sh")
+        seen = set()
+        for number, step in enumerate(steps, 1):
+            for how in ("kill", "fail"):
+                with self.subTest(step=number, command=" ".join(step), how=how):
+                    self.restore(prepared)
+                    self.stop("install.sh", how, number, steps)
+                    if not self.new_state(seen):
+                        continue
+                    stopped = self.snapshot("stopped")
+                    self.assert_rolled_back()
+                    self.assertEqual((boot_set / "vendor_boot.img").read_bytes(), self.hang_vendor_boot)
+                    self.restore(stopped)
+                    found = self.part("boot").read_bytes()
+                    result = self.run_script("install.sh")
+                    if "already installed" in result.stdout:
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assert_installed()
+                    else:
+                        self.assert_upgraded(result, found)
+                    self.assertEqual((boot_set / "vendor_boot.img").read_bytes(), self.expected_vb)
+                    self.assertEqual((self.backup / "saved-set-vendor_boot.img").read_bytes(),
+                                     self.hang_vendor_boot)
+
+    def test_a_first_install_with_vendor_boot_stopped_at_any_step_is_undone_by_rollback(self):
+        self.vendor_boot_kit()
+        self.step_commands()
+        untouched = self.state()
+        prepared, steps = self.full_run("install.sh")
+        seen = set()
+        for number, step in enumerate(steps, 1):
+            for how in ("kill", "fail"):
+                with self.subTest(step=number, command=" ".join(step), how=how):
+                    self.restore(prepared)
+                    self.stop("install.sh", how, number, steps)
+                    if not self.backup.exists():
+                        self.assertEqual(self.state(), untouched)
+                        continue
+                    if not self.new_state(seen):
+                        continue
+                    result = self.run_script("rollback.sh")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assert_on_the_hang_log_kit()
+
+    def test_a_rollback_with_vendor_boot_stopped_at_any_step_is_finished_by_running_it_again(self):
+        self.install_recorded()
+        self.expected_vb = self.vendor_boot_kit()
+        self.assert_upgraded(self.run_script("install.sh"), self.new_boot)
+        self.step_commands()
+        prepared, steps = self.full_run("rollback.sh")
+        seen = set()
+        for number, step in enumerate(steps, 1):
+            for how in ("kill", "fail"):
+                with self.subTest(step=number, command=" ".join(step), how=how):
+                    self.restore(prepared)
+                    self.stop("rollback.sh", how, number, steps)
+                    if not self.new_state(seen):
+                        continue
+                    if self.backup.exists():
+                        self.assert_rolled_back()
+                    else:
+                        again = self.run_script("rollback.sh")
+                        self.assertIn("install.sh never ran (or was rolled back already)", again.stdout)
+                        self.assert_on_the_hang_log_kit()
+
+
 class VerifyTest(FakeTablet):
     def setUp(self):
         super().setUp()
@@ -10259,6 +10644,8 @@ class ScriptsTest(unittest.TestCase):
         self.assertEqual(pinned("install.sh", "hang_boot"), pinned("rollback.sh", "hang_boot"))
         self.assertEqual(pinned("install.sh", "hang_vendor_boot"),
                          pinned("make-kit.sh", "hang_vendor_boot"))
+        self.assertEqual(pinned("install.sh", "hang_vendor_boot"),
+                         pinned("rollback.sh", "hang_vendor_boot"))
         self.assertEqual(pinned("install.sh", "hang_build_id"), HANG_BUILD_ID)
         self.assertEqual(pinned("make-kit.sh", "hang_build_id"), HANG_BUILD_ID)
 
@@ -10267,7 +10654,7 @@ class ScriptsTest(unittest.TestCase):
         install = (KIT_SRC / "install.sh").read_text()
         # One table, and the record that takes over from it.
         self.assertEqual(install.count(R7_BOOT), 1)
-        self.assertIn('echo "$new_boot $new_id" >> "$backup/revisions"', install)
+        self.assertIn('echo "$new_boot $new_id${new_vb:+ $new_vb}" >> "$backup/revisions"', install)
 
     def test_the_revisions_without_a_record_are_the_packed_kits(self):
         """Where the packed kits are (~/ubuntu-gts9u/backups on the build
@@ -10296,9 +10683,13 @@ class ScriptsTest(unittest.TestCase):
         text = (KIT_SRC / "make-kit.sh").read_text()
         shipped = re.search(r"^files=\((.*?)\)$", text, re.M | re.S).group(1).split()
         for name in ("boot.img", '"modules-$release.tar"', "BUILD_ID", "KEY_ID", "SIGNER",
-                     "install.sh", "rollback.sh", "verify.sh"):
+                     "install.sh", "rollback.sh", "verify.sh",
+                     # Revision 14: vendor_boot with the kit's DTB, and what
+                     # that DTB changes.
+                     "vendor_boot.img", "DTB.diff"):
             self.assertIn(name, shipped)
-        self.assertNotIn("vendor_boot.img", text.replace("$hangkit/vendor_boot.img", ""))
+        self.assertIn('pack_vb "$tmp/kit.dtb" "$kit/vendor_boot.img"', text)
+        self.assertIn('cp "$tmp/dtb.diff" "$kit/DTB.diff"', text)
         # Every script and the README go into the kit, and each is in its
         # SHA256SUMS: revision 11's UFS PHY power check among them.
         copied = re.search(r'^install -m 0644 (.*?) "\$kit/"$', text, re.M | re.S).group(1).split()
@@ -10338,6 +10729,121 @@ class ScriptsTest(unittest.TestCase):
         self.assertEqual(text.count('(docs/resume-recovery.md, \\"The PHY power reference\\")'), 2)
         self.assertIn("\n### The PHY power reference (2026-11-23)\n", (REPO / "docs/resume-recovery.md").read_text())
         self.assertIn("(resume-recovery.md#the-phy-power-reference-2026-11-23)", (REPO / "docs/porting-log.md").read_text())
+
+    # Revision 14's DTB in make-kit.sh: the recipe, and the check of what
+    # changed.
+
+    def l15b_check(self, decompiled):
+        """make-kit.sh's awk program that takes revision 14's two lines out
+        of the node named vreg_l15b_1p8, run on DECOMPILED: (what it
+        prints, "NODES DROPPED")."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        program = re.search(r"\tawk -v drops=\"\$tmp/l15b\.drops\" -v gone1=\"\$\{l15b_gone\[0\]\}\" "
+                            r"-v gone2=\"\$\{l15b_gone\[1\]\}\" '\n(.*?)' \"\$tmp/hang\.dts\" > \"\$tmp/want\.dts\"\n",
+                            text, re.S).group(1)
+        gone = shlex.split(re.search(r"^l15b_gone=\((.*)\)$", text, re.M).group(1))
+        with tempfile.TemporaryDirectory() as tmp:
+            drops = pathlib.Path(tmp, "drops")
+            out = subprocess.run(["awk", "-v", f"drops={drops}", "-v", f"gone1={gone[0]}", "-v", f"gone2={gone[1]}",
+                                  program], input=decompiled, capture_output=True, text=True, check=True).stdout
+            return out, drops.read_text().strip()
+
+    DECOMPILED = """\
+/ {
+\tsoc@0 {
+\t\trsc@17a00000 {
+\t\t\tregulators-0 {
+\t\t\t\tvreg_l14b_3p2: ldo14 {
+\t\t\t\t\tregulator-name = "vreg_l14b_3p2";
+\t\t\t\t\tregulator-allow-set-load;
+\t\t\t\t\tregulator-allowed-modes = <0x01 0x03>;
+\t\t\t\t};
+
+\t\t\t\tvreg_l15b_1p8: ldo15 {
+\t\t\t\t\tregulator-name = "vreg_l15b_1p8";
+\t\t\t\t\tregulator-min-microvolt = <0x1b7740>;
+\t\t\t\t\tregulator-initial-mode = <0x03>;
+\t\t\t\t\tregulator-allow-set-load;
+\t\t\t\t\tregulator-allowed-modes = <0x01 0x03>;
+\t\t\t\t\tphandle = <0x94>;
+\t\t\t\t};
+\t\t\t};
+
+\t\t\tregulators-3 {
+\t\t\t\tldo15 {
+\t\t\t\t\tregulator-name = "vreg_l15e";
+\t\t\t\t\tregulator-allow-set-load;
+\t\t\t\t};
+\t\t\t};
+\t\t};
+\t};
+};
+"""
+
+    def test_the_dtb_check_takes_out_revision_14_s_two_lines_of_l15b_and_nothing_else(self):
+        out, drops = self.l15b_check(self.DECOMPILED)
+        self.assertEqual(drops, "1 2")
+        self.assertEqual(out, self.DECOMPILED.replace(
+            "\t\t\t\t\tregulator-initial-mode = <0x03>;\n\t\t\t\t\tregulator-allow-set-load;\n"
+            "\t\t\t\t\tregulator-allowed-modes = <0x01 0x03>;\n",
+            "\t\t\t\t\tregulator-initial-mode = <0x03>;\n"))
+        # Without them in that node, or without the node, make-kit.sh stops
+        # (it wants "1 2"); the other nodes go through as they are.
+        for name, decompiled, want in (
+                ("the lines gone already", out, "1 0"),
+                ("no node named vreg_l15b_1p8", self.DECOMPILED.replace('"vreg_l15b_1p8"', '"other"'), "0 0")):
+            with self.subTest(name):
+                again, found = self.l15b_check(decompiled)
+                self.assertEqual(found, want)
+                self.assertEqual(again, decompiled)
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        self.assertIn('''[ "$(cat "$tmp/l15b.drops")" = '1 2' ] && cmp -s "$tmp/want.dts" "$tmp/kit.dts" ||''', text)
+
+    def test_the_two_lines_are_those_the_device_tree_change_takes_out(self):
+        """make-kit.sh's l15b_gone are the decompiled form of the two
+        properties revision 14 removes from ldo15 on both boards: LPM and
+        HPM are 1 and 3 in the bindings (the pinned kernel checkout)."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        gone = shlex.split(re.search(r"^l15b_gone=\((.*)\)$", text, re.M).group(1))
+        self.assertEqual(gone, ["regulator-allow-set-load;", "regulator-allowed-modes = <0x01 0x03>;"])
+        for board in ("gts9wifi", "gts9uwifi"):
+            dts = (REPO / f"kernel/dts/sm8550-samsung-{board}.dts").read_text()
+            ldo15 = L15bHpmTest.node(dts, "\t\tvreg_l15b_1p8: ldo15 {\n")
+            self.assertNotIn("regulator-allow", ldo15)
+        source = kernel_source()
+        if source is None:
+            self.skipTest("no pinned kernel checkout")
+        header = subprocess.run(["git", "-C", str(source), "show",
+                                 "HEAD:include/dt-bindings/regulator/qcom,rpmh-regulator.h"],
+                                check=True, capture_output=True, text=True).stdout
+        modes = dict(re.findall(r"^#define RPMH_REGULATOR_MODE_(LPM|HPM)\s+(\d+)$", header, re.M))
+        self.assertEqual((modes["LPM"], modes["HPM"]), ("1", "3"))
+
+    def test_the_dtb_recipe_is_kbuild_s_own(self):
+        """dtb_compile runs the two commands of dtb_savedcmd, kbuild's command
+        for the DTB that make-kit.sh requires the build directory's .cmd file
+        to hold, with the paths of its copy; with revision 13's build
+        directory at hand, its .cmd file holds exactly that."""
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        saved = re.search(r'^dtb_savedcmd="(.*)"$', text, re.M).group(1)
+        body = re.search(r"^dtb_compile\(\) \{.*?\n\}\n", text, re.M | re.S).group(0)
+        cpp, dtc, _ = saved.split(" := ", 1)[1].split(" ; ")
+        words = lambda s: s.replace("\\\n", " ").split()
+        cpp_flags = [w for w in words(cpp) if w.startswith("-") and not w.startswith("-Wp,")]
+        dtc_flags = [w for w in words(dtc) if w.startswith("-W") or w in ("-@", "-b")]
+        for flag in cpp_flags + dtc_flags:
+            with self.subTest(flag):
+                self.assertIn(f" {flag} ", " ".join(words(body)) + " ")
+        self.assertIn('"$build/scripts/dtc/dtc" -o "$2" -b 0 -i"$1/" -i"$tree/scripts/dtc/include-prefixes"', body)
+        self.assertIn('-nostdinc -I "$tree/scripts/dtc/include-prefixes" -undef -D__DTS__', body)
+        build = pathlib.Path("/run/media/jstockdale/writable/gts9u-scratch/build-r13")
+        cmd = build / "linux-gts9wifi/arch/arm64/boot/dts/qcom/.sm8550-samsung-gts9wifi.dtb.cmd"
+        if not cmd.exists():
+            self.skipTest(f"no {cmd}")
+        line = next(l for l in cmd.read_text().splitlines() if l.startswith("savedcmd_"))
+        line = line.replace(str(build / "linux-src-gts9wifi"), "@TREE@").rstrip()
+        self.assertEqual(line, saved.replace("$qdir", "arch/arm64/boot/dts/qcom")
+                         .replace("$dts", "sm8550-samsung-gts9wifi"))
 
     def test_tree_comparison_skips_build_products_and_nothing_else(self):
         """The M= module builds leave objects in the kernel source tree, and
@@ -10707,7 +11213,7 @@ class ScriptsTest(unittest.TestCase):
             self.assertIn(f"\n{name}={value}\n", text)
         self.assertIn(f"\nunpark={UNPARK}\n", text)
         self.assertIn('fix_files=("$phymux.c" "$gmu.c" "$ufs_qcom.c")\n', text)
-        self.assertIn("\nrevision=13\n", text)
+        self.assertIn("\nrevision=14\n", text)
         # The build tree has to carry each fix whole and not the unpark
         # patch; the hang-log tree none of the fixes and the unpark patch.
         self.assertIn('die "the build tree\'s $f does not carry ${fix_patches[$i]} whole"', text)

@@ -32,8 +32,14 @@
 # upstream d0cd9c8d0fd5 with its fix 3098c989bd38) and the CXPC log's
 # region logged raw (the third debug switch patch, which revision 13
 # changes), in boot, plus the build's module tree, signed with its own key.
-# The configuration and the DTB do not change, so vendor_boot stays the
-# hang-log kit's.  The build for this kit sets
+# The configuration does not change.  Up to revision 13 the DTB did not
+# either, and vendor_boot stayed the hang-log kit's.  Since revision 14 the
+# kit's DTB is this checkout's committed DTS compiled by the build's own
+# recipe (revision 14: PM8550 LDO15 held in HPM, two properties of its node
+# gone), appended to the kernel in boot and in vendor_boot.img, the hang-log
+# kit's image with only its DTB replaced; revision 14's kernel and module
+# tree are revision 13's, not rebuilt (REUSE_KIT checks that).  The build
+# for this kit sets
 # APPLY_QMP_UFS_PCS_STATE_DIAGNOSTIC=1, APPLY_DEEP_SLEEP_DEBUG_SWITCHES=1,
 # APPLY_SM8550_SLEEP_FIXES=1, APPLY_SM8550_PCIE0_GDSC_OFF=1,
 # APPLY_SM8550_PCIE0_GDSC_GUARD=1, APPLY_LPASS_VA_MACRO_PM_CLK=1,
@@ -51,16 +57,25 @@
 # hang-log build's scratch; its kernel source tree is then the reference the
 # new one is compared with, file by file, its compiled clock controller the
 # reference for the power domain table, and its vmlinux the self-test of the
-# check for the UFS PHY's board gate.
+# check for the UFS PHY's board gate.  REUSE_KIT, when set, is the packed kit
+# whose kernel this revision reuses (revision 14: typec-roles-kit-r13): its
+# build ID, its module key and its module tree have to be this build's, and
+# its boot.img this Image.gz with the build's DTB, byte for byte.
 #
 # Self-tests, each byte for byte:
 #   - boot: the hang-log kernel plus its DTB, by the kits' recipe, is the
 #     hang-log kit's boot.img, the image a first install finds on the tablet
 #     and saves (an upgrade finds an earlier revision there, and the saved
 #     image stays the way back);
-#   - the hang-log vendor_boot carries that same DTB.
-# Then the changes are checked to be only the intended ones: the DTB, the
-# configuration and the module list are the hang-log build's, the source
+#   - vendor_boot: the hang-log vendor_boot carries that same DTB, and
+#     repacked with it, by the CX and camera kits' recipe, is itself;
+#   - DTB: a copy of the build tree's DTS directory, compiled by kbuild's own
+#     command for the DTB (read from the build directory, run here with the
+#     build's dtc, nothing written to the build), gives the build's DTB.
+# Then the changes are checked to be only the intended ones: the
+# configuration and the module list are the hang-log build's, the build's
+# DTB is too, the kit's DTB (this checkout's committed DTS by that recipe)
+# differs from it in revision 14's two properties of ldo15 alone, the source
 # trees differ in the three Type-C files, the clock controller, the
 # dwc3-qcom glue, the UFS PHY driver, the RPMh power domain driver, the
 # PIPE clock mux, the PCIe PHY, the GMU and ufs-qcom files of revision 10
@@ -79,7 +94,8 @@
 # board it runs on, the new vmlinux has the PIPE clock mux's gate operations
 # and not its rate operations and its PCIe PHY power-on sets no clock rate,
 # its geni UART's system sleep callbacks force-suspend and force-resume the
-# port, and the new boot image differs only in its kernel.  Nothing is
+# port, the new boot image differs only in its kernel (the Image.gz with the
+# kit's DTB appended), and the new vendor_boot only in its DTB.  Nothing is
 # flashed.
 set -euo pipefail
 export LC_ALL=C
@@ -108,9 +124,11 @@ size=100663296
 # diagnostic (11), plus the AOP's CXPC violators log behind a third debug
 # switch patch and the VA macro's and the DSI PHY's clocks released in
 # system sleep (12), plus the geni UARTs' resources released in system
-# sleep and the CXPC log's region logged raw (13).  Written to the kit for
-# people; install.sh knows a revision by its boot image and kernel build ID.
-revision=13
+# sleep and the CXPC log's region logged raw (13), and revision 13's kernel
+# and modules with a DTB of its own, L15B held in HPM, in boot and in
+# vendor_boot (14).  Written to the kit for people; install.sh knows a
+# revision by its boot image and kernel build ID (and its vendor_boot image).
+revision=14
 dts=sm8550-samsung-gts9wifi
 tcpm_dir=drivers/usb/typec/tcpm
 gcc=drivers/clk/qcom/gcc-sm8550
@@ -203,6 +221,17 @@ hang_image=3cb91f345b5e217290a737f254d7a278c426a0885305de008f308b27e7321216
 hang_dtb=5ff2495f1cc0e43f141956f84f2d24a4a325ede3e246806d7f034ba89d3c4060
 hang_config=4cd636e12d586ae4c0510217e4237f90627013afa2406a9d34a694ab5c44c394
 hang_build_id=68d243e908c0edfddc10429ede4bb235f205e44c
+# The DTB's directory in the kernel trees, and kbuild's command for the DTB
+# (scripts/Makefile.dtbs, cmd_dtc: cpp, then dtc with the flags of
+# arch/arm64/boot/dts and DTC_FLAGS_<board> := -@) as the build directory's
+# .cmd file has it, the kernel source tree written @TREE@: dtb_compile below
+# runs it.
+qdir=arch/arm64/boot/dts/qcom
+dtb_savedcmd="savedcmd_$qdir/$dts.dtb := clang -E -Wp,-MMD,$qdir/.$dts.dtb.d.pre.tmp -nostdinc -I @TREE@/scripts/dtc/include-prefixes -undef -D__DTS__ -x assembler-with-cpp -o $qdir/.$dts.dtb.dts.tmp @TREE@/$qdir/$dts.dts ; ./scripts/dtc/dtc -o $qdir/$dts.dtb -b 0 -i@TREE@/$qdir/ -i@TREE@/scripts/dtc/include-prefixes -Wno-unique_unit_address -Wno-unit_address_vs_reg -Wno-avoid_unnecessary_addr_size -Wno-alias_paths -Wno-interrupt_map -Wno-simple_bus_reg -@  -d $qdir/.$dts.dtb.d.dtc.tmp $qdir/.$dts.dtb.dts.tmp ; cat $qdir/.$dts.dtb.d.pre.tmp $qdir/.$dts.dtb.d.dtc.tmp > $qdir/.$dts.dtb.d"
+# Revision 14's DTB change, as dtc decompiles the two DTBs: in the node of
+# ldo15 named vreg_l15b_1p8 (PM8550 LDO15), these two lines are gone, and
+# nothing else differs.
+l15b_gone=('regulator-allow-set-load;' 'regulator-allowed-modes = <0x01 0x03>;')
 
 # What only the new kernel may contain: the patch's log line, the driver's
 # two parameters, and the deadline of the Try.SNK wait, a member of tcpm_port
@@ -281,10 +310,12 @@ for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$build/$geni.o" \
 	"$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
 	"$repo/kernel/drivers/sm5714_usbpd.c" "${patches[@]/#/$repo/kernel/patches/}" \
-	"$repo/kernel/patches/$unpark" "$repo/scripts/stage-ufs-resume-experiment.sh"; do
+	"$repo/kernel/patches/$unpark" "$repo/scripts/stage-ufs-resume-experiment.sh" \
+	"$repo/kernel/dts/$dts.dts" "$tree/$qdir/$dts.dts" "$build/$qdir/$dts.dtb" "$build/$qdir/.$dts.dtb.cmd" \
+	"$build/scripts/dtc/dtc"; do
 	[ -f "$f" ] || die "missing: $f"
 done
-for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy llvm-objdump llvm-nm pahole; do
+for t in unpack_bootimg python3 sha256sum cmp diff patch tar modinfo xxd openssl git llvm-objcopy llvm-objdump llvm-nm pahole clang; do
 	command -v "$t" >/dev/null || die "missing tool: $t"
 done
 [ "$(sha "$hang/Image.gz")" = "$hang_image" ] || die "$hang is not the hang-log kit's kernel build"
@@ -299,6 +330,15 @@ modules=$out/modules-root/usr/lib/modules/$release
 hang_modules=$hang/modules-root/usr/lib/modules/$release
 [ -f "$modules/modules.dep" ] && [ -f "$hang_modules/modules.dep" ] || die "no module tree in $out or $hang"
 [ ! -e "$kit" ] || die "$kit exists; choose a new directory"
+if [ -n "${REUSE_KIT:-}" ]; then
+	for f in BUILD_ID KEY_ID SIGNER REVISION SHA256SUMS boot.img "modules-$release.tar"; do
+		[ -f "$REUSE_KIT/$f" ] || die "missing: $REUSE_KIT/$f"
+	done
+	(cd "$REUSE_KIT" && sha256sum -c --quiet SHA256SUMS) || die "$REUSE_KIT does not match its SHA256SUMS"
+fi
+# The kit's DTB comes from this checkout's committed DTS.
+git -C "$repo" show "HEAD:kernel/dts/$dts.dts" | cmp -s - "$repo/kernel/dts/$dts.dts" ||
+	die "kernel/dts/$dts.dts has changes that are not committed; the kit's DTB is built from a commit"
 
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
@@ -327,11 +367,94 @@ for i in "${!args[@]}"; do
 done
 [ -n "$dtb_index" ] || die 'the hang-log vendor_boot carries no DTB'
 [ "$(sha "${args[$dtb_index]}")" = "$hang_dtb" ] || die "the hang-log vendor_boot's DTB is not $hang_dtb"
-echo "self-test: boot (${hang_boot:0:12}) reproduced byte for byte; vendor_boot (${hang_vendor_boot:0:12}) carries the same DTB"
+pack_vb() { # DTB OUT: the hang-log vendor_boot with DTB in place of its own,
+	# by the CX, lens and camera-bus kits' recipe (a fresh AVB footer,
+	# salted with the image's own hash, as every kit's)
+	local a=("${args[@]}")
+	a[$dtb_index]=$1
+	python3 "$mkbootimg" "${a[@]}" --vendor_boot "$2"
+	python3 "$avbtool" add_hash_footer --image "$2" --partition_name vendor_boot \
+		--partition_size "$size" --salt "$(sha "$2")"
+}
+pack_vb "${args[$dtb_index]}" "$tmp/self-vb.img" >/dev/null
+[ "$(sha "$tmp/self-vb.img")" = "$hang_vendor_boot" ] ||
+	die 'self-test failed: the vendor_boot repack does not reproduce the hang-log kit'
+echo "self-test: boot (${hang_boot:0:12}) and vendor_boot (${hang_vendor_boot:0:12}) reproduced byte for byte; vendor_boot carries the same DTB"
 
-# 2. The DTB and the configuration: the hang-log build's, unchanged.
+# 2. The DTB and the configuration.  The build's DTB is the hang-log
+# build's, unchanged.  The kit's DTB is this checkout's committed DTS,
+# compiled by kbuild's command for the DTB (the build directory's .cmd file
+# has to hold dtb_savedcmd above) with the build's dtc, in a copy of the
+# build tree's DTS directory: nothing is written to the build.  Self-test:
+# that copy compiles to the build's DTB, byte for byte.
 cmp -s "$out/$dts.dtb" "$hang/$dts.dtb" ||
-	die "the DTB changed ($(sha "$out/$dts.dtb")); this kit does not write vendor_boot"
+	die "the build's DTB ($(sha "$out/$dts.dtb")) is not the hang-log build's"
+cmp -s "$build/$qdir/$dts.dtb" "$out/$dts.dtb" || die "$out/$dts.dtb is not the build directory's"
+[ "$(sed -n -e "s|$tree|@TREE@|g" -e 's/ *$//' -e '/^savedcmd_/p' "$build/$qdir/.$dts.dtb.cmd")" = "$dtb_savedcmd" ] ||
+	die "kbuild's command for the DTB in $build/$qdir/.$dts.dtb.cmd is not the one this script runs"
+dtb_compile() { # DIR OUT: kbuild's two steps for DIR/$dts.dts, with OUT's temporary files next to it
+	clang -E -Wp,-MMD,"$2.d.pre.tmp" -nostdinc -I "$tree/scripts/dtc/include-prefixes" -undef -D__DTS__ \
+		-x assembler-with-cpp -o "$2.dts.tmp" "$1/$dts.dts" &&
+		"$build/scripts/dtc/dtc" -o "$2" -b 0 -i"$1/" -i"$tree/scripts/dtc/include-prefixes" \
+			-Wno-unique_unit_address -Wno-unit_address_vs_reg -Wno-avoid_unnecessary_addr_size \
+			-Wno-alias_paths -Wno-interrupt_map -Wno-simple_bus_reg -@ -d "$2.d.dtc.tmp" "$2.dts.tmp"
+}
+mkdir -p "$tmp/dts"
+cp -a "$tree/$qdir" "$tmp/dts/qcom"
+dtb_compile "$tmp/dts/qcom" "$tmp/self.dtb" || die "the build tree's DTS does not compile"
+cmp -s "$tmp/self.dtb" "$out/$dts.dtb" ||
+	die "self-test failed: kbuild's command, run on a copy of $tree/$qdir, does not give the build's DTB"
+git -C "$repo" show "HEAD:kernel/dts/$dts.dts" > "$tmp/dts/qcom/$dts.dts"
+dtb_compile "$tmp/dts/qcom" "$tmp/kit.dtb" || die "this checkout's DTS does not compile"
+kit_dtb=$(sha "$tmp/kit.dtb")
+echo "self-test: kbuild's command for the DTB, on a copy of the build tree's DTS directory, gives the build's DTB (${hang_dtb:0:12}); this checkout's DTS gives ${kit_dtb:0:12}"
+# What the kit's DTB changes: nothing, or revision 14's two lines of ldo15.
+# The hang-log tree, decompiled, with those two lines taken out of the
+# node named vreg_l15b_1p8 (they are each there once), has to be the kit's
+# tree byte for byte: no other property, node or phandle differs.
+decompile() { "$build/scripts/dtc/dtc" -I dtb -O dts -q "$1"; }
+decompile "$out/$dts.dtb" > "$tmp/hang.dts"
+decompile "$tmp/kit.dtb" > "$tmp/kit.dts"
+diff "$tmp/hang.dts" "$tmp/kit.dts" > "$tmp/dtb.diff" || :
+if cmp -s "$tmp/kit.dtb" "$out/$dts.dtb"; then
+	dtb_check="the hang-log build's, byte for byte (${hang_dtb:0:12})"
+else
+	awk -v drops="$tmp/l15b.drops" -v gone1="${l15b_gone[0]}" -v gone2="${l15b_gone[1]}" '
+		!inside && /^\t*([A-Za-z0-9_]+: )?ldo15 [{]$/ {
+			inside = 1
+			n = 0
+			match($0, /^\t*/)
+			indent = substr($0, 1, RLENGTH)
+		}
+		inside {
+			line[++n] = $0
+			if ($0 != indent "};")
+				next
+			named = 0
+			for (i = 1; i <= n; i++)
+				if (line[i] == indent "\tregulator-name = \"vreg_l15b_1p8\";")
+					named = 1
+			for (i = 1; i <= n; i++) {
+				if (named && (line[i] == indent "\t" gone1 || line[i] == indent "\t" gone2)) {
+					dropped++
+					continue
+				}
+				print line[i]
+			}
+			nodes += named
+			inside = 0
+			next
+		}
+		{ print }
+		END { print nodes + 0, dropped + 0 > drops }' "$tmp/hang.dts" > "$tmp/want.dts"
+	[ "$(cat "$tmp/l15b.drops")" = '1 2' ] && cmp -s "$tmp/want.dts" "$tmp/kit.dts" || {
+		echo "the kit's DTB differs from the hang-log build's in more, or other, than the two lines of ldo15 (vreg_l15b_1p8), '${l15b_gone[0]}' and '${l15b_gone[1]}':" >&2
+		cat "$tmp/dtb.diff" >&2
+		exit 1
+	}
+	dtb_check="the hang-log build's (${hang_dtb:0:12}) less two properties of ldo15 (vreg_l15b_1p8), '${l15b_gone[0]}' and '${l15b_gone[1]}', and nothing else (decompiled, no other line differs; no phandle renumbered): ${kit_dtb:0:12}"
+fi
+echo "DTB: $dtb_check"
 conf() { # CONFIG -> "SYMBOL<tab>VALUE" lines, "n" for "is not set"
 	sed -n -e 's/^\(CONFIG_[A-Za-z0-9_]*\)=\(.*\)$/\1\t\2/p' \
 		-e 's/^# \(CONFIG_[A-Za-z0-9_]*\) is not set$/\1\tn/p' "$1" | sort
@@ -344,7 +467,7 @@ cmp -s "$out/config" "$hang/config" || {
 }
 [ "$("$tree/scripts/extract-ikconfig" "$out/Image.gz" | sha256sum | cut -d' ' -f1)" = "$hang_config" ] ||
 	die 'the configuration embedded in Image.gz is not out/config'
-echo "DTB (${hang_dtb:0:12}) and configuration (${hang_config:0:12}): the hang-log build's, byte for byte"
+echo "the build's DTB (${hang_dtb:0:12}) and configuration (${hang_config:0:12}): the hang-log build's, byte for byte"
 
 # 3. The sources.  The driver is this checkout's; the two TCPM files, the
 # clock controller and the dwc3-qcom glue are the hang-log tree's with this
@@ -919,25 +1042,63 @@ done
 switch_check="the seven parameters' names in the image and their descriptions in modules.builtin.modinfo, none in the hang-log build's; the set and get handlers, the guard's genpd notifier, the CXPC log's PM notifier, the DSI PHY's system sleep callbacks and the raw CXPC file's show function in vmlinux (build ID ${new_id:0:12})"
 echo "debug switches: $switch_check"
 
-# 7. The kit's boot image, and what changed in it.
+# 6c. The kernel this revision reuses (REUSE_KIT, revision 14: revision
+# 13's): the same build ID and module key, its boot.img this Image.gz with
+# the build's DTB, and below, its module tree this one, byte for byte.
+reuse_check='REUSE_KIT not set: not compared with a packed kit'
+if [ -n "${REUSE_KIT:-}" ]; then
+	reused=$(cat "$REUSE_KIT/REVISION")
+	[ "$(cat "$REUSE_KIT/BUILD_ID")" = "$new_id" ] ||
+		die "$REUSE_KIT/BUILD_ID is $(cat "$REUSE_KIT/BUILD_ID"), not this build's $new_id"
+	[ "$(cat "$REUSE_KIT/KEY_ID")" = "$key_id" ] && [ "$(cat "$REUSE_KIT/SIGNER")" = "$serial" ] ||
+		die "$REUSE_KIT has another module key"
+	unpack "$REUSE_KIT/boot.img" "$tmp/rb"
+	cmp -s "$tmp/rb/kernel" <(cat "$out/Image.gz" "$out/$dts.dtb") ||
+		die "$REUSE_KIT/boot.img's kernel is not this Image.gz with the build's DTB"
+	reuse_check="revision $reused's kernel and module tree ($REUSE_KIT), not rebuilt: build ID ${new_id:0:12}, Image.gz $(sha "$out/Image.gz" | cut -c1-12), its boot.img's kernel this Image.gz with the build's DTB, module key ${key_id:0:12}, and its modules-$release.tar this kit's byte for byte"
+fi
+
+# 7. The kit's images, and what changed in them: boot holds the Image.gz
+# with the kit's DTB appended, vendor_boot is the hang-log kit's with the
+# kit's DTB in place of its own.
 mkdir -p "$kit"
-pack_boot "$out/Image.gz" "$out/$dts.dtb" "$kit/boot.img"
-[ "$(stat -c %s "$kit/boot.img")" = "$size" ] || die 'wrong boot.img size'
+pack_boot "$out/Image.gz" "$tmp/kit.dtb" "$kit/boot.img"
+pack_vb "$tmp/kit.dtb" "$kit/vendor_boot.img" >/dev/null
+for f in boot.img vendor_boot.img; do
+	[ "$(stat -c %s "$kit/$f")" = "$size" ] || die "wrong $f size"
+done
 unpack "$kit/boot.img" "$tmp/nb"
 mapfile -d '' a < "$tmp/b/args"
 mapfile -d '' b < "$tmp/nb/args"
 [ "${#a[@]}" = "${#b[@]}" ] || die 'boot header argument count differs from the hang-log kit'
 for i in "${!a[@]}"; do
 	case "${a[$i]}" in
-	"$tmp"/b/kernel) cmp -s "${b[$i]}" <(cat "$out/Image.gz" "$out/$dts.dtb") ||
-		die 'the boot kernel is not Image.gz plus the DTB' ;;
+	"$tmp"/b/kernel) cmp -s "${b[$i]}" <(cat "$out/Image.gz" "$tmp/kit.dtb") ||
+		die "the boot kernel is not Image.gz plus the kit's DTB" ;;
 	"$tmp"/b/*) cmp -s "${a[$i]}" "${b[$i]}" || die "boot differs from the hang-log kit in ${a[$((i - 1))]}" ;;
 	*) [ "${a[$i]}" = "${b[$i]}" ] || die "boot differs from the hang-log kit: ${a[$i]} vs ${b[$i]}" ;;
 	esac
 done
-echo 'boot: only the kernel differs from the hang-log kit; vendor_boot is not part of this kit'
+unpack "$kit/vendor_boot.img" "$tmp/nvb"
+mapfile -d '' c < "$tmp/nvb/args"
+[ "${#c[@]}" = "${#args[@]}" ] || die 'vendor_boot header argument count differs from the hang-log kit'
+for i in "${!args[@]}"; do
+	[ "$i" = "$dtb_index" ] && continue
+	case "${args[$i]}" in
+	"$tmp"/vb/*) cmp -s "${args[$i]}" "${c[$i]}" || die "vendor_boot differs from the hang-log kit in ${args[$((i - 1))]}" ;;
+	*) [ "${args[$i]}" = "${c[$i]}" ] || die "vendor_boot differs from the hang-log kit: ${args[$i]} vs ${c[$i]}" ;;
+	esac
+done
+cmp -s "${c[$dtb_index]}" "$tmp/kit.dtb" || die "the kit's DTB did not read back from vendor_boot"
+vb_check="the hang-log kit's (${hang_vendor_boot:0:12}) with only its DTB replaced: unpacked, its header arguments, vendor ramdisk, bootconfig and command line are the hang-log kit's byte for byte, its DTB is the kit's"
+echo "boot: only the kernel differs from the hang-log kit (Image.gz with the kit's DTB); vendor_boot: $vb_check"
 
 tar --owner=0 --group=0 -C "$out/modules-root" -cf "$kit/modules-$release.tar" "usr/lib/modules/$release"
+if [ -n "${REUSE_KIT:-}" ]; then
+	cmp -s "$REUSE_KIT/modules-$release.tar" "$kit/modules-$release.tar" ||
+		die "the module tree is not $REUSE_KIT's byte for byte"
+	echo "kernel and modules: $reuse_check"
+fi
 printf '%s\n' "$new_id" > "$kit/BUILD_ID"
 printf '%s\n' "$key_id" > "$kit/KEY_ID"
 printf '%s\n' "$serial" > "$kit/SIGNER"
@@ -969,10 +1130,18 @@ printf '%s\n' "$revision" > "$kit/REVISION"
 	echo "geni UARTs: the console's and the Bluetooth UART's resources off in system sleep (kernel/patches/${xo_patches[2]}, upstream d0cd9c8d0fd5 and 3098c989bd38, APPLY_GENI_SERIAL_FORCE_SUSPEND=1)"
 	echo "geni UART callbacks: $geni_check"
 	echo "left out: kernel/patches/pcie-qcom-root-port-d3-in-system-suspend.patch (APPLY_SM8550_ROOT_PORT_D3 not set)"
+	echo "kernel and modules: $reuse_check"
+	echo "kernel/dts/$dts.dts $(sha "$repo/kernel/dts/$dts.dts") (committed: $(git -C "$repo" log -n 1 --format=%h -- "kernel/dts/$dts.dts"))"
+	echo "DTB: $dtb_check"
+	echo "DTB sha256: the build's (the hang-log build's) $(sha "$out/$dts.dtb"), the kit's $kit_dtb"
+	echo "DTB recipe: kbuild's command from $build/$qdir/.$dts.dtb.cmd, the build's dtc, a copy of $tree/$qdir; self-test: that copy gives the build's DTB byte for byte"
+	echo "vendor_boot: $vb_check"
+	echo "boot: the Image.gz with the kit's DTB appended, by the kits' recipe"
 } > "$kit/SOURCE"
+cp "$tmp/dtb.diff" "$kit/DTB.diff"
 install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/sleep-test.sh" \
 	"$here/ufs-phy-power-check.sh" "$here/README.md" "$kit/"
-files=(boot.img "modules-$release.tar" BUILD_ID KEY_ID SIGNER REVISION SOURCE
+files=(boot.img vendor_boot.img "modules-$release.tar" BUILD_ID KEY_ID SIGNER REVISION SOURCE DTB.diff
 	install.sh rollback.sh verify.sh sleep-test.sh ufs-phy-power-check.sh README.md)
 (cd "$kit" && sha256sum "${files[@]}" > SHA256SUMS)
 cat "$kit/SHA256SUMS"
