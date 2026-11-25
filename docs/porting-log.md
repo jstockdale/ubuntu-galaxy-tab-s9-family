@@ -10394,3 +10394,171 @@ before the sleep (`bi_tcxo itself 1`, by the counts the USB PHY's reference
 clock, which goes with the PHY's other clocks in the suspend: inferred),
 `mx.lvl` left out of the sleep set with no vote in the trace, and the other
 requesters, which only the AOP can name.
+
+### Kit revision 13 on squirtle: the PMIC resets the tablet in the deepest sleep, and the first deep sleep comes with Bluetooth off (2026-11-24)
+
+Revision 13 was built from a4d6aa0 (kernel build ID
+`0b977cd78220bf46e4ae3d04455a09468cc4a6b2`, `boot.img` sha256
+`b14495e52b3efe58670229501f70dd85d3f771d2cad5df5ab565d2b798198ca4`,
+revision 12's module key, `51029e652d6e`) and installed over revision 12 at
+17:55 with one command and one reboot. `sudo sh verify.sh` passed, 29 `ok`
+and no `FAIL`: Bluetooth came back from the boot's panel cycle, the first
+suspend in which both geni UARTs are force-suspended, and the console's tty
+had its wakeup off. The bt-uart kit's twenty `pm_test=platform` suspends ran
+in the same boot: every cycle started (the boot's console record has the
+markers), and by the next run the kernel had counted 21 successful suspends,
+the panel cycle's and the twenty; the test's own `RESULT` line is not in the
+saved output. Logs: `backups/squirtle-verify-r13-20261124.log` and
+`backups/squirtle-bt-uart-r13-platform20-20261124.log`.
+
+Then nine real suspend-to-idle sleeps, one 30 s cycle each, each in a boot
+of its own, with `hold=60`, the interconnect floor released, and
+`mode=s2idle pci=keep rpmh sensors=hook` (`sensors=hook`: the device
+package's sleep hook, put on the tablet by the sensors-hook kit that
+afternoon, stopped the sensor clients), the PC's USB cable in and Bluetooth
+on unless said. The logs are
+`backups/squirtle-sleep-r13-1-s2idle-wifi-20261124.log` to
+`squirtle-sleep-r13-9-s2idle-l15b-hpm-20261124.log` with their pstore
+directories; the kit's README, "Revision 13: results", has them in a table.
+- **18:24, 19:47 and 20:20, runs 1 to 3**, with `root-port-d3 cxpc` (run 2
+  also with `cxmx=ret`, Linux's CX and MX votes held at retention): the
+  tablet reset within seconds of the sleep's entry, silently. No verdict
+  line, pmsg ending at `progress: cycle 1/1: entering the sleep`, the console
+  record at the run's `cycle 1` marker. From the entry to the next boot's
+  pstore archive took 35.4 to 37.7 s, against 34.5 to 35.5 s from a planned
+  `sysrq b` in the runs that came back: each reset came 0 to 3 s after the
+  entry. With revision 12's two UART clocks released, these were the first
+  sleeps of this port in which Linux held nothing of XO (runs 7 to 9, also
+  with `root-port-d3`, show XO free at the sleep's entry). The research of that
+  evening (`backups/xo-release-reset-research-2026-11-24.md`) pointed first
+  at the AOP's CXPC monitor, which `cxpc` turns on and which was running in
+  all three.
+- **20:42, run 4**, `cxpc` without `root-port-d3`: back, SHALLOW (s2idle),
+  31.3 s, `aosd +0 cxsd +0 ddr +1`. Both UART clocks were unprepared in the
+  suspend and prepared again at the resume, so the UART fix works; XO was
+  still voted at the sleep's entry, by the PCIe host's clocks alone
+  (`gcc_pcie_0_aux_clk`, `gcc_pcie_0_phy_rchng_clk`, `tcsr_pcie_0_clkref_en`),
+  which stay on with the root port in D0. The CXPC region was all zeros
+  before the message to the AOP, held a CXPC header right after it
+  (`000024cc 0a0103e8`), and after the sleep a region that is not a CXPC log
+  (`mode 0xdb`, as on revision 12): the AOP answered the message, and its log
+  is still not decoded.
+- **22:01, run 5**, `root-port-d3` without `cxpc`: reset, the same.
+  **22:17, run 6**, run 5's options with the USB cable unplugged (over
+  Wi-Fi): reset, the same. Neither the AOP's monitor nor USB was the cause.
+- **22:24, run 7**, run 5's options with a sound stream held open (playback
+  `RUNNING`): back, SHALLOW, `aosd +0 cxsd +0 ddr +0`, XO free at the sleep's
+  entry as far as Linux goes, the audio DSP awake and the DDR at 547 MHz for
+  the whole 30.6 s. XO released by Linux alone does not reset the tablet:
+  the reset needs the whole SoC to shut XO down.
+- **22:42, run 8**, run 5's options with Bluetooth powered off: **PASS
+  (s2idle), deep**, `aosd +1 cxsd +1 ddr +1`, 30.7 s, the UFS read back, the
+  Wi-Fi back. The first sleep on this port that reached AOSS sleep, CX
+  collapse and DDR low power and came back.
+- **22:55, run 9**, run 5's options with Bluetooth on and a test module
+  holding L15B in its high-power mode (below): the cycle PASS (s2idle), deep,
+  `aosd +3 cxsd +1 ddr +1`, 31.2 s. The run's `RESULT` said `PCIE-DOWN` on
+  four ath11k lines, `Failed to set the requested Country regulatory
+  setting` and `failed to process regulatory info -22`, two in the suspend
+  and two in the resume, while the Wi-Fi's function was back in D0 with
+  ath11k bound and its firmware loaded again: the script's false alarm,
+  fixed in revision 14's (1693305). Why the firmware turned the country
+  setting down is not known.
+
+**What the PMIC recorded.** Its power-on log, read as root in the boots
+after runs 4 and 5 (`backups/squirtle-xo-reset-records-20261124-215410` and
+`-220729`, decoded with
+`backups/deep-sleep-plan-2026-11-22/notes/pmic_pon_log_decode.py`), has each
+reset in its window, runs 2, 3 and 5, as `Reset Trigger: SID=0x1, PID=0x1C,
+IRQ=0x0` and `Reset Type: WARM_RESET`, each followed by a `PS_HOLD` hard
+reset: a peripheral of PM8550 (SPMI SID 1) reset the tablet, not PS_HOLD.
+The hangs of 2026-11-22 had been PS_HOLD dropped by the SoC, and each
+planned restart in the log is a lone `PS_HOLD` with `HARD_RESET`. In the
+same dump PMK8550's over-current log (three two-byte entries at 0x7076, all
+zero on 2026-11-22) holds three entries, each `12 cf`: ppid 0x1CF, as
+Samsung's `qti-ocp-notifier.c` decodes it, which is PM8550's LDO15, L15B
+(`vreg_l15b_1p8`).
+
+**Why.** L15B, 1.8 V, feeds the WCN6855's I/O rail (`vddio` of its
+power-management unit, which declares no load) and the PTN3222 eUSB2
+repeater (`vdd1v8`, 55 mA declared while its PHY is up). Its node had
+`regulator-allow-set-load` with LPM and HPM allowed, as sm8550-hdk has it.
+With the USB PHY down in a sleep the summed load was 0, and Linux voted L15B
+to its low-power mode (LPM) with the Wi-Fi and Bluetooth chip still on it;
+in a sleep in which nothing else kept the SoC up, the PMIC's over-current
+protection on L15B then reset the tablet. Five resets of five with Bluetooth
+on (runs 1 to 3, 5 and 6), deep sleep with Bluetooth off (run 8) and with
+L15B held in HPM (run 9). LPM while awake did not do it: in run 6, the
+cable out and the repeater down, the regulator summary before the sleep had
+L15B `idle`, its LPM, with Bluetooth on.
+
+**The L15B hold test (run 9).** `gts9u_l15b_hold`, a throw-away module kept
+only in the backups (`backups/l15b-hold-test/gts9u_l15b_hold.c`; it was
+never in this tree or in a kit), takes L15B as an enabled consumer with a
+declared 60 mA load, so the summed load stays above the LDO's 30 mA
+threshold for HPM: before the run the rail read `normal, 115000 uA
+requested`, the repeater's 55 mA and the module's 60. The restart at the
+run's end took it out again.
+
+Not run on revision 13: a deep (`mem`) sleep with `root-port-d3`.
+
+### L15B held in HPM: the device-tree fix, kit revision 14, and a deep sleep with Bluetooth on (2026-11-25)
+
+**The fix** (040c857, committed late on 2026-11-24): in both boards'
+device trees `vreg_l15b_1p8: ldo15` keeps `regulator-initial-mode =
+<RPMH_REGULATOR_MODE_HPM>` and loses `regulator-allow-set-load` and
+`regulator-allowed-modes`, as mainline's sm8550-qrd and sm8550-mtp describe
+it. Read from the 7.2-rc3 source, not measured: the regulator core applies
+the initial mode when the regulator registers (`set_machine_constraints()`)
+and nothing changes it after that; without `REGULATOR_CHANGE_DRMS` a
+consumer's load is recorded and ignored (`drms_uA_update()` returns 0, so
+the repeater's and the PMU's calls succeed as before); and the RPMh
+regulator driver writes the mode in the active-only set, which RPMh keeps
+through the sleep. The other LDOs with set-load (L5B, L17B, L1G) are
+unchanged. The SM-X910 has the same LDO with the same two consumers (its
+radio a WCN7850), and its DTS has the same change, but its builds compile a
+pinned baseline DTS (`fingerprint_baseline` in
+`scripts/build-mainline-kernel.sh`: its bootloader bootloops on a
+vendor_boot DTB whose structure moves, d838e22), so the change does not
+reach that tablet. How the fix gets there is the owner's decision, open.
+
+**Kit revision 14** (7a6db19, 1693305 and b6642d7; the report is
+`backups/l15b-hpm-kit-r14-2026-11-24.md`, the kit
+`backups/typec-roles-kit-r14/`): revision 13's kernel and module tree,
+unchanged, with a DTB of its own, revision 13's with ldo15's two lines out
+and nothing else (32 bytes shorter). It goes into vendor_boot (the hang-log
+kit's image with only its DTB replaced) and, appended to the kernel, into
+boot, since which of the two the SM-X710's bootloader reads has not been
+isolated. `install.sh` saves the hang-log kit's vendor_boot before it writes
+it, and `rollback.sh` writes it back; `verify.sh` checks the running device
+tree's ldo15 node and the regulator's mode, and with sudo both partitions;
+`sleep-test.sh` and `verify.sh` take ath11k's country-setting lines for a
+note.
+
+**On squirtle.** Revision 14 went on over revision 13 and booted at 01:19
+(boot `f9366ef8`). The X710's bootloader took the DTB with two properties
+removed: `sudo sh verify.sh` passed every check, 32 `ok`, with the running
+device tree's ldo15 without the two properties and L15B `normal` (HPM), and
+boot and vendor_boot holding the kit's images
+(`backups/squirtle-verify-r14-sudo-20261125.log`).
+
+**The confirming sleep**, 01:30
+(`backups/squirtle-sleep-r14-1-s2idle-bt-on-20261125.log` and its pstore
+directory): revision 13's run 5 again, `mode=s2idle pci=keep root-port-d3
+rpmh sensors=hook` with the floor released, Bluetooth on, no test module, the
+PC's cable in. PASS (s2idle), deep: `aosd +3 cxsd +1 ddr +1`, asleep 31.0 s,
+woken by the RTC alarm, XO free at the sleep's entry, the UFS read back as
+before, Bluetooth with no disabled interrupt and no HCI command timeout, the
+PCIe host and the Wi-Fi back with no failure line. L15B dropping to LPM in a
+whole-SoC sleep with Bluetooth on caused revision 13's resets, and the
+device tree holding it in HPM stopped them, on the evidence of this sleep
+and revision 13's run 9.
+
+What it does not show: deep sleep with Bluetooth on rests on those two
+sleeps, each a single 30 s cycle; the extra standby current of L15B held in
+HPM is not measured; the Wi-Fi is powered down for the sleep on purpose
+(`root-port-d3` takes the PCIe host and the Wi-Fi chip down), so it cannot
+wake the tablet, and wake-on-wireless is a later option; a deep (`mem`)
+sleep with `root-port-d3`, longer sleeps and a sleep with a writable root
+have not run. None of it is in a release: the device-tree change and the
+kit are on the work branch, and the feature branch has not moved.
