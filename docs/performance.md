@@ -58,22 +58,50 @@ appended to `boot` leaves the live DT unchanged: ABL uses `vendor_boot` here.
 The appended-only test was rolled back to the original boot image.
 
 `kernel/dts/gts9-performance.dtso` adds only the prime-CPU OPP node,
-`kernel/dts/gts9u-performance.dtso` only the GPU OPP node, and
-`kernel/dts/gts9-family.dtso` only `wakeup-source` on `/soc@0/usb@a600000`
-(both boards). `scripts/stage-performance-overlay.sh` embeds all three,
-8-byte aligned, in a small built-in board
-helper. Its `core_initcall` applies the overlays to Linux's live tree, after
-OF initialization and before cpufreq and DRM can consume their OPP tables.
-The CPU overlay runs for `samsung,gts9uwifi` and `samsung,gts9wifi`, the GPU
-overlay only for `samsung,gts9uwifi` (see [SM-X710](#sm-x710-gts9wifi)).
-No firmware RPC, memory ownership change, Gunyah hook, reserved-memory
-modification or bootloader DT replacement occurs. The full Ultra board DTS
-also records the OPPs for a future unpinned build.
+`kernel/dts/gts9u-performance.dtso` only the GPU OPP node and the UFS inline
+crypto engine clock (the `ufshc@1d84000` clock list and three UFS `opp-hz`
+values), and `kernel/dts/gts9-family.dtso` only `wakeup-source` on
+`/soc@0/usb@a600000` (both boards). `scripts/stage-performance-overlay.sh`
+embeds all three, 8-byte aligned, in a small built-in board helper,
+`kernel/drivers/gts9u-performance.c`. Its `core_initcall` applies the
+overlays to Linux's live tree, after OF initialization and before cpufreq and
+DRM can consume their OPP tables. The CPU overlay runs for
+`samsung,gts9uwifi` and `samsung,gts9wifi`, the GPU and UFS ICE overlay only
+for `samsung,gts9uwifi` (see [SM-X710](#sm-x710-gts9wifi)). No firmware RPC,
+memory ownership change, Gunyah hook, reserved-memory modification or
+bootloader DT replacement occurs. The full Ultra board DTS also records the
+OPPs for a future unpinned build.
+
+The same `core_initcall` makes one more early fix, on both boards and before
+the overlays: PM8550 L15B (`vreg_l15b_1p8`, the eUSB2 repeater's 1.8 V and
+the WCN PMU's I/O rail) held in HPM, the SM-X710's device-tree fix for the
+resets in its deep sleeps with Bluetooth on
+([resume notes](resume-recovery.md#deep-sleep-on-the-sm-x710-2026-11-24-and-25)).
+That fix removes two properties of `/soc@0/rsc@17a00000/regulators-0/ldo15`,
+`regulator-allow-set-load` and `regulator-allowed-modes`, and an overlay can
+only add or replace properties, so it is C, not a fourth overlay. The helper
+acts only if the node's parent is `qcom,pm8550-rpmh-regulators` and its
+`regulator-name` is `vreg_l15b_1p8` (a node that is missing or is not that
+one is left alone), removes the two with `of_remove_property()` (their
+`/proc/device-tree` files go too), and logs one line: `gts9u-performance:
+L15B held in HPM: 2 of its DTB properties dropped` (the Ultra's pinned DTB),
+`gts9u-performance: L15B held in HPM by the DTB` (a DTB without them, the
+SM-X710's since its Type-C kit's revision 14), or an error that starts with
+`gts9u-performance: L15B`. The RPMh regulators read the node when they
+probe, on the device rpmh-rsc creates once its own device appears at
+`arch_initcall_sync`, so they see the edited node; the initial HPM vote is
+sent when they register, and (read from the 7.2-rc3 source) nothing changes
+the mode after that. The bootloader's copy (`/sys/firmware/fdt`) keeps both
+properties. The step was written and compiled with the Ultra build's
+compiler flags on 2026-11-25; it is not yet in a kernel that has run on
+either tablet.
 
 Each overlay application is transactional, one failing does not stop the
-others, and the overlays remain for the boot lifetime. `CONFIG_OF_OVERLAY=y`
-is already required by the port's Gunyah integration. It must be built in;
-loading this helper after the GPU/cpufreq drivers probe would be too late.
+others, and the overlays remain for the boot lifetime. The L15B step neither
+needs the overlays nor stops them, and each failure logs its own line.
+`CONFIG_OF_OVERLAY=y` is already required by the port's Gunyah integration.
+It must be built in; loading this helper after the GPU/cpufreq drivers or
+the RPMh regulators probe would be too late.
 
 Two cpufreq fixes are also needed in this kernel:
 

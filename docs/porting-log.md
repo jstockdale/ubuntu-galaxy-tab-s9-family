@@ -10838,3 +10838,30 @@ wake the tablet, and wake-on-wireless is a later option; a deep (`mem`)
 sleep with `root-port-d3`, longer sleeps and a sleep with a writable root
 have not run. None of it is in a release: the device-tree change and the
 kit are on the work branch, and the feature branch has not moved.
+
+### L15B held in HPM on the SM-X910 too, from the live tree (2026-11-25)
+
+The SM-X910's builds compile the pinned baseline DTS, whose ldo15 still has
+`regulator-allow-set-load` and `regulator-allowed-modes`, so revision 14's
+device-tree fix does not reach that board's DTB, and an overlay cannot
+delete a property. The owner chose the route of the delivery research
+(`backups/ultra-l15b-delivery-research-2026-11-25.md`, route A):
+`kernel/drivers/gts9u-performance.c`, in the `core_initcall` that applies the
+early overlays, now takes the two properties out of the live tree's
+`/soc@0/rsc@17a00000/regulators-0/ldo15` first, on both boards, if the node's
+parent is `qcom,pm8550-rpmh-regulators` and its name `vreg_l15b_1p8`, and
+logs a `gts9u-performance: L15B` line. The RPMh regulators read the
+node later, when rpmh-rsc's device has probed (`arch_initcall_sync` or
+after). On the SM-X710, whose DTB lacks both since revision 14, it removes
+nothing. The pinned DTB, `vendor_boot` and the build script are unchanged.
+The implementation report is
+`backups/ultra-l15b-live-tree-fix-2026-11-25.md`.
+
+What is established: the SM-X710's fix in its DTB, on hardware (revision
+14's run 1, and revision 13's run 9 with a test module, each one 30 s
+cycle). The helper is written and compiled with the Ultra build's flags,
+without a warning; it is not in a kernel, and has run on no tablet. Whether
+the SM-X910 would reset without it is not known, and it cannot be confirmed
+there yet: the SM-X910 reaches no whole-SoC sleep while its RPMh power
+domains have not synced. It is to ship in a later SM-X910 kernel, with the
+deep-sleep work that kernel needs anyway.

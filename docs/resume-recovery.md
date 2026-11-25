@@ -759,8 +759,15 @@ Still open:
   WCN7850), and its DTS has the same change, but its builds compile a pinned
   baseline DTS (`fingerprint_baseline` in `scripts/build-mainline-kernel.sh`,
   because its bootloader bootloops on a vendor_boot DTB whose structure
-  moves), so the fix does not reach it. How it gets there is the owner's
-  decision, open;
+  moves), whose ldo15 still has both properties. Since 2026-11-25 the board
+  helper `kernel/drivers/gts9u-performance.c` takes them out of the live
+  tree at boot instead, on both boards (a no-op on the SM-X710:
+  [performance notes](performance.md#bootloader-compatible-implementation));
+  it is written and compiled, not yet in a kernel or on a tablet. Whether the
+  SM-X910 resets without it is not known, and it cannot be confirmed there
+  yet: the SM-X910 cannot reach a whole-SoC sleep while its RPMh power
+  domains have not synced (until they do, rpmhpd votes them at their highest
+  level in the sleep set too);
 - the AOP's CXPC log, which no run has decoded.
 
 ### Protecting the storage in a sleep test
