@@ -288,6 +288,24 @@ error in resume`) is a note too: USB works, the devices were enumerated
 again. A module the kernel refused fails the check, and so does a kernel log
 that cannot be read.
 
+It also reports L15B, PM8550's LDO15 (`vreg_l15b_1p8`, the eUSB2 repeater's
+1.8 V and the WCN7850's I/O rail). On the SM-X710 a sleep with Bluetooth on
+voted that LDO to LPM, and once the whole SoC slept the PMIC reset the
+tablet; held in HPM, the same sleep went deep
+([`docs/resume-recovery.md`](../../../docs/resume-recovery.md#deep-sleep-on-the-sm-x710-2026-11-24-and-25)).
+This board's pinned DTB still lets L15B leave HPM. A kernel with the L15B
+step of `kernel/drivers/gts9u-performance.c` (2026-11-25) takes
+`regulator-allow-set-load` and `regulator-allowed-modes` out of the live
+tree at boot and logs a `gts9u-performance: L15B` line; the bootloader's
+copy, `/sys/firmware/fdt`, keeps both. With that line `verify.sh` checks
+that the running DT's ldo15 has neither property and that the regulator
+reads `normal` (HPM), and fails on the kit's kernel if not. Without it, as
+on every revision so far (1 to 7), it prints a note and checks nothing:
+`make-kit.sh` does not yet require the step in a new kernel. Whether the
+SM-X910 needs the step has not been measured, and it cannot be yet: this
+board reaches no whole-SoC sleep while its RPMh power domains have not
+synced.
+
 ## Physical checks still to run (owner)
 
 Checks 1 to 3 passed with the second revision on 2026-11-21 (two boots with

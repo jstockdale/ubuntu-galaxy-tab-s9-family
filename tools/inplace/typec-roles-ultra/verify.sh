@@ -371,9 +371,9 @@ tr '\0' '\n' < /proc/device-tree/compatible | grep -qx 'samsung,gts9uwifi' && ok
 findmnt -no OPTIONS / | tr ',' '\n' | grep -qx rw && ok 'root is rw' || bad 'root is not rw'
 
 k=$(journalctl -k -b --no-pager -q 2>/dev/null)
-# Three checks below read this boot's kernel log; without it none can pass.
+# Four checks below read this boot's kernel log; without it none can pass.
 [ -n "$k" ] || bad "cannot read this boot's kernel log (journalctl -k -b): the module key, the module" \
-	'failures and the USB host controller were not checked'
+	'failures, the USB host controller and L15B were not checked'
 key=$(cat "$kit/KEY_ID" 2>/dev/null)
 if [ -n "$k" ]; then
 	printf '%s\n' "$k" | grep -q "Loaded X.509 cert .*: ${key:-none}" &&
@@ -435,6 +435,45 @@ if [ "$(role data_role)" = host ] && [ -e "$partner" ]; then
 	n=$(usb_devices | wc -l)
 	[ "$n" -gt 0 ] && ok "USB host, devices on the bus: $n" ||
 		note 'USB host with no device on the bus (nothing behind the dock, or its hub did not come up)'
+fi
+# PM8550 LDO15 (vreg_l15b_1p8: the eUSB2 repeater's 1.8 V and the WCN7850's
+# I/O rail) held in HPM, as on the SM-X710 since its kit's revision 14: the
+# node has neither regulator-allow-set-load nor regulator-allowed-modes, and
+# the regulator reads normal (HPM).  This board's DTB is the pinned release
+# one, whose ldo15 still has both (the bootloader's copy, /sys/firmware/fdt,
+# keeps them); a kernel with the L15B step of
+# kernel/drivers/gts9u-performance.c (2026-11-25) takes them out of the live
+# tree at boot and logs a "gts9u-performance: L15B" line.  Revisions 1 to 7
+# have no such step, so without its line this is a note.
+if [ -n "$k" ]; then
+	l15=/proc/device-tree/soc@0/rsc@17a00000/regulators-0/ldo15
+	l15_name=$(tr -d '\0' < "$l15/regulator-name" 2>/dev/null)
+	l15_mode=
+	for r in /sys/class/regulator/regulator.*; do
+		[ "$(cat "$r/name" 2>/dev/null)" = vreg_l15b_1p8 ] && l15_mode=$(cat "$r/opmode" 2>/dev/null)
+	done
+	l15_step=$(printf '%s\n' "$k" | sed -n 's/^.*\(gts9u-performance: L15B.*\)$/\1/p' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+	l15_dt=
+	if [ -z "$l15_step" ]; then
+		note "DT: L15B (vreg_l15b_1p8) not checked: this kernel has no L15B step (no \"gts9u-performance: L15B\" line this boot), and with the pinned DTB L15B may drop to LPM in a sleep (it reads ${l15_mode:-no mode} now)"
+	elif [ "$l15_name" != vreg_l15b_1p8 ]; then
+		l15_dt="no vreg_l15b_1p8 node at $l15 ($l15_step)"
+	elif ! printf '%s\n' "$l15_step" | grep -q '^gts9u-performance: L15B held in HPM'; then
+		l15_dt="the kernel's L15B step failed: $l15_step"
+	elif [ -e "$l15/regulator-allow-set-load" ] || [ -e "$l15/regulator-allowed-modes" ]; then
+		l15_dt="L15B (vreg_l15b_1p8) may drop to LPM: its node still has regulator-allow-set-load or regulator-allowed-modes, though the kernel logged \"$l15_step\" (it reads ${l15_mode:-no mode} now)"
+	elif [ "$l15_mode" != normal ]; then
+		l15_dt="L15B's node has neither property, but the regulator reads ${l15_mode:-no mode} (its opmode), not normal (HPM)"
+	else
+		ok "DT: L15B (vreg_l15b_1p8) held in HPM: no regulator-allow-set-load or regulator-allowed-modes, and it reads normal ($l15_step)"
+	fi
+	if [ -n "$l15_dt" ]; then
+		if [ -n "$want" ] && [ "$id" = "$want" ]; then
+			bad "DT: $l15_dt"
+		else
+			note "DT: $l15_dt"
+		fi
+	fi
 fi
 # The stopgap writes the data role from userspace and would collide with the
 # kernel's own request.

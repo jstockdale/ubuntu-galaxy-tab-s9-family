@@ -10640,7 +10640,9 @@ class L15bHpmTest(unittest.TestCase):
     """Revision 14's device-tree change, on both boards: PM8550 LDO15
     (vreg_l15b_1p8, the eUSB2 repeater's 1.8 V and the WCN PMU's I/O rail)
     held in HPM, with no regulator-allow-set-load and no
-    regulator-allowed-modes, as sm8550-qrd and sm8550-mtp describe it."""
+    regulator-allowed-modes, as sm8550-qrd and sm8550-mtp describe it; and
+    the early board helper's L15B step, which takes the same two properties
+    out of the live tree for the SM-X910's pinned DTB."""
 
     BOARDS = (("gts9wifi", "qcom,wcn6855-pmu"), ("gts9uwifi", "qcom,wcn7850-pmu"))
 
@@ -10700,6 +10702,136 @@ class L15bHpmTest(unittest.TestCase):
                 self.assertIn("regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;", ldo15)
                 self.assertEqual("regulator-allow-set-load;" in ldo15, set_load)
                 self.assertEqual("regulator-allowed-modes" in ldo15, set_load)
+
+    # The SM-X910's builds compile a pinned DTS: there the fix is the L15B
+    # step of the early board helper, which takes the same two properties out
+    # of the live tree.
+
+    HELPER = REPO / "kernel/drivers/gts9u-performance.c"
+    STEP_HEAD = "static int __init gts9_hold_l15b_hpm(void)\n{\n"
+
+    @staticmethod
+    def function(source, head):
+        """The C function that starts with the lines HEAD, to its closing
+        brace."""
+        start = source.index(head)
+        return source[start:source.index("\n}\n", start) + 3]
+
+    def test_the_ultra_s_pinned_dts_still_lets_l15b_leave_hpm(self):
+        """Why the SM-X910 needs the step: its builds install the pinned
+        baseline DTS, not the working copy, and the baseline's
+        vreg_l15b_1p8: ldo15, in PM8550's ("b") regulators of the
+        application processor's RSC, still has both properties.  This fails
+        the day the pin moves, for a review of the step."""
+        build = (REPO / "scripts/build-mainline-kernel.sh").read_text()
+        pin = re.search(r"^fingerprint_baseline=([0-9a-f]{40})$", build, re.M).group(1)
+        self.assertIn('\nif [ "$DEVICE" = gts9uwifi ]; then\n'
+                      '\tgit -C "$repo" show \\\n'
+                      '\t\t"$fingerprint_baseline:kernel/dts/sm8550-samsung-gts9uwifi.dts" \\\n'
+                      '\t\t> "$board_dts"\n'
+                      'else\n', build)
+        self.assertIn("\nboard_dts=$kernel_tree/arch/arm64/boot/dts/qcom/$DEVICE_DTS.dts\n", build)
+        if not (REPO / ".git").exists() or not shutil.which("git"):
+            self.skipTest("not a git checkout")
+        dts = subprocess.run(["git", "-C", str(REPO), "show", f"{pin}:kernel/dts/sm8550-samsung-gts9uwifi.dts"],
+                             check=True, capture_output=True, text=True).stdout
+        self.assertEqual(dts.count("vreg_l15b_1p8: ldo15 {"), 1)
+        ldo15 = self.node(dts, "\t\tvreg_l15b_1p8: ldo15 {\n")
+        self.assertEqual(ldo15.splitlines()[1:], [
+            '\t\t\tregulator-name = "vreg_l15b_1p8";',
+            "\t\t\tregulator-min-microvolt = <1800000>;",
+            "\t\t\tregulator-max-microvolt = <1800000>;",
+            "\t\t\tregulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;",
+            "\t\t\tregulator-allow-set-load;",
+            "\t\t\tregulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM",
+            "\t\t\t\t\t\t   RPMH_REGULATOR_MODE_HPM>;"])
+        apps = self.node(dts, "&apps_rsc {\n")
+        pmic = self.node(dts, "\tregulators-0 {\n")
+        self.assertIn(pmic, apps)
+        self.assertIn('\t\tcompatible = "qcom,pm8550-rpmh-regulators";\n', pmic)
+        self.assertIn('\t\tqcom,pmic-id = "b";\n', pmic)
+        self.assertIn(ldo15, pmic)
+
+    def test_the_early_helper_takes_the_two_properties_out_of_that_node_alone(self):
+        """kernel/drivers/gts9u-performance.c: from its core_initcall, on
+        both boards, after the board gate and before the overlays, it takes
+        regulator-allow-set-load and then regulator-allowed-modes out of the
+        live tree's ldo15 of PM8550's regulators, the node both DTSes make,
+        and only if that node's parent is PM8550's RPMh regulators and its
+        regulator-name vreg_l15b_1p8.  Its error is not overwritten by the
+        overlays'."""
+        source = self.HELPER.read_text()
+        path = re.search(r'^#define GTS9_L15B_PATH\t"([^"]+)"$', source, re.M).group(1)
+        self.assertEqual(path, "/soc@0/rsc@17a00000/regulators-0/ldo15")
+        step = self.function(source, self.STEP_HEAD)
+        props = re.search(r"\tstatic const char \* const props\[\] __initconst = \{\n(.*?)\n\t\};\n",
+                          step, re.S).group(1)
+        self.assertEqual(re.findall(r'^\t\t"([^"]*)",$', props, re.M),
+                         ["regulator-allow-set-load", "regulator-allowed-modes"])
+        self.assertEqual(props.count('"'), 4)
+        for line in ("\tnp = of_find_node_by_path(GTS9_L15B_PATH);\n",
+                     '\tif (!of_device_is_compatible(np->parent, "qcom,pm8550-rpmh-regulators") ||\n'
+                     '\t    of_property_read_string(np, "regulator-name", &name) ||\n'
+                     '\t    strcmp(name, "vreg_l15b_1p8")) {\n',
+                     "\tfor (i = 0; i < ARRAY_SIZE(props); i++) {\n"
+                     "\t\tstruct property *pp = of_find_property(np, props[i], NULL);\n",
+                     "\t\tret = of_remove_property(np, pp);\n",
+                     "\tof_node_put(np);\n"):
+            with self.subTest(line):
+                self.assertEqual(step.count(line), 1)
+        for call in ("of_find_node_by_path(", "of_device_is_compatible(", "of_remove_property(",
+                     "of_node_put("):
+            self.assertEqual(step.count(call), 1, call)
+        # The guard comes first, and a node it refuses is left alone.
+        guard = step[step.index("\tif (!of_device_is_compatible("):step.index("\tfor (i = 0;")]
+        self.assertTrue(guard.rstrip().endswith("ret = -ENODEV;\n\t\tgoto out;\n\t}"), guard)
+        # Called once, from the core_initcall, for both boards.
+        init = self.function(source, "static int __init gts9u_performance_init(void)\n{\n")
+        self.assertEqual(re.findall(r"\bgts9_hold_l15b_hpm\(\)", source), ["gts9_hold_l15b_hpm()"])
+        gate = init.index('\tif (!ultra && !of_machine_is_compatible("samsung,gts9wifi"))\n\t\treturn 0;\n')
+        call = init.index("\tret = gts9_hold_l15b_hpm();\n")
+        self.assertLess(gate, call)
+        self.assertLess(call, init.index("gts9u_apply("))
+        self.assertLess(call, init.index("\tif (!ultra)\n\t\treturn ret;\n"))
+        after = init[call + len("\tret = gts9_hold_l15b_hpm();\n"):]
+        self.assertEqual(set(re.findall(r"\bret = ([^;]*);", after)), {"ret ?: err"})
+        self.assertEqual(re.findall(r"\breturn ([^;]*);", after), ["ret", "ret ?: err"])
+        self.assertIn("\ncore_initcall(gts9u_performance_init);\n", source)
+        # The path is the node both board DTSes make: their PM8550 ("b")
+        # regulators-0 in &apps_rsc, and in sm8550.dtsi apps_rsc is
+        # rsc@17a00000, a child of soc@0.
+        for board, _ in self.BOARDS:
+            with self.subTest(board):
+                dts = (REPO / f"kernel/dts/sm8550-samsung-{board}.dts").read_text()
+                pmic = self.node(dts, "\tregulators-0 {\n")
+                self.assertIn(pmic, self.node(dts, "&apps_rsc {\n"))
+                self.assertIn('\t\tcompatible = "qcom,pm8550-rpmh-regulators";\n', pmic)
+                self.assertIn("\t\tvreg_l15b_1p8: ldo15 {\n", pmic)
+        kernel = kernel_source()
+        if kernel is None:
+            self.skipTest("no pinned kernel checkout")
+        dtsi = subprocess.run(["git", "-C", str(kernel), "show", "HEAD:arch/arm64/boot/dts/qcom/sm8550.dtsi"],
+                              check=True, capture_output=True, text=True).stdout
+        self.assertEqual(dtsi.count("\tsoc: soc@0 {\n"), 1)
+        self.assertEqual(dtsi.count("apps_rsc: rsc@17a00000 {"), 1)
+        self.assertIn("\n\t\tapps_rsc: rsc@17a00000 {\n", self.node(dtsi, "\tsoc: soc@0 {\n"))
+
+    def test_the_helper_and_the_kits_name_the_same_two_properties(self):
+        """One pair of names, and one node: the step's, the decompiled
+        lines the SM-X710 kit's make-kit.sh checks were taken out, and what
+        both kits' verify.sh look for in the running DT."""
+        source = self.HELPER.read_text()
+        names = re.findall(r'^\t\t"(regulator-[a-z-]+)",$', self.function(source, self.STEP_HEAD), re.M)
+        self.assertEqual(names, ["regulator-allow-set-load", "regulator-allowed-modes"])
+        text = (KIT_SRC / "make-kit.sh").read_text()
+        gone = shlex.split(re.search(r"^l15b_gone=\((.*)\)$", text, re.M).group(1))
+        self.assertEqual([re.fullmatch(r"([a-z-]+)(?: = .*)?;", line).group(1) for line in gone], names)
+        path = re.search(r'^#define GTS9_L15B_PATH\t"([^"]+)"$', source, re.M).group(1)
+        for kit in ("typec-roles", "typec-roles-ultra"):
+            with self.subTest(kit):
+                verify = (REPO / "tools/inplace" / kit / "verify.sh").read_text()
+                self.assertEqual(re.findall(r"^\t*l15=(\S+)$", verify, re.M), [f"/proc/device-tree{path}"])
+                self.assertEqual(re.findall(r'\[ -e "\$l15/(regulator-[a-z-]+)" \]', verify), names)
 
 
 class ScriptsTest(unittest.TestCase):
@@ -12119,7 +12251,7 @@ class ScriptsTest(unittest.TestCase):
                      "**PASS (s2idle), deep**: `aosd +3 cxsd +1 ddr +1`, asleep 31.0 s, woken by the RTC alarm",
                      "deep sleep with Bluetooth on rests on two sleeps",
                      "the extra standby current of L15B held in HPM has not been measured",
-                     "How the fix reaches that tablet is the owner's decision, and open",
+                     "it is written and compiled, in no kernel yet, and has run on no tablet",
                      "the feature branch has not moved",
                      # The owner's list: the first PASS, and what is left.
                      "The first PASS, a sleep that counted AOSS sleep, CX collapse and DDR low power and came back, "

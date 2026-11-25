@@ -57,7 +57,7 @@ PREFIXES = (
     "/var/lib/gts9u-boot-sets/", "/proc/device-tree/", "/proc/sys/kernel/",
     "/sys/kernel/notes", "/sys/class/power_supply/", "/sys/class/typec/",
     "/sys/kernel/debug/usb/", "/sys/bus/usb/devices/", "/sys/module/sm5714_usbpd/parameters",
-    "/dev/kmsg",
+    "/dev/kmsg", "/sys/class/regulator/",
 )
 
 STUBS = {
@@ -107,6 +107,12 @@ MODULE_REFUSED = ("blastoise kernel: Lockdown: modprobe: unsigned module loading
                   "see man kernel_lockdown.7")
 # The controller lost its state in a suspend and the driver set it up again.
 USB_HOST_REINIT = "blastoise kernel: xhci-hcd xhci-hcd.2.auto: xHC error in resume, USBSTS 0x401, Reinit"
+# The L15B step of kernel/drivers/gts9u-performance.c (2026-11-25): its line
+# with the pinned DTB, and one of its refusals (a node that is not PM8550's
+# vreg_l15b_1p8).
+L15B_NODE = "/soc@0/rsc@17a00000/regulators-0/ldo15"
+L15B_STEP = "gts9u-performance: L15B held in HPM: 2 of its DTB properties dropped"
+L15B_REFUSED = f"gts9u-performance: L15B not held in HPM: {L15B_NODE} is not PM8550's vreg_l15b_1p8, left alone"
 
 PASS_LOG = """\
 [  100.000001] state change SNK_DEBOUNCED -> SNK_ATTACHED [rev3 NONE_AMS]
@@ -2028,12 +2034,12 @@ class VerifyTest(FakeTablet):
                 result = self.run_script("verify.sh")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("FAIL cannot read this boot's kernel log (journalctl -k -b): the "
-                              "module key, the module failures and the USB host controller were "
-                              "not checked\n", result.stdout)
+                              "module key, the module failures, the USB host controller and L15B "
+                              "were not checked\n", result.stdout)
                 self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
                 for claim in ("the kernel trusts", "Loaded X.509", "no module was refused",
                               "symbol failures this boot", "the USB host controller did not die",
-                              "the USB host controller died"):
+                              "the USB host controller died", "DT: L15B"):
                     self.assertNotIn(claim, result.stdout)
                 # What does not need the log is still checked.
                 self.assertIn("ok   2 modules, all signed with the kit's key", result.stdout)
@@ -2114,6 +2120,113 @@ class VerifyTest(FakeTablet):
         self.assertEqual(result.returncode, 1)
         self.assertIn("FAIL 2 of 2 modules are not signed with the kit's key", result.stdout)
         self.assertIn("FAIL sm5714_usbpd.try_snk_extra_wait_ms is 0, expected 600", result.stdout)
+
+    def l15b(self, set_load=False, mode="normal"):
+        """PM8550 LDO15 as the running DT and the regulator's sysfs show it:
+        the node as the kernel's L15B step leaves it (no
+        regulator-allow-set-load or regulator-allowed-modes), or with
+        SET_LOAD the pinned DTB's node; MODE is its opmode."""
+        node = self.root / "proc/device-tree" / L15B_NODE.lstrip("/")
+        if node.exists():
+            shutil.rmtree(node)
+        node.mkdir(parents=True)
+        (node / "regulator-name").write_bytes(b"vreg_l15b_1p8\0")
+        (node / "regulator-initial-mode").write_bytes(bytes.fromhex("00000003"))
+        if set_load:
+            (node / "regulator-allow-set-load").write_bytes(b"")
+            (node / "regulator-allowed-modes").write_bytes(bytes.fromhex("0000000100000003"))
+        reg = self.root / "sys/class/regulator/regulator.22"
+        reg.mkdir(parents=True, exist_ok=True)
+        (reg / "name").write_text("vreg_l15b_1p8\n")
+        (reg / "opmode").write_text(mode + "\n")
+
+    def test_verify_checks_that_the_kernel_s_l15b_step_held_it_in_hpm(self):
+        """A kernel with the L15B step: the step's line, and the running DT
+        and the regulator as the step leaves them."""
+        self.boot_kit()
+        self.l15b()
+        self.journal_add(f"blastoise kernel: {L15B_STEP}\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   DT: L15B (vreg_l15b_1p8) held in HPM: no regulator-allow-set-load or "
+                      f"regulator-allowed-modes, and it reads normal ({L15B_STEP})\n", result.stdout)
+        self.assertIn("all checks passed", result.stdout)
+        for name, kwargs, line, said in (
+                ("the properties still in the node", {"set_load": True, "mode": "idle"}, L15B_STEP,
+                 "DT: L15B (vreg_l15b_1p8) may drop to LPM: its node still has regulator-allow-set-load "
+                 f"or regulator-allowed-modes, though the kernel logged \"{L15B_STEP}\" (it reads idle now)"),
+                ("the node as the step leaves it, the regulator in LPM", {"mode": "idle"}, L15B_STEP,
+                 "DT: L15B's node has neither property, but the regulator reads idle (its opmode), "
+                 "not normal (HPM)"),
+                ("the step refused the node", {"set_load": True, "mode": "idle"}, L15B_REFUSED,
+                 f"DT: the kernel's L15B step failed: {L15B_REFUSED}")):
+            with self.subTest(name):
+                self.boot_kit()
+                self.l15b(**kwargs)
+                self.journal_add(f"blastoise kernel: {line}\n")
+                result = self.run_script("verify.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"FAIL {said}\n", result.stdout)
+                self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+                self.assertNotIn("ok   DT: L15B", result.stdout)
+                # On another kernel it is a note.
+                self.running(NEWER_BUILD_ID)
+                result = self.run_script("verify.sh")
+                self.assertIn(f"note {said}\n", result.stdout)
+        self.boot_kit()
+        self.journal_add(f"blastoise kernel: {L15B_STEP}\n")
+        shutil.rmtree(self.root / "proc/device-tree" / L15B_NODE.lstrip("/"))
+        result = self.run_script("verify.sh")
+        self.assertIn(f"FAIL DT: no vreg_l15b_1p8 node at {self.root}/proc/device-tree{L15B_NODE} "
+                      f"({L15B_STEP})\n", result.stdout)
+
+    def test_a_kernel_without_the_l15b_step_gets_a_note(self):
+        """Revisions 1 to 7 and the release have no L15B step, and their node
+        is the pinned DTB's, L15B in LPM with the USB PHY down.  Without the
+        step's line the block judges nothing, on the kit's kernel too: a
+        note, never "held"."""
+        for name, kwargs in (("the pinned DTB's node", {"set_load": True, "mode": "idle"}),
+                             ("a node without the two properties", {})):
+            with self.subTest(name):
+                self.boot_kit()
+                self.l15b(**kwargs)
+                result = self.run_script("verify.sh")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                mode = kwargs.get("mode", "normal")
+                self.assertIn("note DT: L15B (vreg_l15b_1p8) not checked: this kernel has no L15B step "
+                              "(no \"gts9u-performance: L15B\" line this boot), and with the pinned DTB "
+                              f"L15B may drop to LPM in a sleep (it reads {mode} now)\n", result.stdout)
+                self.assertNotIn("ok   DT: L15B", result.stdout)
+                self.assertIn("all checks passed", result.stdout)
+
+    def test_the_l15b_lines_are_the_helper_s(self):
+        """verify.sh knows the L15B step by the prefix of every line that
+        gts9_hold_l15b_hpm() logs, and its success by the prefix of the two
+        it logs with pr_info(); the lines these tests feed it are those
+        format strings filled in."""
+        source = (REPO / "kernel/drivers/gts9u-performance.c").read_text()
+        body = re.search(r"^static int __init gts9_hold_l15b_hpm\(void\)\n\{\n.*?^\}\n", source,
+                         re.M | re.S).group(0)
+        lines = re.findall(r'\bpr_(err|info)\("([^"]*)\\n"', body)
+        self.assertEqual([level for level, _ in lines], ["err", "err", "err", "info", "info"])
+        for level, fmt in lines:
+            with self.subTest(fmt):
+                self.assertTrue(fmt.startswith("gts9u-performance: L15B"), fmt)
+                self.assertEqual(fmt.startswith("gts9u-performance: L15B held in HPM"), level == "info")
+        # The rest of the file logs nothing with that prefix.
+        rest = source.replace(body, "")
+        self.assertNotIn("gts9u-performance: L15B", rest)
+        verify = (KIT_SRC / "verify.sh").read_text()
+        self.assertIn("sed -n 's/^.*\\(gts9u-performance: L15B.*\\)$/\\1/p'", verify)
+        self.assertIn("grep -q '^gts9u-performance: L15B held in HPM'", verify)
+
+        def pattern(fmt):
+            spec = {"%s": r"\S+", "%pOF": r"/\S+", "%d": r"-?\d+", "%u": r"\d+"}
+            return "".join(spec.get(piece, re.escape(piece))
+                           for piece in re.split(r"(%pOF|%[sdu])", fmt))
+        self.assertTrue(re.fullmatch(pattern(lines[3][1]), L15B_STEP))
+        self.assertTrue(re.fullmatch(pattern(lines[1][1]), L15B_REFUSED))
+        self.assertIn(f'#define GTS9_L15B_PATH\t"{L15B_NODE}"\n', source)
 
 
 # llvm-objdump --no-show-raw-insn of qmp_ufs_phy_calibrate in a vmlinux, as
@@ -2764,6 +2877,13 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn("**no `DR_SWAP_SEND` was cut short by a Soft Reset**", readme)
         self.assertNotIn("none was sent into a discovery", readme.replace("*", ""))
         self.assertIn("A run in which no plug-in got a verdict fails.", readme)
+        # The L15B check judges only a kernel that logs the step, and no
+        # revision so far has one.
+        self.assertIn("With that line `verify.sh` checks that the running DT's ldo15 has neither "
+                      "property and that the regulator reads `normal` (HPM), and fails on the kit's "
+                      "kernel if not. Without it, as on every revision so far (1 to 7), it prints a "
+                      "note and checks nothing: `make-kit.sh` does not yet require the step in a new "
+                      "kernel.", readme)
         for said in ("until the reboot the running kernel can load no module it has not loaded yet",
                      "while the kit is installed: rollback.sh first, then upgrade "
                      "ubuntu-gts9u-device or ubuntu-gts9u-hardware"):

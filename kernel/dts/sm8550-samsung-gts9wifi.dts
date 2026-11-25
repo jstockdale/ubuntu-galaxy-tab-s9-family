@@ -610,7 +610,11 @@
 		 * once the whole SoC slept (XO off) the PMIC's over-current
 		 * protection on L15B reset the tablet about 1 s in (SM-X710,
 		 * 2026-11-24: 5 of 5; the same sleep held in HPM, or with
-		 * Bluetooth off, went deep).
+		 * Bluetooth off, went deep).  kernel/drivers/gts9u-performance.c
+		 * takes regulator-allow-set-load and regulator-allowed-modes out
+		 * of this node in the live tree at boot on both boards, for the
+		 * SM-X910's pinned DTB; here it finds neither, and would take
+		 * them out again if they came back.
 		 */
 		vreg_l15b_1p8: ldo15 {
 			regulator-name = "vreg_l15b_1p8";

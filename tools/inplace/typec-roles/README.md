@@ -478,9 +478,12 @@ with L15B held in HPM by a test module with an enabled 60 mA consumer (1 of
   calls succeed as before), and the RPMh driver writes the mode in the
   active set only, which RPMh keeps through the sleep. The SM-X910's DTS
   has the same change (same LDO, same two consumers: its radio is a
-  WCN7850); that board's builds compile a pinned DTS, so it reaches the
-  SM-X910 only when that pin moves. The other three LDOs with set-load
-  (L5B, L17B, L1G) are not changed.
+  WCN7850); that board's builds compile a pinned DTS, so the edit reaches
+  the SM-X910's DTB only when that pin moves. Since 2026-11-25
+  `kernel/drivers/gts9u-performance.c` takes the same two properties out of
+  the live tree at boot instead, on both boards (a no-op with this kit's
+  DTB); no kit's kernel has it yet, this one's included. The other three
+  LDOs with set-load (L5B, L17B, L1G) are not changed.
 - `boot.img`: revision 13's `Image.gz` with the new DTB appended;
   `vendor_boot.img`: the hang-log kit's image with only its DTB replaced
   (its vendor ramdisk, bootconfig, command line and header the hang-log
@@ -2078,12 +2081,15 @@ What this does not establish:
 - `root-port-d3` powers the PCIe host and the Wi-Fi chip down for the sleep,
   on purpose, so the Wi-Fi cannot wake the tablet; wake-on-wireless is a
   later option;
-- the SM-X910 does not get the fix. Its DTS has the same change, but its
-  builds compile a pinned baseline DTS (`fingerprint_baseline` in
+- the SM-X910's DTB does not get the fix. Its DTS has the same change, but
+  its builds compile a pinned baseline DTS (`fingerprint_baseline` in
   `scripts/build-mainline-kernel.sh`, because its bootloader bootloops on any
   vendor_boot DTB whose structure moves, d838e22), and two properties
-  removed is such a change. How the fix reaches that tablet is the owner's
-  decision, and open;
+  removed is such a change. Since 2026-11-25 the early board helper
+  (`kernel/drivers/gts9u-performance.c`) takes the two properties out of the
+  live tree at boot instead; it is written and compiled, in no kernel yet,
+  and has run on no tablet. Whether the SM-X910 resets without it is not
+  known;
 - a deep (`mem`) sleep with `root-port-d3`, a sleep longer than 30 s, more
   than one cycle in a run and a `systemctl suspend` with a writable root have
   not run on revision 14;

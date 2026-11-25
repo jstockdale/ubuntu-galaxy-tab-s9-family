@@ -591,8 +591,12 @@
 		 * 2026-11-24: 5 of 5; the same sleep held in HPM, or with
 		 * Bluetooth off, went deep).  This board's builds compile the
 		 * pinned baseline DTS (scripts/build-mainline-kernel.sh,
-		 * fingerprint_baseline), so this reaches the SM-X910 only once
-		 * that pin moves.
+		 * fingerprint_baseline), whose ldo15 still has
+		 * regulator-allow-set-load and regulator-allowed-modes, so this
+		 * edit reaches the SM-X910's DTB only once that pin moves.
+		 * Until then kernel/drivers/gts9u-performance.c takes those two
+		 * properties out of the live tree at boot (2026-11-25; not yet
+		 * run on an SM-X910).
 		 */
 		vreg_l15b_1p8: ldo15 {
 			regulator-name = "vreg_l15b_1p8";
