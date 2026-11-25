@@ -3399,6 +3399,25 @@ class VerifyTest(FakeTablet):
                       "come back from this boot's first suspend (a sleep test's pci=remove leaves the bus so until a "
                       "restart)\n", result.stdout)
 
+    def test_ath11k_s_country_setting_lines_after_the_first_suspend_are_a_note(self):
+        """As sleep-test.sh's wifi_note_re: the firmware turning a country
+        setting down is no Wi-Fi that did not come back."""
+        regulatory = ("kernel: ath11k_pci 0000:01:00.0: Failed to set the requested Country regulatory setting\n"
+                      "kernel: ath11k_pci 0000:01:00.0: failed to process regulatory info -22\n")
+        self.boot_kit()
+        self.wifi_function()
+        self.journal_add("kernel: PM: suspend entry (deep)\n" + regulatory
+                         + "kernel: ath11k_pci 0000:01:00.0: fw_version 0x11021302 fw_build_timestamp 2026-02-04 08:10\n"
+                         + regulatory + "kernel: PM: suspend exit\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok   Wi-Fi after this boot's first suspend: 0000:01:00.0, link 5.0 GT/s PCIe, no PCI, ath11k or "
+                      "MHI failure line\n", result.stdout)
+        self.assertIn("note ath11k turned a country setting down after this boot's first suspend (4 lines, the last: "
+                      "ath11k_pci 0000:01:00.0: failed to process regulatory info -22): its firmware answered; not a "
+                      "failure line\n", result.stdout)
+        self.assertNotIn("FAIL", result.stdout)
+
     def test_the_guard_of_the_pcie_power_domain_is_checked_in_the_boot_s_first_suspend(self):
         """Revision 11's guard: on the kit's kernel the boot's first suspend
         (the panel cycle) has to have the PCIe host's line of a kept link
@@ -8584,6 +8603,75 @@ exit 0
         self.assertIn("cycle 1/2: evidence: wifi: pci 0000:00:00.0 - D0 -, 0000:01:00.0 - D0 -; no Wi-Fi failure "
                       "line; ath11k firmware loads 0\n", self.out)
         self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles", self.out)
+
+    # ath11k's lines for a country setting its firmware turned down, as
+    # revision 13's run 9 had them (2026-11-24): a pair twice before the
+    # sleep, the firmware's load at the resume, and a pair twice after it.
+    REGULATORY = ("ath11k_pci 0000:01:00.0: Failed to set the requested Country regulatory setting",
+                  "ath11k_pci 0000:01:00.0: failed to process regulatory info -22")
+
+    def regulatory_cycle(self, firmware=True, lost=None):
+        pair = "".join(f"[  100.00000{i}] {self.REGULATORY[(i - 1) % 2]}\n" for i in range(1, 5))
+        return ("[  100.000000] PM: suspend entry (deep)\n" + pair
+                + "[  100.000005] Timekeeping suspended for 30.002 seconds\n"
+                + (f"[  100.000006] {lost}\n" if lost else "")
+                + ("[  100.000007] ath11k_pci 0000:01:00.0: fw_version 0x11021302 fw_build_timestamp 2026-02-04 "
+                   "08:10\n" if firmware else "")
+                + pair.replace("100.00000", "101.00000")
+                + "[  101.000009] PM: suspend exit\n")
+
+    def wifi_bound(self):
+        """The fake bus's Wi-Fi function with ath11k_pci bound, in D0."""
+        paths = self.pci_tree()
+        driver = self.root / "sys/bus/pci/drivers/ath11k_pci"
+        driver.mkdir(parents=True)
+        (paths["0000:01:00.0"] / "driver").symlink_to(os.path.relpath(driver, paths["0000:01:00.0"]))
+        return paths
+
+    def test_pci_keep_takes_ath11k_s_country_setting_lines_for_a_note(self):
+        """Revision 13's run 9 ended with PCIE-DOWN on "failed to process
+        regulatory info -22" with the Wi-Fi back.  Those lines are a note in
+        the wifi evidence now: with the function back in D0 with ath11k_pci
+        bound and the firmware loaded again the run goes on; without the
+        firmware's load it ends as before, and says why; with another line
+        of a Wi-Fi that did not come back, that line is the reason."""
+        note = (f"note: {self.REGULATORY[0]} (8 lines of the firmware turning a country setting down: not a failure "
+                "line)")
+        self.wifi_bound()
+        self.r11_switches()
+        self.cycle(1, log=self.regulatory_cycle())
+        result = self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn("cycle 1/2: evidence: wifi: pci 0000:00:00.0 - D0 -, 0000:01:00.0 ath11k_pci D0 -; no Wi-Fi "
+                      f"failure line; {note}; ath11k firmware loads 1\n", self.out)
+        self.assertNotIn("SLEEP-TEST RESULT: PCIE-DOWN", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PASS: 2 of 2 cycles", self.out)
+        # The firmware not loaded again: the run ends, and names it.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.wifi_bound()
+        self.r11_switches()
+        self.cycle(1, log=self.regulatory_cycle(firmware=False))
+        result = self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
+        self.assertEqual(result.returncode, 1, self.out)
+        self.assertIn(f"no Wi-Fi failure line; {note}; ath11k firmware loads 0\n", self.out)
+        self.assertIn("SLEEP-TEST RESULT: PCIE-DOWN after cycle 1/2: with the PCI devices kept, the PCIe host or the "
+                      "Wi-Fi did not come back (no Wi-Fi function in D0 with ath11k_pci bound, or no firmware load in "
+                      f"this cycle's kernel lines; ath11k said: {self.REGULATORY[0]}), and a later suspend would meet a "
+                      "controller", self.out)
+        self.assertEqual(self.read("rtcwake.calls").count("-m mem -s 30"), 1)
+        self.assertEqual(self.sysrq(), "b")
+        # Another line that says the Wi-Fi did not come back: that line.
+        FakeTablet.setUp(self)
+        SleepTestTest.setUp(self)
+        self.wifi_bound()
+        self.r11_switches()
+        lost = "ath11k_pci 0000:01:00.0: failed to resume core: -110"
+        self.cycle(1, log=self.regulatory_cycle(lost=lost))
+        self.run_test("ro", "2", "pci=keep", "restart-ok", "hold=0")
+        self.assertIn(f"0000:01:00.0 ath11k_pci D0 -; {lost}; {note}; ath11k firmware loads 1\n", self.out)
+        self.assertIn(f"SLEEP-TEST RESULT: PCIE-DOWN after cycle 1/2: with the PCI devices kept, the PCIe host or the "
+                      f"Wi-Fi did not come back ({lost}), and a later suspend", self.out)
 
     def rpmh_files(self, tracing_on="1", clock="[local] global counter uptime perf mono mono_raw boot tai"):
         """tracefs with the RPMh tracepoint off, tracing on, the trace with

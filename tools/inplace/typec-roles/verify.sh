@@ -667,8 +667,13 @@ fi
 # on any kernel), its PCI function on the bus with ath11k bound, and its
 # firmware loaded again after that suspend (ath11k powers the chip down and
 # up at each one); without the function on the bus it is a note (a sleep
-# test's pci=remove).
+# test's pci=remove).  ath11k's lines for a country setting its firmware
+# turned down ("Failed to set the requested Country regulatory setting",
+# "failed to process regulatory info -22") are a note, not such a line: the
+# firmware sent the event, and keeps its setting (sleep-test.sh's
+# wifi_note_re).
 wifi_fail='Unable to change power state from [A-Za-z0-9]+ to D0, device inaccessible|ath11k_pci [0-9a-f:.]+: .*(failed|timeout|link down)|mhi mhi[0-9]+: .*(fail|[Ee]rror|timeout|not in valid state|Did not enter)|pcieport [0-9a-f:.]+: AER: |Internal error:|SError'
+wifi_note='ath11k_pci [0-9a-f:.]+: (Failed to set the requested Country regulatory setting|failed to process regulatory info -?[0-9]+)'
 if [ -n "$k" ]; then
 	after=$(printf '%s\n' "$ku" | sed -n '/PM: suspend entry/,$p')
 	wfn=
@@ -681,8 +686,11 @@ if [ -n "$k" ]; then
 	if [ -z "$after" ]; then
 		note "no suspend has run yet this boot (the panel cycle runs about 22 s in): the Wi-Fi after it was not checked; run this again later${wfn:+ (Wi-Fi now: $wfn)}"
 	else
-		wf=$(printf '%s\n' "$after" | grep -E "$wifi_fail")
+		wf=$(printf '%s\n' "$after" | grep -E "$wifi_fail" | grep -vE "$wifi_note")
 		fw=$(printf '%s\n' "$after" | grep -c 'ath11k_pci .*fw_version')
+		wn=$(printf '%s\n' "$after" | grep -E "$wifi_note")
+		[ -z "$wn" ] ||
+			note "ath11k turned a country setting down after this boot's first suspend ($(printf '%s\n' "$wn" | wc -l) lines, the last: $(printf '%s\n' "$wn" | tail -n 1 | sed 's/.*ath11k_pci /ath11k_pci /')): its firmware answered; not a failure line"
 		if [ -n "$wf" ]; then
 			bad "the Wi-Fi did not come back from this boot's first suspend (the panel cycle, unless a sleep test ran before it) ($(printf '%s\n' "$wf" | wc -l) lines):"
 			printf '%s\n' "$wf" | head -n 5
