@@ -12024,7 +12024,7 @@ class ScriptsTest(unittest.TestCase):
                      "23:06, and over every earlier revision.",
                      "From revision 12, the way back to revision 11 in one step",
                      "**Revision 12: the runs** (written before the kernel was built; steps 1 and 2 have run, "
-                     "below, \"Revision 12: results\", steps 3 and 4 have not).",
+                     "below, \"Revision 12: results\", step 3 twice with the sensors hook, step 4 has not).",
                      # What ran on revision 12, from its logs, and the
                      # microphone as the owner reported it.
                      "**Revision 12: results** (2026-11-24, squirtle;",
@@ -12036,24 +12036,46 @@ class ScriptsTest(unittest.TestCase):
                      "gcc_qupv3_wrap2_s6_clk`",
                      # Revision 13: what it is, what it changes, how it is
                      # built and installed, the way back, and its runs.
-                     "**Revision 13** (written 2026-11-24, not built yet) is revision 12 plus one upstream fix and a "
-                     "change to the CXPC log's diagnostic",
+                     "**Revision 13** (built 2026-11-24 from a4d6aa0, kernel build ID 0b977cd78220, on squirtle from "
+                     "17:55 that day; nine sleeps, below, \"Revision 13: results\") is revision 12 plus one upstream "
+                     "fix and a change to the CXPC log's diagnostic",
                      "upstream d0cd9c8d0fd5 (v7.3-rc1) with its fix 3098c989bd38 (v7.3-rc6) folded in, with "
                      "`APPLY_GENI_SERIAL_FORCE_SUSPEND=1`.",
                      "**Every system suspend runs it, the boot's panel cycle included**, on both UARTs.",
                      "`qcom_stats/cxpc_violators_raw`. What the region holds, and whether the message changes it, is "
-                     "what the next run settles.",
+                     "what the next run settles. Revision 13's run 4 settled the second half: the region was all "
+                     "zeros before the message, held a CXPC header right after it (`000024cc 0a0103e8`)",
                      "Revision 13 adds `kernel/patches/qcom-geni-serial-force-suspend-in-system-sleep.patch` and "
                      "changes the CXPC log's patch: twenty-four patches, nineteen files",
-                     "Revision 13 is to be built the same way, in `build-r13`, its `certs` given that key from "
-                     "`build-r12`, with `APPLY_GENI_SERIAL_FORCE_SUSPEND=1` added.",
+                     "Revision 13 was built the same way, in `build-r13`, its `certs` given that key from "
+                     "`build-r12`, with `APPLY_GENI_SERIAL_FORCE_SUSPEND=1` added, on 2026-11-24 from commit "
+                     "a4d6aa0: kernel build ID `0b977cd78220bf46e4ae3d04455a09468cc4a6b2`",
                      "Revision 13 installs the same way over revision 12, which squirtle has run since 2026-11-24 "
                      "08:45, over revision 11, and over every earlier revision",
                      "From revision 13, the way back to revision 12 in one step, the same way: "
                      "`~/ubuntu-gts9u/backups/typec-roles-kit-r12/boot.img` (sha256 "
                      "`9bca1427d84dc351ec0b050ae52fc43bf874af279f19e7386edcfb5688c572ec`)",
-                     "**Revision 13: the runs** (written before the kernel was built).",
+                     "**Revision 13: the runs** (written before the kernel was built; what ran is below, "
+                     "\"Revision 13: results\"; step 5 has not run).",
                      "   sudo sh ~/bt-uart/suspend-bt.sh platform 20\n",
+                     # What ran on revision 13, from its logs and the PMIC's
+                     # records: the nine sleeps, the reset's source, its
+                     # cause, and run 9's false alarm.
+                     "**Revision 13: results** (2026-11-24, squirtle;",
+                     "`sudo sh verify.sh`: 29 `ok`, no `FAIL`",
+                     "Its own `RESULT` line is not in the saved output",
+                     "| 1 | 18:24 | `root-port-d3 cxpc` | reset 0 to 3 s after the sleep's entry, silently",
+                     "| 4 | 20:42 | `cxpc`, no `root-port-d3` | SHALLOW (s2idle), 31.3 s, `aosd +0 cxsd +0 ddr +1`",
+                     "| 5 | 22:01 | `root-port-d3`, no `cxpc` | reset, the same | not the AOP's CXPC monitor",
+                     "| 6 | 22:17 | run 5's, the USB cable out (over Wi-Fi) | reset, the same | not USB or the PC's cable |",
+                     "| 8 | 22:42 | run 5's, Bluetooth powered off | **PASS (s2idle), deep**: `aosd +1 cxsd +1 ddr +1`",
+                     "| 9 | 22:55 | run 5's, Bluetooth on, a test module holding L15B in HPM | the cycle PASS (s2idle), "
+                     "deep: `aosd +3 cxsd +1 ddr +1`, 31.2 s;",
+                     "`Reset Trigger: SID=0x1, PID=0x1C, IRQ=0x0` with `Reset Type: WARM_RESET`",
+                     "ppid 0x1CF (SID 1, peripheral 0xCF), as Samsung's `qti-ocp-notifier.c` decodes them",
+                     "it was never part of this tree or of a kit",
+                     "Run 9's `PCIE-DOWN` was a false alarm",
+                     "Why the firmware turned the country setting down is not known.",
                      "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 "
                      "rpmh cxpc sensors=stop hold=60 restart-ok\n",
                      "- **`cxpc`** (`ro`; revision 12's kernel)",
@@ -12063,8 +12085,10 @@ class ScriptsTest(unittest.TestCase):
                      # what it changes, why, which DTB the bootloader takes,
                      # its risk, how it is packed and installed, the way
                      # back, and its runs.
-                     "**Revision 14** (written 2026-11-24, not installed yet) is revision 13's kernel and module tree, "
-                     "not rebuilt (kernel build ID `0b977cd78220`, the same module key), with a DTB of its own.",
+                     "**Revision 14** (packed 2026-11-25 from b6642d7, on squirtle from 01:19 that day; its first "
+                     "sleep below, \"Revision 14: results\") is revision 13's kernel and module tree, not rebuilt "
+                     "(kernel build ID `0b977cd78220`, the same module key), with a DTB of its own.",
+                     "It took it: squirtle booted revision 14 on 2026-11-25",
                      "`kernel/dts/sm8550-samsung-gts9wifi.dts`: `vreg_l15b_1p8: ldo15` keeps `regulator-initial-mode = "
                      "<RPMH_REGULATOR_MODE_HPM>` and loses `regulator-allow-set-load` and `regulator-allowed-modes`, as "
                      "sm8550-qrd and sm8550-mtp describe it.",
@@ -12076,10 +12100,23 @@ class ScriptsTest(unittest.TestCase):
                      "Revision 14 installs the same way over revision 13, which squirtle has run since 2026-11-24 17:55, "
                      "and over every earlier revision, with vendor_boot as well: one command, one reboot.",
                      "From revision 14, the way back to revision 13 without TWRP:",
-                     "**Revision 14: the runs** (written before the kit was installed).",
+                     "**Revision 14: the runs** (written before the kit was installed; both steps have run, below, "
+                     "\"Revision 14: results\").",
                      "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 rpmh "
                      "sensors=hook hold=60 restart-ok\n",
-                     "Since revision 14's script ath11k's lines for a country setting its firmware turned down"):
+                     "Since revision 14's script ath11k's lines for a country setting its firmware turned down",
+                     # What ran on revision 14, and what it does not
+                     # establish.
+                     "**Revision 14: results** (2026-11-25, squirtle;",
+                     "`sudo sh verify.sh`: 32 `ok`, no `FAIL`, `all checks passed`",
+                     "**PASS (s2idle), deep**: `aosd +3 cxsd +1 ddr +1`, asleep 31.0 s, woken by the RTC alarm",
+                     "deep sleep with Bluetooth on rests on two sleeps",
+                     "the extra standby current of L15B held in HPM has not been measured",
+                     "How the fix reaches that tablet is the owner's decision, and open",
+                     "the feature branch has not moved",
+                     # The owner's list: the first PASS, and what is left.
+                     "The first PASS, a sleep that counted AOSS sleep, CX collapse and DDR low power and came back, "
+                     "was revision 13's run 8"):
             with self.subTest(said):
                 self.assertIn(said, readme if "\\" not in said and "\n" not in said
                               else (KIT_SRC / "README.md").read_text())
@@ -12104,7 +12141,13 @@ class ScriptsTest(unittest.TestCase):
                       "The data role fault has not been seen on it", "Not on the SM-X710 for now",
                       # Revision 12 was built, installed and run (2026-11-24).
                       "**Revision 12** (written 2026-11-24, not built yet)",
-                      "(none has run; the kernel is not built yet)"):
+                      "(none has run; the kernel is not built yet)",
+                      # Revision 13 was built, installed and run (2026-11-24),
+                      # and revision 14 installed and run (2026-11-25).
+                      "**Revision 13** (written 2026-11-24, not built yet)",
+                      "Revision 13 is to be built the same way",
+                      "**Revision 14** (written 2026-11-24, not installed yet)",
+                      "No run has reached a PASS yet"):
             self.assertNotIn(stale, readme)
         # What the SM-X710 showed.
         self.assertIn("That is the SM-X910's fault, seen once here: the reason revision 7 carries the "
