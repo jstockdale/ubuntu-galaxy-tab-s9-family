@@ -1,12 +1,13 @@
 #!/bin/sh
 # Checks after booting the Type-C roles kit, and a recorder for plug-in tests.
-#   sh ~/typec-roles/verify.sh                  kernel, key, switches, the root's
-#                                               ext4, UFS, PCIe, its power
-#                                               domain's guard, Wi-Fi, GPU,
-#                                               Bluetooth and the console's
-#                                               UART, roles now
-#                                               (with sudo also the UFS host
-#                                               clocks' enable counts)
+#   sh ~/typec-roles/verify.sh                  kernel, key, switches, the DTB's
+#                                               L15B, the root's ext4, UFS,
+#                                               PCIe, its power domain's
+#                                               guard, Wi-Fi, GPU, Bluetooth
+#                                               and the console's UART, roles
+#                                               now (with sudo also the UFS
+#                                               host clocks' enable counts,
+#                                               boot and vendor_boot)
 #   sudo sh ~/typec-roles/verify.sh dock [N]    N plug-ins of a powered dock
 #                                               (default 10), a verdict for each
 #   sudo sh ~/typec-roles/verify.sh record [N]  the same without a verdict: a
@@ -364,7 +365,7 @@ wait_partner() { # present|absent SECONDS; absent has to hold for 3 s, a
 case ${1:-} in
 dock|record|now|swap) plug_test "$@" ;;
 '') ;;
-*) sed -n '2,21s/^# //p' "$0" >&2; exit 2 ;;
+*) sed -n '2,22s/^# //p' "$0" >&2; exit 2 ;;
 esac
 
 echo "kernel: $(uname -v)"
@@ -478,6 +479,58 @@ ok 'config: the hang-log detectors, netconsole and pstore options are as built'
 if [ -n "$k" ]; then
 	printf '%s\n' "$k" | grep -q 'ramoops: using 0x200000@0x880900000, ecc: 96' &&
 		ok 'ramoops registered with ECC 96' || bad 'no "ramoops: using 0x200000@0x880900000, ecc: 96" this boot'
+fi
+
+# Revision 14's DTB, in vendor_boot and appended to the kernel in boot: PM8550
+# LDO15 (vreg_l15b_1p8: the eUSB2 repeater's 1.8 V and the WCN6855's I/O
+# rail) held in HPM.  Its node has neither regulator-allow-set-load nor
+# regulator-allowed-modes, and the regulator reads normal (HPM).  With them
+# a sleep with Bluetooth on voted it to LPM, and once the whole SoC slept the
+# PMIC reset the tablet.  The running DT is the copy the bootloader passed,
+# from either partition; the kit's kernel is revision 13's, so the build ID
+# alone does not tell revision 14 from 13.
+l15=/proc/device-tree/soc@0/rsc@17a00000/regulators-0/ldo15
+l15_name=$(tr -d '\0' < "$l15/regulator-name" 2>/dev/null)
+l15_mode=
+for r in /sys/class/regulator/regulator.*; do
+	[ "$(cat "$r/name" 2>/dev/null)" = vreg_l15b_1p8 ] && l15_mode=$(cat "$r/opmode" 2>/dev/null)
+done
+if [ "$l15_name" != vreg_l15b_1p8 ]; then
+	l15_dt="no vreg_l15b_1p8 node at $l15"
+elif [ -e "$l15/regulator-allow-set-load" ] || [ -e "$l15/regulator-allowed-modes" ]; then
+	l15_dt="L15B (vreg_l15b_1p8) may drop to LPM: its node has regulator-allow-set-load or regulator-allowed-modes, as before revision 14 (it reads ${l15_mode:-no mode} now)"
+elif [ "$l15_mode" != normal ]; then
+	l15_dt="L15B's node is revision 14's, but the regulator reads ${l15_mode:-no mode} (its opmode), not normal (HPM)"
+else
+	l15_dt=
+	ok "DT: L15B (vreg_l15b_1p8) held in HPM: no regulator-allow-set-load or regulator-allowed-modes, and it reads normal (revision 14's DTB)"
+fi
+if [ -n "$l15_dt" ]; then
+	if [ -n "$want" ] && [ "$id" = "$want" ]; then
+		bad "DT: $l15_dt"
+	else
+		note "DT: $l15_dt"
+	fi
+fi
+# The partitions are root's: with sudo, boot and vendor_boot are checked
+# against the kit's images (revision 14 writes both).
+size=100663296
+if [ "$(id -u)" = 0 ]; then
+	for p in boot vendor_boot; do
+		pw=$(awk -v f="$p.img" '$2 == f {print $1}' "$kit/SHA256SUMS" 2>/dev/null)
+		[ -n "$pw" ] || continue
+		pg=$(dd if="/dev/disk/by-partlabel/$p" bs=4M count=$((size / 4194304)) status=none 2>/dev/null |
+			sha256sum | cut -d' ' -f1)
+		if [ "$pg" = "$pw" ]; then
+			ok "$p holds the kit's $p.img ($(echo "$pw" | cut -c1-12))"
+		elif [ -n "$want" ] && [ "$id" = "$want" ]; then
+			bad "$p holds $pg, not the kit's $p.img ($pw): install.sh has not run, or did not finish"
+		else
+			note "$p holds $pg, not the kit's $p.img ($pw)"
+		fi
+	done
+else
+	note "boot and vendor_boot are root's: sudo sh $kit/verify.sh checks that they hold the kit's images"
 fi
 
 path=$(modinfo -n netconsole 2>/dev/null)
@@ -614,8 +667,13 @@ fi
 # on any kernel), its PCI function on the bus with ath11k bound, and its
 # firmware loaded again after that suspend (ath11k powers the chip down and
 # up at each one); without the function on the bus it is a note (a sleep
-# test's pci=remove).
+# test's pci=remove).  ath11k's lines for a country setting its firmware
+# turned down ("Failed to set the requested Country regulatory setting",
+# "failed to process regulatory info -22") are a note, not such a line: the
+# firmware sent the event, and keeps its setting (sleep-test.sh's
+# wifi_note_re).
 wifi_fail='Unable to change power state from [A-Za-z0-9]+ to D0, device inaccessible|ath11k_pci [0-9a-f:.]+: .*(failed|timeout|link down)|mhi mhi[0-9]+: .*(fail|[Ee]rror|timeout|not in valid state|Did not enter)|pcieport [0-9a-f:.]+: AER: |Internal error:|SError'
+wifi_note='ath11k_pci [0-9a-f:.]+: (Failed to set the requested Country regulatory setting|failed to process regulatory info -?[0-9]+)'
 if [ -n "$k" ]; then
 	after=$(printf '%s\n' "$ku" | sed -n '/PM: suspend entry/,$p')
 	wfn=
@@ -628,8 +686,11 @@ if [ -n "$k" ]; then
 	if [ -z "$after" ]; then
 		note "no suspend has run yet this boot (the panel cycle runs about 22 s in): the Wi-Fi after it was not checked; run this again later${wfn:+ (Wi-Fi now: $wfn)}"
 	else
-		wf=$(printf '%s\n' "$after" | grep -E "$wifi_fail")
+		wf=$(printf '%s\n' "$after" | grep -E "$wifi_fail" | grep -vE "$wifi_note")
 		fw=$(printf '%s\n' "$after" | grep -c 'ath11k_pci .*fw_version')
+		wn=$(printf '%s\n' "$after" | grep -E "$wifi_note")
+		[ -z "$wn" ] ||
+			note "ath11k turned a country setting down after this boot's first suspend ($(printf '%s\n' "$wn" | wc -l) lines, the last: $(printf '%s\n' "$wn" | tail -n 1 | sed 's/.*ath11k_pci /ath11k_pci /')): its firmware answered; not a failure line"
 		if [ -n "$wf" ]; then
 			bad "the Wi-Fi did not come back from this boot's first suspend (the panel cycle, unless a sleep test ran before it) ($(printf '%s\n' "$wf" | wc -l) lines):"
 			printf '%s\n' "$wf" | head -n 5

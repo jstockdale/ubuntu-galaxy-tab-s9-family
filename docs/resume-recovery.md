@@ -622,10 +622,16 @@ power_count 1 ... host reference held` and a calibration entry with `PWRDN
 0x1`, no run logged a `setup_clocks repeated` line, and the userdata read
 matched every time (the kit's README, "Revision 11: results" and
 "Revision 12: results"). None reached AOSS sleep or CX collapse. Revision
-13 (written 2026-11-24, not built) changes nothing on the storage's path:
-it releases the console's and the Bluetooth UART's clocks in system sleep
-(upstream d0cd9c8d0fd5) and logs the AOP's CXPC region raw; the sleep
-test's protection is the same.
+13 (built and installed on 2026-11-24) changes nothing on the storage's
+path: it releases the console's and the Bluetooth UART's clocks in system
+sleep (upstream d0cd9c8d0fd5) and logs the AOP's CXPC region raw; the sleep
+test's protection is the same. Of its nine sleeps four came back, and so did
+revision 14's first (2026-11-25), each with the storage: one calibration at
+the resume, logged with `power_count 1 ... host reference held` and `PWRDN
+0x1`, no `setup_clocks repeated` line, and the userdata read matched. The
+other five reset the tablet within seconds of the sleep's entry, with the
+root frozen; each boot after them found the root clean, `errors_count` 0.
+Those resets, their cause and the first deep sleeps are the next section.
 
 The sleep test also has experiment options, each off unless given (the
 kit's README, "The experiment options", has the details and the risks):
@@ -682,6 +688,80 @@ After boot and after every sleep, `findmnt -no OPTIONS /` must show `rw`
 without `emergency_ro`,
 `journalctl -k -b | grep -iE 'phy initialization timed-out|ufshcd.*(error|fail)'`
 must print nothing, and `cat /sys/fs/ext4/sda34/errors_count` must say 0.
+
+### Deep sleep on the SM-X710 (2026-11-24 and 25)
+
+Up to revision 12 no sleep of the SM-X710 reached AOSS sleep and CX
+collapse: something held XO through every one, last of all the two geni
+UARTs' clocks (revision 12's first sleep). Revision 13 released them, and
+its sleeps with the PCIe host powered down (`root-port-d3`) were the first
+in which Linux held nothing of XO. With Bluetooth on and nothing else
+keeping the SoC up, each of them reset the tablet within seconds of the
+sleep's entry, five of five; one with a sound stream held open, which kept
+the audio DSP and the DDR up, came back shallow; with Bluetooth off the same
+sleep came back deep. The PMIC raised the resets (its power-on log
+names a PM8550 peripheral, `SID=0x1, PID=0x1C`, with a warm reset, where the
+2026-11-22 hangs were PS_HOLD dropped by the SoC), and its over-current log
+names L15B, PM8550's LDO15 (`vreg_l15b_1p8`). L15B feeds the WCN6855's I/O
+rail and the eUSB2 repeater; the device tree let it follow the load, the
+repeater's 55 mA went with the USB PHY in the sleep, and Linux voted the LDO
+to its low-power mode with Bluetooth still on it. Held in its high-power
+mode (HPM), by a test module first and then by the device tree, the sleep
+went deep with Bluetooth on. The runs, the PMIC's records and the test
+module are in the [porting log](porting-log.md) under 2026-11-24 and 25, and
+in the Type-C kit's README ("Revision 13: results", "Revision 14: results").
+
+What works now, on the Type-C kit's test kernel (revision 14, on squirtle
+since 2026-11-25): one 30 s suspend-to-idle sleep that reaches AOSS sleep,
+CX collapse and DDR low power (`aosd +3 cxsd +1 ddr +1`) and comes back,
+woken by the RTC alarm, with the storage, Bluetooth and the Wi-Fi, on the
+PC's USB cable, Bluetooth on. The sleep test's options for it are
+`mode=s2idle pci=keep root-port-d3 rpmh sensors=hook`, with the interconnect
+floor released:
+- `mode=s2idle`: suspend-to-idle (`rtcwake -m freeze`); a deep (`mem`)
+  sleep with the root port in D3hot has not run;
+- `root-port-d3`, a debug switch off at every boot: the PCIe root port goes
+  to D3hot in the suspend, so the PCIe host powers itself down with the
+  Wi-Fi bound and its power domain collapses. Without it the PCIe host's
+  clocks keep XO voted and the sleep stays shallow (revision 13's run 4).
+  The Wi-Fi chip is powered down for the sleep with it, on purpose, so the
+  Wi-Fi cannot wake the tablet; wake-on-wireless is a later option;
+- `sensors=hook`: the device package's sleep hook stops the sensor clients,
+  without which the audio DSP wakes 30 to 50 times a second. A sound stream
+  left open keeps the DSP awake and the DDR at 547 MHz all the same
+  (revision 13's run 7);
+- `pci=keep` keeps the Wi-Fi bound through the run, and `rpmh` only
+  records what Linux handed the RPMh hardware;
+- the floor released: the interconnect's boot-time vote, which
+  `ubuntu-gts9u-icc-late-release` drops after the boot's panel cycle.
+
+The kernel it ran is the Type-C kit's revision 13 build with revision 14's
+device tree (the kit's README lists every change, revision by revision);
+most of the sleep changes are behind build variables for test builds, and
+none of them is in a release. Suspend stays off by default.
+
+Still open:
+- the evidence: two deep sleeps with Bluetooth on (revision 13's run 9 with
+  the test module, revision 14's run 1) and one with it off (revision 13's
+  run 8), each a single 30 s cycle;
+- a deep (`mem`) sleep, several cycles and longer sleeps, a docked sleep (USB
+  host role), then sleeps with a writable root
+  (`scripts/diagnostics/suspend/gts9u-suspend-cycles.sh`) and the suspend
+  policy;
+- what L15B in HPM costs in standby current, and the battery drain over a
+  night of sleep;
+- the root port's D3hot in every suspend, which a normal sleep with the
+  Wi-Fi needs (`pcie-qcom-root-port-d3-in-system-suspend.patch`, in no kit
+  yet), and wake-on-wireless;
+- why ath11k's firmware turned a country setting down in one of revision
+  13's sleeps (`failed to process regulatory info -22`; the Wi-Fi came back);
+- the SM-X910: the same LDO feeds the same two consumers there (its radio a
+  WCN7850), and its DTS has the same change, but its builds compile a pinned
+  baseline DTS (`fingerprint_baseline` in `scripts/build-mainline-kernel.sh`,
+  because its bootloader bootloops on a vendor_boot DTB whose structure
+  moves), so the fix does not reach it. How it gets there is the owner's
+  decision, open;
+- the AOP's CXPC log, which no run has decoded.
 
 ### Protecting the storage in a sleep test
 
@@ -1085,7 +1165,8 @@ revision 9: the fixes do not cure the hang itself (the kit's README,
 and the interconnect floor released, the sleep came back 9 times of 9 with
 `gdsc=pcie0` on revisions 9 and 10, of which 2 then lost the UFS (revision
 9's run 3 and revision 10's run 5). Type-C kit revision 11 carries the fix
-of the PHY power reference and its diagnostic (not built yet). The device
+of the PHY power reference and its diagnostic (not built when this was
+written; it ran from 2026-11-23 23:06, "Testing it", above). The device
 tree's UFS PHY supplies (L1D) are left for a later, separate change.
 
 #### Repairing the root from recovery
@@ -1123,10 +1204,14 @@ no fsck (the two built images, `rootfs/boot/initrd.img-7.2.0-rc3-dirty` and
 `checkfs` says "fsck not present, so skipping root file system" before
 the mount. Not changed here; open, as said above.
 
-X710 suspend has so far passed one real deep and one real s2idle cycle
-(2026-11-06, baseline kernel, rpmhpd unsynced and the interconnect floor
-held), lost the UFS in one real deep sleep (2026-11-21) and in two
-suspend-to-idle sleeps with the PCIe GDSC collapsed (2026-11-23, revision
-9's run 3 and revision 10's run 5, the second traced to the leaked PHY
-power reference), all above, and stays off by default; see the [display
+X710 suspend passed one real deep and one real s2idle cycle on 2026-11-06
+(baseline kernel, rpmhpd unsynced and the interconnect floor held), lost the
+UFS in one real deep sleep (2026-11-21) and in two suspend-to-idle sleeps
+with the PCIe GDSC collapsed (2026-11-23, revision 9's run 3 and revision
+10's run 5, the second traced to the leaked PHY power reference), and since
+the fix of that reference (Type-C kit revision 11) has had the storage back
+from every sleep that came back. Its first sleeps that reached AOSS sleep,
+CX collapse and DDR low power came on the kit's revisions 13 and 14
+(2026-11-24 and 25, "Deep sleep on the SM-X710", above), all in the sleep
+test, on test kernels. Suspend stays off by default; see the [display
 notes](gts9wifi-display.md) and `scripts/diagnostics/suspend/`.

@@ -214,8 +214,12 @@ if [ "$DEVICE" = gts9uwifi ]; then
 		"$fingerprint_baseline:kernel/dts/sm8550-samsung-gts9uwifi.dts" \
 		> "$board_dts"
 else
-	# No tree has been physically booted on this board yet, so there is no
-	# baseline to pin: the working copy is the bring-up tree.
+	# No baseline is pinned for the SM-X710: its ABL has taken every
+	# device-tree change booted on it so far (among them the camera kits'
+	# lens rail delay and buses, the hang-log kit's ramoops node, and on
+	# 2026-11-25 Type-C kit revision 14's ldo15 with two properties
+	# removed, written to boot and vendor_boot alike), so the working copy
+	# is installed as it is.
 	install -m 0644 "$repo/kernel/dts/$DEVICE_DTS.dts" "$board_dts"
 fi
 

@@ -149,6 +149,23 @@ iio-sensor-proxy.service`.  [`tools/inplace/sensors-hook`](../tools/inplace/sens
 puts the hook and the resume unit on a tablet whose device package cannot be
 upgraded yet.
 
+On the X710 (2026-11-24 and 25, through that kit, on device package 2.69)
+the new hook has run: its two steps by hand, with SSC ready again 14.0 s
+after the post step; one `pm_test=freezer` suspend through `systemd-sleep`
+with every hook around it, the sensors ready 14.2 s after the return; and
+its pre step before twelve real suspend-to-idle sleeps of the Type-C kit's
+sleep test (revisions 12 to 14).  It stopped both clients every time, and
+every one of those sleeps that came back with no sound stream open had the
+DSP asleep for the whole sleep (`adsp +0`), where it had woken about 1,500
+times in 30 s with the clients running.  One more client showed: a sound
+stream left open keeps the DSP awake, and the DDR out of its low-power mode,
+through the sleep whatever the hook does (two sleeps, one with a playback
+and a capture stream open, one with a playback stream held open on
+purpose).  Not run yet: rotation and auto-brightness checked at the tablet
+after a sleep, a `systemctl suspend` whose post step follows a real sleep,
+and the X910 with the new hook.  The kit's
+[results](../tools/inplace/sensors-hook/README.md#results) have the logs.
+
 Stock Android does not stop its sensor daemons (`sscrpcd`, the sensors HAL)
 for a suspend.  Its kernel tells the DSP that the application processor is
 going to sleep, through an SMP2P bit (`smp2p_sleepstate.c`, the `sleepstate`

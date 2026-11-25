@@ -83,9 +83,61 @@ lists them as changed.
 
 The Type-C roles kit's `sleep-test.sh sensors=hook` runs this hook's `pre`
 before its rtcwake sleeps; it knows the hook by the text `systemctl stop
-iio-sensor-proxy.service`, which this hook keeps, so revisions 12 and 13 of
+iio-sensor-proxy.service`, which this hook keeps, so revisions 12 to 14 of
 that kit need no change for it.
 
 ## Results
 
-None yet.
+On the SM-X710 (squirtle), 2026-11-24 and 25; the logs are in
+`~/ubuntu-gts9u/backups/`.
+
+- **Install**, 2026-11-24 16:24 (boot `74dba99a`, device package 2.69, the
+  Type-C kit's revision 12 running; `squirtle-sensors-hook-1-install.log`):
+  revision 1, from 7a03a68. The package's three files were saved, the kit's
+  three put in place, root-owned with their modes, and systemd had the unit
+  as `Restart=on-failure TimeoutStopUSec=5s NeedDaemonReload=no
+  StartLimitBurst=3`; no reboot. `verify.sh`: every check `ok`, and
+  iio-sensor-proxy reported `HasAccelerometer = true` and `HasAmbientLight =
+  true`.
+- **`cycle.sh hand 10`**, 16:27 (`squirtle-sensors-hook-2-hand.log`): after
+  `pre`, iio-sensor-proxy `failed` (it ends by SIGKILL), the file server and
+  the resume unit `inactive`; after `post`, `SENSORS BACK after 45 s (SSC
+  ready 14.0 s after it; ubuntu-gts9u-sensors-resume.service result success,
+  restarts 0; iio-sensor-proxy active, HasAccelerometer true)`. The 45 s
+  include the resume unit's 30 s handover watch: SSC was ready 14.0 s after
+  `post`.
+- **`cycle.sh freezer`**, 16:32, over Wi-Fi (`squirtle-sensors-hook-3-freezer.log`):
+  one suspend through `systemd-sleep`, every hook around it, with
+  `pm_test=freezer`: `systemd-sleep returned 0`, `SENSORS BACK after 44 s
+  (SSC ready 13.1 s after it; ...)`, and `verify.sh` found the sleep in the
+  journal: `back after 5.2 s; sensors ready 14.2 s after it (attempt 1)`.
+- **Real sleeps with the hook's `pre`**: the Type-C kit's `sleep-test.sh
+  sensors=hook`, which runs the `pre` step alone (the restart that ends each
+  run brings the clients back, so `post` is not seen there). Two
+  suspend-to-idle sleeps on revision 12 (17:03 and 17:43, the USB cable out),
+  all nine of revision 13 and the first of revision 14 (2026-11-25 01:30)
+  ran with it ([Type-C kit](../typec-roles/README.md), "Revision 12:
+  results" to "Revision 14: results"). In each the hook stopped both clients
+  with status 0 (`iio-sensor-proxy failed, hexagonrpcd-adsp-sensorspd
+  inactive`), and no run stopped at it. In every one of those sleeps that
+  came back with no sound stream open, the audio DSP slept through it
+  (`adsp +0` with the DSP asleep for the whole sleep: 34.7 s at 17:43, 34.4
+  s on revision 14), where it had woken 1,439 times in 49.7 s with the
+  clients running (the Type-C kit's revision 10, run 5, 2026-11-23).
+- **An open sound stream alone keeps the audio DSP awake.** With the
+  clients stopped by the hook, the 17:03 sleep, with a playback and a
+  capture stream open, and revision 13's run 7 (22:24), with a playback
+  stream held open on purpose, had the audio DSP awake for the whole sleep
+  and the DDR at 547 MHz throughout (`ddr +0`). Stopping the sensor clients
+  does not quiet the DSP while a stream stays open.
+
+Not done yet:
+- rotation and auto-brightness checked by the owner at the tablet after a
+  sleep (`~/ubuntu-gts9u/backups/sensors-hook-2026-11-24.md`, section 8,
+  step 5);
+- a real sleep through `systemctl suspend`, so that the hook's `post` runs
+  after a real sleep (it has run only after `cycle.sh hand` and the
+  `pm_test=freezer` cycle);
+- the plan's optional step 6 (stopping the proxy alone) and the resume unit's
+  retries (no recovery has failed by itself);
+- the SM-X910 (blastoise): the kit is not installed there.

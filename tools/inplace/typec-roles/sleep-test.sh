@@ -452,7 +452,11 @@
 #   - pci=keep (ro): the PCI devices stay, and the run watches the Wi-Fi:
 #     it reads the Wi-Fi's state after each resume (evidence: wifi), and a
 #     cycle whose kernel lines say the PCIe host or the Wi-Fi did not come
-#     back ends the run (PCIE-DOWN) and restarts it.  Give it one cycle.  In
+#     back ends the run (PCIE-DOWN) and restarts it.  ath11k's lines for a
+#     country setting its firmware turned down are a note in that evidence,
+#     not such a line: with no other, a cycle ends the run only if the
+#     function is not back in D0 or its firmware was not loaded again
+#     (wifi_note_re, wifi_back).  Give it one cycle.  In
 #     a sleep with the PCI devices kept the PCIe host keeps its link (the
 #     root port stays in D0, see pci=remove), unless root-port-d3 (below)
 #     lets the root port go to D3hot.  Revision 11's kernel lets pcie_0_gdsc
@@ -745,6 +749,18 @@ pcie_down_re='[0-9a-f]+\.pcie: (PM: )?(Link failed to come up|Host init failed|f
 # step failed (ath11k_warn()/ath11k_err() lines of drivers/net/wireless/ath/
 # ath11k/core.c and pci.c, MHI's), or the root port reported an error.
 wifi_fail_re='Unable to change power state from [A-Za-z0-9]+ to D0, device inaccessible|ath11k_pci [0-9a-f:.]+: .*(failed|timeout|link down)|mhi mhi[0-9]+: .*(fail|[Ee]rror|timeout|not in valid state|Did not enter)|pcieport [0-9a-f:.]+: AER: '
+# ath11k's two lines for a country setting its firmware turned down
+# (ath11k_reg_handle_chan_list(), reg.c: "Failed to set the requested
+# Country regulatory setting"; ath11k_reg_chan_list_event(), wmi.c: "failed
+# to process regulatory info -22"), which wifi_fail_re's "failed" takes as
+# well.  They come from a regulatory event the firmware sent, and it keeps
+# its setting: they do not say that the Wi-Fi did not come back (revision
+# 13's run 9, 2026-11-24: a pair before the sleep and a pair at the resume,
+# twice each, with the function back in D0, the firmware loaded again and
+# the SSH session over the Wi-Fi carrying on).  They are a note; with no
+# other line of wifi_fail_re, the function and its firmware say whether the
+# Wi-Fi came back (wifi_back).
+wifi_note_re='ath11k_pci [0-9a-f:.]+: (Failed to set the requested Country regulatory setting|failed to process regulatory info -?[0-9]+)'
 # A line about the UFS or its disk (storage_lines) that says something
 # failed (this, without case) is never an aborted attempt, whatever it is:
 # a UFS device that refused to suspend, too.  "timing out command" and
@@ -1602,8 +1618,11 @@ pcie_down() {
 		grep -qE "$pcie_down_re" "$k"
 	elif [ "$pci_keep" = 1 ]; then
 		# pci=keep: a host that lost its controller under the kept link,
-		# or a Wi-Fi that did not come back, is not tried again.
-		grep -qE "$pcie_down_re|$wifi_fail_re|$guard_bad_re" "$k"
+		# or a Wi-Fi that did not come back, is not tried again.  ath11k's
+		# country-setting lines (wifi_note_re) are no such line: with them
+		# alone, the function and its firmware decide (wifi_back).
+		grep -E "$pcie_down_re|$wifi_fail_re|$guard_bad_re" "$k" | grep -qvE "$wifi_note_re" ||
+			{ grep -qE "$wifi_note_re" "$k" && ! wifi_back "$k"; }
 	else
 		# The PCI devices kept without pci=keep (a guard that held this
 		# boot): a guard that did not hold in this sleep ends it too.
@@ -1611,9 +1630,27 @@ pcie_down() {
 	fi
 }
 
+# Did the Wi-Fi come back, as the bus and the cycle's kernel lines (K) show
+# it rather than by a line of its own: its function on the bus with
+# ath11k_pci bound and in D0, and its firmware loaded again in K (ath11k
+# loads it at the resume of each sleep it powered the chip down for).
+wifi_back() { # K
+	wbd=
+	for wbp in "$pci_devs"/*; do
+		[ -e "$wbp/driver" ] || continue
+		wbr=$(readlink "$wbp/driver" 2>/dev/null)
+		[ "${wbr##*/}" = ath11k_pci ] || continue
+		[ "$(ev_val "$wbp/power_state")" != D0 ] || wbd=1
+	done
+	[ -n "$wbd" ] && grep -q 'ath11k_pci .*fw_version' "$1"
+}
+
 pcie_down_end() {
 	if [ "$pci_remove" = 0 ]; then
-		pdown=$(grep -E "$pcie_down_re|$wifi_fail_re|$guard_bad_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+		pdown=$(grep -E "$pcie_down_re|$wifi_fail_re|$guard_bad_re" "$k" | grep -vE "$wifi_note_re" |
+			awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+		[ -n "$pdown" ] ||
+			pdown="no Wi-Fi function in D0 with ath11k_pci bound, or no firmware load in this cycle's kernel lines; ath11k said: $(grep -E "$wifi_note_re" "$k" | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')"
 		verdict "SLEEP-TEST RESULT: PCIE-DOWN$mword after $cyc: with the PCI devices kept, the PCIe host or the Wi-Fi did not come back ($pdown), and a later suspend would meet a controller that lost its registers under its link, so the run ends here; $passes of $cycles cycles came back with the UFS readable; floor $floor; kernel $kernel$optnote"
 		verdict 'NEXT: no further sleep in this boot: the restart brings the PCIe host and the Wi-Fi back; the wifi and pcie evidence and the kernel lines of that cycle say what failed (README, "Revision 11: the runs")'
 	else
@@ -2577,10 +2614,14 @@ ev_after() { # SFX K
 	evclk1=$(ev_clk_line "$ramdir/ev-clk-$1.1" short)
 	# The Wi-Fi with the PCI devices kept: its function's state now, and the
 	# first line of the cycle's that says it did not come back
-	# (wifi_fail_re), or none.
-	evwifi=$(grep -E "$wifi_fail_re" "$2" 2>/dev/null | awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
+	# (wifi_fail_re, less ath11k's country-setting lines), or none; those
+	# lines (wifi_note_re) are a note, the first and how many.
+	evwifi=$(grep -E "$wifi_fail_re" "$2" 2>/dev/null | grep -vE "$wifi_note_re" |
+		awk '{sub(/^\[[^]]*\] /, ""); print; exit}')
 	evfw=$(grep -c 'ath11k_pci .*fw_version' "$2" 2>/dev/null)
-	evwifi="$(ev_pci_state); ${evwifi:-no Wi-Fi failure line}; ath11k firmware loads ${evfw:-0}"
+	evnote=$(grep -E "$wifi_note_re" "$2" 2>/dev/null | awk '{sub(/^\[[^]]*\] /, ""); if (!n++) f = $0}
+		END {if (n) printf "%s (%d line%s of the firmware turning a country setting down: not a failure line)", f, n, n == 1 ? "" : "s"}')
+	evwifi="$(ev_pci_state); ${evwifi:-no Wi-Fi failure line}${evnote:+; note: $evnote}; ath11k firmware loads ${evfw:-0}"
 	evgpd=$(ev_genpd_offs_delta "$ramdir/ev-gpd-$1.0" "$ramdir/ev-gpd-$1.1" full)
 	evdsp=$(ev_irq_dsp_delta "$ramdir/ev-irqs-$1.0" "$ramdir/ev-irqs-$1.1")
 	evxo1=$(ev_xo_holders "$ramdir/ev-clk-$1.1")

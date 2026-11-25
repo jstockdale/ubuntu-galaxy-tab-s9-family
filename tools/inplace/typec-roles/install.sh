@@ -17,9 +17,14 @@
 # collapsing (a debug switch, off at every boot) and the VA macro's and the
 # DSI PHY's clocks released in system sleep, and since revision 13 with the
 # console's and the Bluetooth UART's resources released in system sleep (and
-# the AOP log's region logged raw), in boot, and its module tree.
-# The DTB and the configuration are the hang-log kit's, so vendor_boot is
-# checked but not written.
+# the AOP log's region logged raw), in boot, and its module tree.  The
+# configuration is the hang-log kit's.  Up to revision 13 so was the DTB, and
+# vendor_boot was checked but not written; revision 14 is revision 13's
+# kernel and module tree with a DTB of its own (L15B held in HPM), appended
+# to the kernel in boot and in its vendor_boot.img, the hang-log kit's image
+# with only the DTB replaced.  A kit with a vendor_boot.img in its SHA256SUMS
+# has vendor_boot written; one without has vendor_boot hold the hang-log
+# kit's image.
 #
 #   sudo sh ~/typec-roles/install.sh      then reboot
 #   sudo sh ~/typec-roles/rollback.sh     back to the hang-log kit, then reboot
@@ -28,8 +33,9 @@
 # kit is installed (boot and vendor_boot hold its images, its kernel is
 # running, the module tree has its modules), that root is writable, the
 # battery, dpkg and free space.  It saves boot (root-only, hash-checked) and
-# the module tree, swaps the module tree, syncs, then writes boot
-# synchronously and reads it back from the disk.
+# the module tree, and vendor_boot when it writes it, swaps the module tree,
+# syncs, then writes vendor_boot and boot synchronously, each read back from
+# the disk.
 #
 # Over an earlier revision of this kit it runs as an upgrade, with no
 # rollback in between: the hang-log kit saved by the first install stays the
@@ -39,14 +45,24 @@
 # hash, the module tree by its list of modules), that boot holds the hang-log
 # kit (after a restore from TWRP) or a revision of this kit, that the running
 # kernel is one of theirs, and that the module tree in place has the same
-# list of modules.  vendor_boot holds the hang-log kit's image throughout:
-# no revision writes it.
+# list of modules.  vendor_boot has to hold the hang-log kit's image (no
+# revision before 14 writes it), this revision's, or one the record names;
+# when it does not hold the hang-log kit's, the copy of that image an
+# install saved before it wrote vendor_boot has to be whole.  The hang-log
+# kit's vendor_boot is saved once, by the first run that writes vendor_boot,
+# before anything is written, and is on the disk before vendor_boot is.
 #
 # Revisions 1 to 7 recorded nothing; they are known by their boot images and
 # kernels below.  Every later install or upgrade adds a line for what it
 # writes to $backup/revisions before it writes it, and that line is on the
 # disk before boot is written: a later run knows each boot image, and each
-# kernel, that this kit can have left.
+# kernel, that this kit can have left.  Since revision 14 a line has a third
+# field when the kit has a vendor_boot.img of its own: that image's sha256.
+#
+# Either partition alone still boots: vendor_boot is written first, then
+# boot.  ABL takes the DTB from vendor_boot on the SM-X910 (measured); which
+# copy the SM-X710's ABL takes is not known, and both DTBs run the same
+# kernel, so either is fine there.
 #
 # An upgrade marks itself ($backup/upgrading) before it changes anything and
 # removes the mark at the end; once it has begun, Ctrl-C, hangups and TERM
@@ -59,8 +75,10 @@
 #     back, then swapped again);
 #   - the new tree in place, the earlier one still in $old or gone, depmod not
 #     run (swapped again);
-#   - boot partly or wholly written (boot is not checked while the mark is
-#     there: it is written again);
+#   - the hang-log kit's vendor_boot partly or wholly copied (copied again
+#     while vendor_boot still holds it);
+#   - vendor_boot or boot partly or wholly written (neither is checked while
+#     the mark is there: each is written again);
 #   - the saved boot set's copy made, or the set updated, or not (made once,
 #     updated again).
 # Without the mark: boot holding this revision, with the record's last line
@@ -81,6 +99,9 @@
 # If the tablet does not come back: TWRP, then write the saved image back,
 #   dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-typec-roles/boot-hang-log.img \
 #      of=/dev/block/by-name/boot bs=4M
+# and, if this kit wrote vendor_boot (revision 14 on), the saved vendor_boot,
+#   dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-typec-roles/vendor_boot-hang-log.img \
+#      of=/dev/block/by-name/vendor_boot bs=4M
 # and run rollback.sh on the next boot: that boot has the hang-log kernel
 # with this kit's modules, which it refuses, until rollback.sh has run.
 set -eu
@@ -94,6 +115,9 @@ modules=/usr/lib/modules/$release
 stage=/usr/lib/modules/.typec-roles-$release
 old=/usr/lib/modules/.typec-roles-old-$release
 backup=/var/backups/ubuntu-gts9u-typec-roles
+# The hang-log kit's vendor_boot, saved by the first run that writes
+# vendor_boot (revision 14 on): rollback.sh's way back for that partition.
+saved_vb=$backup/vendor_boot-hang-log.img
 hang_backup=/var/backups/ubuntu-gts9u-hang-log
 log=/var/log/gts9u-typec-roles.log
 size=100663296
@@ -139,6 +163,21 @@ kit_knows() {
 	{ printf '%s\n' "$earlier"; cat "$backup/revisions" 2>/dev/null || :; } |
 		awk -v f="$1" -v x="$2" '$f == x { found = 1 } END { exit !found }'
 }
+# Is $1 the vendor_boot image of a revision in the record (its third field,
+# revision 14 on)?
+vb_recorded() {
+	[ -n "$1" ] || return 1
+	awk -v x="$1" '$3 == x { found = 1 } END { exit !found }' "$backup/revisions" 2>/dev/null
+}
+# The hang-log kit's vendor_boot, copied once before vendor_boot is first
+# written; the sync before the flash puts it on the disk.
+save_vb() {
+	dd if=/dev/disk/by-partlabel/vendor_boot of="$saved_vb" iflag=direct \
+		bs=4M count=$((size / 4194304)) status=none
+	[ "$(sha256sum "$saved_vb" | cut -d' ' -f1)" = "$hang_vendor_boot" ] ||
+		die 'the saved vendor_boot image does not match the hang-log kit'
+	say "vendor_boot saved to $backup"
+}
 
 [ "$(id -u)" = 0 ] || { echo 'run with sudo' >&2; exit 1; }
 exec 9> /run/gts9u-typec-roles.lock
@@ -171,7 +210,21 @@ new_boot=$(awk '$2 == "boot.img" {print $1}' "$kit/SHA256SUMS")
 new_id=$(cat "$kit/BUILD_ID" 2>/dev/null) || new_id=
 case $new_id in *[!0-9a-f]*) new_id= ;; esac
 [ "${#new_id}" = 40 ] || die 'BUILD_ID in the kit is not a kernel build ID'
+# What vendor_boot is to hold: the kit's vendor_boot.img (revision 14 on),
+# or without one the hang-log kit's image, as up to revision 13.
+new_vb=$(awk '$2 == "vendor_boot.img" {print $1}' "$kit/SHA256SUMS")
+if [ -n "$new_vb" ]; then
+	[ "$(stat -c %s "$kit/vendor_boot.img")" = "$size" ] || die 'vendor_boot.img is not the partition size'
+	want_vb=$new_vb
+	vb_from=$kit/vendor_boot.img
+else
+	want_vb=$hang_vendor_boot
+	vb_from=$saved_vb
+fi
 on_boot=$(part_sha boot)
+on_vb=$(part_sha vendor_boot)
+vb_whole=0
+[ "$(sha256sum "$saved_vb" 2>/dev/null | cut -d' ' -f1)" != "$hang_vendor_boot" ] || vb_whole=1
 if [ "$upgrade" = 1 ]; then
 	# The hang-log kit's kernel runs after a restore of boot from TWRP, or
 	# before the first install's reboot; a revision of this kit's, this one's
@@ -183,16 +236,24 @@ if [ "$upgrade" = 1 ]; then
 	# After an upgrade that stopped, boot may be half-written: anything goes.
 	[ -e "$backup/upgrading" ] || case $on_boot in
 	"$new_boot")
-		[ "$installed" != "$new_boot" ] ||
+		[ "$installed" != "$new_boot" ] || [ "$on_vb" != "$want_vb" ] ||
 			die "this revision of the Type-C roles kit is already installed ($backup); nothing was changed" ;;
 	"$hang_boot") ;;
 	*) kit_knows 1 "$on_boot" ||
 		die "the boot partition holds neither the hang-log kit nor a revision of this kit ($on_boot)" ;;
 	esac
+	if [ "$on_vb" != "$hang_vendor_boot" ]; then
+		# Written by a revision of this kit, which saved the hang-log kit's
+		# image first, or, after an upgrade that stopped, half-written.
+		[ -e "$backup/upgrading" ] || [ "$on_vb" = "$new_vb" ] || vb_recorded "$on_vb" ||
+			die "vendor_boot does not hold the hang-log kit, nor an image of this kit's ($on_vb); nothing was changed"
+		[ "$vb_whole" = 1 ] ||
+			die "the hang-log vendor_boot image saved in $backup is missing or changed; nothing was changed"
+	fi
 else
 	[ "$on_boot" = "$hang_boot" ] || die 'the boot partition does not hold the hang-log kit'
+	[ "$on_vb" = "$hang_vendor_boot" ] || die 'vendor_boot does not hold the hang-log kit'
 fi
-[ "$(part_sha vendor_boot)" = "$hang_vendor_boot" ] || die 'vendor_boot does not hold the hang-log kit'
 # The kit replaces the whole module tree with the same list of modules built
 # for the new kernel.  A module added by hand since would be left behind.
 tree=$modules
@@ -244,6 +305,10 @@ if [ "$upgrade" = 1 ]; then
 	# From here to the end the module tree and boot may not belong together.
 	touch "$backup/upgrading"
 	say "upgrade: boot holds $(echo "$on_boot" | cut -c1-12); the hang-log kit saved in $backup stays the way back"
+	# The copy is made when vendor_boot is to be written and none is whole
+	# yet; vendor_boot then holds the hang-log kit's image (any other was
+	# refused above without a whole copy).
+	[ "$on_vb" = "$want_vb" ] || [ "$vb_whole" = 1 ] || save_vb
 else
 	mkdir -p "$backup"
 	chmod 0700 "$backup"
@@ -251,6 +316,7 @@ else
 		bs=4M count=$((size / 4194304)) status=none
 	[ "$(sha256sum "$backup/boot-hang-log.img" | cut -d' ' -f1)" = "$hang_boot" ] ||
 		die 'the saved boot image does not match the hang-log kit'
+	[ "$on_vb" = "$want_vb" ] || save_vb
 	# The way back has to be on the disk before anything else changes: a
 	# power failure may keep a later rename and lose this file's data.
 	sync || die 'sync failed'
@@ -258,7 +324,7 @@ else
 fi
 # What this revision writes, for the next revision's install.sh; the sync
 # before the flash puts it on the disk.
-echo "$new_boot $new_id" >> "$backup/revisions"
+echo "$new_boot $new_id${new_vb:+ $new_vb}" >> "$backup/revisions"
 
 # The module tree first, the flash last, so that a failure before it leaves
 # the kernel on boot bootable, and rollback.sh can undo any step.
@@ -280,10 +346,17 @@ mv "$stage" "$modules" || die 'moving the new module tree into place failed'
 rm -rf -- "$old"
 depmod -a "$release" || die 'depmod failed'
 # The new kernel refuses every module but these: they have to be on the disk
-# before it is.
+# before it is.  So does the copy of vendor_boot before vendor_boot is
+# written.
 sync || die 'sync failed'
 say "modules: $(find "$modules" -name '*.ko*' | wc -l) modules installed (hang-log tree in $backup)"
 
+# vendor_boot first, boot last: either alone boots the same kernel, with the
+# DTB before or after the change.
+if [ "$on_vb" != "$want_vb" ]; then
+	say 'writing vendor_boot (a few seconds; do not interrupt)'
+	write_part vendor_boot "$vb_from" "$want_vb"
+fi
 say 'writing boot (a few seconds; do not interrupt)'
 write_part boot "$kit/boot.img" "$new_boot"
 
@@ -299,6 +372,18 @@ if [ -f "$saved_set/boot.img" ]; then
 	cp "$kit/boot.img" "$saved_set/boot.img.new"
 	mv "$saved_set/boot.img.new" "$saved_set/boot.img"
 	say "saved Ubuntu boot set: boot.img updated (what rollback.sh restores is in $backup)"
+fi
+# The set's vendor_boot.img the same way, when the kit has one of its own and
+# the set holds another: what the set held is saved once.
+if [ -n "$new_vb" ] && [ -f "$saved_set/vendor_boot.img" ] &&
+	[ "$(sha256sum < "$saved_set/vendor_boot.img" | cut -d' ' -f1)" != "$new_vb" ]; then
+	if [ ! -f "$backup/saved-set-vendor_boot.img" ]; then
+		cp "$saved_set/vendor_boot.img" "$backup/saved-set-vendor_boot.img.new"
+		mv "$backup/saved-set-vendor_boot.img.new" "$backup/saved-set-vendor_boot.img"
+	fi
+	cp "$kit/vendor_boot.img" "$saved_set/vendor_boot.img.new"
+	mv "$saved_set/vendor_boot.img.new" "$saved_set/vendor_boot.img"
+	say "saved Ubuntu boot set: vendor_boot.img updated (what rollback.sh restores is in $backup)"
 fi
 
 rm -f "$backup/upgrading"
