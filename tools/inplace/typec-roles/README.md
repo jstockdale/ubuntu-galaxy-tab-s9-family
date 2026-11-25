@@ -17,9 +17,11 @@ lost the storage at a resume, with a diagnostic of it (below, "Revision
 in a sleep and two fixes for clocks that kept XO voted through every sleep
 (below, "Revision 12"), and since revision 13 the console's and the
 Bluetooth UART's clocks released in every sleep, the last two that held XO
-at revision 12's first sleep (below, "Revision 13"). Everything the hang-log kit
-set stays: the same configuration, the same DTB, the same ramoops region
-and sysctl drop-in.
+at revision 12's first sleep (below, "Revision 13"), and in revision 14
+revision 13's kernel with a DTB of its own, PM8550 LDO15 held in HPM, in
+boot and in vendor_boot (below, "Revision 14"). Everything else the
+hang-log kit set stays: the same configuration, the same ramoops region and
+sysctl drop-in, and up to revision 13 the same DTB.
 
 **Why.** A powered dock should leave the tablet as power sink and USB host,
 also when the tablet boots with the dock attached. On the SM-X910 two docks
@@ -444,6 +446,73 @@ CXPC log's region held no CXPC log:
 
 Not in revision 13, as in revision 12: the root port's D3hot by default.
 
+**Revision 14** (written 2026-11-24, not installed yet) is revision 13's
+kernel and module tree, not rebuilt (kernel build ID `0b977cd78220`, the
+same module key), with a DTB of its own. On revision 13 (2026-11-24,
+squirtle) every real sleep in which the whole SoC went down, XO off, with
+Bluetooth on was reset about 1 s in by the PMIC (5 of 5), and the PMIC's
+over-current log names PM8550 LDO15 (`vreg_l15b_1p8`). That LDO feeds the
+eUSB2 repeater (`vdd1v8`, 55 mA declared while its PHY is up) and the
+WCN6855's I/O rail (`vddio` of its PMU, which declares no load), and the
+DTB let it change mode with the load (`regulator-allow-set-load`, LPM and
+HPM allowed, as sm8550-hdk has it). With the USB PHY down in a sleep the
+summed load was 0, and Linux voted the LDO to LPM with the Wi-Fi/Bluetooth
+chip still on it. The same sleep went deep with Bluetooth off (1 of 1), and
+with L15B held in HPM by a test module with an enabled 60 mA consumer (1 of
+1: `aosd +3 cxsd +1 ddr +1`):
+- `kernel/dts/sm8550-samsung-gts9wifi.dts`: `vreg_l15b_1p8: ldo15` keeps
+  `regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>` and loses
+  `regulator-allow-set-load` and `regulator-allowed-modes`, as
+  sm8550-qrd and sm8550-mtp describe it. The regulator core applies the
+  initial mode when the regulator registers and nothing changes it after
+  that: without `REGULATOR_CHANGE_DRMS` a consumer's load is recorded and
+  ignored (`drms_uA_update()` returns 0, so the repeater's and the PMU's
+  calls succeed as before), and the RPMh driver writes the mode in the
+  active set only, which RPMh keeps through the sleep. The SM-X910's DTS
+  has the same change (same LDO, same two consumers: its radio is a
+  WCN7850); that board's builds compile a pinned DTS, so it reaches the
+  SM-X910 only when that pin moves. The other three LDOs with set-load
+  (L5B, L17B, L1G) are not changed.
+- `boot.img`: revision 13's `Image.gz` with the new DTB appended;
+  `vendor_boot.img`: the hang-log kit's image with only its DTB replaced
+  (its vendor ramdisk, bootconfig, command line and header the hang-log
+  kit's, byte for byte); `DTB.diff`: the two DTBs decompiled, two lines
+  apart; `modules-7.2.0-rc3-dirty.tar`: revision 13's, byte for byte.
+- `install.sh` writes vendor_boot too. The first run that writes it saves
+  the hang-log kit's vendor_boot first, next to the saved boot
+  (`vendor_boot-hang-log.img`, hash-checked, on the disk before anything is
+  written), then writes vendor_boot and boot, each read back; the record's
+  line gets a third field, the vendor_boot image. `rollback.sh` puts the
+  hang-log kit's vendor_boot back from that copy. `verify.sh` checks the
+  running DT's ldo15 node and the regulator's mode without root, and with
+  sudo that boot and vendor_boot hold the kit's images.
+- `sleep-test.sh`: ath11k's lines for a country setting its firmware turned
+  down (`Failed to set the requested Country regulatory setting`, `failed
+  to process regulatory info -22`) are a note in the wifi evidence, no
+  longer a Wi-Fi that did not come back: revision 13's run 9 ended with
+  `PCIE-DOWN` on them with the Wi-Fi back. With no other such line, the
+  function back in D0 with ath11k bound and the firmware loaded again
+  decide; `verify.sh` takes them for a note as well.
+
+**Which DTB the bootloader uses.** The same DTB goes into vendor_boot and,
+appended to the kernel, into boot. On the SM-X910 ABL was measured to take
+vendor_boot's ([`docs/performance.md`](../../../docs/performance.md#bootloader-compatible-implementation),
+and the vibrator node in [`docs/porting-log.md`](../../../docs/porting-log.md));
+on the SM-X710 it has not been isolated
+([`docs/boot-strategy.md`](../../../docs/boot-strategy.md)), so the kit writes
+both. Either partition alone boots revision 13's kernel with one of the two
+DTBs, which differ in ldo15 alone: vendor_boot is written first, boot last.
+**The risk this revision takes:** the SM-X910's ABL bootloops on any
+vendor_boot DTB whose structure moves (two tries, 2026-08-24, one of them
+purely additive); the SM-X710's has taken every DTB change made so far,
+the lens rail's delay, the camera buses and the ramoops node among them.
+Whether it takes this one (two properties out of one node, 32 bytes
+shorter) is what the reboot shows. If the tablet does not come back from
+it: TWRP, then write the two saved images back (below, "Install, check,
+roll back").
+
+Not in revision 14: any kernel change, and any other device-tree change.
+
 `sleep-test.sh` is new in revision 8: deep sleeps with every disk
 filesystem frozen, so that a resume that loses the storage costs a restart
 and nothing else. It also runs on revision 7's kernel, for a baseline
@@ -498,16 +567,20 @@ without a sleep.
   (`qcom_geni_serial.c` the new one; the hang-log build's has the Bluetooth
   UART's interrupt patch, as every SM-X710 build), and two differ against
   revision 12's tree, `qcom_stats.c` and `qcom_geni_serial.c`.
-  `make-kit.sh` checks that, and that the configuration and the DTB are
-  byte for byte the hang-log build's. The fix's line numbers are those of
-  files with the lane clock fix, which goes on top of it, so it goes in 31
+  `make-kit.sh` checks that, and that the configuration and the build's
+  DTB are byte for byte the hang-log build's (revision 14's own DTB is
+  checked against it: two lines of ldo15 apart). The fix's line numbers
+  are those of files with the lane clock fix, which goes on top of it, so
+  it goes in 31
   lines up (one in `ufs-qcom.h`) and patch(1) leaves `ufs-qcom.c.orig` and
   `ufs-qcom.h.orig` in the build tree, as it does `dwc3-qcom.c.orig` for the
   NULL check; `make-kit.sh` passes over such a copy when it is the hang-log
   tree's file.
-- **boot** holds the new kernel. **vendor_boot is not written**: it carries
-  the DTB, which did not change. `install.sh` checks that it still holds the
-  hang-log kit's image.
+- **boot** holds the new kernel. **vendor_boot is not written** up to
+  revision 13: it carries the DTB, which did not change, and `install.sh`
+  checks that it still holds the hang-log kit's image. Revision 14 writes it:
+  the hang-log kit's image with revision 14's DTB, the same DTB that boot
+  has appended (above, "Revision 14").
 - **The module tree** comes from this build and is signed with the key of
   its build directory, which is archived in the key registry. The hang-log
   kit has another key; revisions 2 to 7 of this kit were built in one
@@ -663,6 +736,38 @@ same module key. Revision 12 was built the same way, in `build-r12`, its
 sha256 `9bca1427d84dc351ec0b050ae52fc43bf874af279f19e7386edcfb5688c572ec`.
 Revision 13 is to be built the same way, in `build-r13`, its `certs` given
 that key from `build-r12`, with `APPLY_GENI_SERIAL_FORCE_SUSPEND=1` added.
+It was, on 2026-11-24 from commit a4d6aa0: kernel build ID
+`0b977cd78220bf46e4ae3d04455a09468cc4a6b2`, the same module key, `boot.img`
+sha256 `b14495e52b3efe58670229501f70dd85d3f771d2cad5df5ab565d2b798198ca4`.
+
+Revision 14 is not a build: it is packed from revision 13's build
+directory and output, read only, and its packed kit, from a checkout whose
+`kernel/dts/sm8550-samsung-gts9wifi.dts` is committed with the change:
+
+```sh
+REUSE_KIT=$HOME/ubuntu-gts9u/backups/typec-roles-kit-r13 \
+HANG_SCRATCH=/path/to/scratch/build-hang \
+TMPDIR=/path/to/scratch/tmp \
+  bash tools/inplace/typec-roles/make-kit.sh /path/to/scratch/build-r13 \
+  $HOME/ubuntu-gts9u/out/kernel-gts9wifi-typec-r13 \
+  $HOME/ubuntu-gts9u/out/kernel-gts9wifi-hang \
+  $HOME/ubuntu-gts9u/backups/hang-log-kit-r2 \
+  $HOME/ubuntu-gts9u/backups/typec-roles-kit-r14
+```
+
+Besides every check above, `make-kit.sh` then: repacks the hang-log kit's
+vendor_boot with its own DTB and gets it back byte for byte; reads kbuild's
+command for the DTB from the build directory's `.cmd` file (it has to be
+the one the script runs), runs it with the build's `dtc` on a copy of the
+build tree's DTS directory, and gets the build's DTB back byte for byte,
+then compiles the checkout's committed DTS the same way (nothing is written
+to the build); requires that DTB, decompiled, to be the hang-log one with
+ldo15's two lines taken out and nothing else; packs `boot.img` and
+`vendor_boot.img` with it and checks that each differs from the hang-log
+kit's in the DTB alone; and with `REUSE_KIT` checks that the kernel is that
+kit's (build ID, module key, its `boot.img`'s kernel this `Image.gz` with
+the build's DTB) and that the module tar is that kit's, byte for byte.
+`SOURCE` names the checkout, the DTS's commit and every hash.
 
 The build archives its module key in the registry
 (`scripts/kernel-key-registry.sh`); `make-kit.sh` refuses a build whose key is
@@ -771,12 +876,23 @@ which squirtle has run since 2026-11-23 23:06, and over every earlier
 revision. Revision 13 installs the same way over revision 12, which squirtle
 has run since 2026-11-24 08:45, over revision 11, and over every earlier
 revision: `install.sh` knows revisions 8 and later by the record each
-install leaves on the tablet, so its upgrade path is unchanged.
+install leaves on the tablet, so its upgrade path is unchanged. Revision 14
+installs the same way over revision 13, which squirtle has run since
+2026-11-24 17:55, and over every earlier revision, with vendor_boot as
+well: one command, one reboot. Before anything is written it checks that
+vendor_boot holds the hang-log kit's image (or, over a revision with a
+vendor_boot of its own, an image the record names, with the hang-log kit's
+copy whole); it saves that image once, writes vendor_boot, then boot, and
+the same run again after it says that it is installed already. A
+vendor_boot written back by hand makes the next run write it again.
 
 `rollback.sh` writes boot and the module tree back first and syncs. If it
 stops after that, it says that the hang-log kernel and its modules are back
 in place; a second run finishes the rest (the saved boot set, retiring the
-backup).
+backup). Since revision 14 it writes vendor_boot back right after boot,
+from the copy an install saved; it refuses, with nothing changed, a
+vendor_boot that holds an image no install of this kit wrote (no copy),
+and a copy that changed while vendor_boot is not the hang-log kit's.
 
 If the tablet does not come back: TWRP, then
 
@@ -788,7 +904,14 @@ dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-typec-roles/boot-hang-log.img \
 and `rollback.sh` on the next boot. That boot has the hang-log kernel with
 this kit's modules, which it refuses: **no NAT, no v4l2loopback and no
 netconsole until `rollback.sh` has run**. Wi-Fi, USB networking and
-Bluetooth are built in, so it can be run over SSH; then reboot.
+Bluetooth are built in, so it can be run over SSH; then reboot. After
+revision 14, write the saved vendor_boot back as well (the hang-log kit's
+DTB; ABL may be taking the DTB from there):
+
+```sh
+dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-typec-roles/vendor_boot-hang-log.img \
+   of=/dev/block/by-name/vendor_boot bs=4M
+```
 
 From revision 11, the way back to revision 10 in one step: its `boot.img`
 is on the build host, `~/ubuntu-gts9u/backups/typec-roles-kit-r10/boot.img`
@@ -834,6 +957,18 @@ revision 12's kernel with revision 13's module tree, whose modules it
 probably refuses (revision 13 adds functions to the kernel, and with them
 entries to its BTF); then copy revision 12's kit back into `~/typec-roles`,
 run its `install.sh` and reboot.
+
+From revision 14, the way back to revision 13 without TWRP: `sudo sh
+~/typec-roles/rollback.sh` (revision 14's: boot, vendor_boot and the module
+tree back to the hang-log kit's), reboot, copy revision 13's kit back into
+`~/typec-roles`, `sudo sh ~/typec-roles/install.sh` (a first install over
+the hang-log kit) and reboot. Revision 13's `install.sh` cannot run over
+revision 14 directly: it refuses a vendor_boot that is not the hang-log
+kit's, with nothing written. With TWRP, in one step: revision 13's
+`boot.img` (`~/ubuntu-gts9u/backups/typec-roles-kit-r13/boot.img`, sha256
+`b14495e52b3efe58670229501f70dd85d3f771d2cad5df5ab565d2b798198ca4`) to
+boot and the saved `vendor_boot-hang-log.img` (above) to vendor_boot: the
+same kernel and module tree, with revision 13's DTB.
 
 ## The sleep test
 
@@ -1738,6 +1873,43 @@ panel cycle first:
 5. **A deep sleep**, step 3's command without `mode=s2idle` (revision 12's
    step 4, which has not run either).
 
+**Revision 14: the runs** (written before the kit was installed). Nothing
+of the test module of revision 13's run 9 (`gts9u_l15b_hold`) is needed or
+loaded: the DTB does what it did.
+
+1. **Install and check.** Copy the kit over revision 13's in
+   `~/typec-roles`, `sudo sh ~/typec-roles/install.sh` (an upgrade: one
+   command, one reboot), `sudo reboot`, then, a minute after the boot, `sh
+   ~/typec-roles/verify.sh` and `sudo sh ~/typec-roles/verify.sh`. Expected:
+   revision 13's checks (the kit's kernel is revision 13's), `ok   DT: L15B
+   (vreg_l15b_1p8) held in HPM: no regulator-allow-set-load or
+   regulator-allowed-modes, and it reads normal (revision 14's DTB)`, and
+   with sudo `ok   boot holds the kit's boot.img (...)` and `ok   vendor_boot
+   holds the kit's vendor_boot.img (...)`. Bluetooth and the USB cable as
+   before.
+
+   | What you see | What it means |
+   | --- | --- |
+   | `FAIL DT: L15B ... may drop to LPM: its node has regulator-allow-set-load ...` with both partitions the kit's | the bootloader passed a DTB that is in neither partition: keep `sudo cp /sys/firmware/fdt ~/r14-fdt.dtb` and stop |
+   | `FAIL vendor_boot holds ..., not the kit's vendor_boot.img` | the install did not finish: run `install.sh` again before anything else |
+   | no boot (the Samsung logo, then a loop or Download mode) | ABL refused the new DTB: TWRP, write the two saved images back (above, "Install, check, roll back"), boot, then `rollback.sh` |
+2. **The sleep that reset the tablet on revision 13, Bluetooth on**:
+   revision 13's run 9 without the module (run 5's options), on the cable,
+   with no sound stream open:
+
+   ```sh
+   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 rpmh sensors=hook hold=60 restart-ok
+   ```
+
+   | What you see | What it means |
+   | --- | --- |
+   | `PASS (s2idle)`, `aosd`, `cxsd` and `ddr` +1 or more, XO free at the sleep's entry | the fix holds: the whole SoC slept with Bluetooth on and L15B in HPM |
+   | the tablet restarts by itself about 1 s into the sleep, as on revision 13 | L15B in HPM is not enough on its own: read the PMIC's reset and over-current logs as root before anything else (the reads of 2026-11-24), and check that `verify.sh` saw revision 14's DTB in that boot |
+   | `SHALLOW (s2idle)` | the sleep came back without the SoC's deep states: the XO and rpmh evidence name what held them, as in revision 13's runs |
+   | `PCIE-DOWN` | the Wi-Fi did not come back by a line other than ath11k's country setting, or its function or firmware is not back (the wifi evidence says which); revision 13's run 9 had a `PCIE-DOWN` on that line alone, which is now a note |
+
+   One restart.
+
 `fstrim.timer` (weekly) would, if it fired during a run, send discards to
 the read-only disk, which the block layer logs as a write and the run
 fails; it is not stopped for the run.
@@ -2064,8 +2236,17 @@ name the ones in force (`options: none` without them).
   D0, device inaccessible`, an ath11k or MHI failure, a root port error) or
   that the guard did not hold ends the run with `SLEEP-TEST RESULT:
   PCIE-DOWN after cycle N/M: with the PCI devices kept, ...` and its restart.
-  Give it one cycle. On revision 11's kernel `pcie_0_gdsc` collapses in a
-  sleep in which the PCIe host has powered itself down, and its guard keeps
+  Since revision 14's script ath11k's lines for a country setting its
+  firmware turned down (`Failed to set the requested Country regulatory
+  setting`, `failed to process regulatory info -22`) are no such line: the
+  wifi evidence shows them as `note: ... (N lines of the firmware turning a
+  country setting down: not a failure line)`, and with no other line a
+  cycle ends the run only when the Wi-Fi's function is not back in D0 with
+  ath11k bound or its firmware was not loaded again (`no Wi-Fi function in
+  D0 with ath11k_pci bound, or no firmware load in this cycle's kernel
+  lines; ath11k said: ...`). Give it one cycle. On revision 11's kernel
+  `pcie_0_gdsc` collapses in a sleep in which the PCIe host has powered
+  itself down, and its guard keeps
   it on in one in which the host keeps its link (above, "Revision 11"). The
   run reads this boot's kernel log for the host's lines before it does
   anything (the header names what it found, `PCIe power domain guard:

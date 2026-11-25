@@ -12058,7 +12058,28 @@ class ScriptsTest(unittest.TestCase):
                      "rpmh cxpc sensors=stop hold=60 restart-ok\n",
                      "- **`cxpc`** (`ro`; revision 12's kernel)",
                      "- **`sensors=hook`** (`ro`; revision 12's script)",
-                     "revision 12's script names that flush `at T, the sleep's entry`"):
+                     "revision 12's script names that flush `at T, the sleep's entry`",
+                     # Revision 14: revision 13's kernel with its own DTB,
+                     # what it changes, why, which DTB the bootloader takes,
+                     # its risk, how it is packed and installed, the way
+                     # back, and its runs.
+                     "**Revision 14** (written 2026-11-24, not installed yet) is revision 13's kernel and module tree, "
+                     "not rebuilt (kernel build ID `0b977cd78220`, the same module key), with a DTB of its own.",
+                     "`kernel/dts/sm8550-samsung-gts9wifi.dts`: `vreg_l15b_1p8: ldo15` keeps `regulator-initial-mode = "
+                     "<RPMH_REGULATOR_MODE_HPM>` and loses `regulator-allow-set-load` and `regulator-allowed-modes`, as "
+                     "sm8550-qrd and sm8550-mtp describe it.",
+                     "`vendor_boot.img`: the hang-log kit's image with only its DTB replaced",
+                     "**Which DTB the bootloader uses.**",
+                     "**The risk this revision takes:**",
+                     "Revision 14 is not a build:",
+                     "REUSE_KIT=$HOME/ubuntu-gts9u/backups/typec-roles-kit-r13 \\\n",
+                     "Revision 14 installs the same way over revision 13, which squirtle has run since 2026-11-24 17:55, "
+                     "and over every earlier revision, with vendor_boot as well: one command, one reboot.",
+                     "From revision 14, the way back to revision 13 without TWRP:",
+                     "**Revision 14: the runs** (written before the kit was installed).",
+                     "   sudo sh ~/typec-roles/sleep-test.sh ro 1 30 release-floor mode=s2idle pci=keep root-port-d3 rpmh "
+                     "sensors=hook hold=60 restart-ok\n",
+                     "Since revision 14's script ath11k's lines for a country setting its firmware turned down"):
             with self.subTest(said):
                 self.assertIn(said, readme if "\\" not in said and "\n" not in said
                               else (KIT_SRC / "README.md").read_text())
@@ -12134,7 +12155,10 @@ class ScriptsTest(unittest.TestCase):
                      "scp ~/ubuntu-gts9u/backups/typec-roles-kit/* <user>@<tablet>:typec-roles/",
                      # The way back from TWRP stays.
                      "dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-typec-roles/boot-hang-log.img \\ "
-                     "of=/dev/block/by-name/boot bs=4M"):
+                     "of=/dev/block/by-name/boot bs=4M",
+                     # And, since revision 14, vendor_boot's.
+                     "dd if=/mnt/ubuntu/var/backups/ubuntu-gts9u-typec-roles/vendor_boot-hang-log.img \\ "
+                     "of=/dev/block/by-name/vendor_boot bs=4M"):
             with self.subTest(said):
                 self.assertIn(said, readme)
         # Why the recorder reads the log every second, and what a plug-in or
