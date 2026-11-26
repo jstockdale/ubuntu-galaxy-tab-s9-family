@@ -177,10 +177,14 @@ only the "answer here" bit (MSGQ) of `GMU2HOST_INTR_INFO`, and that bit was
 not there. The hfi interrupt handler writes back to the clear register every
 bit it reads, MSGQ and the OOB acknowledge bits among them, although since
 upstream df0dff132905 (2018) other code polls for those bits; it runs outside
-`gmu->lock`. The register reads were off for those four; with them on, 14 of
-the first 15 hfi interrupts found `INTR_INFO` 0 at the handler's entry. Which
-bit raises the interrupt, whether MSGQ was among the bits cleared at a
-timeout, and what the interrupt mask holds then are not known yet.
+`gmu->lock`. The register reads were off for those four. A fifth timeout
+(12:27:59), the same in every other respect, had them on: when the handler
+was entered, 199 us into the wait, `INTR_INFO` read 0 and `INTR_MASK`
+0xff7fffff. The mask held what the driver wrote, and no status bit was up
+yet; 43 of the 44 hfi interrupts traced with the reads on found `INTR_INFO`
+0 the same way. What raises the interrupt is still not known, nor whether
+MSGQ came up between the tracer's read and the handler's own, which then
+cleared it, or never came at all.
 
 Two patches, in every build on both boards, after the sleep fixes:
 
@@ -217,7 +221,7 @@ tablet yet**. After the first boot with them,
 journalctl -k | grep -E 'timed out waiting for response|GMU interrupt mask|Timeout waiting for GMU OOB'
 ```
 
-should show no vote timeout; a `GMU interrupt mask` line, if any, gives the
-register values the captures lacked. Not done, and wanted only if timeouts
+should show no vote timeout. A `GMU interrupt mask` line is not expected (the
+mask held in the fifth capture); if one comes, it gives the register values. Not done, and wanted only if timeouts
 remain: longer OOB waits, re-sending a failed vote, and taking the devfreq
 lock out of the submit path.

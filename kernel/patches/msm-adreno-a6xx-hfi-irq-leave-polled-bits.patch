@@ -36,10 +36,12 @@ A masked bit does not raise the line: MSGQ is set for every HFI
 response and the GPU_SET acknowledge at every GPU power-up, hundreds
 of times for each of these interrupts.  So a polled bit can raise it
 only if GMU2HOST_INTR_MASK no longer holds what a6xx_gmu_resume() wrote.
-Which bit raises the interrupts seen here, and what the mask holds
-then, is not known yet; most of them find no status bit set at all
-(14 of 15 traced), as if a bit had raised the line and been cleared by
-its waiter before the handler ran.  Cover that case as well: when a
+Which bit raises the interrupts seen here is not known yet; most of
+them find no status bit set at all (43 of 44 traced), as if a bit had
+raised the line and been cleared by its waiter before the handler ran.
+In the one timeout traced with the registers, the mask held (0xff7fffff)
+and the status read 0 just before the handler's own read.  Cover a mask
+that does not hold as well: when a
 polled bit, or any pending bit other than CM3_FAULT, is unmasked, write
 the mask again and read it back, so that the line drops, the bit stays
 for its waiter, and the mask is right for the rest of the power-up.
