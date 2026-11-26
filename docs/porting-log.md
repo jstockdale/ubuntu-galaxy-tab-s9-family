@@ -7222,3 +7222,42 @@ Every step is now checked by hand.
 
 Not yet run on a tablet. `tests/test_swap_sizing.py` runs both scripts
 against a fake root.
+
+### zram at three quarters of the RAM (2026-11-25)
+
+The 4 GiB cap above was chosen with swap nearly idle and never reached a
+tablet. Three days later the SM-X910, still on the fixed 8 GiB of zram and
+16 GiB swapfile, ran a desktop that asked for far more than its RAM (a
+browser alone wanted about 15 GB), and the owner asked whether the smaller
+zram would help. Read-only that evening, 3.8 days after boot:
+
+- zram was full at 18:36. At 19:04 it held 6,272,057,344 bytes of pages in
+  1,685,712,896 bytes of memory (3.72:1; 2,931,716,096 at most that boot),
+  35,258 of its pages stored uncompressed (2.3 %). The swapfile held
+  3,910,940 kB more, 9.95 GiB swapped in all.
+- zram's own counters at 18:44: 21.86 million reads in 334 s (about 15 µs a
+  page) and 25.97 million writes in 601 s (about 23 µs a page), 0.3 % of one
+  core over the boot.
+- The kernel counted 24.87 million swap-ins, so about 3.0 million (12 %)
+  came from the swapfile. At the 114–165 µs of a UFS random read measured on
+  2026-11-22 those cost 340–500 s of waiting, as much as or more than the
+  88 % served from zram.
+
+So under real over-commit a smaller zram hurts: 4 GiB instead of 8 would
+have freed under 1 GiB of RAM and moved about 3 GiB more onto the tier that
+is ten times slower a page. The owner chose three quarters of `MemTotal`
+instead, with no fixed cap: 10,915 MiB (10.7 GiB) on the SM-X910 and
+7,922 MiB (7.7 GiB) on the SM-X710. On the SM-X910 that would have held all
+9.95 GiB for about 3 GiB of memory. It is not the whole RAM because pages
+that do not compress are stored at full size and save nothing. The swapfile
+keeps the size of the RAM.
+
+What this does not fix: zram fills first, with whatever was swapped out
+first, and what overflows to the UFS afterwards may be in more demand than
+what sits in zram. Keeping the hot pages in the compressed tier takes zswap,
+zram writeback or the multi-generational LRU, none of which this kernel is
+built with. The stalls themselves come from asking for more memory than the
+tablet has, and from the GPU controller's timeouts, which are a separate
+fault.
+
+Not yet run on a tablet; `tests/test_swap_sizing.py` covers the new sizes.

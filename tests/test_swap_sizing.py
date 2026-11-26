@@ -419,9 +419,11 @@ class ZramTest(FakeRoot):
     def start(self):
         return self.run_text(self.script(), "start")
 
-    def test_four_gib_at_most_half_the_ram_below(self):
-        cases = ((SM_X910_16GB, 4096), (SM_X710_12GB, 4096),
-                 (8 * 1048576, 4096), (ESTIMATE_8GB, 3515), (2 * 1048576, 1024))
+    def test_three_quarters_of_the_ram(self):
+        # 10.66 GiB on the SM-X910, 7.74 GiB on the SM-X710; no fixed cap.
+        cases = ((SM_X910_16GB, 10915), (SM_X710_12GB, 7922),
+                 (8 * 1048576, 6144), (ESTIMATE_8GB, 5273), (2 * 1048576, 1536),
+                 (999999999999, 732421874))
         for kb, mib in cases:
             with self.subTest(kb=kb):
                 shutil.rmtree(self.root / "sys/block")
@@ -434,7 +436,7 @@ class ZramTest(FakeRoot):
                 self.assertIn("enabled %s/dev/zram0, %d MiB, zstd" % (self.root, mib),
                               result.stderr)
 
-    def test_unreadable_meminfo_uses_the_cap(self):
+    def test_unreadable_meminfo_uses_the_fallback(self):
         (self.root / "proc/meminfo").unlink()
         result = self.start()
         self.assertIn("cannot read MemTotal; using 4096 MiB", result.stderr)
@@ -451,9 +453,10 @@ class ZramTest(FakeRoot):
         # new device and leaves zram0 alone.
         (self.root / "sys/block/zram0/disksize").write_text("%d\n" % (8 * GIB))
         self.device(1)
+        self.ram(SM_X910_16GB)
         self.start()
         self.assertEqual(self.disksize(0), 8 * GIB)
-        self.assertEqual(self.disksize(1), 4096 * MIB)
+        self.assertEqual(self.disksize(1), 10915 * MIB)
         self.assertFalse((self.root / "sys/block/zram0/reset").exists())
 
 

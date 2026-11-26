@@ -12,37 +12,42 @@
 # module here and this port does not install the generic module tree, but that
 # does not matter: modern zram carries its own zstd backend, and the device
 # advertises it in comp_algorithm.  Measured on this board, zstd holds desktop
-# anonymous pages at 3:1 to 4.5:1, so the 4 GiB below occupies 0.9 to 1.4 GiB
-# of real memory when completely full.
+# anonymous pages at 3:1 to 4.5:1.
 #
 # The size is a ceiling, never a reservation: zram only takes memory for the
-# pages it holds.  4 GiB at most, and half of the RAM the kernel reports if that
-# is less (the default of systemd's zram-generator), so that a worst-case run of
-# incompressible pages cannot claim more memory than it saves.  The swapfile,
-# sized to the RAM, takes what does not fit.  Up to 2026-11 this was a fixed
-# 8 GiB, which a full device at 4.5:1 would have paid for with 1.8 GiB of RAM.
+# pages it holds.  It is three quarters of the RAM the kernel reports: 10.7 GiB
+# on the 16 GB SM-X910, 7.7 GiB on the 12 GB SM-X710.  Under a desktop that
+# asked for far more than the RAM (SM-X910, 2026-11-25) the old 8 GiB filled
+# up, 3.7 GiB more went to the swapfile, and the one swap-in in eight that came
+# from the UFS cost as much waiting as the seven from zram; three quarters of
+# the RAM would have kept all of it here, for about 3 GiB of real memory at
+# the 3.7:1 measured then.  It is not the whole RAM because pages that do not
+# compress are stored at full size and save nothing (2.3 % of them that day);
+# the swapfile, sized to the RAM, takes what does not fit.  Up to 2026-11 this
+# was a fixed 8 GiB on every model.
 set -eu
 
-cap_mib=4096
+# Used only when MemTotal cannot be read: below three quarters of the smallest
+# model in the family.
+fallback_mib=4096
 algorithm=zstd
 priority=100
 
 log() { echo "ubuntu-gts9u-zram: $*" >&2; }
 
-# Half of MemTotal in MiB, at most cap_mib.  Without a readable MemTotal, the
-# cap: it is half of the smallest model in the family.
+# Three quarters of MemTotal in MiB.  Without a readable MemTotal,
+# fallback_mib.
 zram_mib() {
 	kb=$(sed -n 's/^MemTotal:[[:space:]]*\([1-9][0-9]\{0,11\}\) kB$/\1/p' \
 		/proc/meminfo 2>/dev/null) || kb=
 	case $kb in
 		''|*[!0-9]*)
-			log "cannot read MemTotal; using $cap_mib MiB"
-			echo "$cap_mib"
+			log "cannot read MemTotal; using $fallback_mib MiB"
+			echo "$fallback_mib"
 			return 0
 			;;
 	esac
-	half=$((kb / 2048))
-	if [ "$half" -lt "$cap_mib" ]; then echo "$half"; else echo "$cap_mib"; fi
+	echo $((kb * 3 / 4096))
 }
 
 find_device() {

@@ -208,12 +208,12 @@ extended first, and the script tells the two cases apart by device and label.
 The image carried **no** swap at all: with 14.2 GiB of usable RAM and a real
 desktop load (Steam plus a browser), the only backstop against a spike was the
 OOM killer. Since v2.22 of the device package there are two tiers, sized from
-the RAM since 2026-11-22 (20 GiB in all on the 16 GB SM-X910, 16 GiB on the
+the RAM since 2026-11 (26.7 GiB in all on the 16 GB SM-X910, 19.7 GiB on the
 12 GB SM-X710):
 
 | Tier | Size | Priority | Unit |
 |---|---|---|---|
-| zram (zstd) | 4 GiB at most | 100 | `ubuntu-gts9u-zram.service` |
+| zram (zstd) | three quarters of `MemTotal`: 10.7 or 7.7 GiB | 100 | `ubuntu-gts9u-zram.service` |
 | swapfile on the UFS | the RAM: 8, 12 or 16 GiB | 10 | `ubuntu-gts9u-swapfile.service` |
 
 The decisions, and why:
@@ -228,12 +228,19 @@ The decisions, and why:
   `comp_algorithm`. Measured on the tablet: **4.53×** — 0.65 GiB of pages
   occupying 0.16 GiB of RAM. After 16 hours of a desktop under memory
   pressure it was 4.46×.
-- **4 GiB of zram at most, or half the RAM if that is less.** The size is a
-  ceiling, not a reservation: zram only takes memory for the pages it holds.
-  At 4.46× a full 4 GiB costs about 0.9 GiB of RAM; the 8 GiB of before
-  would have cost 1.8 GiB. The cap bounds that worst case, and the swapfile
-  takes what does not fit. Half of `MemTotal` is below 4 GiB only on an 8 GB
-  model. The rule is also the default of systemd's zram-generator.
+- **zram is three quarters of `MemTotal`.** The size is a ceiling, not a
+  reservation: zram only takes memory for the pages it holds. A cap of 4 GiB
+  was chosen on 2026-11-22, when swap was nearly idle, and never shipped. On
+  2026-11-25 the SM-X910 ran a desktop that asked for far more than its RAM:
+  the 8 GiB of zram filled up, 3.7 GiB more went to the swapfile, and about
+  one swap-in in eight came from the UFS — at ten times the cost a page,
+  those cost as much waiting as all the ones from zram. Three quarters of
+  `MemTotal` (10.7 GiB there) would have held all 9.95 GiB, for about 3 GiB
+  of RAM at the 3.7× measured that day; a smaller zram would have freed
+  under 1 GiB and sent several more GiB to the UFS. It is not the whole RAM
+  because a page that does not compress is stored at full size and saves
+  nothing (2.3 % of the stored pages that day), and a load full of such
+  pages would do worse than a browser. The swapfile takes what does not fit.
   `comp_algorithm` only accepts writes while `disksize` is still unset, so
   that order in the script is not interchangeable.
 - **The swapfile does not travel in the image.** Gigabytes of zeros would
