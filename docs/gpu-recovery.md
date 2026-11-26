@@ -177,14 +177,15 @@ only the "answer here" bit (MSGQ) of `GMU2HOST_INTR_INFO`, and that bit was
 not there. The hfi interrupt handler writes back to the clear register every
 bit it reads, MSGQ and the OOB acknowledge bits among them, although since
 upstream df0dff132905 (2018) other code polls for those bits; it runs outside
-`gmu->lock`. The register reads were off for those four. A fifth timeout
-(12:27:59), the same in every other respect, had them on: when the handler
-was entered, 199 us into the wait, `INTR_INFO` read 0 and `INTR_MASK`
-0xff7fffff. The mask held what the driver wrote, and no status bit was up
-yet; 43 of the 44 hfi interrupts traced with the reads on found `INTR_INFO`
-0 the same way. What raises the interrupt is still not known, nor whether
-MSGQ came up between the tracer's read and the handler's own, which then
-cleared it, or never came at all.
+`gmu->lock`. The register reads were off for those four. Five more timeouts
+(12:27:59, 12:55:36, 12:56:19, 12:58:25 and 12:58:37), the same in every
+other respect, had them on. When the handler was entered, 194 to 219 us into
+the wait, `INTR_MASK` read 0xff7fffff in all five: the mask held what the
+driver wrote. `INTR_INFO` read 1, the MSGQ bit alone, in two of them, and the
+handler's next step is to write that back to the clear register: that is the
+answer bit being lost. In the other three it read 0, a moment before the
+handler's own read. The interrupt comes just when the answer does. What
+raises it with MSGQ masked is still not known.
 
 Two patches, in every build on both boards, after the sleep fixes:
 
