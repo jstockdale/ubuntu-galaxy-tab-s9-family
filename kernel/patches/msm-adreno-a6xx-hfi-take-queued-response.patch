@@ -1,0 +1,83 @@
+Subject: [PATCH] drm/msm/a6xx: Take an HFI response from the queue without its MSGQ bit
+
+a6xx_hfi_wait_for_msg_interrupt() waits for the MSGQ bit of
+GMU2HOST_INTR_INFO alone.  When the bit goes missing, a response that
+is already in the response queue is not seen: the wait times out after
+1 s, the caller gets -ETIMEDOUT (a6xx_gmu_set_freq() ignores it and
+takes the new frequency as set), and the next message reports the
+response as "Unexpected message id".  The wait holds gmu->lock and, for
+a frequency change, the devfreq lock, which a submit takes when the GPU
+leaves idle: the GPU gets no new work for that second, and hangcheck
+then reports lockups that need no recovery.
+
+Seen on two SM8550 (Adreno 740) tablets, up to about once an hour of
+use.  Traces of three such GX_BW_PERF_VOTEs, each the first vote after
+a GMU resume, found the response in the queue when the wait gave up
+(read index 24, write index 28), with the vote's sequence number and no
+error; in the one that recorded it, the queue was still empty when an
+hfi interrupt ran 196 us into the wait.  One way the bit is lost is the
+HFI interrupt handler, which clears it (addressed separately); whether
+it is the only one is not known.
+
+End the wait also when the response queue is not empty.  The poll
+checks its condition once more after the timeout, so a response that
+came in time is taken whatever happened to its bit.  The caller reads
+the queue as before: a response with another sequence number is
+reported and dropped, and an empty queue after a stale MSGQ bit still
+waits again.  MSGQ is cleared as before; when the response is seen
+before its bit, the bit stays set and ends the next wait early, which
+then finds the queue empty and waits again.
+
+The wait can now end on the queue's write index alone, a plain load
+from the write-combined HFI memory, where the MMIO read of INTR_INFO
+used to come first.  Order the reads of the message after the read of
+the write index in a6xx_hfi_queue_read().
+
+Fixes: df0dff132905 ("drm/msm/a6xx: Poll for HFI responses")
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+@@ -39,6 +39,9 @@ static int a6xx_hfi_queue_read(struct a6
+ 		return 0;
+ 	}
+ 
++	/* Ensure the message is read only after the write index that covers it */
++	dma_rmb();
++
+ 	hdr = queue->data[index];
+ 
+ 	queue->history[(queue->history_idx++) % HFI_HISTORY_SZ] = index;
+@@ -108,6 +111,14 @@ static int a6xx_hfi_queue_write(struct a
+ 	return 0;
+ }
+ 
++/* Has the GMU queued a message that the host has not read yet? */
++static bool a6xx_hfi_queue_has_msg(struct a6xx_hfi_queue *queue)
++{
++	struct a6xx_hfi_queue_header *header = queue->header;
++
++	return header->read_index != READ_ONCE(header->write_index);
++}
++
+ static int a6xx_hfi_wait_for_msg_interrupt(struct a6xx_gmu *gmu, u32 id, u32 seqnum)
+ {
+ 	int ret;
+@@ -116,9 +127,16 @@ static int a6xx_hfi_wait_for_msg_interru
+ 	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
+ 
+ 	do {
+-		/* Wait for a response */
++		/*
++		 * Wait for a response.  The MSGQ bit announces it, but a
++		 * response that is already in the queue ends the wait too:
++		 * the bit can go missing while the response is there, and
++		 * the caller reads the queue either way.
++		 */
+ 		ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO, val,
+-			val & A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ, 100, 1000000);
++			(val & A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ) ||
++			a6xx_hfi_queue_has_msg(&gmu->queues[HFI_RESPONSE_QUEUE]),
++			100, 1000000);
+ 
+ 		if (!ret)
+ 			break;

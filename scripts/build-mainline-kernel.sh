@@ -875,6 +875,25 @@ sleep_fix drivers/gpu/drm/msm/adreno/a6xx_gmu.c \
 sleep_fix drivers/ufs/host/ufs-qcom.c \
 	'host->tx_lane0_sync_clk = devm_clk_get(dev, "tx_lane0_sync_clk");' \
 	ufs-qcom-enable-only-lane-clocks.patch
+# The GPU controller's (GMU's) "hfi" interrupt handler wrote every status
+# bit it read back to the clear register, the MSGQ bit that announces the
+# answer to an HFI message and the OOB acknowledge bits among them, which
+# other code waits for under gmu->lock.  A frequency vote then waited 1 s
+# and gave up with its answer in the queue: about once an hour of use on
+# both tablets, traced on the SM-X910 on 2026-11-26 (docs/gpu-recovery.md).
+# The handler now leaves those bits to their waiters (and writes the mask
+# again when it finds one unmasked), and the HFI wait takes an answer that
+# is in the queue whether or not its bit came.  Every build, both boards:
+# same GPU, same timeouts.  After the sleep fixes, whose line numbers count
+# this script's other patches of a6xx_gmu.c and none of these; with or
+# without them, and on a6xx_hfi.c, these go in with no offset.  Not run on
+# a tablet yet.
+apply_unless 'Leave those bits to them' \
+	drivers/gpu/drm/msm/adreno/a6xx_gmu.c \
+	msm-adreno-a6xx-hfi-irq-leave-polled-bits.patch
+apply_unless 'response that is already in the queue ends the wait too' \
+	drivers/gpu/drm/msm/adreno/a6xx_hfi.c \
+	msm-adreno-a6xx-hfi-take-queued-response.patch
 apply_unless 'adopt_retained_source_ufp' \
 	include/linux/usb/tcpm.h tcpm-adopt-retained-source-ufp-role.patch
 apply_unless 'consume_retained_sink_dfp' \

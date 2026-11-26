@@ -149,5 +149,75 @@ hand-off changes are written and compiled for it (2026-11-25,
 [resume notes](resume-recovery.md#deep-sleep-groundwork-on-the-sm-x910-2026-11-25)),
 in no kernel that has run there yet. Late
 GMU `GX_BW_PERF_VOTE` answers like the ones above were also seen on the X710
-while rpmhpd was held; whether they persist with it synced is not checked
-yet.
+while rpmhpd was held, and they persist with it synced: squirtle logged one
+or two vote timeouts in each of five boots between 2026-11-22 and 2026-11-24,
+all on kernels that build the video clock controller in (that rpmhpd synced
+in those boots is inferred from the build; its `state_synced` was not read).
+They are not an rpmhpd effect; see the next section.
+
+## GMU vote timeouts: the answer bit that goes missing (2026-11-26)
+
+Both tablets log, up to about once an hour of use, `Message
+HFI_H2F_MSG_GX_BW_PERF_VOTE id N timed out waiting for response` and then
+`Unexpected message id N on the response queue`: a GPU frequency vote waits
+1 s for the GPU controller (GMU), gives up, and the next message finds the
+answer. The wait holds the locks that GPU submissions need, so the desktop
+freezes for that second (longer while the serial console prints slowly), and
+hangcheck often reports a lockup that needs no reset. The investigation is in
+`~/ubuntu-gts9u/backups/gpu-gmu-timeouts-rootcause-2026-11-25.md`.
+
+The first four timeouts caught with the gpu-watch tracing kit (blastoise,
+kit r8 kernel, 2026-11-26 10:54:43, 11:51:44, 12:01:07 and 12:10:38) show
+that the GMU was not late, and all four look alike. Each vote was the first
+after a GPU wake-up, sent right after the hfi interrupt is enabled again;
+exactly one hfi interrupt ran 196 to 318 us into the wait (in the first
+record, with the response queue still empty); when the wait gave up the
+answer was in the queue (the vote's sequence number, error 0). The wait polls
+only the "answer here" bit (MSGQ) of `GMU2HOST_INTR_INFO`, and that bit was
+not there. The hfi interrupt handler writes back to the clear register every
+bit it reads, MSGQ and the OOB acknowledge bits among them, although since
+upstream df0dff132905 (2018) other code polls for those bits; it runs outside
+`gmu->lock`. The register reads were off for those four; with them on, 14 of
+the first 15 hfi interrupts found `INTR_INFO` 0 at the handler's entry. Which
+bit raises the interrupt, whether MSGQ was among the bits cleared at a
+timeout, and what the interrupt mask holds then are not known yet.
+
+Two patches, in every build on both boards, after the sleep fixes:
+
+- `msm-adreno-a6xx-hfi-irq-leave-polled-bits.patch`: the handler clears every
+  bit but MSGQ and the OOB acknowledge bits, and leaves those to their
+  waiters. A polled bit, or any pending bit but the firmware-fault one, that
+  it finds unmasked (the driver masks all others) means the mask no longer
+  holds what the driver wrote: it writes the mask again, also when no status
+  bit is left, so the line drops, the bit stays, and the mask is right for
+  the rest of that power-up; it clears a pending bit as before only if the
+  mask does not take. The first such event is logged once per boot: `GMU
+  interrupt mask 0x... left 0x... unmasked (status 0x...), written again:
+  0x...`.
+- `msm-adreno-a6xx-hfi-take-queued-response.patch`: the HFI wait also ends
+  when the response queue holds an answer, whether or not its bit came, and
+  the queue is read after a read barrier.
+
+`tests/test_gpu_hfi_irq.py` checks the build lines, applies the patches the
+way the build does (no offset, with and without `APPLY_SM8550_SLEEP_FIXES`),
+and runs the driver's own handler, OOB request and HFI wait, compiled for the
+build host, against a simulated GMU in each case the capture leaves open. The
+handler's patch alone covers an interrupt that runs while MSGQ and the answer
+are both there, and the OOB acknowledges; the wait's patch alone covers every
+vote case, among them MSGQ up before the answer shows in the queue (one
+reading of the capture), a bit that never comes (the other), and a mask that
+does not take; with both, no case fails and the line is always down
+afterwards.
+
+Status: written and compiled for arm64 with both tablets' configurations
+(no warnings, also with `W=1`); not built into a boot image and **not run on a
+tablet yet**. After the first boot with them,
+
+```
+journalctl -k | grep -E 'timed out waiting for response|GMU interrupt mask|Timeout waiting for GMU OOB'
+```
+
+should show no vote timeout; a `GMU interrupt mask` line, if any, gives the
+register values the captures lacked. Not done, and wanted only if timeouts
+remain: longer OOB waits, re-sending a failed vote, and taking the devfreq
+lock out of the submit path.

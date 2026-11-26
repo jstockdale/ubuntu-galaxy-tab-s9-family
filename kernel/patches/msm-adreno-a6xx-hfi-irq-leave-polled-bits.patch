@@ -1,0 +1,147 @@
+Subject: [PATCH] drm/msm/a6xx: Do not clear polled GMU2HOST bits in the HFI interrupt
+
+a6xx_hfi_irq() reads GMU2HOST_INTR_INFO and writes the whole value back
+to GMU2HOST_INTR_CLR.  Since commit df0dff132905 ("drm/msm/a6xx: Poll
+for HFI responses") the handler serves only CM3_FAULT, the one bit that
+a6xx_gmu_resume() unmasks.  MSGQ, which announces an HFI response, and
+the OOB acknowledge bits are polled for under gmu->lock, by
+a6xx_hfi_wait_for_msg_interrupt() and a6xx_gmu_set_oob(), which clear
+them once seen.  The handler runs outside that lock: if it runs between
+the GMU setting one of those bits and the waiter's next read, up to
+100 us later, it clears the bit and the waiter times out, after 1 s for
+an HFI message ("Message ... timed out waiting for response", and the
+next sender reports the response as "Unexpected message id"), after
+10 ms for an OOB request ("Timeout waiting for GMU OOB set ...: 0x0").
+
+Seen on two SM8550 (Adreno 740) tablets, which log vote timeouts up to
+about once an hour of use, and one of them OOB timeouts as well.  The
+hfi interrupt fires about ten times an hour on both, never with a "GMU
+firmware fault" line; where it was watched, within 30 ms after the GMU
+powered up, which is when the first frequency vote and the GPU_SET
+request wait for their bits.  Traces of three timed-out
+GX_BW_PERF_VOTEs: each was the first vote after a GMU resume, sent by
+a6xx_gmu_set_initial_freq() right after enable_irq(gmu->hfi_irq); in
+each, one hfi interrupt ran 196, 318 and 202 us into the wait; when the
+wait gave up the response was in the queue, with the vote's sequence
+number and no error.  In the first 92 minutes of that boot: 3424 GMU
+resumes, 39 hfi interrupts, 15761 votes, three timeouts.
+
+The downstream kgsl driver clears only the bits it handles in its HFI
+interrupt handler.  Clear every bit but MSGQ and the OOB acknowledge
+bits of this GMU (a6xx_gmu_oob_bits[], legacy or not), and leave those
+to their waiters.  Any other bit is still cleared, so that a bit the
+driver does not know cannot keep the level-triggered line asserted.
+
+A masked bit does not raise the line: MSGQ is set for every HFI
+response and the GPU_SET acknowledge at every GPU power-up, hundreds
+of times for each of these interrupts.  So a polled bit can raise it
+only if GMU2HOST_INTR_MASK no longer holds what a6xx_gmu_resume() wrote.
+Which bit raises the interrupts seen here, and what the mask holds
+then, is not known yet; most of them find no status bit set at all
+(14 of 15 traced), as if a bit had raised the line and been cleared by
+its waiter before the handler ran.  Cover that case as well: when a
+polled bit, or any pending bit other than CM3_FAULT, is unmasked, write
+the mask again and read it back, so that the line drops, the bit stays
+for its waiter, and the mask is right for the rest of the power-up.
+Only if the mask does not take, clear a pending bit too, as before, so
+that the interrupt cannot storm.  The first such event is logged with
+the mask, the unmasked bits, the status and the mask read back.
+
+Move A6XX_HFI_IRQ_MASK above the handler, which now uses it.
+
+Fixes: df0dff132905 ("drm/msm/a6xx: Poll for HFI responses")
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -59,13 +59,54 @@ static irqreturn_t a6xx_gmu_irq(int irq,
+ 	return IRQ_HANDLED;
+ }
+ 
++/* The GMU2HOST interrupts that a6xx_hfi_irq() handles, the only ones unmasked */
++#define A6XX_HFI_IRQ_MASK \
++	(A6XX_GMU_GMU2HOST_INTR_INFO_CM3_FAULT)
++
++static u32 a6xx_gmu_oob_ack_bits(struct a6xx_gmu *gmu);
++
+ static irqreturn_t a6xx_hfi_irq(int irq, void *data)
+ {
+ 	struct a6xx_gmu *gmu = data;
+-	u32 status;
++	u32 status, mask, polled, unexpected, clear;
+ 
+ 	status = gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO);
+-	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, status);
++	mask = gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK);
++
++	/*
++	 * a6xx_hfi_wait_for_msg_interrupt() and a6xx_gmu_set_oob() poll for
++	 * the MSGQ bit and the OOB acknowledge bits under gmu->lock, and clear
++	 * them once seen.  Leave those bits to them: cleared here, they are
++	 * lost to the waiter.  Clear every other bit, as the line is
++	 * level-triggered.
++	 */
++	polled = (A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ | a6xx_gmu_oob_ack_bits(gmu)) &
++		 ~A6XX_HFI_IRQ_MASK;
++	clear = status & ~polled;
++
++	/*
++	 * a6xx_gmu_resume() unmasks A6XX_HFI_IRQ_MASK alone, so another bit
++	 * can raise this interrupt only if the mask no longer holds that.
++	 * If a polled bit, or a pending one, is unmasked, write the mask
++	 * again, so that a polled bit stops driving the line and stays for
++	 * its waiter; only if the mask does not take, clear a pending bit
++	 * too rather than take this interrupt again and again.
++	 */
++	unexpected = (status | polled) & ~mask & ~A6XX_HFI_IRQ_MASK;
++	if (unexpected) {
++		u32 restored;
++
++		gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK, ~A6XX_HFI_IRQ_MASK);
++		restored = gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK);
++		clear |= status & unexpected & ~restored;
++
++		dev_warn_once(gmu->dev,
++			      "GMU interrupt mask 0x%x left 0x%x unmasked (status 0x%x), written again: 0x%x\n",
++			      mask, unexpected, status, restored);
++	}
++
++	if (clear)
++		gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, clear);
+ 
+ 	if (status & A6XX_GMU_GMU2HOST_INTR_INFO_CM3_FAULT) {
+ 		dev_err_ratelimited(gmu->dev, "GMU firmware fault\n");
+@@ -389,6 +430,24 @@ static const struct a6xx_gmu_oob_bits a6
+ 	},
+ };
+ 
++/* The GMU2HOST_INTR_INFO bits that a6xx_gmu_set_oob() polls for on this GMU */
++static u32 a6xx_gmu_oob_ack_bits(struct a6xx_gmu *gmu)
++{
++	u32 bits = 0;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(a6xx_gmu_oob_bits); i++) {
++		int ack = gmu->legacy ? a6xx_gmu_oob_bits[i].ack :
++				       a6xx_gmu_oob_bits[i].ack_new;
++
++		/* 0: no such request on this GMU, see a6xx_gmu_set_oob() */
++		if (ack)
++			bits |= BIT(ack);
++	}
++
++	return bits;
++}
++
+ /* Trigger a OOB (out of band) request to the GMU */
+ int a6xx_gmu_set_oob(struct a6xx_gmu *gmu, enum a6xx_gmu_oob_state state)
+ {
+@@ -1070,9 +1129,6 @@ static int a6xx_gmu_fw_start(struct a6xx
+ 	return 0;
+ }
+ 
+-#define A6XX_HFI_IRQ_MASK \
+-	(A6XX_GMU_GMU2HOST_INTR_INFO_CM3_FAULT)
+-
+ #define A6XX_GMU_IRQ_MASK \
+ 	(A6XX_GMU_AO_HOST_INTERRUPT_STATUS_WDOG_BITE | \
+ 	 A6XX_GMU_AO_HOST_INTERRUPT_STATUS_HOST_AHB_BUS_ERROR | \

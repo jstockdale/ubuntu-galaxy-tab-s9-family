@@ -9691,7 +9691,9 @@ class SleepFixesTest(unittest.TestCase):
         patches of their files (the HS-G5 one of ufs-qcom.c on the SM-X710
         alone, and since revision 11 the UFS PHY power reference fix of
         every build and its diagnostic), and no other patch of the checkout
-        touches those files; the unpark patch is the PCIe PHY's only one."""
+        touches those files but the GMU's HFI interrupt fix of a6xx_gmu.c,
+        which goes on after them (tests/test_gpu_hfi_irq.py); the unpark
+        patch is the PCIe PHY's only one."""
         text = self.text()
         block, unpark, pwrdn = self.fix_block(), self.unpark_block(), self.pwrdn_block()
         for name, part in (("fixes", block), ("unpark", unpark), ("diagnostics", pwrdn)):
@@ -9712,7 +9714,9 @@ class SleepFixesTest(unittest.TestCase):
         self.assertEqual(touching[f"{PHYMUX}.c"], {FIX_PATCHES[0]})
         self.assertEqual(touching[f"{GMU}.c"], {FIX_PATCHES[1], "msm-adreno-bound-fault-coredump-wait-gts9u.patch",
                                                 "msm-adreno-a740-scm-init-param.patch",
-                                                "msm-adreno-gmu-hub-clk-param.patch"})
+                                                "msm-adreno-gmu-hub-clk-param.patch",
+                                                "msm-adreno-a6xx-hfi-irq-leave-polled-bits.patch"})
+        self.assertGreater(text.index("\tmsm-adreno-a6xx-hfi-irq-leave-polled-bits.patch\n"), at)
         self.assertEqual(touching[f"{UFS_QCOM}.c"], {FIX_PATCHES[2], "ufs-qcom-hs-g5-at-300mhz-sm8550.patch",
                                                      *UFS_QCOM_PATCHES})
         self.assertEqual(touching[f"{UFS_QCOM}.h"], {FIX_PATCHES[2], *UFS_QCOM_PATCHES})
