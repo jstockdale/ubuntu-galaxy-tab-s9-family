@@ -111,13 +111,16 @@ asks for a swap of its own while the tablet's request is still due gets Wait:
 that is TCPM's answer to a PD 2.0 partner for as long as discovery is due,
 and the request keeps it due a few hundred milliseconds longer at most.
 
-A Hard Reset puts both ends back to their default data roles.  A host role
-that came from a swap is given up there, and asked for again after the new
-contract if a request is left.  A request that was queued but had not gone
-out when the reset came is dropped with it.  A host role taken over for a
-dock that kept its own role across the reset (the earlier
-`adopt_retained_source_ufp` patch) is still kept.  With `sink_host_swap` off,
-a hard reset is handled as it was before this change.
+A Hard Reset puts both ends back to their default data roles, and the
+tablet as sink goes back to the device role there, whatever made it host: a
+swap, an attach as source and a PR_Swap since (run 3, below), or a dock that
+had kept its own role.  A dock that keeps UFP across the reset too is taken
+back as host on its first message, by the earlier
+`adopt_retained_source_ufp` patch; one that goes back to DFP, as the
+specification has it, then matches.  The request is made again after the new
+contract if one is left, and a request that was queued but had not gone out
+when the reset came is dropped with it.  With `sink_host_swap` off nothing is
+requested after the reset.
 
 ### A swap asked for from userspace
 
@@ -336,11 +339,79 @@ TCPM's error recovery a real detach (switches below):
   0x..)`;
 - TCPM's error recovery after an in-place swap or a Hard Reset opens CC, so
   that the partner sees a detach and the port comes back in one reconnect:
-  `CC opened for TCPM's error recovery after a swap or Hard Reset`.
+  `CC opened for TCPM's error recovery after a swap or Hard Reset`, and when
+  the port toggles again `CC on again through Unattached.SNK after the driver
+  opened it` (run 3, next).
 
 A short USB 2 drop at a swap is expected: a PR_Swap takes VBUS to 0 V, and a
 self-powered USB 2 device has to let go of the bus without VBUS.  It comes
 back about a second after the hub's VBUS; the USB 3 side may stay.
+
+### Run 3: a Hard Reset after a deaf swap, and a port that died
+
+**Two fixes, written and compiled, not run on a tablet** (2026-11-27).
+
+Measured on the SM-X910 with kit r9 on 2026-11-26 at 22:07, with
+`swap_protocol_reset` at `N` and the Anker hub's charger pulled and plugged
+in again.  The tablet became the hub's source (and USB host), the hub asked
+for the source role, and the in-place swap completed: the tablet was sink,
+still host, charging at 5 V 3 A.  As expected without the reset the chip was
+deaf: the hub's capabilities came in, the tablet's Request got no Accept, and
+TCPM sent a Hard Reset 60 ms later.  Then two things went wrong.
+
+- **The tablet stayed host through the Hard Reset.**  After it the hub was
+  back at its default, Source/DFP (its capabilities' header 0x51a1), and TCPM
+  answered with `Data role mismatch, initiating error recovery`.  The
+  earlier retained-role patch kept every host role of a sink across a Hard
+  Reset, unless it came from a DR_Swap; this one came from the attach as
+  source.  Fixed in `tcpm-use-retained-sink-data-role.patch` and
+  `tcpm-request-dfp-as-sink-before-discovery.patch`: the sink is UFP after
+  every Hard Reset, as upstream has it (the data role section above).
+- **The port never came back.**  The error recovery opened CC (`CC opened
+  for TCPM's error recovery after a swap or Hard Reset`), the hub saw the
+  detach and dropped its VBUS, and 100 ms later the port toggled again, with
+  `CC_CNTL1` 0x40 and `CC_CNTL3` 0x80.  For 100 minutes nothing followed: the
+  chip read `CC_STATUS` 0 with the hub plugged in and powered, raised no
+  interrupt (the count stayed at 311, also across re-plugs) and had no VBUS,
+  since the hub powers only an Rd it sees.  An unbind and bind of the driver
+  brought it back: the hub was reported 112 ms after the toggling started,
+  9 V, then host by the tablet's own DR_Swap.  The difference is one step.
+  On the re-probe, and on every boot that reset a retained dock, PORT_RESET
+  found nothing attached and wrote `CC_CNTL1` 0x45 and `CC_CNTL3` 0x82 before
+  the toggling; the error recovery wrote 0x88 and then only the toggling's
+  0x80.
+  Samsung's driver turns CC on again with 0x82, never with 0x80, and writes
+  0x82 whenever its CC state machine reads `CC_DISABLE`.  The driver now
+  leaves a CC open of its own the same way (`CC on again through
+  Unattached.SNK after the driver opened it`), and clears the role bit only
+  after CC is off.  It leaves the chip in Unattached.SNK for 1 ms before the
+  toggling's 0x80: the re-probe had 0.5 ms between the two writes, and what
+  the chip needs has not been measured.  That the chip's CC logic stayed off
+  is read from Samsung's code; the chip's CC state (`PD_STATE0`) was not read
+  in the dead port.
+
+Behind the fix there is a net, `cc_self_heal`: when the port has toggled for
+5 s after a CC open of the driver's and the chip reports nothing, or the chip
+reports nothing on two samples in a row while VBUS comes from a partner, the
+driver writes to the chip what a re-probe writes on an empty port, without
+touching TCPM.  At most three times (about 5 s, 30 s and 2 min into the
+toggling) until a partner is seen, each with one warning that has the
+chip's CC state in it: `CC finds no partner since the driver opened it (CC
+status 0x00, status1 0x10, CC state 0x01): CC logic re-initialised, try 1 of
+3`, or `... though VBUS comes from one ...`.  `CC state 0x01` is
+`CC_DISABLE`, which would confirm the reading above.  The VBUS case would
+not have caught run 3 (no VBUS); the first one would have, 5 to 9 s in.
+
+The attach watchdog of August (an attach that the chip shows in `CC_STATUS`
+but announces with no interrupt) now compares the chip with what TCPM was
+told: while TCPM toggles and no `get_cc()` since its `start_toggling()` has
+reported a partner, a partner in `CC_STATUS` on two samples 0.5 s apart is
+reported to TCPM (`CC status 0x.. shows a partner TCPM was not told of;
+resyncing TCPM`).  Before, its memory of the last attach could hide the next
+one after a detach shorter than its 4 s period.  For an attachment that TCPM
+looks at and does not take it is repeated at the next sample, then after
+30 s and 2 min, and then every 10 min at the most.  While TCPM is attached,
+swapping or resetting it reads nothing.
 
 ### Asking: the swap back
 
@@ -435,6 +506,8 @@ Read like the others from the next attach, except where the table says
 | `/sys/module/sm5714_usbpd/parameters/swap_protocol_reset` | `Y` | Reset the PD Protocol Layer at the end of an in-place PR_Swap (each time).  `N`: the r8 behaviour, for comparison |
 | `/sys/module/sm5714_usbpd/parameters/recovery_detach` | `Y` | Open CC for TCPM's error recovery after an in-place swap or a Hard Reset (each time).  `N`: keep the attachment, as before |
 | `/sys/module/sm5714_usbpd/parameters/pr_swap_rd_delay_ms` | `0` | Wait before Rd in an in-place swap to sink (each time); at most 500, keep it at 450 or less |
+| `/sys/module/sm5714_usbpd/parameters/cc_reopen_via_snk` | `Y` | After a CC open of the driver's (the error recovery's detach), turn CC on again through Unattached.SNK, `0x45`/`0x82`, before toggling (each time).  `N`: `0x80` alone, the r9 sequence of run 3 |
+| `/sys/module/sm5714_usbpd/parameters/cc_self_heal` | `Y` | Re-initialise the CC logic, at most three times, when the port toggles and finds no partner 5 s after a CC open of the driver's, or with VBUS from a partner (each time).  `N`: leave such a port as it is; `Y` again acts at the next sample |
 
 `pr_swap_rd_delay_ms` is for one failure only: the tablet's PS_RDY goes out
 with `status: 0` but the partner's never comes.  Samsung changes the pull
@@ -496,10 +569,21 @@ gives the kernel's own time stamps, the ones the TCPM log uses.
    - `ERROR_RECOVERY`, `PORT_RESET`, and `CC opened for TCPM's error recovery
      after a swap or Hard Reset`, then `disconnected` within a few tens of
      ms: the net under both; one fresh attach, with PD.
-   - Repeat once with `echo N | sudo tee $P/swap_protocol_reset`: the r8
-     deafness up to the hub's Hard Reset is expected again, and then the
-     second line above and charging without a reconnect.  That run tests
-     the Hard Reset fix on purpose.  Set it back to `Y`.
+   - Repeat once with `echo N | sudo tee $P/swap_protocol_reset`: the
+     deafness after the swap is expected again, and then a Hard Reset, but
+     from TCPM, 60 ms after its Request got no Accept (`HARD_RESET_SEND`), not
+     from the hub.  On kit r9 that was run 3 (above): the tablet stayed host
+     through the reset, `Data role mismatch, initiating error recovery`, and
+     a dead port.  With the two fixes, expected: `SNK_HARD_RESET_SINK_OFF`
+     with `usb-role 2`, `PD protocol layer released after a Hard Reset
+     (PD_STATE3 0x06)`, the hub's capabilities with a header ending in `a1`
+     (Source/DFP), the 9 V contract, `Requesting DFP before discovery` and
+     the hub's Accept; no `Data role mismatch`, no `ERROR_RECOVERY`, no
+     reconnect.  If an error recovery comes all the same: `CC opened for
+     TCPM's error recovery after a swap or Hard Reset`, `CC on again through
+     Unattached.SNK after the driver opened it`, and the hub back within a
+     second; a `CC finds no partner since the driver opened it` warning means
+     the reopen did not do it and the self-heal did.  Set it back to `Y`.
 2. **The tablet's own PR_Swap**, with `swap_back_to_sink` and
    `sink_tx_ok_rp` at `N` (`echo N | sudo tee $P/swap_back_to_sink
    $P/sink_tx_ok_rp`, so that neither the question nor the hub gets there
@@ -521,8 +605,16 @@ gives the kernel's own time stamps, the ones the TCPM log uses.
    put it back.  The tablet becomes the source, and about 5 s after its
    `SRC_READY` the TCPM log shows `AMS GET_SOURCE_CAPABILITIES start`,
    `AMS_START -> GET_SOURCE_CAP`, `PD TX, header:` ending in `a7`
-   (Get_Source_Cap) and the answer.  Each kernel log line it can give,
-   prefixed `swap back to sink:`:
+   (Get_Source_Cap) and the answer.  **The Anker hub never gives the
+   first answer below.**  As the tablet's sink it answers Get_Source_Cap
+   with `5000 mV, 3000 mA [RUD]`, without `E`, also with its charger back in
+   (kit r9, 2026-11-26: run 2, `sink_tx_ok_rp` at `N`, the tablet stayed the
+   source), so the tablet never asks it for a PR_Swap and stays the hub's
+   source, asked again on the ladder.  The hub asks for the source role
+   itself when it has power, which needs `sink_tx_ok_rp` (step 1: 4 swaps of
+   4 clean with the defaults on kit r9, at 742, 917, 1712 and 1720 s).  The
+   first answer needs a partner whose 5 V PDO says `E`.  Each kernel log
+   line it can give, prefixed `swap back to sink:`:
    - `partner has external power (vSafe5V PDO 0x2e0190c8), requesting the
      sink role, PR_Swap 1 of 8` (the PDO as sent; 0x2e0190c8 is the 5 V 2 A
      `[RUDE]` one): the hub's supply is back.  Then `PR_Swap accepted, swap
@@ -849,13 +941,13 @@ enumerates nothing (see "Still open").
   counts as one of the three.  A dock that starts its own discovery right
   after the contract could use all three up that way.  Neither dock here
   does: none of the nine requests on record was discarded.
-- The earlier patch keeps every host role that did not come from a swap
-  across a Hard Reset received as sink, not only one taken over from a dock
-  that kept its role.  A tablet that attached as power source and became
-  sink through a PR_Swap is such a case: the dock goes back to host at the
-  reset, and its next message is a data role mismatch.  It needs a PR_Swap
-  that succeeds, which this controller does not manage today (next item); a
-  marker for the adopted role would close it.
+- A host role kept across a Hard Reset after an attach as source and a
+  PR_Swap, which was named here before, is what run 3 hit; the sink is now
+  UFP after every Hard Reset.  Not run on a tablet.
+- Whether the SM5714's CC logic really stays off after a CC open that is
+  turned on with 0x80 alone: `PD_STATE0` has never been read on these
+  boards.  A self-heal warning with `CC state 0x01` would show it.  The
+  reopen through Unattached.SNK and the self-heal have not run on a tablet.
 - PR_Swap on this controller: with one dock the CC connection drops in
   `PR_SWAP_SRC_SNK_SOURCE_OFF`.  Once the tablet is attached as power source
   there is still no way to become the sink short of re-plugging.

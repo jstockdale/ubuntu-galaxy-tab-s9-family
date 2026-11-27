@@ -452,6 +452,7 @@ class AppliedTests(unittest.TestCase):
             (tree / path).write_bytes(subprocess.run(
                 ["git", "-C", str(kernel_source()), "show", "HEAD:" + path],
                 check=True, capture_output=True).stdout)
+        cls.upstream = (tree / TCPM_C).read_text()
         cls.log = {}
         for marker, patch in FIELDS + LATER + [SWAP_BACK]:
             marked = TCPM_H if (marker, patch) in FIELDS + [SWAP_BACK] else TCPM_C
@@ -465,8 +466,10 @@ class AppliedTests(unittest.TestCase):
 
     def test_new_patches_apply_exactly(self):
         # Fuzz or an offset in a state machine full of look-alike case blocks
-        # is how a hunk lands in the wrong state.
-        for _, patch in FIELDS[2:] + LATER + [SWAP_BACK]:
+        # is how a hunk lands in the wrong state.  All eight: the two imported
+        # ones as well, since the second lost its Hard Reset hunk (and its
+        # offset of -9 lines with it).
+        for _, patch in FIELDS + LATER + [SWAP_BACK]:
             self.assertNotRegex(self.log[patch], r"fuzz|offset", patch)
 
     def test_header_declares_every_field_once(self):
@@ -514,7 +517,7 @@ class AppliedTests(unittest.TestCase):
     def test_attach_state_starts_over_on_detach(self):
         reset = function(self.source, "tcpm_reset_port")
         for line in ("port->sink_dfp_tries = 0;", "port->sink_dfp_done = false;",
-                     "port->sink_dfp_not_before = 0;", "port->data_role_swapped = false;"):
+                     "port->sink_dfp_not_before = 0;"):
             self.assertIn(line, reset)
         self.assertEqual(self.source.count("port->sink_dfp_tries = 0;"), 1)
         # A request queued for the old partner (upcoming_state, which the
@@ -580,30 +583,50 @@ class AppliedTests(unittest.TestCase):
         self.assertNotIn("swap_pending", timeout)
         self.assertEqual(self.source.count("port->send_discover_before_swap ="), 1)
 
-    def test_host_role_from_a_swap_does_not_outlive_a_hard_reset(self):
-        # A Hard Reset puts both ends back to their default data roles.  The
-        # earlier patch keeps a sink that is host in that role, for a partner
-        # that retained UFP; a role that came from a DR_Swap must go back, or
-        # the partner's next message is a data role mismatch.
+    def test_a_hard_reset_returns_a_sink_to_ufp_as_upstream_does(self):
+        # A Hard Reset puts both ends back to their default data roles,
+        # Source/DFP and Sink/UFP, sent or received (both run
+        # HARD_RESET_START).  The series kept a sink in the host role across
+        # it with adopt_retained_source_ufp, unless the role came from a
+        # DR_Swap: a sink that had become one through a PR_Swap from
+        # Source/DFP was still host, the partner's first message after the
+        # reset was a data role mismatch and the port went to error recovery
+        # (SM-X910, Anker hub, 2026-11-26, swap_protocol_reset=N).  Both
+        # Hard Reset states are upstream's again, byte for byte.
         machine = function(self.source, "run_state_machine")
+        upstream = function(self.upstream, "run_state_machine")
+        for label, following in (("SNK_HARD_RESET_SINK_OFF", "SNK_HARD_RESET_WAIT_VBUS"),
+                                 ("SRC_HARD_RESET_VBUS_OFF", "SRC_HARD_RESET_VBUS_ON")):
+            with self.subTest(label):
+                self.assertEqual(case(machine, label, following), case(upstream, label, following))
         sink_off = case(machine, "SNK_HARD_RESET_SINK_OFF", "SNK_HARD_RESET_WAIT_VBUS")
-        self.assertRegex(sink_off,
-                         r"port->tcpc->adopt_retained_source_ufp &&\n"
-                         r"\s+port->data_role == TYPEC_HOST &&\n"
-                         r"\s+!\(port->tcpc->request_dfp_as_sink &&\n"
-                         r"\s+port->data_role_swapped\) \?\n"
-                         r"\s+TYPEC_HOST : tcpm_data_role_for_sink\(port\)\);\n"
-                         r"\t+port->data_role_swapped = false;")
-        # Set by a completed swap and by nothing else; cleared wherever the
-        # role goes back to a default: detach and both hard reset paths.
-        self.assertEqual(self.source.count("port->data_role_swapped = true;"), 1)
-        self.assertIn("port->data_role_swapped = true;",
-                      case(machine, "DR_SWAP_CHANGE_DR", "FR_SWAP_SEND"))
-        self.assertEqual(self.source.count("port->data_role_swapped = false;"), 3)
-        self.assertIn("port->data_role_swapped = false;",
-                      case(machine, "SRC_HARD_RESET_VBUS_OFF", "SRC_HARD_RESET_VBUS_ON"))
-        self.assertIn("port->data_role_swapped = false;",
-                      function(self.source, "tcpm_reset_port"))
+        self.assertRegex(sink_off, r"tcpm_set_roles\(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SINK,\n"
+                                   r"\t+ +tcpm_data_role_for_sink\(port\)\);")
+        self.assertNotIn("TYPEC_HOST", sink_off)
+        # Nothing is left of the exception that decided which host role to
+        # keep.
+        self.assertNotIn("data_role_swapped", self.source)
+        for _, patch in FIELDS + LATER + [SWAP_BACK]:
+            self.assertNotIn("data_role_swapped", (PATCHES / patch).read_text(), patch)
+
+    def test_a_partner_that_kept_ufp_is_taken_back_as_host_on_its_first_message(self):
+        # The reboot case the retained-role patches exist for: a dock that
+        # kept Source/UFP across a Hard Reset finds the sink UFP after it; its
+        # first message then has the port adopt DFP in place, without an
+        # error recovery.  Only as Sink/UFP, towards a Source/UFP message,
+        # and only with the opt-in.
+        rx = function(self.source, "tcpm_pd_rx_handler")
+        self.assertRegex(rx, r"if \(port->tcpc->adopt_retained_source_ufp &&\n"
+                             r"\t+ +port->pwr_role == TYPEC_SINK &&\n"
+                             r"\t+ +port->data_role == TYPEC_DEVICE &&\n"
+                             r"\t+ +\(header & PD_HEADER_PWR_ROLE\) &&\n"
+                             r"\t+ +!\(header & PD_HEADER_DATA_ROLE\)\) \{\n")
+        self.assertRegex(rx, r"ret = tcpm_set_roles\(port, true, TYPEC_STATE_USB,\n"
+                             r"\t+ +TYPEC_SINK, TYPEC_HOST\);\n\t+if \(!ret\)\n\t+goto process_message;")
+        # And the attach-time restore of a retained Sink/DFP role stays.
+        attach = function(self.source, "tcpm_snk_attach")
+        self.assertIn("port->tcpc->consume_retained_sink_dfp(port->tcpc);", attach)
+        self.assertIn("Restoring DFP for retained Source/UFP attachment", attach)
 
     def test_try_snk_waits_on_in_its_own_state(self):
         machine = function(self.source, "run_state_machine")
@@ -1450,10 +1473,15 @@ class SwapBackDriverTests(unittest.TestCase):
         self.assertNotIn("restore_cc_role", self.source)
         # Toggled only by the two in-place swaps.
         self.assertEqual(self.source.count("sm5714_usbpd_flip_cc_role(sm);"), 2)
-        # Cleared where the driver forgets a swap or forces a mode: CC open,
-        # toggling, the error recovery's detach, both forced modes, and probe.
+        # Cleared where the driver forgets a swap or forces a mode: CC open
+        # (set_cc(OPEN) and the error recovery's detach, both through
+        # sm5714_usbpd_open_cc()), toggling, both forced modes, the self-heal
+        # and probe.
         set_cc = function(self.source, "sm5714_usbpd_set_cc")
-        self.assertEqual(set_cc.count("sm5714_usbpd_clear_cc_role(sm);"), 4)
+        self.assertEqual(set_cc.count("sm5714_usbpd_clear_cc_role(sm);"), 2)
+        self.assertEqual(set_cc.count("sm5714_usbpd_open_cc(sm);"), 2)
+        self.assertIn("return sm5714_usbpd_clear_cc_role(sm);", function(self.source, "sm5714_usbpd_open_cc"))
+        self.assertIn("sm5714_usbpd_clear_cc_role(sm);", function(self.source, "sm5714_usbpd_restart_cc"))
         for forced in ("SM5714_REG_CC_CNTL1, 0x45);", "SM5714_REG_CC_CNTL1,\n\t\t\t\t   0x49 |"):
             at = set_cc.index(forced)
             self.assertIn("sm5714_usbpd_clear_cc_role(sm);", set_cc[set_cc.rindex("break;", 0, at):at])
@@ -1524,8 +1552,9 @@ class SwapBackDriverTests(unittest.TestCase):
         self.assertLess(rx.index("SM5714_PD_RESET_DONE"), rx.index("SM5714_REG_PD_CNTL1"))
         self.assertIn("#define  SM5714_PD_STATE3_RESET_WAIT\tGENMASK(2, 1)", self.source)
         self.assertIn("#define  SM5714_PD_RESET_DONE\t\tBIT(0)", self.source)
-        # The same test as at probe (0x06).
-        self.assertIn("if (state3 & 0x06) {", function(self.source, "sm5714_usbpd_init"))
+        # The same test as at probe (0x06), in the register init that
+        # tcpc->init() and the self-heal share.
+        self.assertIn("if (state3 & 0x06) {", function(self.source, "sm5714_usbpd_init_regs"))
 
     def test_an_error_recovery_after_a_swap_or_hard_reset_is_a_detach(self):
         self.param("recovery_detach", "bool", " = true")
@@ -1533,19 +1562,20 @@ class SwapBackDriverTests(unittest.TestCase):
         rd = set_cc[set_cc.index("case TYPEC_CC_RD:"):set_cc.index("case TYPEC_CC_RP_DEF:")]
         self.assertRegex(rd, r"SM5714_CC_ATTACH_SOURCE\) \{\n(?:\t+ ?/?\*.*\n)+"
                              r"\t+if \(!sm->recovery_detach_armed \|\| !recovery_detach\)\n\t+break;\n"
-                             r"\t+sm5714_usbpd_clear_swap\(sm\);\n"
-                             r"\t+sm->recovery_detach_armed = false;\n"
-                             r"\t+sm5714_usbpd_clear_cc_role\(sm\);\n"
-                             r"\t+ret = regmap_write\(sm->regmap, SM5714_REG_CC_CNTL3, 0x88\);\n")
+                             r"\t+ret = sm5714_usbpd_open_cc\(sm\);\n")
+        opened = function(self.source, "sm5714_usbpd_open_cc")
+        self.assertRegex(opened, r"^\tint ret;\n\n\tsm5714_usbpd_clear_swap\(sm\);\n"
+                                 r"\tsm->recovery_detach_armed = false;\n"
+                                 r"\tret = regmap_write\(sm->regmap, SM5714_REG_CC_CNTL3, 0x88\);\n")
         # Armed by both pull changes and by a Hard Reset either way; cleared
-        # by a detach the chip saw, by CC open, by its own use and whenever
-        # the port toggles again.
+        # by a detach the chip saw, by a CC open (its own use included) and
+        # whenever the port toggles again.
         self.assertEqual(self.source.count("sm->recovery_detach_armed = true;"), 4)
-        self.assertEqual(self.source.count("sm->recovery_detach_armed = false;"), 4)
+        self.assertEqual(self.source.count("sm->recovery_detach_armed = false;"), 3)
         irq = function(self.source, "sm5714_usbpd_irq")
         self.assertRegex(irq, r"if \(intr\[0\] & SM5714_INT1_DETACH\)\n\t\tsm->recovery_detach_armed = false;\n"
                               r"\n\tmutex_unlock\(&sm->lock\);")
-        self.assertIn("sm->recovery_detach_armed = false;",
+        self.assertIn("ret = sm5714_usbpd_open_cc(sm);",
                       set_cc[set_cc.index("case TYPEC_CC_OPEN:"):set_cc.index("case TYPEC_CC_RD:")])
 
     def test_toggling_again_disarms_the_detach_for_every_port_type(self):
@@ -2249,6 +2279,913 @@ class SwapBackBehaviourTests(unittest.TestCase):
         self.assertEqual(self.ending(trace)["stopped"], "0")
 
 
+class CcRecoveryDriverTests(unittest.TestCase):
+    """The SM5714 after a CC open of its own (the recovery detach that left
+    the SM-X910's port dead on 2026-11-26), the self-heal, and the attach
+    watchdog that compares the chip with what TCPM was told."""
+
+    def setUp(self):
+        self.source = DRIVER.read_text()
+
+    def param(self, name):
+        self.assertIn("static bool %s = true;" % name, self.source)
+        self.assertIn("module_param(%s, bool, 0644);" % name, self.source)
+
+    def test_a_cc_open_is_left_through_unattached_snk(self):
+        # Samsung turns CC on again with 0x82, never with 0x80; the probe path
+        # and every docked boot go 0x88, 0x45/0x82, 0x40/0x80.  The runtime
+        # path went 0x88, 0x40/0x80, and the chip detected nothing for 100
+        # minutes.
+        self.param("cc_reopen_via_snk")
+        reopen = function(self.source, "sm5714_usbpd_reopen_cc")
+        self.assertRegex(reopen, r"\tif \(!sm->cc_open \|\| !READ_ONCE\(cc_reopen_via_snk\)\)\n\t\treturn 0;\n\n"
+                                 r"\tret = regmap_write\(sm->regmap, SM5714_REG_CC_CNTL1, 0x45\);\n"
+                                 r"\tif \(!ret\)\n\t\tret = regmap_write\(sm->regmap, SM5714_REG_CC_CNTL3, 0x82\);\n")
+        toggling = function(self.source, "sm5714_usbpd_start_toggling")
+        order = [toggling.index(s) for s in ("sm5714_usbpd_clear_cc_role(sm);",
+                                             "ret = sm5714_usbpd_reopen_cc(sm);",
+                                             "SM5714_REG_CC_CNTL1, val);",
+                                             "SM5714_REG_CC_CNTL3, 0x80);",
+                                             "sm->cc_open = false;")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(self.source.count("sm5714_usbpd_reopen_cc(sm)"), 1)
+        # The chip is left in Unattached.SNK for no less than the 0.5 ms the
+        # re-probe of 2026-11-26 had between its 0x82 and its 0x80, here and in
+        # the self-heal, and nowhere else.
+        self.assertIn("#define SM5714_CC_REOPEN_US\t\t1000", self.source)
+        dwell = "\tusleep_range(SM5714_CC_REOPEN_US, 2 * SM5714_CC_REOPEN_US);\n"
+        self.assertEqual(self.source.count("usleep_range("), 2)
+        self.assertIn("SM5714_REG_CC_CNTL3, 0x82);\n\tif (ret)\n\t\treturn ret;\n" + dwell, reopen)
+        self.assertIn("SM5714_REG_CC_CNTL3, 0x82);\n\tif (ret)\n\t\treturn ret;\n" + dwell +
+                      "\tret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1, 0x40);\n",
+                      function(self.source, "sm5714_usbpd_restart_cc"))
+        # The open: CC off first, the role bit after it (not an in-place swap
+        # back of its own while still attached), and the self-heal armed.
+        opened = function(self.source, "sm5714_usbpd_open_cc")
+        order = [opened.index(s) for s in ("SM5714_REG_CC_CNTL3, 0x88);", "sm->cc_open = true;",
+                                           "sm->heal_armed = true;",
+                                           "return sm5714_usbpd_clear_cc_role(sm);")]
+        self.assertEqual(order, sorted(order))
+        # Every 0x88 the driver writes marks the open: the helper's and the
+        # probe's retained-dock reset.
+        self.assertEqual(self.source.count("SM5714_REG_CC_CNTL3, 0x88);"), 2)
+        probe = function(self.source, "sm5714_usbpd_probe")
+        at = probe.index("SM5714_REG_CC_CNTL3, 0x88);")
+        self.assertLess(probe.index("sm->cc_open = true;", at), probe.index("msleep(50);", at))
+        # And every CC_CNTL3 write without bit 3 clears it: both forced modes,
+        # toggling and the self-heal.
+        set_cc = function(self.source, "sm5714_usbpd_set_cc")
+        for forced in ("0x82);", "0x81);"):
+            at = set_cc.index("SM5714_REG_CC_CNTL3,\n\t\t\t\t\t   " + forced)
+            self.assertTrue(set_cc[at:].split("break;")[0].rstrip().endswith("sm->cc_open = false;"), forced)
+        self.assertTrue(function(self.source, "sm5714_usbpd_restart_cc").rstrip().endswith(
+            "if (!ret)\n\t\tsm->cc_open = false;\n\treturn ret;"))
+
+    def test_the_register_init_is_one_and_the_same(self):
+        init = function(self.source, "sm5714_usbpd_init")
+        self.assertRegex(init, r"\tmutex_lock\(&sm->lock\);\n\tret = sm5714_usbpd_init_regs\(sm\);\n"
+                               r"\tmutex_unlock\(&sm->lock\);\n\treturn ret;")
+        regs = function(self.source, "sm5714_usbpd_init_regs")
+        order = [regs.index(s) for s in ("SM5714_REG_CORR_CNTL5, 0x00);", "SM5714_REG_CORR_CNTL4, 0x00);",
+                                         "SM5714_REG_PD_STATE3, &state3);", "SM5714_REG_RX_BUF_ST, 0x10);",
+                                         "if (state3 & 0x06) {", "SM5714_REG_PD_CNTL4, 0x01);",
+                                         "regmap_bulk_read(sm->regmap, SM5714_REG_INT1,",
+                                         "regmap_bulk_write(sm->regmap, SM5714_REG_MASK1,")]
+        self.assertEqual(order, sorted(order))
+        self.assertRegex(self.source, r"static const u8 sm5714_usbpd_masks\[5\] = \{\n\t0xe6,[^\n]*\n"
+                                      r"\t0xcf,[^\n]*\n\t0xff,\n\t0x08,[^\n]*\n\t0xff,\n\};")
+        # The self-heal is what a re-probe writes on an empty port, in order.
+        restart = function(self.source, "sm5714_usbpd_restart_cc")
+        order = [restart.index(s) for s in ("ret = sm5714_usbpd_init_regs(sm);",
+                                            "SM5714_REG_CC_CNTL1, 0x45);", "SM5714_REG_CC_CNTL3, 0x82);",
+                                            "SM5714_REG_CC_CNTL1, 0x40);", "SM5714_REG_CC_CNTL3, 0x80);")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(self.source.count("sm5714_usbpd_restart_cc(sm)"), 1)
+        self.assertIn("heal = !sm5714_usbpd_restart_cc(sm);", function(self.source, "sm5714_usbpd_cc_watch_work"))
+
+    def test_the_watchdog_compares_with_what_tcpm_was_told(self):
+        # No edge memories any more: the stale ones hid the attach after a
+        # forced detach shorter than a sample period.
+        for gone in ("irq_saw_attach", "watch_saw_attach"):
+            self.assertNotIn(gone, self.source)
+        # TCPM toggles from a successful start_toggling() until it calls
+        # set_cc() or set_roles(); a get_cc() that reports a partner is TCPM
+        # being told.
+        self.assertEqual(self.source.count("sm->toggling = true;"), 1)
+        self.assertIn("sm->toggling = true;", function(self.source, "sm5714_usbpd_start_toggling"))
+        self.assertEqual(self.source.count("sm->toggling = false;"), 2)
+        for name in ("sm5714_usbpd_set_cc", "sm5714_usbpd_set_roles"):
+            self.assertIn("sm->toggling = false;", function(self.source, name))
+        self.assertEqual(self.source.count("sm->partner_seen = true;"), 1)
+        self.assertIn("sm->partner_seen = true;", function(self.source, "sm5714_usbpd_note_cc"))
+        get_cc = function(self.source, "sm5714_usbpd_get_cc")
+        self.assertRegex(get_cc, r"ret = regmap_read\(sm->regmap, SM5714_REG_CC_STATUS, &cc\);\n"
+                                 r"\tif \(ret\)\n\t\treturn ret;\n\tsm5714_usbpd_note_cc\(sm, cc\);\n")
+        # A partner is what get_cc() reports as one, in both places.
+        attached = function(self.source, "sm5714_usbpd_cc_attached")
+        for kind in ("SOURCE", "SINK", "AUDIO"):
+            self.assertIn("case SM5714_CC_ATTACH_%s:" % kind, attached)
+            self.assertIn("case SM5714_CC_ATTACH_%s:" % kind, get_cc)
+        # Nothing is read before the watchdog knows that TCPM toggles and has
+        # not been told of a partner, and everything under the lock.
+        watch = function(self.source, "sm5714_usbpd_cc_watch_work")
+        guard = watch.index("if (!sm->toggling || sm->partner_seen) {")
+        self.assertLess(watch.index("mutex_lock(&sm->lock);"), guard)
+        self.assertLess(guard, watch.index("regmap_read("))
+        self.assertLess(watch.rindex("regmap_read("), watch.index("unlock:\n\tmutex_unlock(&sm->lock);"))
+        self.assertLess(watch.index("unlock:\n\tmutex_unlock(&sm->lock);"), watch.index("tcpm_cc_change(sm->port);"))
+        # Two samples SM5714_CC_CONFIRM_MS apart, and the waits between
+        # resyncs of an attachment TCPM did not take only grow, to 10 min.
+        self.assertIn("#define SM5714_CC_CONFIRM_MS\t\t500", self.source)
+        waits = [int(n) for n in re.search(r"sm5714_resync_wait_ms\[\] = \{ ([0-9, ]+) \};",
+                                           self.source).group(1).split(", ")]
+        self.assertEqual(waits, sorted(waits))
+        self.assertEqual((waits[0], waits[-1]), (0, 600000))
+        # The resyncs come back on a change the chip or TCPM shows.
+        self.assertIn("sm->resyncs = 0;", function(self.source, "sm5714_usbpd_irq"))
+        self.assertIn("if (attached)\n\t\tsm->resyncs = 0;", function(self.source, "sm5714_usbpd_set_roles"))
+
+    def test_the_self_heal_is_bounded(self):
+        self.param("cc_self_heal")
+        waits = [int(n) for n in re.search(r"sm5714_heal_wait_ms\[\] = \{ ([0-9, ]+) \};",
+                                           self.source).group(1).split(", ")]
+        self.assertEqual(len(waits), 3)
+        self.assertEqual(waits[0], 5000)
+        watch = function(self.source, "sm5714_usbpd_cc_watch_work")
+        self.assertRegex(watch, r"if \(!why \|\| !READ_ONCE\(cc_self_heal\) \|\|\n"
+                                r"\t+ +sm->heal_tries >= ARRAY_SIZE\(sm5714_heal_wait_ms\) \|\|\n"
+                                r"\t+ +time_before\(jiffies, sm->heal_after\)\)\n\t+goto unlock;")
+        # Reset only where the chip detects again: a partner in get_cc() and
+        # a fresh CC open of the driver's.
+        self.assertEqual(self.source.count("sm->heal_tries = 0;"), 2)
+        self.assertIn("sm->heal_tries = 0;", function(self.source, "sm5714_usbpd_note_cc"))
+        self.assertIn("sm->heal_tries = 0;", function(self.source, "sm5714_usbpd_open_cc"))
+
+
+# The driver itself on the host, around a model of the chip's CC logic, of the
+# partner and of the few TCPM steps that matter here (fake_kernel.h stands in
+# for the kernel headers).  The model has 0x88 turn the CC logic off and only
+# a forced state (0x82, 0x81) turn it on again, the reading of 2026-11-26;
+# the scenario short_detach_missed_irq has 0x80 do it too.  Time in ms.
+FAKE_KERNEL_H = r"""/* Just enough of the kernel API for sm5714_usbpd.c on the host. */
+#ifndef FAKE_KERNEL_H
+#define FAKE_KERNEL_H
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint16_t __le16;
+typedef uint32_t __le32;
+
+#define BIT(n) (1U << (n))
+#define GENMASK(h, l) (((~0U) << (l)) & (~0U >> (31 - (h))))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+#define EIO 5
+#define ENOMEM 12
+#define EINVAL 22
+#define EOPNOTSUPP 95
+#define GFP_KERNEL 0
+#define IS_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
+#define PTR_ERR(p) ((long)(p))
+
+#define module_param(n, t, p)
+#define MODULE_PARM_DESC(n, d)
+#define MODULE_DEVICE_TABLE(a, b)
+#define MODULE_DESCRIPTION(d)
+#define MODULE_LICENSE(l)
+#define module_i2c_driver(d)
+
+extern unsigned long jiffies;
+#define msecs_to_jiffies(m) ((unsigned long)(m))
+#define time_before(a, b) ((long)((a) - (b)) < 0)
+void msleep(unsigned int ms);
+/* Under a jiffy (1 ms here): the clock stays where it is, the call is counted */
+extern int usleeps;
+static inline void usleep_range(unsigned long min, unsigned long max)
+{ (void)min; (void)max; usleeps++; }
+
+struct mutex { int held; };
+void mutex_init(struct mutex *m);
+void mutex_lock(struct mutex *m);
+void mutex_unlock(struct mutex *m);
+
+struct work_struct { int unused; };
+struct delayed_work {
+	struct work_struct work;
+	long due;
+	void (*fn)(struct work_struct *);
+};
+#define to_delayed_work(w) container_of(w, struct delayed_work, work)
+#define INIT_DELAYED_WORK(d, f) ((d)->fn = (f), (d)->due = -1)
+#define INIT_DEFERRABLE_WORK(d, f) INIT_DELAYED_WORK(d, f)
+extern int system_dfl_wq;
+bool queue_delayed_work(int wq, struct delayed_work *d, unsigned long delay);
+bool mod_delayed_work(int wq, struct delayed_work *d, unsigned long delay);
+bool cancel_delayed_work(struct delayed_work *d);
+bool cancel_delayed_work_sync(struct delayed_work *d);
+
+struct device { void *drvdata; };
+struct fwnode_handle { int unused; };
+struct i2c_client { struct device dev; int irq; };
+struct gpio_desc;
+#define GPIOD_OUT_LOW 0
+void fake_log(const char *kind, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+#define dev_info(dev, ...) fake_log("I", __VA_ARGS__)
+#define dev_warn(dev, ...) fake_log("W", __VA_ARGS__)
+#define dev_err_probe(dev, err, ...) (fake_log("E", __VA_ARGS__), (int)(err))
+#define dev_name(dev) "8-0033"
+static inline void *dev_get_drvdata(struct device *d) { return d->drvdata; }
+static inline void i2c_set_clientdata(struct i2c_client *c, void *p) { c->dev.drvdata = p; }
+static inline void *i2c_get_clientdata(struct i2c_client *c) { return c->dev.drvdata; }
+static inline void *devm_kzalloc(struct device *d, size_t n, int gfp) { (void)d; (void)gfp; return calloc(1, n); }
+static inline struct gpio_desc *devm_gpiod_get_optional(struct device *d, const char *n, int f)
+{ (void)d; (void)n; (void)f; return NULL; }
+static inline void gpiod_set_value_cansleep(struct gpio_desc *g, int v) { (void)g; (void)v; }
+extern struct fwnode_handle fake_fwnode;
+static inline struct fwnode_handle *device_get_named_child_node(struct device *d, const char *n)
+{ (void)d; (void)n; return &fake_fwnode; }
+static inline void fwnode_handle_put(struct fwnode_handle *f) { (void)f; }
+static inline bool device_property_read_bool(struct device *d, const char *n) { (void)d; (void)n; return false; }
+static inline void device_init_wakeup(struct device *d, bool w) { (void)d; (void)w; }
+static inline bool device_may_wakeup(struct device *d) { (void)d; return false; }
+static inline int enable_irq_wake(int irq) { (void)irq; return 0; }
+static inline int disable_irq_wake(int irq) { (void)irq; return 0; }
+
+typedef int irqreturn_t;
+#define IRQ_NONE 0
+#define IRQ_HANDLED 1
+#define IRQF_ONESHOT 1
+#define IRQF_TRIGGER_LOW 2
+int devm_request_threaded_irq(struct device *d, int irq, void *h,
+			      irqreturn_t (*thread)(int, void *), int flags,
+			      const char *name, void *data);
+
+struct of_device_id { const char *compatible; };
+struct dev_pm_ops { int (*suspend)(struct device *); int (*resume)(struct device *); };
+#define DEFINE_SIMPLE_DEV_PM_OPS(name, s, r) \
+	const struct dev_pm_ops name = { .suspend = (s), .resume = (r) }
+#define pm_sleep_ptr(p) (p)
+struct i2c_driver {
+	struct {
+		const char *name;
+		const struct of_device_id *of_match_table;
+		const struct dev_pm_ops *pm;
+	} driver;
+	int (*probe)(struct i2c_client *);
+	void (*remove)(struct i2c_client *);
+};
+
+struct regmap { int unused; };
+#define REGCACHE_NONE 0
+struct regmap_config { int reg_bits, val_bits, max_register, cache_type; };
+struct regmap *devm_regmap_init_i2c(struct i2c_client *c, const struct regmap_config *cfg);
+int regmap_read(struct regmap *m, unsigned int reg, unsigned int *val);
+int regmap_write(struct regmap *m, unsigned int reg, unsigned int val);
+int regmap_update_bits(struct regmap *m, unsigned int reg, unsigned int mask, unsigned int val);
+int regmap_bulk_read(struct regmap *m, unsigned int reg, void *buf, size_t n);
+int regmap_bulk_write(struct regmap *m, unsigned int reg, const void *buf, size_t n);
+
+#define PD_MAX_PAYLOAD 7
+struct pd_message { __le16 header; __le32 payload[PD_MAX_PAYLOAD]; };
+#define pd_header_cnt_le(h) (((h) >> 12) & 7)
+#define pd_header_type_le(h) ((h) & 0x1f)
+#define PD_CTRL_ACCEPT 3
+#define PD_CTRL_PS_RDY 6
+#define PD_CTRL_PR_SWAP 10
+
+enum typec_cc_status { TYPEC_CC_OPEN, TYPEC_CC_RA, TYPEC_CC_RD, TYPEC_CC_RP_DEF,
+		       TYPEC_CC_RP_1_5, TYPEC_CC_RP_3_0 };
+enum typec_cc_polarity { TYPEC_POLARITY_CC1, TYPEC_POLARITY_CC2 };
+enum typec_role { TYPEC_SINK, TYPEC_SOURCE };
+enum typec_data_role { TYPEC_DEVICE, TYPEC_HOST };
+enum typec_port_type { TYPEC_PORT_SRC, TYPEC_PORT_SNK, TYPEC_PORT_DRP };
+enum tcpm_transmit_type { TCPC_TX_SOP, TCPC_TX_SOP_PRIME, TCPC_TX_SOP_PRIME_PRIME,
+			  TCPC_TX_SOP_DEBUG_PRIME, TCPC_TX_SOP_DEBUG_PRIME_PRIME,
+			  TCPC_TX_HARD_RESET, TCPC_TX_CABLE_RESET, TCPC_TX_BIST_MODE_2 };
+enum tcpm_transmit_status { TCPC_TX_SUCCESS, TCPC_TX_DISCARDED, TCPC_TX_FAILED };
+struct tcpm_port;
+struct tcpc_dev {
+	struct fwnode_handle *fwnode;
+	bool adopt_retained_source_ufp;
+	bool (*consume_retained_sink_dfp)(struct tcpc_dev *dev);
+	bool request_dfp_as_sink;
+	unsigned int try_snk_extra_wait_ms;
+	bool request_sink_as_source;
+	int (*init)(struct tcpc_dev *dev);
+	int (*get_vbus)(struct tcpc_dev *dev);
+	int (*get_current_limit)(struct tcpc_dev *dev);
+	int (*set_cc)(struct tcpc_dev *dev, enum typec_cc_status cc);
+	int (*get_cc)(struct tcpc_dev *dev, enum typec_cc_status *cc1,
+		      enum typec_cc_status *cc2);
+	int (*set_polarity)(struct tcpc_dev *dev, enum typec_cc_polarity polarity);
+	int (*set_vconn)(struct tcpc_dev *dev, bool on);
+	int (*set_vbus)(struct tcpc_dev *dev, bool on, bool charge);
+	int (*set_current_limit)(struct tcpc_dev *dev, u32 max_ma, u32 mv);
+	int (*set_pd_rx)(struct tcpc_dev *dev, bool on);
+	int (*set_roles)(struct tcpc_dev *dev, bool attached, enum typec_role role,
+			 enum typec_data_role data);
+	int (*start_toggling)(struct tcpc_dev *dev, enum typec_port_type port_type,
+			      enum typec_cc_status cc);
+	int (*pd_transmit)(struct tcpc_dev *dev, enum tcpm_transmit_type type,
+			   const struct pd_message *msg, unsigned int negotiated_rev);
+};
+struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc);
+void tcpm_unregister_port(struct tcpm_port *port);
+void tcpm_cc_change(struct tcpm_port *port);
+void tcpm_vbus_change(struct tcpm_port *port);
+void tcpm_pd_hard_reset(struct tcpm_port *port);
+void tcpm_pd_receive(struct tcpm_port *port, const struct pd_message *msg,
+		     enum tcpm_transmit_type sop);
+void tcpm_pd_transmit_complete(struct tcpm_port *port, enum tcpm_transmit_status status);
+#endif
+"""
+
+DRIVER_HARNESS = r"""/*
+ * sm5714_usbpd.c on the host: a model of the chip's CC logic, of the
+ * partner, and of the few TCPM steps that matter here.  Time is in ms (one
+ * jiffy each).  Trace lines: "<kind> <ms> <text>".
+ */
+#include "fake_kernel.h"
+
+unsigned long jiffies = 100000;
+int usleeps;
+int system_dfl_wq;
+struct fwnode_handle fake_fwnode;
+static struct regmap the_regmap;
+
+/* ---- the chip ---- */
+enum partner { P_NONE, P_HUB, P_LEGACY, P_AUDIO };
+static u8 regs[256];
+static enum partner partner;
+static bool engine_off;		/* CC logic disabled (CC_CNTL3 bit 3 or stuck) */
+static bool model_80_revives;	/* does 0x80 alone leave a CC open? */
+static bool model_dead;		/* nothing revives the CC logic */
+static bool die_on_open;	/* a CC open kills the CC logic for good */
+static bool irq_dead;		/* the chip raises no attach/detach interrupt */
+static bool was_attached;
+static int reads_watch, reads_other, in_watch, cc_changes, heals;
+
+static u8 cc_status(void)
+{
+	if (engine_off || model_dead)
+		return 0;
+	switch (partner) {
+	case P_HUB: case P_LEGACY: return 0x09;	/* source, Rp 1.5 A */
+	case P_AUDIO: return 0x03;
+	default: return 0;
+	}
+}
+
+static bool vbus(void)
+{
+	if (partner == P_LEGACY)
+		return true;
+	return partner == P_HUB && cc_status();	/* the hub powers a seen Rd */
+}
+
+static void chip_update(void)
+{
+	bool now = cc_status() != 0;
+
+	if (now != was_attached && !irq_dead)
+		regs[0x01] |= now ? 0x08 : 0x10;
+	was_attached = now;
+}
+
+int regmap_read(struct regmap *m, unsigned int reg, unsigned int *val)
+{
+	(void)m;
+	if (in_watch)
+		reads_watch++;
+	else
+		reads_other++;
+	switch (reg) {
+	case 0x28: *val = cc_status(); break;
+	case 0x0b: *val = (vbus() ? 0x01 : 0) | (cc_status() ? 0x08 : 0x10); break;
+	case 0xd5: *val = (engine_off || model_dead) ? 0x01 : 0x05; break;
+	default: *val = regs[reg]; break;
+	}
+	return 0;
+}
+
+int regmap_write(struct regmap *m, unsigned int reg, unsigned int val)
+{
+	(void)m;
+	regs[reg] = val;
+	if (reg == 0x2b) {
+		if (val & 0x08) {
+			engine_off = true;
+			model_dead |= die_on_open;
+		}
+		else if ((val & 3) || model_80_revives)
+			engine_off = false;
+		printf("C %lu CC_CNTL3=0x%02x usleeps=%d\n", jiffies, val, usleeps);
+	}
+	chip_update();
+	return 0;
+}
+
+int regmap_update_bits(struct regmap *m, unsigned int reg, unsigned int mask, unsigned int val)
+{
+	unsigned int old;
+
+	regmap_read(m, reg, &old);
+	if (((old & ~mask) | (val & mask)) == old)
+		return 0;
+	return regmap_write(m, reg, (old & ~mask) | (val & mask));
+}
+
+int regmap_bulk_read(struct regmap *m, unsigned int reg, void *buf, size_t n)
+{
+	u8 *b = buf;
+	size_t i;
+
+	(void)m;
+	for (i = 0; i < n; i++) {
+		b[i] = regs[reg + i];
+		if (reg + i >= 0x01 && reg + i <= 0x05)
+			regs[reg + i] = 0;	/* read to clear */
+	}
+	return 0;
+}
+
+int regmap_bulk_write(struct regmap *m, unsigned int reg, const void *buf, size_t n)
+{
+	(void)m;
+	memcpy(&regs[reg], buf, n);
+	return 0;
+}
+
+struct regmap *devm_regmap_init_i2c(struct i2c_client *c, const struct regmap_config *cfg)
+{
+	(void)c; (void)cfg;
+	return &the_regmap;
+}
+
+/* ---- kernel bits ---- */
+void fake_log(const char *kind, const char *fmt, ...)
+{
+	va_list args;
+
+	printf("%s %lu ", kind, jiffies);
+	va_start(args, fmt);
+	vprintf(fmt, args);
+	va_end(args);
+}
+
+void msleep(unsigned int ms) { jiffies += ms; }
+
+void mutex_init(struct mutex *m) { m->held = 0; }
+void mutex_lock(struct mutex *m)
+{
+	if (m->held) {
+		printf("X %lu recursive mutex_lock\n", jiffies);
+		exit(3);
+	}
+	m->held = 1;
+}
+void mutex_unlock(struct mutex *m)
+{
+	if (!m->held) {
+		printf("X %lu unlock of a free mutex\n", jiffies);
+		exit(3);
+	}
+	m->held = 0;
+}
+
+bool queue_delayed_work(int wq, struct delayed_work *d, unsigned long delay)
+{
+	(void)wq;
+	if (d->due >= 0)
+		return false;
+	d->due = jiffies + delay;
+	return true;
+}
+bool mod_delayed_work(int wq, struct delayed_work *d, unsigned long delay)
+{
+	(void)wq;
+	d->due = jiffies + delay;
+	return true;
+}
+bool cancel_delayed_work(struct delayed_work *d) { d->due = -1; return true; }
+bool cancel_delayed_work_sync(struct delayed_work *d) { d->due = -1; return true; }
+
+static irqreturn_t (*irq_thread)(int, void *);
+static void *irq_data;
+int devm_request_threaded_irq(struct device *d, int irq, void *h,
+			      irqreturn_t (*thread)(int, void *), int flags,
+			      const char *name, void *data)
+{
+	(void)d; (void)irq; (void)h; (void)flags; (void)name;
+	irq_thread = thread;
+	irq_data = data;
+	return 0;
+}
+
+int sm5714_battery_set_pd_contract(unsigned int mv, unsigned int ma) { (void)mv; (void)ma; return 0; }
+int sm5714_battery_set_otg(bool active) { (void)active; return 0; }
+bool sm5714_battery_is_otg_active(void) { return false; }
+
+/* ---- TCPM, the few steps that matter ---- */
+enum tstate { T_IDLE, T_RESET, T_TOGGLING, T_ATTACH_WAIT, T_ATTACHED };
+static struct {
+	struct tcpc_dev *tcpc;
+	enum tstate st;
+	unsigned long timer;
+	bool cc_event, refuse;
+	int attaches;
+} tc;
+static int fake_port;
+
+struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
+{
+	enum typec_cc_status a, b;
+
+	(void)dev;
+	tc.tcpc = tcpc;
+	tcpc->init(tcpc);
+	tcpc->get_vbus(tcpc);
+	tcpc->get_cc(tcpc, &a, &b);
+	tc.st = T_RESET;		/* tcpm_init(): PORT_RESET */
+	tcpc->set_cc(tcpc, TYPEC_CC_RD);
+	tc.timer = jiffies;		/* no VBUS: no wait */
+	return (struct tcpm_port *)&fake_port;
+}
+void tcpm_unregister_port(struct tcpm_port *port) { (void)port; }
+void tcpm_cc_change(struct tcpm_port *port) { (void)port; tc.cc_event = true; cc_changes++; }
+void tcpm_vbus_change(struct tcpm_port *port) { (void)port; }
+void tcpm_pd_hard_reset(struct tcpm_port *port) { (void)port; }
+void tcpm_pd_receive(struct tcpm_port *port, const struct pd_message *msg,
+		     enum tcpm_transmit_type sop) { (void)port; (void)msg; (void)sop; }
+void tcpm_pd_transmit_complete(struct tcpm_port *port, enum tcpm_transmit_status status)
+{ (void)port; (void)status; }
+
+static void tcpm_toggle(void)
+{
+	tc.st = T_TOGGLING;
+	tc.tcpc->start_toggling(tc.tcpc, TYPEC_PORT_DRP, TYPEC_CC_RD);
+}
+
+/* An error recovery of an attached port: PORT_RESET, 100 ms, toggling */
+static void tcpm_error_recovery(void)
+{
+	tc.st = T_RESET;
+	tc.tcpc->set_cc(tc.tcpc, TYPEC_CC_RD);
+	tc.timer = jiffies + 100;
+}
+
+static void tcpm_step(void)
+{
+	enum typec_cc_status a, b;
+	bool seen;
+
+	if (tc.st == T_RESET && jiffies >= tc.timer)
+		tcpm_toggle();
+	if (tc.cc_event) {
+		tc.cc_event = false;
+		tc.tcpc->get_cc(tc.tcpc, &a, &b);
+		seen = a != TYPEC_CC_OPEN || b != TYPEC_CC_OPEN;
+		if (tc.st == T_TOGGLING && seen) {
+			tc.st = T_ATTACH_WAIT;
+			tc.timer = jiffies + 200;
+		} else if ((tc.st == T_ATTACH_WAIT || tc.st == T_ATTACHED) && !seen) {
+			printf("D %lu\n", jiffies);
+			tcpm_toggle();
+		}
+	}
+	if (tc.st == T_ATTACH_WAIT && jiffies >= tc.timer) {
+		if (tc.refuse) {
+			printf("F %lu\n", jiffies);
+			tcpm_toggle();
+		} else {
+			tc.tcpc->set_roles(tc.tcpc, true, TYPEC_SINK, TYPEC_DEVICE);
+			tc.st = T_ATTACHED;
+			tc.attaches++;
+			printf("A %lu\n", jiffies);
+		}
+	}
+}
+
+/* ---- the loop ---- */
+#include "sm5714_usbpd.c"
+
+static struct i2c_client client;
+static struct sm5714_usbpd *sm;
+
+static void run_work(struct delayed_work *d)
+{
+	if (d->due >= 0 && (long)jiffies >= d->due) {
+		d->due = -1;
+		if (d == &sm->cc_watch_work)
+			in_watch = 1;
+		d->fn(&d->work);
+		in_watch = 0;
+	}
+}
+
+static void run(unsigned long ms)
+{
+	unsigned long end = jiffies + ms;
+
+	while (jiffies < end) {
+		if ((regs[0x01] | regs[0x02] | regs[0x04]) && irq_thread)
+			irq_thread(0, irq_data);
+		tcpm_step();
+		run_work(&sm->cc_resync_work);
+		run_work(&sm->cc_watch_work);
+		jiffies += 10;
+	}
+}
+
+static void plug(enum partner p) { partner = p; chip_update(); printf("P %lu %d\n", jiffies, p); }
+
+static void attach_hub(void)
+{
+	plug(P_HUB);
+	run(1000);
+	if (tc.st != T_ATTACHED) {
+		printf("X %lu hub did not attach\n", jiffies);
+		exit(4);
+	}
+}
+
+static void end(void)
+{
+	printf("END attaches=%d state=%d cc_changes=%d reads_watch=%d\n",
+	       tc.attaches, tc.st, cc_changes, reads_watch);
+}
+
+int main(int argc, char **argv)
+{
+	const char *s = argc > 1 ? argv[1] : "";
+
+	model_80_revives = !strcmp(s, "short_detach_missed_irq");
+	if (sm5714_usbpd_driver.probe(&client)) {
+		printf("X probe failed\n");
+		return 2;
+	}
+	sm = i2c_get_clientdata(&client);
+	run(10000);			/* boot: toggling, empty */
+
+	if (!strcmp(s, "idle")) {
+		reads_watch = 0;
+		run(3600L * 1000);
+	} else if (!strcmp(s, "healthy_plug")) {
+		attach_hub();
+		run(60000);
+	} else if (!strcmp(s, "missed_attach")) {
+		irq_dead = true;
+		plug(P_HUB);
+		run(60000);
+	} else if (!strcmp(s, "short_detach_missed_irq")) {
+		attach_hub();
+		irq_dead = true;
+		sm->recovery_detach_armed = true;	/* as a Hard Reset leaves it */
+		tcpm_error_recovery();
+		run(60000);
+	} else if (!strcmp(s, "recovery_detach")) {
+		attach_hub();
+		sm->recovery_detach_armed = true;
+		tcpm_error_recovery();
+		run(60000);
+	} else if (!strcmp(s, "recovery_detach_r9")) {
+		cc_reopen_via_snk = false;
+		attach_hub();
+		sm->recovery_detach_armed = true;
+		tcpm_error_recovery();
+		run(60000);
+	} else if (!strcmp(s, "recovery_detach_dead")) {
+		attach_hub();
+		die_on_open = true;
+		sm->recovery_detach_armed = true;
+		tcpm_error_recovery();
+		run(3600L * 1000);
+	} else if (!strcmp(s, "recovery_detach_unplugged")) {
+		attach_hub();
+		sm->recovery_detach_armed = true;
+		tcpm_error_recovery();
+		plug(P_NONE);
+		run(3600L * 1000);
+	} else if (!strcmp(s, "self_heal_off")) {
+		cc_reopen_via_snk = false;
+		cc_self_heal = false;
+		attach_hub();
+		sm->recovery_detach_armed = true;
+		tcpm_error_recovery();
+		run(300000);
+		printf("M %lu self-heal on\n", jiffies);
+		cc_self_heal = true;
+		run(30000);
+	} else if (!strcmp(s, "refused_partner")) {
+		tc.refuse = true;
+		plug(P_AUDIO);
+		run(3600L * 1000);
+	} else if (!strcmp(s, "vbus_no_cc")) {
+		engine_off = true;		/* stuck, with no open of the driver's */
+		plug(P_LEGACY);
+		run(4000);
+		sm->tcpc.get_vbus(&sm->tcpc);	/* TCPM's VBUS event */
+		run(60000);
+	} else if (!strcmp(s, "suspend_dead")) {
+		cc_reopen_via_snk = false;
+		attach_hub();
+		sm->recovery_detach_armed = true;
+		tcpm_error_recovery();
+		run(200);
+		sm5714_usbpd_pm_ops.suspend(&client.dev);
+		printf("M %lu suspended\n", jiffies);
+		run(600000);
+		printf("M %lu resumed\n", jiffies);
+		sm5714_usbpd_pm_ops.resume(&client.dev);
+		run(30000);
+	} else {
+		printf("X unknown scenario\n");
+		return 2;
+	}
+	end();
+	return 0;
+}
+"""
+
+FAKE_HEADERS = ("bitops", "delay", "gpio/consumer", "i2c", "interrupt", "minmax", "module", "mutex",
+                "of", "property", "regmap", "usb/pd", "usb/tcpm", "workqueue")
+
+
+def build_driver_harness(directory, driver=DRIVER):
+    """Compile the driver in its harness; returns the binary's path."""
+    directory = Path(directory)
+    for name in FAKE_HEADERS:
+        header = directory / "inc/linux" / (name + ".h")
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text('#include "fake_kernel.h"\n')
+    (directory / "inc/fake_kernel.h").write_text(FAKE_KERNEL_H)
+    (directory / "sm5714_usbpd.c").write_text(Path(driver).read_text())
+    (directory / "harness.c").write_text(DRIVER_HARNESS)
+    binary = directory / "harness"
+    subprocess.run([host_compiler(), "-std=gnu11", "-O0", "-w", "-Werror=implicit-function-declaration",
+                    "-I", str(directory / "inc"), "-I", str(directory), "-o", str(binary),
+                    str(directory / "harness.c")], check=True, capture_output=True, text=True)
+    return binary
+
+
+@unittest.skipUnless(host_compiler(), "no C compiler")
+class CcRecoveryBehaviourTests(unittest.TestCase):
+    """What the driver does, run: the recovery detach, the self-heal and the
+    attach watchdog."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.binary = build_driver_harness(cls.tmp.name)
+
+    def run_scenario(self, name):
+        out = subprocess.run([str(self.binary), name], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout[-2000:])
+        trace = []
+        for line in out.stdout.splitlines():
+            kind, _, rest = line.partition(" ")
+            if kind == "END":
+                trace.append((kind, None, rest))
+                continue
+            ms, _, text = rest.partition(" ")
+            trace.append((kind, int(ms), text))
+        self.assertNotIn("X", [kind for kind, _, _ in trace], trace[-5:])
+        self.assertEqual(trace[-1][0], "END")
+        return trace
+
+    @staticmethod
+    def times(trace, kind, text=""):
+        return [ms for k, ms, rest in trace if k == kind and text in rest]
+
+    @staticmethod
+    def ending(trace):
+        return dict(item.split("=") for item in trace[-1][2].split())
+
+    def test_an_idle_empty_port_costs_one_read_per_period_and_says_nothing(self):
+        trace = self.run_scenario("idle")
+        self.assertEqual(self.times(trace, "W"), [])
+        self.assertEqual([rest for kind, _, rest in trace if kind == "I"],
+                         ["SM5714 USB Type-C/PD controller registered",
+                          "resynchronizing TCPM, CC status 0x00"])
+        end = self.ending(trace)
+        self.assertEqual(int(end["reads_watch"]), 3600 // 4)
+        self.assertEqual(end["cc_changes"], "1")
+
+    def test_a_healthy_attach_is_left_alone(self):
+        trace = self.run_scenario("healthy_plug")
+        self.assertEqual(len(self.times(trace, "A")), 1)
+        self.assertEqual(self.times(trace, "I", "resyncing TCPM"), [])
+        self.assertEqual(self.times(trace, "W"), [])
+
+    def test_an_attach_the_chip_did_not_announce_is_reported_within_a_few_seconds(self):
+        trace = self.run_scenario("missed_attach")
+        plugged = self.times(trace, "P")[0]
+        resyncs = self.times(trace, "I", "shows a partner TCPM was not told of; resyncing TCPM")
+        self.assertEqual(len(resyncs), 1)
+        self.assertLessEqual(resyncs[0] - plugged, 4600)
+        self.assertEqual(len(self.times(trace, "A")), 1)
+
+    def test_an_attach_after_a_forced_detach_shorter_than_a_period_is_reported(self):
+        # The old watchdog's blind spot: its memory of the attach before the
+        # forced detach kept it quiet for the attach after it.
+        trace = self.run_scenario("short_detach_missed_irq")
+        opened = self.times(trace, "I", "CC opened for TCPM's error recovery")[0]
+        attaches = self.times(trace, "A")
+        self.assertEqual(len(attaches), 2)
+        self.assertLessEqual(attaches[1] - opened, 5000)
+
+    def test_the_recovery_detach_comes_back_through_unattached_snk(self):
+        trace = self.run_scenario("recovery_detach")
+        opened = self.times(trace, "I", "CC opened for TCPM's error recovery after a swap or Hard Reset")[0]
+        self.assertEqual(len(self.times(trace, "I", "CC on again through Unattached.SNK after the driver opened it")), 1)
+        writes = [rest.split(" usleeps=") for kind, ms, rest in trace if kind == "C" and ms >= opened]
+        self.assertEqual([reg for reg, _ in writes[:3]], ["CC_CNTL3=0x88", "CC_CNTL3=0x82", "CC_CNTL3=0x80"])
+        # One dwell in Unattached.SNK, between the 0x82 and the 0x80.
+        dwells = [int(n) for _, n in writes[:3]]
+        self.assertEqual((dwells[1] - dwells[0], dwells[2] - dwells[1]), (0, 1))
+        attaches = self.times(trace, "A")
+        self.assertEqual(len(attaches), 2)
+        self.assertLess(attaches[1] - opened, 1000)
+        self.assertEqual(self.times(trace, "W"), [])
+
+    def test_the_r9_sequence_is_healed(self):
+        # cc_reopen_via_snk=N: 0x88 then 0x80, the port of 2026-11-26.  The
+        # self-heal re-initialises it 5 to 9 s into the toggling, and says
+        # what the chip's CC state was.
+        trace = self.run_scenario("recovery_detach_r9")
+        opened = self.times(trace, "I", "CC opened for TCPM's error recovery")[0]
+        heals = [(ms, rest) for kind, ms, rest in trace if kind == "W"]
+        self.assertEqual(len(heals), 1)
+        self.assertTrue(5000 <= heals[0][0] - opened <= 10000, heals)
+        self.assertIn("CC finds no partner since the driver opened it (CC status 0x00, status1 0x10, "
+                      "CC state 0x01): CC logic re-initialised, try 1 of 3", heals[0][1])
+        attaches = self.times(trace, "A")
+        self.assertEqual(len(attaches), 2)
+        self.assertLess(attaches[1] - heals[0][0], 1000)
+
+    def test_a_chip_that_stays_dead_is_tried_three_times_and_left(self):
+        trace = self.run_scenario("recovery_detach_dead")
+        opened = self.times(trace, "I", "CC opened for TCPM's error recovery")[0]
+        heals = [ms - opened for ms in self.times(trace, "W")]
+        self.assertEqual(len(heals), 3)
+        self.assertTrue(5000 <= heals[0] <= 10000 and 29000 <= heals[1] <= 40000
+                        and 119000 <= heals[2] <= 135000, heals)
+        self.assertEqual(len(self.times(trace, "A")), 1)
+        self.assertEqual(self.times(trace, "I", "resyncing TCPM"), [])
+
+    def test_an_empty_port_after_a_recovery_detach_is_healed_at_most_three_times(self):
+        trace = self.run_scenario("recovery_detach_unplugged")
+        self.assertLessEqual(len(self.times(trace, "W")), 3)
+        self.assertEqual(len(self.times(trace, "A")), 1)
+
+    def test_the_self_heal_can_be_held_off_and_then_acts(self):
+        trace = self.run_scenario("self_heal_off")
+        on = self.times(trace, "M", "self-heal on")[0]
+        heals = self.times(trace, "W")
+        self.assertEqual(len(heals), 1)
+        self.assertTrue(0 <= heals[0] - on <= 4100, heals)
+        self.assertEqual(len(self.times(trace, "A")), 2)
+
+    def test_an_attachment_tcpm_does_not_take_is_resynced_with_back_off(self):
+        trace = self.run_scenario("refused_partner")
+        resyncs = self.times(trace, "I", "resyncing TCPM")
+        self.assertTrue(4 <= len(resyncs) <= 12, resyncs)
+        gaps = [b - a for a, b in zip(resyncs, resyncs[1:])]
+        self.assertEqual(gaps[1:], sorted(gaps[1:]))
+        self.assertTrue(600000 <= max(gaps) < 610000, gaps)
+
+    def test_vbus_from_a_partner_with_nothing_detected_is_healed(self):
+        trace = self.run_scenario("vbus_no_cc")
+        heals = [rest for kind, _, rest in trace if kind == "W"]
+        self.assertEqual(len(heals), 1)
+        self.assertIn("CC finds no partner though VBUS comes from one", heals[0])
+        self.assertEqual(len(self.times(trace, "A")), 1)
+
+    def test_nothing_runs_in_a_system_sleep(self):
+        trace = self.run_scenario("suspend_dead")
+        asleep = self.times(trace, "M", "suspended")[0]
+        awake = self.times(trace, "M", "resumed")[0]
+        heals = self.times(trace, "W")
+        self.assertEqual([ms for ms in heals if asleep <= ms < awake], [])
+        self.assertEqual(len(heals), 1)
+        self.assertTrue(0 < heals[0] - awake <= 5000, heals)
+        self.assertEqual(len(self.times(trace, "A")), 2)
+
+
 def block_after(text, marker):
     """The first fenced block after a marker."""
     start = text.index("```", text.index(marker))
@@ -2474,7 +3411,8 @@ class SwapBackWriteUpTests(unittest.TestCase):
 
     # The switches of this section and the defaults kit r9 ships with.
     SWITCHES = {"swap_back_to_sink": "Y", "own_pr_swap_in_place": "Y", "sink_tx_ok_rp": "Y",
-                "swap_protocol_reset": "Y", "recovery_detach": "Y", "pr_swap_rd_delay_ms": "0"}
+                "swap_protocol_reset": "Y", "recovery_detach": "Y", "pr_swap_rd_delay_ms": "0",
+                "cc_reopen_via_snk": "Y", "cc_self_heal": "Y"}
 
     @staticmethod
     def driver_default(driver, name):
@@ -2589,6 +3527,37 @@ class SwapBackWriteUpTests(unittest.TestCase):
                 self.assertIn(shown, flat)
         # The PDO in the example is the 5 V 2 A [RUDE] one.
         self.assertEqual((1 << 29) | (1 << 27) | (1 << 26) | (1 << 25) | (100 << 10) | 200, 0x2e0190c8)
+
+    def test_run_3_is_told_with_the_code_s_lines(self):
+        # 2026-11-26, kit r9, swap_protocol_reset=N: the host role kept
+        # through a Hard Reset, and a port that died after the error
+        # recovery's CC open.  Both fixes are said not to have run.
+        driver = DRIVER.read_text()
+        flat = " ".join(self.section.split())
+        self.assertIn("### Run 3: a Hard Reset after a deaf swap, and a port that died", self.section)
+        self.assertIn("**Two fixes, written and compiled, not run on a tablet** (2026-11-27).", flat)
+        for line in ("CC on again through Unattached.SNK after the driver opened it",
+                     "shows a partner TCPM was not told of; resyncing TCPM"):
+            with self.subTest(line):
+                self.assertIn(line, driver)
+                self.assertIn(line, flat)
+        self.assertIn('"CC finds no partner %s (CC status 0x%02x, status1 0x%02x, CC state 0x%02x): '
+                      '%s, try %u of %zu\\n"', driver)
+        for why in ("since the driver opened it", "though VBUS comes from one"):
+            self.assertIn('why = "%s";' % why, driver)
+        self.assertIn("`CC finds no partner since the driver opened it (CC status 0x00, status1 0x10, "
+                      "CC state 0x01): CC logic re-initialised, try 1 of 3`", flat)
+        self.assertIn("CC logic re-initialised", driver)
+        # The numbers are the driver's.
+        heal = [int(n) // 1000 for n in re.search(r"sm5714_heal_wait_ms\[\] = \{ ([0-9, ]+) \};",
+                                                  driver).group(1).split(", ")]
+        self.assertEqual(heal, [5, 25, 90])
+        self.assertIn("about 5 s, 30 s and 2 min into the toggling", flat)
+        self.assertIn("repeated at the next sample, then after 30 s and 2 min, and then every 10 min "
+                      "at the most", flat)
+        # The Anker hub's answer to Get_Source_Cap never asks for the swap.
+        self.assertIn("**The Anker hub never gives the first answer below.**", flat)
+        self.assertNotIn("the r8 deafness up to the hub's Hard Reset is expected again", flat)
 
     def test_states_it_names_exist(self):
         states = set(re.findall(r"^\tS\(([A-Z_]+)\),", added(SWAP_BACK[1], TCPM_C), re.M))
