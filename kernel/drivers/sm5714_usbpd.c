@@ -53,10 +53,14 @@
 #define SM5714_REG_CC_CNTL3		0x2b
 #define SM5714_REG_CC_CNTL5		0x2d
 #define SM5714_REG_CC_CNTL7		0x2f
+/* Toggled by an in-place PR_Swap; 0 is the role the attachment was made in */
+#define  SM5714_CC_ROLE_SWAPPED		BIT(0)
 #define SM5714_REG_PD_CNTL1		0x38
 #define SM5714_REG_PD_CNTL2		0x39
 #define SM5714_REG_PD_CNTL4		0x3b
+#define  SM5714_PD_RESET_DONE		BIT(0)
 #define  SM5714_PD_HARD_RESET		BIT(2)
+#define  SM5714_PD_PROTOCOL_RESET	BIT(3)
 #define SM5714_REG_RX_SRC		0x41
 #define SM5714_REG_RX_HEADER		0x42
 #define SM5714_REG_RX_PAYLOAD		0x44
@@ -66,6 +70,8 @@
 #define SM5714_REG_TX_PAYLOAD		0x62
 #define SM5714_REG_TX_REQ		0x7e
 #define SM5714_REG_PD_STATE3		0xd8
+/* Samsung: "Reset Wait Policy Engine", the Protocol Layer after a Hard Reset */
+#define  SM5714_PD_STATE3_RESET_WAIT	GENMASK(2, 1)
 
 /* How often the attach watchdog samples CC while the port is idle. */
 #define SM5714_CC_WATCH_MS		4000
@@ -81,6 +87,9 @@
  * genuinely sources only 900 mA, and a device that believes otherwise can
  * brown the rail out.  Hence a knob, defaulting to today's behaviour, so the
  * theory can be tested on hardware without shipping it to anyone.
+ *
+ * Under a PD 3 contract sink_tx_ok_rp (on by default) presents Rp 3.0 A
+ * where TCPM asks for SinkTxOK; otg_rp is what every other Rp request gets.
  */
 static unsigned int otg_rp;
 module_param(otg_rp, uint, 0644);
@@ -148,6 +157,128 @@ module_param(try_snk_extra_wait_ms, uint, 0644);
 MODULE_PARM_DESC(try_snk_extra_wait_ms,
 		 "extra ms to wait for a source in Try.SNK: 0 standard timing, default 600, at most 2000");
 
+/*
+ * As power source to a PD partner, ask it now and then for its source
+ * capabilities, and ask for the sink role with a PR_Swap when they say that
+ * it has its own supply (tcpc_dev.request_sink_as_source).
+ *
+ * A charge-through dock whose supply goes away for a moment falls back to an
+ * unpowered sink, Try.SNK finds no source, and the tablet powers the dock.
+ * The Anker hub (291a:8383) then said nothing for 26 minutes, also when its
+ * charger was pulled and plugged in again: no PD message, no CC change, and
+ * the tablet powered it from its battery until the hub was re-plugged.  TCPM
+ * asks 5 s after the contract, then backs off to once every 10 minutes while
+ * the partner has no supply of its own; a swap that fails stops it while
+ * this partner stays attached, or comes back within a minute, and the swaps
+ * are bounded.  Only while the port prefers the sink role.  sink_tx_ok_rp
+ * below, on by default, lets a PD 3 partner ask for the swap itself, which
+ * the same hub did at once; this is the fallback for a partner that does not.
+ *
+ * Clear this to get TCPM's standard behaviour back; a change applies from
+ * the next attach (see sm5714_usbpd_latch_policy()).
+ */
+static bool swap_back_to_sink = true;
+module_param(swap_back_to_sink, bool, 0644);
+MODULE_PARM_DESC(swap_back_to_sink,
+		 "as power source, ask a partner with its own supply for the sink role (default on)");
+
+/*
+ * Apply a Source-to-Sink PR_Swap that the tablet asked for in place, once the
+ * partner has accepted it, as one the partner asks for (see
+ * sm5714_usbpd_set_cc()).
+ *
+ * Without it the tablet's own request ends the connection: set_cc(RD) in
+ * PR_SWAP_SRC_SNK_SOURCE_OFF forces the sink/UFP mode, the SM5714 drops its
+ * attachment (CC reads open 0.8 ms later), the PS_RDY that follows is never
+ * sent, and TCPM goes to error recovery, the partner sending a Hard Reset
+ * (SM-X910, Anker hub, 2026-11-26).  Samsung's driver runs the same in-place
+ * sequence for its own request and for the partner's.  The partner's swap
+ * ran in place on the SM-X910 (2026-11-26, with the hub's own PR_Swap) up to
+ * the hub's PS_RDY; the tablet's own has not run yet.  Clear this for the old
+ * behaviour; a change applies from the next attach.
+ */
+static bool own_pr_swap_in_place = true;
+module_param(own_pr_swap_in_place, bool, 0644);
+MODULE_PARM_DESC(own_pr_swap_in_place,
+		 "apply the tablet's own accepted PR_Swap to sink in place (default on)");
+
+/*
+ * Reset the chip's PD Protocol Layer at the end of an in-place PR_Swap, as
+ * Samsung's PE_SNK_Startup and PE_SRC_Startup do after every swap.
+ *
+ * The SM5714 keeps GoodCRC, retries and the MessageIDs in hardware, and TCPM
+ * resets only its own counters in SNK_STARTUP and SRC_STARTUP.  Without the
+ * reset the hub's PR_Swap on the SM-X910 (2026-11-26) ended deaf: the swap
+ * itself completed, then no message was received, a Hard Reset followed, and
+ * PD came back only with a detach 12 s later.  The hub's PS_RDY carried
+ * MessageID 0, as a new source's first Source_Capabilities do.  Clear this to
+ * see the old behaviour again (the Hard Reset path below then runs); read at
+ * each swap.
+ */
+static bool swap_protocol_reset = true;
+module_param(swap_protocol_reset, bool, 0644);
+MODULE_PARM_DESC(swap_protocol_reset,
+		 "reset the PD protocol layer at the end of an in-place PR_Swap (default on)");
+
+/*
+ * Wait this long in the in-place Source-to-Sink swap, after VBUS is off and
+ * before the pull is changed to Rd.  Samsung changes the pull about 375 ms
+ * after the Accept, this driver about 65 ms after it, and sends PS_RDY 200 ms
+ * after that; a partner gives up on the PS_RDY after tPSSourceOff, at least
+ * 750 ms after the Accept.  Accept to PS_RDY is about 265 ms plus this wait,
+ * so keep it at 450 ms or less; 310 matches Samsung's pull change.  0 (the
+ * default) changes nothing; read at each swap; at most 500.
+ */
+#define SM5714_PR_SWAP_RD_DELAY_MAX_MS	500
+
+static unsigned int pr_swap_rd_delay_ms;
+module_param(pr_swap_rd_delay_ms, uint, 0644);
+MODULE_PARM_DESC(pr_swap_rd_delay_ms,
+		 "ms to wait before Rd in an in-place PR_Swap to sink: 0 none (default), at most 500");
+
+/*
+ * As source under a PD 3 contract, present Rp 3.0 A when TCPM asks for
+ * SinkTxOK, so that the partner may start a message sequence itself, and
+ * otg_rp otherwise.
+ *
+ * Without it a PD 3 sink never sees SinkTxOK and never asks for anything:
+ * the hub above said nothing for 26 minutes as the tablet's sink.  With Rp
+ * 3.0 A on the SM-X910 (otg_rp=2, 2026-11-26) it asked for the source role
+ * itself 8 s after its charger came back.  TCPM asks for TYPEC_CC_RP_3_0 only
+ * as SinkTxOK, after a PD 3 contract (tcpm_ams_finish()): the 900 mA source
+ * PDO gives TYPEC_CC_RP_DEF otherwise, a PD 2 contract SinkTxNG, and a
+ * partner without PD never gets a contract.  Under a contract the sink
+ * follows the PDO, not the Rp; a sink that does not runs into the OTG
+ * current limit.  Samsung's driver presents Rp 3.0 A to PD 3 sinks too, with
+ * its Rp auto control.  Clear this to present otg_rp for every Rp request
+ * again, as before; a change applies from the next attach (see
+ * sm5714_usbpd_latch_policy()).
+ */
+static bool sink_tx_ok_rp = true;
+module_param(sink_tx_ok_rp, bool, 0644);
+MODULE_PARM_DESC(sink_tx_ok_rp,
+		 "as PD 3 source, present Rp 3.0 A for SinkTxOK (default on)");
+
+/*
+ * Make TCPM's error recovery a real detach after an in-place PR_Swap or a
+ * Hard Reset, by opening CC as set_cc(OPEN) does.
+ *
+ * TCPM keeps Rd up in PORT_RESET on a port that is not self-powered, and
+ * while the chip has a source attached this driver then writes nothing: the
+ * partner never sees a detach.  After the deaf swap above that gave three
+ * more attaches without a message, until the hub opened its own CC.  Only
+ * when an in-place swap or a Hard Reset has happened since the port last
+ * went unattached or the chip last reported a detach.  A boot with a
+ * charger keeps its Rd unless a Hard Reset came first; after one, the
+ * charger's VBUS is away for about a second, as it already was for the Hard
+ * Reset itself.  Clear this for the old behaviour; read at each error
+ * recovery.
+ */
+static bool recovery_detach = true;
+module_param(recovery_detach, bool, 0644);
+MODULE_PARM_DESC(recovery_detach,
+		 "open CC for TCPM's error recovery after an in-place PR_Swap or a Hard Reset (default on)");
+
 /* Implemented by the companion charger/fuel-gauge driver on this board. */
 int sm5714_battery_set_pd_contract(unsigned int mv, unsigned int ma);
 int sm5714_battery_set_otg(bool active);
@@ -165,8 +296,25 @@ struct sm5714_usbpd {
 	struct delayed_work otg_det_work;
 	struct gpio_desc *otg_det_gpio;
 	enum typec_cc_polarity polarity;
+	/*
+	 * An in-place swap is armed (sm5714_usbpd_receive()) until its pull is
+	 * changed; sm5714_usbpd_forget_swap() disarms it.
+	 */
 	bool pr_swap_src_to_snk;
 	bool pr_swap_snk_to_src;
+	/* Source-to-Sink: the CC hold is applied, until the partner's PS_RDY */
+	bool pr_swap_hold;
+	/* Sink-to-Source: the pull is changed, our PS_RDY is still to go out */
+	bool pr_swap_ps_rdy_due;
+	/* Our PS_RDY of that swap is on the wire: reset the Protocol Layer */
+	bool prl_reset_on_tx_done;
+	/* The last SOP message sent was a PR_Swap, not answered yet */
+	bool pr_swap_sent;
+	/* own_pr_swap_in_place and sink_tx_ok_rp, as latched for this attach */
+	bool own_swap_in_place;
+	bool sink_tx_ok;
+	/* An in-place swap or a Hard Reset since the chip last saw a detach */
+	bool recovery_detach_armed;
 	bool retained_sink_dfp;
 	bool retained_dock_reset;
 	bool irq_saw_attach;
@@ -194,6 +342,88 @@ static int sm5714_usbpd_set_cc_hold(struct sm5714_usbpd *sm, u8 hold)
 {
 	return regmap_update_bits(sm->regmap, SM5714_REG_CC_CNTL3,
 				  GENMASK(5, 4), hold);
+}
+
+/*
+ * An in-place PR_Swap changes the pull by toggling bit 0 of CC_CNTL7, in
+ * either direction, as Samsung's sm5714_assert_rd() and sm5714_assert_rp()
+ * do.  Samsung clears bits 1:0 at every detach, so bit 0 says "swapped" from
+ * the role the attachment was made in, whichever that was.  This driver
+ * clears bit 0 wherever it forgets a swap or forces a mode of its own, which
+ * also heals a bit left by a swap before a reboot; bit 1 is never written by
+ * either driver and is left alone.  regmap_update_bits() writes nothing when
+ * the bit is already clear.  Called with sm->lock (or before the IRQ).
+ */
+static int sm5714_usbpd_flip_cc_role(struct sm5714_usbpd *sm)
+{
+	unsigned int role;
+	int ret;
+
+	ret = regmap_read(sm->regmap, SM5714_REG_CC_CNTL7, &role);
+	if (!ret)
+		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL7,
+				   role ^ SM5714_CC_ROLE_SWAPPED);
+	return ret;
+}
+
+static int sm5714_usbpd_clear_cc_role(struct sm5714_usbpd *sm)
+{
+	return regmap_update_bits(sm->regmap, SM5714_REG_CC_CNTL7,
+				  SM5714_CC_ROLE_SWAPPED, 0);
+}
+
+/*
+ * Reset the Protocol Layer (MessageIDs, retries) and flush the RX buffer, as
+ * Samsung's sm5714_protocol_layer_reset() does on entry to its PE_SNK_Startup
+ * and PE_SRC_Startup.  Called with sm->lock, at a moment when the partner
+ * sends nothing: right after the PS_RDY that ends an in-place swap, which
+ * leaves it tSwapSourceStart (20 ms) before its first message.
+ */
+static void sm5714_usbpd_reset_protocol(struct sm5714_usbpd *sm,
+					const char *swap)
+{
+	int ret;
+
+	ret = regmap_write(sm->regmap, SM5714_REG_RX_BUF_ST, 0x10);
+	if (!ret)
+		ret = regmap_write(sm->regmap, SM5714_REG_PD_CNTL4,
+				   SM5714_PD_PROTOCOL_RESET);
+	if (ret)
+		dev_warn(sm->dev, "%s PR_SWAP: protocol layer reset failed: %d\n",
+			 swap, ret);
+	else
+		dev_info(sm->dev, "%s PR_SWAP: protocol layer reset\n", swap);
+}
+
+/* No swap of any kind under way any more; the caller sees to the CC hold */
+static void sm5714_usbpd_clear_swap(struct sm5714_usbpd *sm)
+{
+	sm->pr_swap_src_to_snk = false;
+	sm->pr_swap_snk_to_src = false;
+	sm->pr_swap_hold = false;
+	sm->pr_swap_ps_rdy_due = false;
+	sm->prl_reset_on_tx_done = false;
+	sm->pr_swap_sent = false;
+}
+
+/*
+ * Forget an in-place swap that does not go ahead, or whose end is not coming:
+ * disarm it, and release a CC hold it applied, as Samsung's transition to
+ * default does at a Hard Reset.  The pull stays as it is: a Hard Reset keeps
+ * the power roles.  Called with sm->lock.
+ */
+static void sm5714_usbpd_forget_swap(struct sm5714_usbpd *sm,
+				     const char *why)
+{
+	bool armed = sm->pr_swap_src_to_snk || sm->pr_swap_snk_to_src ||
+		     sm->pr_swap_hold || sm->pr_swap_ps_rdy_due;
+	bool held = sm->pr_swap_hold;
+
+	sm5714_usbpd_clear_swap(sm);
+	if (held)
+		sm5714_usbpd_set_cc_hold(sm, 0);
+	if (armed)
+		dev_info(sm->dev, "PR_SWAP: in-place swap dropped (%s)\n", why);
 }
 
 static void sm5714_usbpd_cc_resync_work(struct work_struct *work)
@@ -394,6 +624,9 @@ static void sm5714_usbpd_update_policy(struct sm5714_usbpd *sm)
 	sm->tcpc.request_dfp_as_sink = sink_host_swap;
 	sm->tcpc.try_snk_extra_wait_ms =
 		min(try_snk_extra_wait_ms, SM5714_TRY_SNK_EXTRA_WAIT_MAX_MS);
+	sm->tcpc.request_sink_as_source = swap_back_to_sink;
+	sm->own_swap_in_place = own_pr_swap_in_place;
+	sm->sink_tx_ok = sink_tx_ok_rp;
 }
 
 /*
@@ -465,16 +698,27 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 			       enum typec_cc_status cc)
 {
 	struct sm5714_usbpd *sm = tcpc_to_sm5714(tcpc);
-	unsigned int role;
 	unsigned int status;
+	unsigned int delay;
+	unsigned int rp;
 	int ret;
+
+	/*
+	 * pr_swap_rd_delay_ms, before the lock so that the interrupt is
+	 * served meanwhile; the branch below checks the swap again.
+	 */
+	delay = min(READ_ONCE(pr_swap_rd_delay_ms),
+		    SM5714_PR_SWAP_RD_DELAY_MAX_MS);
+	if (cc == TYPEC_CC_RD && delay && READ_ONCE(sm->pr_swap_src_to_snk))
+		msleep(delay);
 
 	mutex_lock(&sm->lock);
 	switch (cc) {
 	case TYPEC_CC_OPEN:
-		sm->pr_swap_src_to_snk = false;
-		sm->pr_swap_snk_to_src = false;
+		sm5714_usbpd_clear_swap(sm);
+		sm->recovery_detach_armed = false;
 		sm5714_usbpd_set_cc_hold(sm, 0);
+		sm5714_usbpd_clear_cc_role(sm);
 		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x88);
 		break;
 	case TYPEC_CC_RD:
@@ -483,8 +727,26 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 		if (ret)
 			break;
 		if ((status & SM5714_CC_ATTACH_MASK) ==
-		    SM5714_CC_ATTACH_SOURCE)
+		    SM5714_CC_ATTACH_SOURCE) {
+			/*
+			 * A source is attached and TCPM wants Rd: keep the
+			 * attachment, except in TCPM's error recovery
+			 * (PORT_RESET) after an in-place swap or a Hard Reset,
+			 * where the partner has to see a detach: open CC as
+			 * set_cc(OPEN) does (Samsung's "force to detach").
+			 * start_toggling() closes it again.
+			 */
+			if (!sm->recovery_detach_armed || !recovery_detach)
+				break;
+			sm5714_usbpd_clear_swap(sm);
+			sm->recovery_detach_armed = false;
+			sm5714_usbpd_clear_cc_role(sm);
+			ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x88);
+			if (!ret)
+				dev_info(sm->dev,
+					 "CC opened for TCPM's error recovery after a swap or Hard Reset\n");
 			break;
+		}
 		if (sm->pr_swap_src_to_snk) {
 			/*
 			 * Apply an in-place Source -> Sink PR_SWAP.  Forcing
@@ -492,23 +754,27 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 			 * powered dock disappears before TCPM can complete the
 			 * swap.  Samsung's driver toggles bit 0 of CC_CNTL7 for
 			 * both PR_SWAP directions; the SM5714 then changes the
-			 * pull while preserving the existing attachment.
+			 * pull while preserving the existing attachment.  The
+			 * swap is no longer armed once applied, so that a
+			 * second set_cc(RD) in the same swap (PORT_RESET after
+			 * a lost PS_RDY) takes the paths above or below and
+			 * does not toggle again.
 			 */
 			ret = sm5714_usbpd_set_cc_hold(sm, 0x10);
 			if (!ret)
-				ret = regmap_read(sm->regmap,
-						  SM5714_REG_CC_CNTL7, &role);
-			if (!ret)
-				ret = regmap_write(sm->regmap,
-						   SM5714_REG_CC_CNTL7,
-						   role ^ BIT(0));
-			if (!ret)
+				ret = sm5714_usbpd_flip_cc_role(sm);
+			if (!ret) {
+				sm->pr_swap_src_to_snk = false;
+				sm->pr_swap_hold = true;
+				sm->recovery_detach_armed = true;
 				dev_info(sm->dev,
 					 "Source-to-Sink PR_SWAP: CC hold applied\n");
+			}
 			break;
 		}
 
 		/* No natural DRP attachment exists: force sink/UFP. */
+		sm5714_usbpd_clear_cc_role(sm);
 		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1, 0x45);
 		if (!ret)
 			ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3,
@@ -540,28 +806,30 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 			 * attachment.  Samsung leaves mode 0x40/0x80 intact
 			 * and only changes the Rp selection in bits 5:4.
 			 * Forcing 0x49/0x81 here generates an immediate DETACH.
+			 * With sink_tx_ok_rp, SinkTxOK is Rp 3.0 A (Samsung's
+			 * PLUG_CTRL_RP330); see there.
 			 */
+			rp = sm->sink_tx_ok && cc == TYPEC_CC_RP_3_0 ?
+			     2 : otg_rp & 3;
 			ret = regmap_update_bits(sm->regmap,
 						 SM5714_REG_CC_CNTL1,
-						 GENMASK(5, 4),
-						 (otg_rp & 3) << 4);
+						 GENMASK(5, 4), rp << 4);
 			break;
 		}
 		if (sm->pr_swap_snk_to_src) {
 			/* Apply the inverse Sink -> Source PR_SWAP in place. */
-			ret = regmap_read(sm->regmap, SM5714_REG_CC_CNTL7,
-					  &role);
-			if (!ret)
-				ret = regmap_write(sm->regmap,
-						   SM5714_REG_CC_CNTL7,
-						   role ^ BIT(0));
-			if (!ret)
+			ret = sm5714_usbpd_flip_cc_role(sm);
+			if (!ret) {
+				sm->pr_swap_ps_rdy_due = true;
+				sm->recovery_detach_armed = true;
 				dev_info(sm->dev,
 					 "Sink-to-Source PR_SWAP: Rp applied\n");
+			}
 			break;
 		}
 
 		/* No natural DRP attachment exists: force source/DFP. */
+		sm5714_usbpd_clear_cc_role(sm);
 		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1,
 				   0x49 | ((otg_rp & 3) << 4));
 		if (!ret)
@@ -589,6 +857,19 @@ static int sm5714_usbpd_start_toggling(struct tcpc_dev *tcpc,
 	sm->policy_open = true;
 
 	/*
+	 * TCPM toggles only unattached (SRC_UNATTACHED, SNK_UNATTACHED, a clean
+	 * port after CHECK_CONTAMINANT), and its PORT_RESET, the one user of
+	 * the error recovery's detach, calls set_cc() before that.  An in-place
+	 * swap or a Hard Reset of the attach that ended no longer calls for a
+	 * detach, also when the chip never announced the detach or TCPM sent a
+	 * Hard Reset after it.  For every port type: the sink-only one goes
+	 * through set_cc(RD) below.
+	 */
+	mutex_lock(&sm->lock);
+	sm->recovery_detach_armed = false;
+	mutex_unlock(&sm->lock);
+
+	/*
 	 * The SM5714 has an autonomous DRP state machine.  Samsung's NORMAL_DRP
 	 * configuration selects it with CC_CNTL1=0x40; bits 5:4 retain the Rp
 	 * advertisement requested by TCPM.  Using the hardware state machine is
@@ -607,9 +888,9 @@ static int sm5714_usbpd_start_toggling(struct tcpc_dev *tcpc,
 	 */
 
 	mutex_lock(&sm->lock);
-	sm->pr_swap_src_to_snk = false;
-	sm->pr_swap_snk_to_src = false;
+	sm5714_usbpd_clear_swap(sm);
 	sm5714_usbpd_set_cc_hold(sm, 0);
+	sm5714_usbpd_clear_cc_role(sm);
 	ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1, val);
 	/*
 	 * set_cc(OPEN) disables both CC comparators with CC_CNTL3=0x88.
@@ -710,12 +991,38 @@ static int sm5714_usbpd_set_current_limit(struct tcpc_dev *tcpc,
 	return 0;
 }
 
+/*
+ * TCPM turns PD reception off at every Hard Reset (HARD_RESET_START) and back
+ * on where its transition to default ends: SNK_WAIT_CAPABILITIES as sink,
+ * SRC_HARD_RESET_VBUS_ON as source.  That is where Samsung tells the chip's
+ * Protocol Layer that the Policy Engine is done (PD_CNTL4 bit 0 in
+ * sm5714_snk_transition_to_default() and sm5714_src_transition_to_pwr_on()).
+ * Until it is told, the Protocol Layer waits (PD_STATE3, "Reset Wait Policy
+ * Engine") and neither receives messages nor gets a transmission through;
+ * a Hard Reset received still is.  Without this the SM-X910 stayed deaf from
+ * the hub's Hard Reset until the chip saw a detach 11 s later.  Done only when
+ * the chip says it waits, as at probe.
+ */
 static int sm5714_usbpd_set_pd_rx(struct tcpc_dev *tcpc, bool on)
 {
 	struct sm5714_usbpd *sm = tcpc_to_sm5714(tcpc);
+	unsigned int state3;
+	int ret;
 
-	return regmap_write(sm->regmap, SM5714_REG_PD_CNTL1,
-			    on ? 0x08 : 0x00);
+	mutex_lock(&sm->lock);
+	if (on && !regmap_read(sm->regmap, SM5714_REG_PD_STATE3, &state3) &&
+	    (state3 & SM5714_PD_STATE3_RESET_WAIT)) {
+		ret = regmap_write(sm->regmap, SM5714_REG_PD_CNTL4,
+				   SM5714_PD_RESET_DONE);
+		if (!ret)
+			dev_info(sm->dev,
+				 "PD protocol layer released after a Hard Reset (PD_STATE3 0x%02x)\n",
+				 state3);
+	}
+	ret = regmap_write(sm->regmap, SM5714_REG_PD_CNTL1, on ? 0x08 : 0x00);
+	mutex_unlock(&sm->lock);
+
+	return ret;
 }
 
 static bool sm5714_usbpd_consume_retained_sink_dfp(struct tcpc_dev *tcpc)
@@ -759,11 +1066,15 @@ static int sm5714_usbpd_transmit(struct tcpc_dev *tcpc,
 	struct sm5714_usbpd *sm = tcpc_to_sm5714(tcpc);
 	unsigned int count;
 	u8 request;
+	bool ctrl;
+	u8 msg_type;
 	int ret;
 
 	mutex_lock(&sm->lock);
 
 	if (type == TCPC_TX_HARD_RESET) {
+		sm5714_usbpd_forget_swap(sm, "Hard Reset sent");
+		sm->recovery_detach_armed = true;
 		ret = regmap_update_bits(sm->regmap, SM5714_REG_PD_CNTL4,
 					 SM5714_PD_HARD_RESET,
 					 SM5714_PD_HARD_RESET);
@@ -773,6 +1084,24 @@ static int sm5714_usbpd_transmit(struct tcpc_dev *tcpc,
 	switch (type) {
 	case TCPC_TX_SOP:
 		request = 0x07;
+		ctrl = !pd_header_cnt_le(msg->header);
+		msg_type = pd_header_type_le(msg->header);
+		/*
+		 * An in-place swap goes ahead only with an Accept from TCPM
+		 * (the partner's PR_Swap) and then our PS_RDY.  Anything else
+		 * TCPM sends instead (Wait, Reject, Not_Supported, a Soft
+		 * Reset after an Accept it no longer takes) means it does not.
+		 */
+		if (!ctrl || (msg_type != PD_CTRL_ACCEPT &&
+			      msg_type != PD_CTRL_PS_RDY))
+			sm5714_usbpd_forget_swap(sm, "TCPM sent another message");
+		/* Our PS_RDY of an in-place Sink-to-Source swap */
+		if (ctrl && msg_type == PD_CTRL_PS_RDY && sm->pr_swap_ps_rdy_due) {
+			sm->pr_swap_ps_rdy_due = false;
+			sm->prl_reset_on_tx_done = true;
+		}
+		/* For the answer, in sm5714_usbpd_receive() */
+		sm->pr_swap_sent = ctrl && msg_type == PD_CTRL_PR_SWAP;
 		break;
 	case TCPC_TX_SOP_PRIME:
 		request = 0x17;
@@ -810,6 +1139,7 @@ static void sm5714_usbpd_receive(struct sm5714_usbpd *sm)
 	unsigned int origin;
 	unsigned int status;
 	unsigned int count;
+	bool swapped = false;
 	u8 type;
 	int ret;
 
@@ -846,6 +1176,22 @@ static void sm5714_usbpd_receive(struct sm5714_usbpd *sm)
 	}
 
 	type = pd_header_type_le(msg.header);
+	/*
+	 * The partner's answer to a PR_Swap the tablet sent.  An Accept while
+	 * the chip has a sink attached (the tablet is the source) starts the
+	 * same in-place Source-to-Sink swap as a PR_Swap of the partner's.
+	 * The tablet's own Sink-to-Source request is left as it was.
+	 */
+	if (sop == TCPC_TX_SOP && sm->pr_swap_sent) {
+		sm->pr_swap_sent = false;
+		if (!count && type == PD_CTRL_ACCEPT && sm->own_swap_in_place &&
+		    !regmap_read(sm->regmap, SM5714_REG_CC_STATUS, &status) &&
+		    (status & SM5714_CC_ATTACH_MASK) == SM5714_CC_ATTACH_SINK) {
+			sm->pr_swap_src_to_snk = true;
+			dev_info(sm->dev,
+				 "Source-to-Sink PR_SWAP: own request accepted, applying it in place\n");
+		}
+	}
 	if (sop == TCPC_TX_SOP && !count && type == PD_CTRL_PR_SWAP) {
 		ret = regmap_read(sm->regmap, SM5714_REG_CC_STATUS, &status);
 		if (!ret) {
@@ -857,19 +1203,23 @@ static void sm5714_usbpd_receive(struct sm5714_usbpd *sm)
 				sm->pr_swap_snk_to_src = true;
 		}
 	}
+	/* The partner's PS_RDY that ends an in-place Source-to-Sink swap */
 	if (sop == TCPC_TX_SOP && !count && type == PD_CTRL_PS_RDY &&
-	    sm->pr_swap_src_to_snk) {
+	    sm->pr_swap_hold) {
+		sm->pr_swap_hold = false;
+		swapped = true;
 		ret = sm5714_usbpd_set_cc_hold(sm, 0);
-		if (!ret) {
-			sm->pr_swap_src_to_snk = false;
+		if (!ret)
 			dev_info(sm->dev,
 				 "Source-to-Sink PR_SWAP: CC hold released\n");
-		}
 	}
 	tcpm_pd_receive(sm->port, &msg, sop);
 
 acknowledge:
 	regmap_write(sm->regmap, SM5714_REG_RX_BUF, 0x80);
+	/* The partner's first message as source comes tSwapSourceStart later */
+	if (swapped && READ_ONCE(swap_protocol_reset))
+		sm5714_usbpd_reset_protocol(sm, "Source-to-Sink");
 }
 
 static irqreturn_t sm5714_usbpd_irq(int irq, void *data)
@@ -888,14 +1238,27 @@ static irqreturn_t sm5714_usbpd_irq(int irq, void *data)
 
 	if (intr[3] & SM5714_INT4_RX_DONE)
 		sm5714_usbpd_receive(sm);
-	if (intr[3] & SM5714_INT4_TX_DONE)
+	if (intr[3] & SM5714_INT4_TX_DONE) {
+		/* Our PS_RDY ended an in-place Sink-to-Source swap */
+		if (sm->prl_reset_on_tx_done && READ_ONCE(swap_protocol_reset))
+			sm5714_usbpd_reset_protocol(sm, "Sink-to-Source");
+		sm->prl_reset_on_tx_done = false;
 		tcpm_pd_transmit_complete(sm->port, TCPC_TX_SUCCESS);
-	else if (intr[3] & SM5714_INT4_TX_DISCARD)
+	} else if (intr[3] & SM5714_INT4_TX_DISCARD) {
+		sm->prl_reset_on_tx_done = false;
 		tcpm_pd_transmit_complete(sm->port, TCPC_TX_DISCARDED);
-	else if (intr[3] & SM5714_INT4_TX_SOP_ERR)
+	} else if (intr[3] & SM5714_INT4_TX_SOP_ERR) {
+		sm->prl_reset_on_tx_done = false;
 		tcpm_pd_transmit_complete(sm->port, TCPC_TX_FAILED);
-	if (intr[3] & SM5714_INT4_HRST_RX)
+	}
+	if (intr[3] & SM5714_INT4_HRST_RX) {
+		sm5714_usbpd_forget_swap(sm, "Hard Reset received");
+		sm->recovery_detach_armed = true;
 		tcpm_pd_hard_reset(sm->port);
+	}
+	/* A detach the chip saw itself starts the next attach afresh */
+	if (intr[0] & SM5714_INT1_DETACH)
+		sm->recovery_detach_armed = false;
 
 	mutex_unlock(&sm->lock);
 
@@ -922,6 +1285,7 @@ static int sm5714_usbpd_probe(struct i2c_client *client)
 	struct sm5714_usbpd *sm;
 	unsigned int cc;
 	unsigned int retained_roles;
+	unsigned int role;
 	int ret;
 
 	sm = devm_kzalloc(dev, sizeof(*sm), GFP_KERNEL);
@@ -949,6 +1313,23 @@ static int sm5714_usbpd_probe(struct i2c_client *client)
 	if (!sm->connector)
 		return dev_err_probe(dev, -EINVAL,
 				     "missing usb-c-connector child\n");
+
+	/*
+	 * The SM5714 keeps its registers across a reboot or power-off taken
+	 * while sink after an in-place swap, CC_CNTL7 bit 0 with them.  Clear it
+	 * before anything below forces a mode or reads the attachment (see
+	 * sm5714_usbpd_clear_cc_role()).
+	 */
+	ret = regmap_read(sm->regmap, SM5714_REG_CC_CNTL7, &role);
+	if (ret)
+		goto put_fwnode;
+	if (role & SM5714_CC_ROLE_SWAPPED) {
+		ret = sm5714_usbpd_clear_cc_role(sm);
+		if (ret)
+			goto put_fwnode;
+		dev_info(dev, "CC role bit left set by a swap before this boot (CC_CNTL7 0x%02x), cleared\n",
+			 role);
+	}
 
 	/*
 	 * A powered dock and the SM5714 both survive a warm tablet reboot.  Save
