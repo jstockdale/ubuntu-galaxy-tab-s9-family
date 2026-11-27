@@ -1,3 +1,21 @@
+Subject: [PATCH] usb: typec: tcpm: restore a retained Sink/DFP role at attach
+
+A controller that kept its Sink/DFP data role over a reboot of the host,
+next to a dock that kept Source/UFP, can say so once through the opt-in
+tcpc_dev.consume_retained_sink_dfp() callback (adopt_retained_source_ufp
+set as well): the sink then attaches as host, before the dock's first
+message.
+
+A Hard Reset still returns the sink to UFP, as upstream does and as the
+USB PD specification requires of both ends.  A partner that kept UFP
+across the reset is taken back as host on its first message by the
+mismatch handler of the patch before this one; one that went back to DFP,
+as a Source does at a Hard Reset, then simply matches.  An earlier
+revision kept every host role of a sink across a Hard Reset.  A sink that
+had become one through a PR_Swap from Source/DFP then answered the
+partner's first message after the reset with a data role mismatch and an
+error recovery (SM-X910, Anker hub 291a:8383, 2026-11-26).
+---
 --- a/include/linux/usb/tcpm.h
 +++ b/include/linux/usb/tcpm.h
 @@ -141,6 +141,13 @@ struct tcpc_dev {
@@ -46,14 +64,3 @@
  	if (ret < 0)
  		return ret;
  
-@@ -5949,7 +5961,9 @@ static void run_state_machine(struct tcpm_port *port)
- 		if (port->pd_capable)
- 			tcpm_set_charge(port, false);
- 		tcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SINK,
--			       tcpm_data_role_for_sink(port));
-+			       port->tcpc->adopt_retained_source_ufp &&
-+			       port->data_role == TYPEC_HOST ?
-+			       TYPEC_HOST : tcpm_data_role_for_sink(port));
- 		/*
- 		 * VBUS may or may not toggle, depending on the adapter.
- 		 * If it doesn't toggle, transition to SNK_HARD_RESET_SINK_ON

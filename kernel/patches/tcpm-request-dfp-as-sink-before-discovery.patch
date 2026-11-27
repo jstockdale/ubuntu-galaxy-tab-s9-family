@@ -35,13 +35,9 @@ answer or was lost to another message is repeated as well.  At most three
 requests are started per attach.  After Accept, discovery runs once, as
 DFP; otherwise it runs as it does today.
 
-A Hard Reset returns both ends to their default data roles.  This tree
-keeps a sink in the host role across it when the TCPC sets
-adopt_retained_source_ufp.  That is right for a role adopted for a partner
-that has retained UFP, and wrong for one that came from a DR_Swap: the
-partner is DFP again, and its next message is a data role mismatch.  With
-the flag set, a role that came from a DR_Swap goes back to the default, and
-the request is made again after the new contract if one is left.
+A Hard Reset returns both ends to their default data roles, a host role
+that came from a DR_Swap included, and the request is made again after
+the new contract if one is left.
 
 DR_SWAP_SEND sets send_discover (as UFP, or above PD 2.0) and
 DR_SWAP_SEND_TIMEOUT clears it, which assumes that discovery had already
@@ -59,9 +55,9 @@ already clears upcoming_state for a Hard Reset that the port sends.
 
 Ports whose TCPC does not set the flag are not affected.
 ---
- drivers/usb/typec/tcpm/tcpm.c | 141 ++++++++++++++++++++++++++++++++++++++++---
+ drivers/usb/typec/tcpm/tcpm.c | 124 +++++++++++++++++++++++++++++++++++++--
  include/linux/usb/tcpm.h      |   9 +++++++++
- 2 files changed, 147 insertions(+), 3 deletions(-)
+ 2 files changed, 131 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
 --- a/drivers/usb/typec/tcpm/tcpm.c
@@ -77,7 +73,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  struct pd_mode_data {
  	int svid_index;		/* current SVID index		*/
  	int nsvids;
-@@ -531,6 +535,17 @@ struct tcpm_port {
+@@ -531,6 +535,15 @@ struct tcpm_port {
  	unsigned int hard_reset_count;
  	bool pd_capable;
  	bool explicit_contract;
@@ -88,14 +84,12 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
 +	unsigned int sink_dfp_tries;
 +	bool sink_dfp_done;
 +	ktime_t sink_dfp_not_before;
-+	/* The data role comes from a DR_Swap since the attach or a Hard Reset */
-+	bool data_role_swapped;
 +	/* What send_discover was when the DR_Swap in progress was sent */
 +	bool send_discover_before_swap;
  	unsigned int rx_msgid;
  
  	/* USB PD objects */
-@@ -1763,6 +1778,62 @@ static int tcpm_ams_start(struct tcpm_po
+@@ -1763,6 +1776,62 @@ static int tcpm_ams_start(struct tcpm_po
  }
  
  /*
@@ -158,7 +152,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
   * VDM/VDO handling functions
   */
  static void tcpm_queue_vdm(struct tcpm_port *port, const u32 header,
-@@ -3680,6 +3751,12 @@ static void tcpm_pd_ctrl_request(struct
+@@ -3680,6 +3749,12 @@ static void tcpm_pd_ctrl_request(struct
  		case DR_SWAP_SEND:
  			port->swap_status = (type == PD_CTRL_WAIT ?
  					     -EAGAIN : -EOPNOTSUPP);
@@ -171,21 +165,20 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  			tcpm_set_state(port, DR_SWAP_CANCEL, 0);
  			break;
  		case PR_SWAP_SEND:
-@@ -4956,6 +5033,13 @@ static void tcpm_reset_port(struct tcpm_
+@@ -4956,6 +5031,12 @@ static void tcpm_reset_port(struct tcpm_
  	tcpm_typec_disconnect(port);
  	port->attached = false;
  	port->pd_capable = false;
 +	port->sink_dfp_tries = 0;
 +	port->sink_dfp_done = false;
 +	port->sink_dfp_not_before = 0;
-+	port->data_role_swapped = false;
 +	/* A request that was about to go out is not for the next partner */
 +	if (port->tcpc->request_dfp_as_sink)
 +		port->upcoming_state = INVALID_STATE;
  	port->pps_data.supported = false;
  	tcpm_set_partner_usb_comm_capable(port, false);
  
-@@ -5853,7 +5937,13 @@ static void run_state_machine(struct tcp
+@@ -5853,7 +5934,13 @@ static void run_state_machine(struct tcp
  				port->tx_sop_type = TCPC_TX_SOP;
  				tcpm_set_initial_svdm_version(port);
  			}
@@ -200,7 +193,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		} else {
  			port->send_discover = false;
  			port->send_discover_prime = false;
-@@ -5904,6 +5994,15 @@ static void run_state_machine(struct tcp
+@@ -5904,6 +5991,15 @@ static void run_state_machine(struct tcp
  		port->nr_sink_caps = 0;
  		port->send_discover = true;
  		port->send_discover_prime = false;
@@ -216,37 +209,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		if (port->pwr_role == TYPEC_SOURCE)
  			tcpm_set_state(port, SRC_HARD_RESET_VBUS_OFF,
  				       PD_T_PS_HARD_RESET);
-@@ -5921,6 +6020,7 @@ static void run_state_machine(struct tcp
- 		tcpm_set_vbus(port, false);
- 		tcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SOURCE,
- 			       tcpm_data_role_for_source(port));
-+		port->data_role_swapped = false;
- 		/*
- 		 * If tcpc fails to notify vbus off, TCPM will wait for PD_T_SAFE_0V +
- 		 * PD_T_SRC_RECOVER before turning vbus back on.
-@@ -5951,10 +6051,20 @@ static void run_state_machine(struct tcp
- 		tcpm_set_vconn(port, false);
- 		if (port->pd_capable)
- 			tcpm_set_charge(port, false);
-+		/*
-+		 * With tcpc->adopt_retained_source_ufp a host role is kept,
-+		 * for a partner that keeps its own role too.  With
-+		 * tcpc->request_dfp_as_sink, one that came from a DR_Swap is
-+		 * not: it goes back to the default like the partner's, and is
-+		 * asked for again after the new contract.
-+		 */
- 		tcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SINK,
- 			       port->tcpc->adopt_retained_source_ufp &&
--			       port->data_role == TYPEC_HOST ?
-+			       port->data_role == TYPEC_HOST &&
-+			       !(port->tcpc->request_dfp_as_sink &&
-+				 port->data_role_swapped) ?
- 			       TYPEC_HOST : tcpm_data_role_for_sink(port));
-+		port->data_role_swapped = false;
- 		/*
- 		 * VBUS may or may not toggle, depending on the adapter.
- 		 * If it doesn't toggle, transition to SNK_HARD_RESET_SINK_ON
-@@ -6052,6 +6162,7 @@ static void run_state_machine(struct tcp
+@@ -6050,6 +6146,7 @@ static void run_state_machine(struct tcp
  	/* DR_Swap states */
  	case DR_SWAP_SEND:
  		tcpm_pd_send_control(port, PD_CTRL_DR_SWAP, TCPC_TX_SOP);
@@ -254,7 +217,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		if (port->data_role == TYPEC_DEVICE || port->negotiated_rev > PD_REV20) {
  			port->send_discover = true;
  			port->send_discover_prime = false;
-@@ -6069,12 +6180,20 @@ static void run_state_machine(struct tcp
+@@ -6067,12 +6164,19 @@ static void run_state_machine(struct tcp
  		break;
  	case DR_SWAP_SEND_TIMEOUT:
  		tcpm_swap_complete(port, -ETIMEDOUT);
@@ -272,11 +235,10 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  	case DR_SWAP_CHANGE_DR:
 +		/* Whoever asked for it, a completed swap settles the data role */
 +		port->sink_dfp_done = true;
-+		port->data_role_swapped = true;
  		tcpm_unregister_altmodes(port);
  		if (port->data_role == TYPEC_HOST)
  			tcpm_set_roles(port, true, TYPEC_STATE_USB, port->pwr_role,
-@@ -7092,8 +7211,22 @@ unlock:
+@@ -7090,8 +7194,22 @@ unlock:
  static void tcpm_send_discover_work(struct kthread_work *work)
  {
  	struct tcpm_port *port = container_of(work, struct tcpm_port, send_discover_work);
@@ -299,7 +261,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  	/* No need to send DISCOVER_IDENTITY anymore */
  	if (!port->send_discover && !port->send_discover_prime)
  		goto unlock;
-@@ -7111,6 +7244,8 @@ static void tcpm_send_discover_work(stru
+@@ -7109,6 +7227,8 @@ static void tcpm_send_discover_work(stru
  		goto unlock;
  	}
  

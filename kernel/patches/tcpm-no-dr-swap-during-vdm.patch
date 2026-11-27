@@ -36,7 +36,7 @@ before.
 diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
 --- a/drivers/usb/typec/tcpm/tcpm.c
 +++ b/drivers/usb/typec/tcpm/tcpm.c
-@@ -1702,6 +1702,17 @@ static int tcpm_ams_start(struct tcpm_po
+@@ -1700,6 +1700,17 @@ static int tcpm_ams_start(struct tcpm_po
  		return -EAGAIN;
  	}
  
