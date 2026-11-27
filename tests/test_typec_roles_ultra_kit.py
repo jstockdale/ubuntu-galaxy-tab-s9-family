@@ -121,14 +121,30 @@ USB_HOST_REINIT = "blastoise kernel: xhci-hcd xhci-hcd.2.auto: xHC error in resu
 L15B_NODE = "/soc@0/rsc@17a00000/regulators-0/ldo15"
 L15B_STEP = "gts9u-performance: L15B held in HPM: 2 of its DTB properties dropped"
 L15B_REFUSED = f"gts9u-performance: L15B not held in HPM: {L15B_NODE} is not PM8550's vreg_l15b_1p8, left alone"
-# Revision 9.  The driver's ten switches as its kernel boots them (sysfs
-# gives a bool as Y or N, and every value ends in a newline), in the order
-# the driver declares them; revisions 1 to 8 have the first four, the
-# release the first two.
+# Revisions 9 and 10.  The driver's twelve switches as its kernel boots them
+# (sysfs gives a bool as Y or N, and every value ends in a newline), in the
+# order the driver declares them; revision 9 has the first ten, revisions 1
+# to 8 the first four, the release the first two.  R9_SWITCHES are the six
+# that revision 9 added, R10_SWITCHES the two of revision 10.
 SWITCHES = {"otg_rp": "0", "connection_wakeup": "N", "sink_host_swap": "Y", "try_snk_extra_wait_ms": "600",
             "swap_back_to_sink": "Y", "own_pr_swap_in_place": "Y", "swap_protocol_reset": "Y",
-            "pr_swap_rd_delay_ms": "0", "sink_tx_ok_rp": "Y", "recovery_detach": "Y"}
-NEW_SWITCHES = tuple(SWITCHES)[4:]
+            "pr_swap_rd_delay_ms": "0", "sink_tx_ok_rp": "Y", "recovery_detach": "Y",
+            "cc_reopen_via_snk": "Y", "cc_self_heal": "Y"}
+R9_SWITCHES = tuple(SWITCHES)[4:10]
+R10_SWITCHES = tuple(SWITCHES)[10:]
+# Revision 10's driver lines as its dev_info() and dev_warn() format them
+# (the kernel log of a tablet, as blastoise's journal writes it), and the
+# resync the probe asks for at every boot, which is none of them.
+CC_OPENED = ("blastoise kernel: sm5714-usbpd 8-0033: CC opened for TCPM's error recovery after a swap or "
+             "Hard Reset")
+CC_REOPENED = "blastoise kernel: sm5714-usbpd 8-0033: CC on again through Unattached.SNK after the driver opened it"
+CC_HEALED = ("blastoise kernel: sm5714-usbpd 8-0033: CC finds no partner since the driver opened it (CC status "
+             "0x00, status1 0x10, CC state 0x01): CC logic re-initialised, try 1 of 3")
+CC_HEALED_VBUS = ("blastoise kernel: sm5714-usbpd 8-0033: CC finds no partner though VBUS comes from one (CC "
+                  "status 0x00, status1 0x10, CC state 0x05): re-initialisation failed, try 2 of 3")
+CC_RESYNC = ("blastoise kernel: sm5714-usbpd 8-0033: CC status 0x09 shows a partner TCPM was not told of; "
+             "resyncing TCPM")
+CC_PROBE_RESYNC = "blastoise kernel: sm5714-usbpd 8-0033: resynchronizing TCPM, CC status 0x00"
 # The GMU's lines as blastoise logged them under revision 8 (2026-11-25 and
 # 26, journalctl -k), and the note of the hfi interrupt fix as its
 # dev_warn_once() formats it.
@@ -1994,9 +2010,9 @@ class VerifyTest(FakeTablet):
             self.assertEqual(sum(f"verify.sh {mode}" in line for line in usage), 1, mode)
 
     def boot_kit(self):
-        """The kit's kernel as it boots: its build ID, the driver's ten
-        switches at their defaults (revision 9's driver), msm built in, the
-        kernel log, 2 h 21 min up."""
+        """The kit's kernel as it boots: its build ID, the driver's twelve
+        switches at their defaults (revision 10's driver), msm and TCPM
+        built in, the kernel log, 2 h 21 min up."""
         self.running(NEW_BUILD_ID)
         params = self.root / "sys/module/sm5714_usbpd/parameters"
         for name, value in SWITCHES.items():
@@ -2464,8 +2480,9 @@ class VerifyTest(FakeTablet):
 
     def test_a_missing_switch_fails_and_one_off_its_default_is_a_note(self):
         """A switch that is not there means that the running driver is not
-        revision 9's: a FAIL, each one.  One that is not at its default was
-        changed since the boot: a note, and the kit's checks still pass."""
+        the kit's (since revision 10 the kit's has twelve): a FAIL, each one.
+        One that is not at its default was changed since the boot: a note,
+        and the kit's checks still pass."""
         params = lambda: self.root / "sys/module/sm5714_usbpd/parameters"
         for name, default in SWITCHES.items():
             with self.subTest(missing=name):
@@ -2480,7 +2497,8 @@ class VerifyTest(FakeTablet):
                 self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
         changed = {"otg_rp": "2", "connection_wakeup": "Y", "sink_host_swap": "N", "try_snk_extra_wait_ms": "1500",
                    "swap_back_to_sink": "N", "own_pr_swap_in_place": "N", "swap_protocol_reset": "N",
-                   "pr_swap_rd_delay_ms": "310", "sink_tx_ok_rp": "N", "recovery_detach": "N"}
+                   "pr_swap_rd_delay_ms": "310", "sink_tx_ok_rp": "N", "recovery_detach": "N",
+                   "cc_reopen_via_snk": "N", "cc_self_heal": "N"}
         self.assertEqual(set(changed), set(SWITCHES))
         for name, value in changed.items():
             with self.subTest(changed=name):
@@ -2499,17 +2517,18 @@ class VerifyTest(FakeTablet):
         FakeTablet.setUp(self)
         VerifyTest.setUp(self)
         self.boot_kit_r9()
-        for name in NEW_SWITCHES:
+        later = tuple(SWITCHES)[4:]
+        for name in later:
             (params() / name).unlink()
         self.running(NEWER_BUILD_ID)
         result = self.run_script("verify.sh")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn(f"FAIL build ID {NEWER_BUILD_ID}, the kit's is {NEW_BUILD_ID}\n", result.stdout)
-        for name in NEW_SWITCHES:
+        for name in later:
             self.assertIn(f"FAIL sm5714_usbpd.{name} is missing, expected {SWITCHES[name]}", result.stdout)
         for name in tuple(SWITCHES)[:4]:
             self.assertIn(f"ok   sm5714_usbpd.{name} = {SWITCHES[name]}\n", result.stdout)
-        self.assertEqual(result.stdout.count("FAIL "), 1 + len(NEW_SWITCHES), result.stdout)
+        self.assertEqual(result.stdout.count("FAIL "), 1 + len(later), result.stdout)
 
     def test_the_gpu_fixes_are_known_by_the_kit_s_build_id_with_msm_built_in(self):
         """msm is built in, so the build ID is all that tells that the
@@ -2613,12 +2632,216 @@ class VerifyTest(FakeTablet):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         (kernel,) = (self.kit / "logs").glob("*/kernel")
         text = kernel.read_text()
-        for name in (*NEW_SWITCHES, "otg_rp"):
+        for name in (*R9_SWITCHES, "otg_rp"):
             with self.subTest(name):
                 value = "310" if name == "pr_swap_rd_delay_ms" else SWITCHES[name]
                 self.assertIn(f"\n{name}: {value}\n", text)
         self.assertLess(text.index("try_snk_extra_wait_ms: 600\n"), text.index("swap_back_to_sink: Y\n"))
         self.assertLess(text.index("otg_rp: 0\n"), text.index("TCPM log: "))
+
+    # Revision 10's kernel as blastoise is to boot it: revision 9's, the
+    # kit's REVISION 10.
+    def boot_kit_r10(self):
+        self.boot_kit_r9()
+        (self.kit / "REVISION").write_text("10\n")
+
+    CC_COUNTS = ('note CC, this boot\'s kernel log (up 2 h 21 min): {} "CC opened for TCPM\'s error recovery", '
+                 '{} "CC on again through Unattached.SNK" (the reopen after one), {} "CC finds no partner" '
+                 '(the self-heal: no partner within 5 s of a reopen, or none with VBUS), {} "shows a partner '
+                 'TCPM was not told of" (the attach watchdog\'s resync, 0 on a healthy port)\n')
+    TCPM_FIX_IN = ("ok   TCPM: a sink is UFP after every Hard Reset in this kernel (TCPM is built in, and the build "
+                   "ID is the kit's)\n")
+
+    def test_revision_10_s_checks_pass_on_its_kernel(self):
+        """The twelve switches at their defaults, the Hard Reset fix known
+        by the build ID, the CC lines counted (none on a plain boot, the
+        probe's resync among them), revision 9's and 8's checks still
+        there."""
+        self.boot_kit_r10()
+        self.journal_add(CC_PROBE_RESYNC + "\n")
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("FAIL", result.stdout)
+        for name, value in SWITCHES.items():
+            with self.subTest(name):
+                self.assertIn(f"ok   sm5714_usbpd.{name} = {value}\n", result.stdout)
+        self.assertNotIn("the running driver has", result.stdout)
+        self.assertIn(self.TCPM_FIX_IN, result.stdout)
+        self.assertIn(self.CC_COUNTS.format(0, 0, 0, 0), result.stdout)
+        # The counts' note is the last of them: no line shown under it.
+        after = result.stdout.split(self.CC_COUNTS.format(0, 0, 0, 0), 1)[1]
+        self.assertFalse(after.startswith("  "), after)
+        self.assertNotIn("resynchronizing", result.stdout)
+        self.assertIn("ok   GPU: the GMU HFI fixes are in this kernel", result.stdout)
+        self.assertIn("ok   sync_state: rpmhpd, gcc and gpu_cc synced at boot", result.stdout)
+        self.assertIn("all checks passed", result.stdout)
+
+    def test_verify_names_revision_9_s_and_earlier_drivers_by_their_switches(self):
+        """Revision 10's kit on another kernel: on revision 9's, its two
+        switches missing (a FAIL each, and the build ID's), and a note that
+        says whose driver runs; on revisions 1 to 8's and on the release's
+        the same with their four and two."""
+        params = lambda: self.root / "sys/module/sm5714_usbpd/parameters"
+        for name, have, said in (
+                ("revision 9's kernel", 10, "note sm5714_usbpd: the running driver has revision 9's ten switches "
+                                            "and not revision 10's two: this is revision 9's kernel (or another "
+                                            "without revision 10's driver)\n"),
+                ("revision 8's kernel", 4, "note sm5714_usbpd: the running driver has the four switches of "
+                                           "revisions 1 to 8: this is one of their kernels\n"),
+                ("the release kernel", 2, "note sm5714_usbpd: the running driver has the release's two switches: "
+                                          "this is the release kernel (or another without the kit's driver)\n")):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                VerifyTest.setUp(self)
+                self.boot_kit_r10()
+                for switch in tuple(SWITCHES)[have:]:
+                    (params() / switch).unlink()
+                self.running(NEWER_BUILD_ID)
+                result = self.run_script("verify.sh")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"FAIL build ID {NEWER_BUILD_ID}, the kit's is {NEW_BUILD_ID}\n", result.stdout)
+                for switch in tuple(SWITCHES)[have:]:
+                    self.assertIn(f"FAIL sm5714_usbpd.{switch} is missing, expected {SWITCHES[switch]}",
+                                  result.stdout)
+                self.assertEqual(result.stdout.count("FAIL "), 1 + len(SWITCHES) - have, result.stdout)
+                self.assertIn(said, result.stdout)
+                self.assertEqual(result.stdout.count("the running driver has"), 1, result.stdout)
+                self.assertIn("note TCPM: the Hard Reset fix is not known to be in this kernel", result.stdout)
+        # A set of switches that is no revision's: the FAILs alone.
+        FakeTablet.setUp(self)
+        VerifyTest.setUp(self)
+        self.boot_kit_r10()
+        (params() / "swap_back_to_sink").unlink()
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+        self.assertNotIn("the running driver has", result.stdout)
+
+    def test_the_hard_reset_fix_is_known_by_the_kit_s_build_id_with_tcpm_built_in(self):
+        """TCPM is built in and the fix logs nothing, so the build ID is all
+        that tells that it runs: ok on revision 10's kernel; a note on the
+        kernel of a kit before revision 10 and on any other kernel; and a
+        modules.builtin without tcpm is a FAIL on revision 10's kernel, a
+        note elsewhere."""
+        not_known = ("note TCPM: the Hard Reset fix is not known to be in this kernel: TCPM is built in, and this "
+                     "is not revision 10's build\n")
+        not_built_in = (f"TCPM: modules.builtin of {RELEASE} does not list tcpm as built in, so the build ID does "
+                        "not tell whether the Hard Reset fix runs\n")
+        for name, boot, kernel, said in (
+                ("revision 10's kernel", self.boot_kit_r10, NEW_BUILD_ID, self.TCPM_FIX_IN),
+                ("revision 9's kit on its kernel", self.boot_kit_r9, NEW_BUILD_ID, not_known),
+                ("a kit without REVISION", self.boot_kit, NEW_BUILD_ID, not_known),
+                ("revision 10's kit on another kernel", self.boot_kit_r10, NEWER_BUILD_ID, not_known)):
+            with self.subTest(name):
+                FakeTablet.setUp(self)
+                VerifyTest.setUp(self)
+                boot()
+                self.running(kernel)
+                result = self.run_script("verify.sh")
+                self.assertIn(said, result.stdout)
+                self.assertEqual(result.stdout.count("TCPM: "), 1, result.stdout)
+        for kernel, word in ((NEW_BUILD_ID, "FAIL"), (NEWER_BUILD_ID, "note")):
+            with self.subTest(tcpm="a module", kernel=kernel):
+                FakeTablet.setUp(self)
+                VerifyTest.setUp(self)
+                self.boot_kit_r10()
+                (self.modules / "modules.builtin").write_text("kernel/drivers/gpu/drm/msm/msm.ko\n")
+                self.running(kernel)
+                result = self.run_script("verify.sh")
+                self.assertIn(f"{word} {not_built_in}", result.stdout)
+                self.assertNotIn(self.TCPM_FIX_IN, result.stdout)
+                if word == "FAIL":
+                    self.assertEqual(result.stdout.count("FAIL "), 1, result.stdout)
+
+    def test_this_boot_s_cc_lines_are_counted_as_information(self):
+        """The recovery's CC opens, the reopens, the self-heal's warnings
+        and the watchdog's resyncs, from this boot's kernel log as blastoise
+        writes it: counted, never a verdict, the self-heal's and the
+        watchdog's lines shown with their values; the probe's resync of
+        every boot is none of them."""
+        self.boot_kit_r10()
+        self.journal_add("".join(f"[  {n}.000001] {line}\n" for n, line in enumerate((
+            CC_PROBE_RESYNC, CC_OPENED, CC_REOPENED, CC_HEALED, CC_OPENED, CC_REOPENED, CC_HEALED_VBUS,
+            CC_RESYNC), start=10)))
+        result = self.run_script("verify.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("FAIL", result.stdout)
+        self.assertIn(self.CC_COUNTS.format(2, 2, 2, 1) + f"  [  13.000001] {CC_HEALED}\n"
+                      f"  [  16.000001] {CC_HEALED_VBUS}\n  [  17.000001] {CC_RESYNC}\n", result.stdout)
+        self.assertNotIn("resynchronizing", result.stdout)
+        self.assertIn("all checks passed", result.stdout)
+        # At most six lines are shown.
+        self.journal_add("".join(f"{CC_HEALED}\n" for _ in range(8)))
+        result = self.run_script("verify.sh")
+        self.assertIn(self.CC_COUNTS.format(2, 2, 10, 1), result.stdout)
+        shown = result.stdout.split(self.CC_COUNTS.format(2, 2, 10, 1), 1)[1].splitlines()
+        self.assertEqual([line.startswith("  ") for line in shown[:7]], [True] * 6 + [False], shown)
+        # On another kernel the same lines are counted the same way.
+        self.running(NEWER_BUILD_ID)
+        result = self.run_script("verify.sh")
+        self.assertIn(self.CC_COUNTS.format(2, 2, 10, 1), result.stdout)
+        # Without the kernel log there is nothing to count: its own FAIL.
+        self.running(NEW_BUILD_ID)
+        (self.root / "journal").write_text("")
+        result = self.run_script("verify.sh")
+        self.assertIn("FAIL cannot read this boot's kernel log", result.stdout)
+        self.assertNotIn("CC, this boot's kernel log", result.stdout)
+
+    def test_the_cc_lines_are_the_drivers_own(self):
+        """The four texts verify.sh counts are revision 10's driver's (the
+        recovery's CC open is revision 9's), each in one format string; the
+        probe's resync is another; and the fake lines above are those
+        formats filled in."""
+        verify = (KIT_SRC / "verify.sh").read_text()
+        driver = (REPO / "kernel/drivers/sm5714_usbpd.c").read_text()
+        # Every string literal of the driver that ends in a newline.
+        formats = re.findall(r'"((?:[^"\\\n]|\\.)*)\\n"', driver)
+        counted = {"CC opened for TCPM's error recovery": CC_OPENED,
+                   "CC on again through Unattached.SNK": CC_REOPENED,
+                   "CC finds no partner": CC_HEALED, "shows a partner TCPM was not told of": CC_RESYNC}
+        for text, line in counted.items():
+            with self.subTest(text):
+                self.assertEqual(verify.count(f"cc_count '{text}'") + verify.count(f'cc_count "{text}"'), 1, text)
+                (fmt,) = [f for f in formats if text in f]
+                pattern = re.escape(fmt).replace("0x%02x", "0x[0-9a-f]{2}").replace("%s", ".+").replace(
+                    "%u", "[0-9]+").replace("%zu", "[0-9]+")
+                self.assertTrue(re.fullmatch(pattern, line.split("8-0033: ", 1)[1]), (fmt, line))
+        (fmt,) = [f for f in formats if "CC finds no partner" in f]
+        pattern = re.escape(fmt).replace("0x%02x", "0x[0-9a-f]{2}").replace("%s", ".+").replace(
+            "%u", "[0-9]+").replace("%zu", "[0-9]+")
+        self.assertTrue(re.fullmatch(pattern, CC_HEALED_VBUS.split("8-0033: ", 1)[1]))
+        for why in ("since the driver opened it", "though VBUS comes from one"):
+            self.assertIn(f'why = "{why}";', driver)
+            self.assertIn(why, CC_HEALED + CC_HEALED_VBUS)
+        (probe,) = [f for f in formats if "resynchronizing TCPM" in f]
+        self.assertFalse([text for text in counted if text in probe])
+        self.assertEqual(CC_PROBE_RESYNC.split("8-0033: ", 1)[1],
+                         probe.replace("0x%02x", "0x00"))
+        # The probe's resync is the work queued at every probe.
+        self.assertIn("mod_delayed_work(system_dfl_wq, &sm->cc_resync_work,", driver)
+
+    def test_a_plug_in_run_records_revision_10_s_switches(self):
+        """The trial's kernel file has revision 10's two switches too, as
+        they were for the run, after revision 9's and before otg_rp; absent
+        on a kernel that has neither."""
+        self.boot_kit_r10()
+        (self.root / "sys/module/sm5714_usbpd/parameters/cc_self_heal").write_text("N\n")
+        self.plug([(PASS_LOG, "host", "sink")])
+        result = self.run_script("verify.sh", "record")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (kernel,) = (self.kit / "logs").glob("*/kernel")
+        text = kernel.read_text()
+        self.assertIn("\ncc_reopen_via_snk: Y\ncc_self_heal: N\notg_rp: 0\n", text)
+        self.assertLess(text.index("recovery_detach: Y\n"), text.index("cc_reopen_via_snk: Y\n"))
+        # Revision 9's kernel: the two are absent.
+        FakeTablet.setUp(self)
+        VerifyTest.setUp(self)
+        self.boot_kit_r10()
+        for name in R10_SWITCHES:
+            (self.root / "sys/module/sm5714_usbpd/parameters" / name).unlink()
+        self.plug([(PASS_LOG, "host", "sink")])
+        self.assertEqual(self.run_script("verify.sh", "record").returncode, 0)
+        (kernel,) = (self.kit / "logs").glob("*/kernel")
+        self.assertIn("\ncc_reopen_via_snk: absent\ncc_self_heal: absent\n", kernel.read_text())
 
 
 # llvm-objdump --no-show-raw-insn of qmp_ufs_phy_calibrate in a vmlinux, as
@@ -3039,7 +3262,7 @@ class ScriptsTest(unittest.TestCase):
         self.assertIn('install -m 0644 "$repo/tools/inplace/typec-roles/sleep-test.sh" \\\n'
                       '\t"$repo/tools/inplace/typec-roles/ufs-phy-power-check.sh" "$kit/"\n', text)
         self.assertIn('printf \'%s\\n\' "$revision" > "$kit/REVISION"\n', text)
-        self.assertEqual(constant("make-kit.sh", "revision"), "9")
+        self.assertEqual(constant("make-kit.sh", "revision"), "10")
         self.assertFalse((KIT_SRC / "sleep-test.sh").exists())
 
     def test_revision_8_s_strings_are_their_sources_own(self):
@@ -3541,8 +3764,10 @@ def make_kit_definitions(*names):
 class Revision9Test(unittest.TestCase):
     """What make-kit.sh adds for revision 9: the GMU's two HFI fixes and the
     swap back to sink in the build's order, their strings, the driver's
-    ten switches in modules.builtin.modinfo, and revision 8's kit (PREV_KIT)
-    as the kernel that must have none of it."""
+    switches as it declares them, and the GMU's HFI wait in vmlinux.  The
+    checks of the driver's switches in modules.builtin.modinfo (6c) and of
+    the kernel before this one (PREV_KIT, 5a) are revision 10's since, in
+    Revision10Test."""
 
     text = (KIT_SRC / "make-kit.sh").read_text()
 
@@ -3626,8 +3851,8 @@ class Revision9Test(unittest.TestCase):
         for s in swap_back:
             with self.subTest(s):
                 self.assertTrue(s in tcpm_added or s in driver, s)
-        self.assertTrue(set(NEW_SWITCHES) <= set(swap_back))
-        for name in NEW_SWITCHES:
+        self.assertTrue(set(R9_SWITCHES) <= set(swap_back))
+        for name in R9_SWITCHES:
             self.assertIn(f"module_param({name}, ", driver)
         others = [p for p in make_kit_array("patches") + make_kit_array("cx_patches") + make_kit_array("fix_patches")
                   + make_kit_array("xo_patches") + make_kit_array("debug_patches") + make_kit_array("pcie_patches")
@@ -3677,143 +3902,11 @@ class Revision9Test(unittest.TestCase):
         verify = (KIT_SRC / "verify.sh").read_text()
         listed = re.search(r"^for p in (otg_rp:.*?); do$", verify, re.M | re.S).group(1).replace("\\\n\t", "")
         self.assertEqual(dict(p.split(":") for p in listed.split()), SWITCHES)
+        # Revision 9's table has its six, revision 10's its two.
         readme = (KIT_SRC / "README.md").read_text()
-        for name in NEW_SWITCHES:
+        for name in tuple(SWITCHES)[4:]:
             with self.subTest(name):
                 self.assertIn(f"| `{name}` | `{SWITCHES[name]}` |", readme)
-
-    def switch_gate(self, new, base, prev=None, undescribed=()):
-        """Section 6c on stand-in modules.builtin.modinfo files, each a list
-        of NAME:TYPE (one parmtype and one parm line each, but no parm line
-        in NEW for the names in UNDESCRIBED)."""
-        block = make_kit_block("builtin_switches() {", 'echo "driver: $driver_check"')
-
-        def modinfo(switches, undescribed=()):
-            lines = []
-            for s in switches:
-                name, kind = s.split(":")
-                lines.append(f"sm5714_usbpd.parmtype={name}:{kind}")
-                if name not in undescribed:
-                    lines.append(f"sm5714_usbpd.parm={name}:what {name} does")
-            return "\n".join(lines + ["sm5714_usbpd.license=GPL"]) + "\n"
-
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = pathlib.Path(tmp)
-            (tmp / "builtin.modinfo").write_text(modinfo(new, undescribed))
-            (tmp / "builtin.base.modinfo").write_text(modinfo(base))
-            setup = (f'set -euo pipefail; export LC_ALL=C\ndie() {{ echo "$*" >&2; exit 1; }}\n'
-                     f'tmp={tmp} release={RELEASE}\n' + make_kit_definitions("switches"))
-            if prev is not None:
-                kit = tmp / "kit8"
-                kit.mkdir()
-                data = modinfo(prev).replace("\n", "\0").encode()
-                with tarfile.open(kit / f"modules-{RELEASE}.tar", "w") as tar:
-                    info = tarfile.TarInfo(f"usr/lib/modules/{RELEASE}/modules.builtin.modinfo")
-                    info.size = len(data)
-                    tar.addfile(info, io.BytesIO(data))
-                setup += f"PREV_KIT={kit} prev_revision=8\n"
-            result = subprocess.run(["bash", "-c", setup + block], capture_output=True, text=True)
-            return result.returncode, result.stdout + result.stderr
-
-    def test_the_driver_s_switches_are_built_in_with_their_types(self):
-        ten = make_kit_array("switches")
-        self.assertEqual(len(ten), 10)
-        self.assertEqual(self.switch_gate(ten, ten[:2]),
-                         (0, "driver: its ten switches in modules.builtin.modinfo with their types, the release "
-                             "build's with the first two alone\n"))
-        self.assertEqual(self.switch_gate(ten, ten[:2], prev=ten[:4]),
-                         (0, "driver: its ten switches in modules.builtin.modinfo with their types, the release "
-                             "build's with the first two alone, revision 8's with the first four\n"))
-        for name, args, message in (
-                ("one missing", (ten[:9], ten[:2]), "has no sm5714_usbpd switch recovery_detach of type bool"),
-                ("another type", ([s.replace(":uint", ":int") if s.startswith("pr_swap") else s for s in ten],
-                                  ten[:2]), "has no sm5714_usbpd switch pr_swap_rd_delay_ms of type uint"),
-                ("an eleventh", (ten + ["extra_switch:bool"], ten[:2]),
-                 "the driver has other switches than these ten"),
-                ("a release driver with four", (ten, ten[:4]),
-                 "self-test failed: the release driver's switches are not"),
-                ("revision 8's kit with the new driver", (ten, ten[:2], ten),
-                 "revision 8's driver does not have exactly the switches"),
-                ("revision 8's kit with the release driver", (ten, ten[:2], ten[:2]),
-                 "revision 8's driver does not have exactly the switches")):
-            with self.subTest(name):
-                code, out = self.switch_gate(*args)
-                self.assertEqual(code, 1, out)
-                self.assertIn(message, out)
-        with self.subTest("a switch without its description"):
-            code, out = self.switch_gate(ten, ten[:2], undescribed=("sink_tx_ok_rp",))
-            self.assertEqual(code, 1, out)
-            self.assertIn("has no sm5714_usbpd switch sink_tx_ok_rp of type bool, or no description of it", out)
-
-    def prev_gate(self, image=None, kernel=None, boot=None, revision="8", sums_ok=True, image_id=None,
-                  new_id="1" * 40, prev=True):
-        """Section 5a on a stand-in revision 8 kit: its boot.img's kernel
-        (the stand-in unpack gives KERNEL, by default the gzipped IMAGE and
-        the release DTB), REVISION and SHA256SUMS."""
-        block = make_kit_block('prev_check="not compared (PREV_KIT not set)"', "fi")
-        build_id = re.search(r"^build_id\(\) \{.*?^\}\n", self.text, re.M | re.S).group(0)
-        prev_id = "9" * 40
-        strings = make_kit_array("new_strings") + make_kit_array("deep_strings")
-        if image is None:
-            image = b"\0".join(s.encode() for s in strings)
-        note = bytes.fromhex("040000001400000003000000") + b"GNU\0" + bytes.fromhex(image_id or prev_id)
-        image = b"head\0" + image + b"\0" + note + b"tail"
-        dtb = b"\xd0\x0d\xfe\xed the release DTB"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = pathlib.Path(tmp)
-            (tmp / "base").mkdir()
-            (tmp / "base/sm8550-samsung-gts9uwifi.dtb").write_bytes(dtb)
-            (tmp / "work").mkdir()
-            kit = tmp / "kit8"
-            kit.mkdir()
-            boot_img = boot or os.urandom(4096)
-            (kit / "boot.img").write_bytes(boot_img)
-            (kit / "REVISION").write_text(revision + "\n")
-            (kit / f"modules-{RELEASE}.tar").write_bytes(b"")
-            sums = "".join(f"{sha((kit / n).read_bytes())}  {n}\n" for n in ("boot.img", "REVISION"))
-            (kit / "SHA256SUMS").write_text(sums if sums_ok else sums.replace(sums[:8], "00000000"))
-            (tmp / "kernel").write_bytes(kernel if kernel is not None else gzip.compress(image) + dtb)
-            setup = (f'set -euo pipefail; export LC_ALL=C\ndie() {{ echo "$*" >&2; exit 1; }}\n'
-                     'sha() { sha256sum "$1" | cut -d\' \' -f1; }\n'
-                     f'unpack() {{ mkdir -p "$2"; cp {tmp}/kernel "$2/kernel"; }}\n'
-                     f'tmp={tmp}/work base={tmp}/base dts=sm8550-samsung-gts9uwifi release={RELEASE} '
-                     f'new_id={new_id}\nprev_revision=8 prev_boot={sha(boot_img) if boot is None else sha(b"x")} '
-                     f'prev_build_id={prev_id}\n'
-                     + (f"PREV_KIT={kit}\n" if prev else "")
-                     + make_kit_definitions("new_strings", "deep_strings", "gpu_strings", "swap_back_strings")
-                     + build_id)
-            result = subprocess.run(["bash", "-c", setup + block + 'echo "check: $prev_check"\n'],
-                                    capture_output=True, text=True)
-            return result.returncode, result.stdout + result.stderr
-
-    def test_revision_8_s_kernel_has_none_of_revision_9(self):
-        strings = make_kit_array("new_strings") + make_kit_array("deep_strings")
-        r9 = make_kit_array("gpu_strings") + make_kit_array("swap_back_strings")
-        said = (f"revision 8's boot.img ({{}}) holds an image with build ID 999999999999 and the release DTB, "
-                f"with all {len(strings)} strings of revisions 1 to 8 and none of the {len(r9)} of revision 9")
-        code, out = self.prev_gate()
-        self.assertEqual(code, 0, out)
-        self.assertRegex(out, r"^revision 8: " + re.escape(said).replace(r"\{\}", "[0-9a-f]{12}") + "\ncheck: ")
-        self.assertEqual(self.prev_gate(prev=False), (0, "check: not compared (PREV_KIT not set)\n"))
-        full = b"\0".join(s.encode() for s in strings)
-        for name, kwargs, message in (
-                ("an image with a string of revision 9", {"image": full + b"\0" + r9[3].encode()},
-                 f"revision 8's image contains '{r9[3]}' already"),
-                ("an image without a string of revision 8",
-                 {"image": b"\0".join(s.encode() for s in strings[1:])},
-                 f"self-test failed: revision 8's image does not contain '{strings[0]}'"),
-                ("another boot.img", {"boot": os.urandom(4096)}, "boot.img is not revision 8's"),
-                ("another DTB after the kernel", {"kernel": gzip.compress(full) + b"\xd0\x0d\xfe\xed another DTB"},
-                 "self-test failed: revision 8's boot kernel does not end with the release DTB"),
-                ("another build", {"image_id": "8" * 40},
-                 "self-test failed: the build ID of revision 8's image is not 999999999999"),
-                ("another revision's kit", {"revision": "7"}, "is not revision 8's kit"),
-                ("a kit that does not match its checksums", {"sums_ok": False}, "does not match its SHA256SUMS"),
-                ("the new image is revision 8's", {"new_id": "9" * 40}, "the new image is revision 8's")):
-            with self.subTest(name):
-                code, out = self.prev_gate(**kwargs)
-                self.assertEqual(code, 1, out)
-                self.assertIn(message, out)
 
     # a6xx_hfi_wait_for_msg_interrupt() as llvm-objdump shows it in revision
     # 8's vmlinux (the release's code: its a6xx_hfi.o has the same text) and
@@ -3931,11 +4024,11 @@ ffff800080e5fa94:      \ttbnz\tw9, #0x0, 0xffff800080e5fae8 <a6xx_hfi_wait_for_m
                      "2026-11-26, under revision 8's kernel, and neither has run on a tablet.**",
                      "**None of revision 9's dock code has run on a tablet.**",
                      "(`mv ~/typec-roles ~/typec-roles-r8`)",
-                     "twenty-three files and two overlay blobs may differ",
-                     "`REVISION` the revision (9; revisions 1 to 7 had none)",
-                     "PREV_KIT=$HOME/ubuntu-gts9u/backups/typec-roles-ultra-kit-r8"):
+                     "twenty-three files and two overlay blobs may differ"):
             with self.subTest(said):
                 self.assertIn(said, readme)
+        # The Build section's REVISION and PREV_KIT are revision 10's since
+        # (Revision10Test).
         for name in (*make_kit_array("gpu_patches"), *make_kit_array("swap_back_patches")):
             self.assertIn(f"`{name}`", readme)
         for line in ("timed out waiting for response", "Timeout waiting for GMU OOB", "Unexpected message id",
@@ -3944,6 +4037,853 @@ ffff800080e5fa94:      \ttbnz\tw9, #0x0, 0xffff800080e5fae8 <a6xx_hfi_wait_for_m
         self.assertNotIn("twenty-two files", readme)
 
 
+# The commits that hold what revision 10 changes: revision 9's kit (its
+# scripts, driver and patches, 319b074), revision 8's kit's scripts
+# (2bb395a), and the Hard Reset fix (7232cff; its parent has the release's
+# tcpm-use-retained-sink-data-role.patch).
+R9_COMMIT = "319b07433a72a1c9e2a15789a9778c447041f94f"
+R8_COMMIT = "2bb395a1306b03541a1dbec19ab6b85b03c2f112"
+HARD_RESET_COMMIT = "7232cffd1c55701c68d581a26dd7344f79e3069b"
+
+
+def repo_file_at(commit, path):
+    """PATH as COMMIT of this checkout has it, or None without git or the
+    commit (an export of the tree)."""
+    try:
+        return subprocess.run(["git", "-C", str(REPO), "show", f"{commit}:{path}"], check=True,
+                              capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def code_lines(script):
+    """A shell script's lines that are not comments or blank."""
+    return [line for line in script.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+class Revision10Test(unittest.TestCase):
+    """What make-kit.sh adds for revision 10: TCPM's Hard Reset role
+    (data_role_swapped gone from tcpm_port, the release's Hard Reset hunk
+    taken out in the replay), the driver's CC reopen, self-heal and watchdog
+    with its two new switches, their strings, and revision 9's kit
+    (PREV_KIT) as the kernel that has what revision 10 takes out and none of
+    what it adds."""
+
+    text = (KIT_SRC / "make-kit.sh").read_text()
+
+    def test_no_patch_was_added_or_removed(self):
+        """The replay's patches are revision 9's; the patch that lost its
+        Hard Reset hunk is one the build applies before the five TCPM
+        patches, and not in the replay (the release tree has it): named,
+        required and recorded in SOURCE; the two TCPM patches have nothing
+        left of what they had."""
+        r9 = repo_file_at(R9_COMMIT, "tools/inplace/typec-roles-ultra/make-kit.sh")
+        if r9 is not None:
+            for name in ("build_order", "patches", "gpu_patches", "swap_back_patches", "patched"):
+                with self.subTest(name):
+                    self.assertEqual(make_kit_array(name), shlex.split(
+                        re.search(rf"^{name}=\((.*?)\)$", r9, re.M | re.S).group(1)))
+        self.assertEqual(constant("make-kit.sh", "retained_patch"), "tcpm-use-retained-sink-data-role.patch")
+        build = (REPO / "scripts/build-mainline-kernel.sh").read_text().replace("\\\n", " ")
+        lines = [line for line in build.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        (at,) = [n for n, line in enumerate(lines)
+                 if re.fullmatch(r"apply_unless '[^']+'\s+\S+\s+tcpm-use-retained-sink-data-role\.patch\s*", line)]
+        (dfp,) = [n for n, line in enumerate(lines)
+                  if line.endswith(" tcpm-request-dfp-as-sink-before-discovery.patch")]
+        self.assertLess(at, dfp)
+        self.assertNotIn("tcpm-use-retained-sink-data-role.patch", make_kit_array("build_order"))
+        required = self.text[self.text.index('for f in "$mkbootimg"'):]
+        self.assertIn('"$repo/kernel/patches/$retained_patch"', required[:required.index("; do\n")])
+        self.assertIn('for p in "${build_order[@]}" "$pcs_patch" "${ufs_patches[@]}" "$retained_patch"; do\n',
+                      self.text)
+        retained = (REPO / "kernel/patches/tcpm-use-retained-sink-data-role.patch").read_text()
+        self.assertNotIn("TYPEC_HOST : tcpm_data_role_for_sink(port)", retained)
+        self.assertNotIn("SNK_HARD_RESET", retained)
+        dfp_patch = (REPO / "kernel/patches/tcpm-request-dfp-as-sink-before-discovery.patch").read_text()
+        self.assertNotIn("data_role_swapped", dfp_patch)
+        self.assertNotIn("TYPEC_HOST : tcpm_data_role_for_sink(port)", dfp_patch)
+        for name in make_kit_array("patches") + make_kit_array("swap_back_patches"):
+            with self.subTest(name):
+                self.assertNotIn("data_role_swapped", (REPO / "kernel/patches" / name).read_text())
+
+    def test_the_hunk_taken_out_is_the_release_patch_s(self):
+        """The hunk make-kit.sh writes is the last hunk of the release's
+        tcpm-use-retained-sink-data-role.patch byte for byte, the one
+        7232cff took out; the current patch is that one without it."""
+        hunk = subprocess.run(["bash", "-c", re.search(r"^release_hard_reset_hunk\(\) \{.*?^\}\n", self.text,
+                                                       re.M | re.S).group(0) + "release_hard_reset_hunk"],
+                              check=True, capture_output=True, text=True).stdout
+        lines = hunk.splitlines()
+        self.assertEqual(lines[:2], ["--- a/drivers/usb/typec/tcpm/tcpm.c", "+++ b/drivers/usb/typec/tcpm/tcpm.c"])
+        self.assertEqual([line[0] for line in lines[3:]], [" "] * 3 + ["-"] + ["+"] * 3 + [" "] * 3)
+        self.assertEqual(lines[9], "+\t\t\t       TYPEC_HOST : tcpm_data_role_for_sink(port));")
+        old = repo_file_at(HARD_RESET_COMMIT + "^", "kernel/patches/tcpm-use-retained-sink-data-role.patch")
+        if old is None:
+            self.skipTest("no git history")
+        self.assertTrue(old.endswith("\n".join(lines[2:]) + "\n"), old[-600:])
+        new = (REPO / "kernel/patches/tcpm-use-retained-sink-data-role.patch").read_text()
+        self.assertEqual(new.split("\n---\n", 1)[1].rstrip("\n"),
+                         old[:old.index("\n".join(lines[2:]))].rstrip("\n"))
+
+    def test_the_replay_takes_the_hunk_out_of_a_model_of_the_release_tree(self):
+        """The release tree's tcpm.c, modelled from the pinned kernel with
+        the release build's two TCPM patches (the adopt patch and the
+        release's retained-role patch, as patch(1) applies them, keeping
+        tcpm.c.orig), gives this build's tcpm.c by make-kit.sh's replay: the
+        hunk out, then the kit's six TCPM patches in the build's order.  And
+        the tree comparison passes over the model's tcpm.c.orig (in the
+        release tree alone) as what patch(1) kept, and shows one that is
+        not that file."""
+        kernel = kernel_source()
+        old = repo_file_at(HARD_RESET_COMMIT + "^", "kernel/patches/tcpm-use-retained-sink-data-role.patch")
+        if kernel is None or old is None:
+            self.skipTest("no pinned kernel checkout, or no git history")
+        tcpm_c, tcpm_h = "drivers/usb/typec/tcpm/tcpm.c", "include/linux/usb/tcpm.h"
+        hunk = subprocess.run(["bash", "-c", re.search(r"^release_hard_reset_hunk\(\) \{.*?^\}\n", self.text,
+                                                       re.M | re.S).group(0) + "release_hard_reset_hunk"],
+                              check=True, capture_output=True, text=True).stdout
+        tcpm_patches = [p for p in make_kit_array("patches") if p.startswith("tcpm-")] + \
+            make_kit_array("swap_back_patches")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            (tmp / "old-retained.patch").write_text(old)
+            (tmp / "hunk").write_text(hunk)
+
+            def tree(name, *patches):
+                root = tmp / name
+                for path in (tcpm_c, tcpm_h):
+                    (root / path).parent.mkdir(parents=True, exist_ok=True)
+                    (root / path).write_text(subprocess.run(
+                        ["git", "-C", str(kernel), "show", f"HEAD:{path}"], check=True, capture_output=True,
+                        text=True).stdout)
+                for patch in patches:
+                    # As scripts/build-mainline-kernel.sh applies one: it keeps
+                    # FILE.orig where a hunk goes in at an offset.
+                    with open(patch) as stream:
+                        subprocess.run(["patch", "-s", "--forward", "--batch", "-d", str(root), "-p1"],
+                                       stdin=stream, check=True, capture_output=True)
+                return root
+
+            adopt = REPO / "kernel/patches/tcpm-adopt-retained-source-ufp-role.patch"
+            new_retained = REPO / "kernel/patches/tcpm-use-retained-sink-data-role.patch"
+            release = tree("release", adopt, tmp / "old-retained.patch")
+            build = tree("build", adopt, new_retained, *(REPO / "kernel/patches" / p for p in tcpm_patches))
+            # The release tree as the build left it has the backup; this
+            # build's tree has none.
+            self.assertTrue((release / f"{tcpm_c}.orig").exists())
+            self.assertFalse((build / f"{tcpm_c}.orig").exists())
+            # The replay.
+            src = tmp / "src"
+            for path in (tcpm_c, tcpm_h):
+                (src / path).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(release / path, src / path)
+            with open(tmp / "hunk") as stream:
+                subprocess.run(["patch", "-s", "--reverse", "--force", "--fuzz=0", "--no-backup-if-mismatch",
+                                "-d", str(src), "-p1"], stdin=stream, check=True)
+            for p in tcpm_patches:
+                with open(REPO / "kernel/patches" / p) as stream:
+                    subprocess.run(["patch", "-s", "--forward", "--batch", "--no-backup-if-mismatch",
+                                    "-d", str(src), "-p1"], stdin=stream, check=True)
+            for path in (tcpm_c, tcpm_h):
+                with self.subTest(path):
+                    self.assertEqual((src / path).read_text(), (build / path).read_text())
+            # The backup that only the release tree has.
+            block = make_kit_block("\trelease_backup=", "\tfi")
+            said = re.search(r'^\tif \[ -n "\$release_backup" \]; then\n.*?^\tfi\n', self.text, re.M | re.S)
+            for name, damage, passed in (("the file patch(1) kept", None, True),
+                                         ("another file", "not the file\n", False)):
+                with self.subTest(name):
+                    if damage:
+                        (release / f"{tcpm_c}.orig").write_text(damage)
+                    work = tmp / f"work-{passed}"
+                    work.mkdir()
+                    shutil.copy(tmp / "hunk", work / "hard-reset.hunk")
+                    script = ('set -euo pipefail; base_tree=$1 tree=$2 tmp=$3 repo=$4\n'
+                              'tcpm_dir=drivers/usb/typec/tcpm retained_patch=tcpm-use-retained-sink-data-role.patch\n'
+                              'diff -rq "$base_tree" "$tree" > "$tmp/trees.diff" || :\n'
+                              + block + 'cat "$tmp/trees.diff"; echo "release_backup:$release_backup"\n'
+                              'source_check=compared\n' + said.group(0) + 'echo "source check: $source_check"\n')
+                    result = subprocess.run(["bash", "-c", script, "orig", str(release), str(build), str(work),
+                                             str(REPO)], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    lines = sorted(result.stdout.splitlines())
+                    only = f"Only in {release / 'drivers/usb/typec/tcpm'}: tcpm.c.orig"
+                    if passed:
+                        self.assertNotIn(only, lines)
+                        self.assertIn("release_backup: tcpm.c.orig", lines)
+                        self.assertIn("sources: passed over the release tree's tcpm.c.orig, the file before its "
+                                      "tcpm-use-retained-sink-data-role.patch as patch(1) kept it", lines)
+                        self.assertIn("source check: compared; passed over, in the release tree alone, the copy "
+                                      "that its patch(1) kept of the file before its "
+                                      "tcpm-use-retained-sink-data-role.patch: tcpm.c.orig", lines)
+                    else:
+                        self.assertIn(only, lines)
+                        self.assertIn("release_backup:", lines)
+                        self.assertIn("source check: compared", lines)
+                    # tcpm.c itself differs, by the kit's patches.
+                    self.assertIn(f"Files {release / tcpm_c} and {build / tcpm_c} differ", lines)
+
+    def marker_gate(self, tcpm, driver):
+        """The build tree's revision 10 markers (section 3) on a stand-in
+        tcpm.c and sm5714_usbpd.c."""
+        block = make_kit_block("! grep -q 'data_role_swapped' \"$tree/$tcpm_dir/tcpm.c\" ||",
+                               "\tdie \"the build tree's sm5714_usbpd.c has no cc_reopen_via_snk or no cc_self_heal\"")
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp, "drivers/usb/typec/tcpm")
+            d.mkdir(parents=True)
+            (d / "tcpm.c").write_text(tcpm)
+            (d / "sm5714_usbpd.c").write_text(driver)
+            setup = (f'set -euo pipefail; export LC_ALL=C\ndie() {{ echo "$*" >&2; exit 1; }}\ntree={tmp}\n'
+                     + make_kit_definitions("tcpm_dir", "retained_patch") + "patches=(" +
+                     " ".join(make_kit_array("patches")) + ")\n")
+            result = subprocess.run(["bash", "-c", setup + block + "echo ok\n"], capture_output=True, text=True)
+            return result.returncode, result.stdout + result.stderr
+
+    def test_the_build_tree_is_checked_for_revision_10_s_markers(self):
+        driver = (REPO / "kernel/drivers/sm5714_usbpd.c").read_text()
+        tcpm = "\t\ttcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SINK,\n" \
+               "\t\t\t       tcpm_data_role_for_sink(port));\n\tktime_t sink_dfp_not_before;\n"
+        self.assertEqual(self.marker_gate(tcpm, driver), (0, "ok\n"))
+        r9_driver = repo_file_at(R9_COMMIT, "kernel/drivers/sm5714_usbpd.c") or driver.replace(
+            "module_param(cc_self_heal, bool, 0644);", "")
+        for name, args, message in (
+                ("revision 9's request-dfp patch", (tcpm + "\tbool data_role_swapped;\n", driver),
+                 "has data_role_swapped: its tcpm-request-dfp-as-sink-before-discovery.patch is revision 9's"),
+                ("the host role kept at a Hard Reset", (tcpm.replace(
+                    "tcpm_data_role_for_sink(port));", "port->tcpc->adopt_retained_source_ufp &&\n"
+                    "\t\t\t       port->data_role == TYPEC_HOST ?\n"
+                    "\t\t\t       TYPEC_HOST : tcpm_data_role_for_sink(port));"), driver),
+                 "keeps a sink's host role across a Hard Reset: its tcpm-use-retained-sink-data-role.patch or "
+                 "tcpm-request-dfp-as-sink-before-discovery.patch is revision 9's"),
+                ("revision 9's driver", (tcpm, r9_driver), "has no cc_reopen_via_snk or no cc_self_heal")):
+            with self.subTest(name):
+                code, out = self.marker_gate(*args)
+                self.assertEqual(code, 1, out)
+                self.assertIn(message, out)
+        # The release tree is checked for the hunk, and for none of the
+        # driver's two switches.
+        self.assertIn("grep -qF 'TYPEC_HOST : tcpm_data_role_for_sink(port)' \"$base_tree/$tcpm_dir/tcpm.c\" ||",
+                      self.text)
+        self.assertIn("! grep -q -e cc_reopen_via_snk -e cc_self_heal \"$base_tree/$tcpm_dir/sm5714_usbpd.c\" ||",
+                      self.text)
+
+    def test_revision_10_s_strings_are_the_driver_s_own(self):
+        """cc_strings are the driver's (its two switches' names, its new
+        format strings or parts of one, two members of its structure), in
+        no patch the kit replays, in the pinned kernel's TCPM, or in
+        revision 9's driver.  gone_strings are revision 9's: data_role_swapped
+        its request-dfp patch's, the rest its driver's; none is in this
+        checkout's driver or patches."""
+        cc, gone = make_kit_array("cc_strings"), make_kit_array("gone_strings")
+        self.assertEqual(len(cc + gone), len(set(cc + gone)))
+        driver = (REPO / "kernel/drivers/sm5714_usbpd.c").read_text()
+        struct = driver[driver.index("struct sm5714_usbpd {\n"):]
+        struct = struct[:struct.index("\n};\n")]
+        # A switch's name, a whole format string, a string the warning's %s
+        # takes, or a member of the driver's structure.
+        for s in cc:
+            with self.subTest(s):
+                if s in R10_SWITCHES:
+                    self.assertIn(f"module_param({s}, bool, 0644);", driver)
+                elif re.fullmatch(r"[a-z_]+", s):
+                    self.assertRegex(struct, rf"\n\t(bool|unsigned int) {s};\n")
+                elif "%" in s or s.startswith("CC on again"):
+                    self.assertIn(f'"{s}\\n"', driver)
+                else:
+                    self.assertIn(f'"{s}"', driver)
+        self.assertEqual(cc[:2], list(R10_SWITCHES))
+        self.assertEqual(cc[-2:], ["heal_armed", "watch_suspect"])
+        added = "\n".join(line for patch in (REPO / "kernel/patches").glob("*.patch")
+                          for lines in added_lines(patch.name).values() for line in lines)
+        for s in cc + gone:
+            with self.subTest(patches=s):
+                self.assertNotIn(s, added)
+        for s in gone:
+            with self.subTest(gone=s):
+                self.assertNotIn(s, driver)
+        r9_driver = repo_file_at(R9_COMMIT, "kernel/drivers/sm5714_usbpd.c")
+        r9_dfp = repo_file_at(R9_COMMIT, "kernel/patches/tcpm-request-dfp-as-sink-before-discovery.patch")
+        if r9_driver is not None:
+            for s in cc:
+                with self.subTest(r9=s):
+                    self.assertNotIn(s, r9_driver)
+            for s in gone[1:]:
+                with self.subTest(r9_gone=s):
+                    self.assertIn(s, r9_driver)
+            self.assertIn("\tbool irq_saw_attach;\n", r9_driver)
+            self.assertIn("\tbool watch_saw_attach;\n", r9_driver)
+            self.assertIn("+\tbool data_role_swapped;\n", r9_dfp)
+        kernel = kernel_source()
+        if kernel is None:
+            return
+        upstream = "".join(subprocess.run(["git", "-C", str(kernel), "show", f"HEAD:{path}"], check=True,
+                                          capture_output=True, text=True).stdout
+                           for path in ("drivers/usb/typec/tcpm/tcpm.c", "include/linux/usb/tcpm.h",
+                                        "include/linux/usb/pd.h"))
+        for s in cc + gone:
+            with self.subTest(upstream=s):
+                self.assertNotIn(s, upstream)
+
+    def image_gate(self, new, base):
+        """Section 4's string checks on stand-in images."""
+        block = re.search(r'^for s in "\$\{new_strings\[@\]\}" "\$\{deep_strings\[@\]\}".*?^echo "image: [^\n]*\n',
+                          self.text, re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            pathlib.Path(tmp, "new.Image").write_bytes(new)
+            pathlib.Path(tmp, "base.Image").write_bytes(base)
+            setup = (f'set -euo pipefail; export LC_ALL=C\ndie() {{ echo "$*" >&2; exit 1; }}\ntmp={tmp}\n'
+                     + make_kit_definitions("new_strings", "deep_strings", "gpu_strings", "swap_back_strings",
+                                            "cc_strings", "gone_strings"))
+            result = subprocess.run(["bash", "-c", setup + block], capture_output=True, text=True)
+            return result.returncode, result.stdout + result.stderr
+
+    def test_the_image_has_revision_10_s_strings_and_none_it_takes_out(self):
+        earlier = (make_kit_array("new_strings") + make_kit_array("deep_strings") + make_kit_array("gpu_strings")
+                   + make_kit_array("swap_back_strings"))
+        cc, gone = make_kit_array("cc_strings"), make_kit_array("gone_strings")
+        new = b"\0".join(s.encode() for s in earlier + cc)
+        self.assertEqual(self.image_gate(new, b"release"),
+                         (0, f"image: {len(earlier + cc)} strings of the change are in the new kernel and not in the "
+                             f"release one, and none of the {len(gone)} that revision 10 takes out\n"))
+        for name, args, message in (
+                ("a string of revision 10 missing", (new.replace(cc[2].encode(), b""), b"release"),
+                 f"the new kernel image does not contain '{cc[2]}'"),
+                ("one in the release image", (new, cc[-1].encode()),
+                 f"self-test failed: the release image contains '{cc[-1]}' too"),
+                ("data_role_swapped still there", (new + b"\0data_role_swapped", b"release"),
+                 "the new kernel image still contains 'data_role_swapped', which revision 10 takes out"),
+                ("the old resync line still there", (new + b"\0" + gone[-1].encode(), b"release"),
+                 f"the new kernel image still contains '{gone[-1]}'")):
+            with self.subTest(name):
+                code, out = self.image_gate(*args)
+                self.assertEqual(code, 1, out)
+                self.assertIn(message, out)
+        # What revision 10 takes out may be in the release image: the
+        # watchdog's old line and members are.
+        self.assertEqual(self.image_gate(new, b"\0".join(s.encode() for s in gone[1:]))[0], 0)
+
+    def switch_gate(self, new, base, prev=None, undescribed=(), described=None, base_described=(),
+                    prev_described=()):
+        """Section 6c on stand-in modules.builtin.modinfo files, each a list
+        of NAME:TYPE (one parmtype and one parm line each, the driver's
+        description for revision 10's two and "what NAME does" for the
+        others; no parm line in NEW for the names in UNDESCRIBED; DESCRIBED
+        replaces NEW's descriptions; BASE_DESCRIBED and PREV_DESCRIBED add the
+        driver's description of those names to the release's and to
+        revision 9's)."""
+        block = make_kit_block("builtin_switches() {", 'echo "driver: $driver_check"')
+        real = dict(d.split(":", 1) for d in make_kit_array("cc_switch_descriptions"))
+
+        def modinfo(switches, undescribed=(), described=None, extra=()):
+            lines = []
+            for s in switches:
+                name, kind = s.split(":")
+                lines.append(f"sm5714_usbpd.parmtype={name}:{kind}")
+                if name not in undescribed:
+                    text = (described or {}).get(name, real.get(name, f"what {name} does"))
+                    lines.append(f"sm5714_usbpd.parm={name}:{text}")
+            lines += [f"sm5714_usbpd.parm={name}:{real[name]}" for name in extra]
+            return "\n".join(lines + ["sm5714_usbpd.license=GPL"]) + "\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            (tmp / "builtin.modinfo").write_text(modinfo(new, undescribed, described))
+            (tmp / "builtin.base.modinfo").write_text(modinfo(base, extra=base_described))
+            setup = (f'set -euo pipefail; export LC_ALL=C\ndie() {{ echo "$*" >&2; exit 1; }}\n'
+                     f'tmp={tmp} release={RELEASE}\n' + make_kit_definitions("switches", "cc_switch_descriptions"))
+            if prev is not None:
+                kit = tmp / "kit9"
+                kit.mkdir()
+                data = modinfo(prev, extra=prev_described).replace("\n", "\0").encode()
+                with tarfile.open(kit / f"modules-{RELEASE}.tar", "w") as tar:
+                    info = tarfile.TarInfo(f"usr/lib/modules/{RELEASE}/modules.builtin.modinfo")
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+                setup += f"PREV_KIT={kit} prev_revision=9\n"
+            result = subprocess.run(["bash", "-c", setup + block], capture_output=True, text=True)
+            return result.returncode, result.stdout + result.stderr
+
+    def test_the_driver_s_twelve_switches_are_built_in_with_their_types(self):
+        twelve = make_kit_array("switches")
+        self.assertEqual(len(twelve), 12)
+        self.assertEqual([s.split(":")[0] for s in twelve], list(SWITCHES))
+        # The two descriptions are the driver's.
+        driver = " ".join((REPO / "kernel/drivers/sm5714_usbpd.c").read_text().split())
+        for d in make_kit_array("cc_switch_descriptions"):
+            name, text = d.split(":", 1)
+            with self.subTest(name):
+                self.assertIn(f'MODULE_PARM_DESC({name}, "{text}");', driver)
+        self.assertEqual([d.split(":")[0] for d in make_kit_array("cc_switch_descriptions")], list(R10_SWITCHES))
+        said = ("driver: its twelve switches in modules.builtin.modinfo with their types, and revision 10's two "
+                "with their descriptions, the release build's with the first two alone")
+        self.assertEqual(self.switch_gate(twelve, twelve[:2]), (0, said + "\n"))
+        self.assertEqual(self.switch_gate(twelve, twelve[:2], prev=twelve[:10]),
+                         (0, said + ", revision 9's with the first ten\n"))
+        for name, args, kwargs, message in (
+                ("one missing", (twelve[:11], twelve[:2]), {}, "has no sm5714_usbpd switch cc_self_heal of type bool"),
+                ("another type", ([s.replace(":bool", ":int") if s.startswith("cc_reopen") else s for s in twelve],
+                                  twelve[:2]), {}, "has no sm5714_usbpd switch cc_reopen_via_snk of type bool"),
+                ("a thirteenth", (twelve + ["extra_switch:bool"], twelve[:2]), {},
+                 "the driver has other switches than these twelve"),
+                ("a release driver with four", (twelve, twelve[:4]), {},
+                 "self-test failed: the release driver's switches are not"),
+                ("revision 9's kit with the new driver", (twelve, twelve[:2], twelve), {},
+                 "revision 9's driver does not have exactly the switches"),
+                ("revision 9's kit with revision 8's driver", (twelve, twelve[:2], twelve[:4]), {},
+                 "revision 9's driver does not have exactly the switches"),
+                ("another description", (twelve, twelve[:2]),
+                 {"described": {"cc_reopen_via_snk": "turn CC on again (default on)"}},
+                 "does not describe cc_reopen_via_snk as the driver does: 'leave a CC open of the driver's through "
+                 "Unattached.SNK before toggling (default on)'"),
+                ("the release describes it", (twelve, twelve[:2]), {"base_described": ("cc_self_heal",)},
+                 "self-test failed: the release build's modules.builtin.modinfo describes cc_self_heal too"),
+                ("revision 9's describes it", (twelve, twelve[:2], twelve[:10]),
+                 {"prev_described": ("cc_reopen_via_snk",)},
+                 "revision 9's modules.builtin.modinfo describes cc_reopen_via_snk already"),
+                ("a switch without its description", (twelve, twelve[:2]), {"undescribed": ("sink_tx_ok_rp",)},
+                 "has no sm5714_usbpd switch sink_tx_ok_rp of type bool, or no description of it")):
+            with self.subTest(name):
+                code, out = self.switch_gate(*args, **kwargs)
+                self.assertEqual(code, 1, out)
+                self.assertIn(message, out)
+
+    def prev_gate(self, image=None, kernel=None, boot=None, revision="9", sums_ok=True, image_id=None,
+                  new_id="1" * 40, prev=True):
+        """Section 5a on a stand-in revision 9 kit: its boot.img's kernel
+        (the stand-in unpack gives KERNEL, by default the gzipped IMAGE and
+        the release DTB), REVISION and SHA256SUMS."""
+        block = make_kit_block('prev_check="not compared (PREV_KIT not set)"', "fi")
+        build_id = re.search(r"^build_id\(\) \{.*?^\}\n", self.text, re.M | re.S).group(0)
+        prev_id = "9" * 40
+        strings = (make_kit_array("new_strings") + make_kit_array("deep_strings") + make_kit_array("gpu_strings")
+                   + make_kit_array("swap_back_strings") + make_kit_array("gone_strings"))
+        if image is None:
+            image = b"\0".join(s.encode() for s in strings)
+        note = bytes.fromhex("040000001400000003000000") + b"GNU\0" + bytes.fromhex(image_id or prev_id)
+        image = b"head\0" + image + b"\0" + note + b"tail"
+        dtb = b"\xd0\x0d\xfe\xed the release DTB"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            (tmp / "base").mkdir()
+            (tmp / "base/sm8550-samsung-gts9uwifi.dtb").write_bytes(dtb)
+            (tmp / "work").mkdir()
+            kit = tmp / "kit9"
+            kit.mkdir()
+            boot_img = boot or os.urandom(4096)
+            (kit / "boot.img").write_bytes(boot_img)
+            (kit / "REVISION").write_text(revision + "\n")
+            (kit / f"modules-{RELEASE}.tar").write_bytes(b"")
+            sums = "".join(f"{sha((kit / n).read_bytes())}  {n}\n" for n in ("boot.img", "REVISION"))
+            (kit / "SHA256SUMS").write_text(sums if sums_ok else sums.replace(sums[:8], "00000000"))
+            (tmp / "kernel").write_bytes(kernel if kernel is not None else gzip.compress(image) + dtb)
+            setup = (f'set -euo pipefail; export LC_ALL=C\ndie() {{ echo "$*" >&2; exit 1; }}\n'
+                     'sha() { sha256sum "$1" | cut -d\' \' -f1; }\n'
+                     f'unpack() {{ mkdir -p "$2"; cp {tmp}/kernel "$2/kernel"; }}\n'
+                     f'tmp={tmp}/work base={tmp}/base dts=sm8550-samsung-gts9uwifi release={RELEASE} '
+                     f'new_id={new_id}\nprev_revision=9 prev_boot={sha(boot_img) if boot is None else sha(b"x")} '
+                     f'prev_build_id={prev_id}\n'
+                     + (f"PREV_KIT={kit}\n" if prev else "")
+                     + make_kit_definitions("new_strings", "deep_strings", "gpu_strings", "swap_back_strings",
+                                            "cc_strings", "gone_strings")
+                     + build_id)
+            result = subprocess.run(["bash", "-c", setup + block + 'echo "check: $prev_check"\n'],
+                                    capture_output=True, text=True)
+            return result.returncode, result.stdout + result.stderr
+
+    def test_revision_9_s_kernel_has_what_revision_10_takes_out_and_none_of_what_it_adds(self):
+        earlier = (make_kit_array("new_strings") + make_kit_array("deep_strings") + make_kit_array("gpu_strings")
+                   + make_kit_array("swap_back_strings"))
+        gone, cc = make_kit_array("gone_strings"), make_kit_array("cc_strings")
+        said = (f"revision 9's boot.img ({{}}) holds an image with build ID 999999999999 and the release DTB, "
+                f"with all {len(earlier)} strings of revisions 1 to 9 and the {len(gone)} that revision 10 takes "
+                f"out, and none of the {len(cc)} of revision 10")
+        code, out = self.prev_gate()
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"^revision 9: " + re.escape(said).replace(r"\{\}", "[0-9a-f]{12}") + "\ncheck: ")
+        self.assertEqual(self.prev_gate(prev=False), (0, "check: not compared (PREV_KIT not set)\n"))
+        full = b"\0".join(s.encode() for s in earlier + gone)
+        for name, kwargs, message in (
+                ("an image with a string of revision 10", {"image": full + b"\0" + cc[2].encode()},
+                 f"revision 9's image contains '{cc[2]}' already: it is not a string of revision 10 alone"),
+                ("an image without a string of revision 9",
+                 {"image": b"\0".join(s.encode() for s in earlier[:-1] + gone)},
+                 f"self-test failed: revision 9's image does not contain '{earlier[-1]}'"),
+                ("an image without data_role_swapped",
+                 {"image": b"\0".join(s.encode() for s in earlier + gone[1:])},
+                 "self-test failed: revision 9's image does not contain 'data_role_swapped'"),
+                ("another boot.img", {"boot": os.urandom(4096)}, "boot.img is not revision 9's"),
+                ("another DTB after the kernel", {"kernel": gzip.compress(full) + b"\xd0\x0d\xfe\xed another DTB"},
+                 "self-test failed: revision 9's boot kernel does not end with the release DTB"),
+                ("another build", {"image_id": "8" * 40},
+                 "self-test failed: the build ID of revision 9's image is not 999999999999"),
+                ("revision 8's kit", {"revision": "8"}, "is not revision 9's kit"),
+                ("a kit that does not match its checksums", {"sums_ok": False}, "does not match its SHA256SUMS"),
+                ("the new image is revision 9's", {"new_id": "9" * 40}, "the new image is revision 9's")):
+            with self.subTest(name):
+                code, out = self.prev_gate(**kwargs)
+                self.assertEqual(code, 1, out)
+                self.assertIn(message, out)
+
+    def test_prev_kit_is_revision_9_s(self):
+        """PREV_KIT's facts are revision 9's kit's: its boot.img hash and
+        build ID as its report and its kit give them (and verify.sh's
+        build ID check would know it by the same)."""
+        self.assertEqual(constant("make-kit.sh", "prev_revision"), "9")
+        self.assertEqual(pinned("make-kit.sh", "prev_boot"),
+                         "a62145c2cbb49a5d5ccbd72a60a587cdcbb3deb35fd1914f2b8ce6be46ad552c")
+        self.assertEqual(pinned("make-kit.sh", "prev_build_id"), "ba183276ef1888ac2813ba5429a107144ccef10d")
+        self.assertIn("# Revision 9 of this kit (2026-11-26), what the tablet runs before this one", self.text)
+
+    # struct tcpm_port as pahole shows it in revision 10's tcpm.o (abridged),
+    # and in revision 9's, with data_role_swapped between the two members
+    # around it (both read from the real objects, 2026-11-27).
+    TCPM_PAHOLE = ("struct tcpm_port {\n\tstruct device *             dev;                  /*     0     8 */\n"
+                   "\tunsigned int               sink_dfp_tries;       /*  1048     4 */\n"
+                   "\tbool                       sink_dfp_done;        /*  1052     1 */\n\n"
+                   "\t/* XXX 3 bytes hole, try to pack */\n\n"
+                   "\tktime_t                    sink_dfp_not_before;  /*  1056     8 */\n"
+                   "\tbool                       send_discover_before_swap; /*  1064     1 */\n\n"
+                   "\t/* XXX 3 bytes hole, try to pack */\n\n"
+                   "\tunsigned int               rx_msgid;             /*  1068     4 */\n"
+                   "\t/* size: 15592, cachelines: 244, members: 151 */\n};\n")
+    TCPM_PAHOLE_R9 = TCPM_PAHOLE.replace(
+        "\tbool                       send_discover_before_swap; /*  1064     1 */\n\n"
+        "\t/* XXX 3 bytes hole, try to pack */\n\n",
+        "\tbool                       data_role_swapped;    /*  1064     1 */\n"
+        "\tbool                       send_discover_before_swap; /*  1065     1 */\n\n"
+        "\t/* XXX 2 bytes hole, try to pack */\n\n").replace("members: 151", "members: 152")
+    CC_NM = "".join(f"ffff8000809b{n:04x} t {f}\n" for n, f in enumerate(
+        ("sm5714_usbpd_cc_watch_work", "sm5714_usbpd_start_toggling", "sm5714_usbpd_set_cc", "sm5714_usbpd_init",
+         "sm5714_usbpd_open_cc", "sm5714_usbpd_restart_cc", "sm5714_usbpd_init_regs")))
+    # What each of the driver's functions calls in revision 10's vmlinux, as
+    # llvm-objdump shows it (abridged to the calls), and in revision 9's.
+    CALLS = {"sm5714_usbpd_cc_watch_work": ("mutex_lock", "regmap_read", "sm5714_usbpd_restart_cc", "_dev_info",
+                                            "_dev_warn", "tcpm_cc_change", "queue_delayed_work_on"),
+             "sm5714_usbpd_start_toggling": ("mutex_lock", "regmap_write", "usleep_range_state", "_dev_info",
+                                             "sm5714_usbpd_set_cc"),
+             "sm5714_usbpd_set_cc": ("msleep", "regmap_read", "sm5714_usbpd_open_cc", "_dev_info"),
+             "sm5714_usbpd_init": ("mutex_lock", "sm5714_usbpd_init_regs", "mutex_unlock")}
+    CALLS_R9 = {"sm5714_usbpd_cc_watch_work": ("regmap_read", "_dev_info", "tcpm_cc_change", "queue_delayed_work_on"),
+                "sm5714_usbpd_start_toggling": ("mutex_lock", "regmap_write", "sm5714_usbpd_set_cc"),
+                "sm5714_usbpd_set_cc": ("msleep", "regmap_read", "_dev_info"),
+                "sm5714_usbpd_init": ("mutex_lock", "regmap_read", "regmap_write", "regmap_bulk_read")}
+
+    @staticmethod
+    def disassembly(function, calls):
+        lines = [f"ffff8000809b0000 <{function}>:"]
+        for n, callee in enumerate(calls):
+            lines.append(f"ffff8000809b{n * 4 + 4:04x}:      \tbl\t0xffff8000801f{n:04x} <{callee}>")
+        # A tail branch to itself and an unnamed one, which are no calls of
+        # the function.
+        lines.append(f"ffff8000809b0100:      \tb\t0xffff8000809b0010 <{function}+0x10>")
+        lines.append("ffff8000809b0104:      \tret")
+        return "\nvmlinux:\tfile format elf64-littleaarch64\n\n" + "\n".join(lines) + "\n"
+
+    def tcpm_gate(self, layout=None, nm=None, base_nm=None, calls=None):
+        """Section 5e on stand-ins: tcpm.o's pahole layout of tcpm_port,
+        vmlinux's symbols and disassembly and, when given, the release
+        build's symbols."""
+        block = make_kit_block("member_end() {", 'echo "driver: $cc_check"')
+        member = re.search(r"^member_offset\(\) \{.*?^\}\n", self.text, re.M | re.S).group(0)
+        nm_has = re.search(r"^nm_has\(\) \{.*\}.*\n", self.text, re.M).group(0)
+        branches = re.search(r"^branches_of\(\) \{.*?^\}\n", self.text, re.M | re.S).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            bin_ = tmp / "bin"
+            bin_.mkdir()
+            (bin_ / "pahole").write_text('#!/bin/sh\ncat "$3.$2" 2>/dev/null\n')
+            (bin_ / "llvm-objdump").write_text('#!/bin/sh\nfor a; do case $a in --disassemble-symbols=*) '
+                                               'f=${a#*=} ;; esac; last=$a; done\n'
+                                               # As llvm-objdump does, a symbol it does not find
+                                               # is a warning and no failure.
+                                               'cat "$last.$f.dis" 2>/dev/null || :\n')
+            for stub in bin_.iterdir():
+                stub.chmod(0o755)
+            obj = tmp / "build/drivers/usb/typec/tcpm/tcpm.o"
+            obj.parent.mkdir(parents=True)
+            obj.write_text("object")
+            (obj.parent / "tcpm.o.tcpm_port").write_text(self.TCPM_PAHOLE if layout is None else layout)
+            (tmp / "vmlinux.nm").write_text(self.CC_NM if nm is None else nm)
+            (tmp / "build/vmlinux").write_text("vmlinux")
+            for function, callees in (self.CALLS if calls is None else calls).items():
+                (tmp / f"build/vmlinux.{function}.dis").write_text(self.disassembly(function, callees))
+            setup = (f'set -euo pipefail; export LC_ALL=C\ndie() {{ echo "$*" >&2; exit 1; }}\n'
+                     f'build={tmp}/build tmp={tmp} new_id={"1" * 40}\n'
+                     + make_kit_definitions("tcpm_dir") + "patches=(" + " ".join(make_kit_array("patches")) + ")\n"
+                     + member + nm_has + branches)
+            if base_nm is not None:
+                (tmp / "vmlinux.base.nm").write_text(base_nm)
+                setup += f"BASE_SCRATCH={tmp}/base\n"
+            env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}")
+            result = subprocess.run(["bash", "-c", setup + block], capture_output=True, text=True, env=env)
+            return result.returncode, (result.stdout + result.stderr).replace(str(tmp), "TMP")
+
+    def test_tcpm_port_has_no_data_role_swapped_and_the_driver_s_new_code_is_linked(self):
+        functions = make_kit_array("cc_functions")
+        self.assertEqual(functions, ["sm5714_usbpd_open_cc", "sm5714_usbpd_restart_cc", "sm5714_usbpd_init_regs"])
+        pairs = [c.split(":") for c in make_kit_array("cc_calls")]
+        # Each caller and callee is the driver's or the kernel's, and the
+        # summary names every pair.
+        driver = (REPO / "kernel/drivers/sm5714_usbpd.c").read_text()
+        for caller, callee in pairs:
+            with self.subTest(caller=caller, callee=callee):
+                self.assertIn(f"{caller}(", driver)
+                self.assertIn(callee, self.CALLS[caller])
+                self.assertNotIn(callee, self.CALLS_R9[caller])
+        said_calls = ("its attach watchdog calls sm5714_usbpd_restart_cc() and _dev_warn(), start_toggling() "
+                      "usleep_range_state() and _dev_info(), set_cc() sm5714_usbpd_open_cc() and init() "
+                      "sm5714_usbpd_init_regs()")
+        for caller, callee in pairs:
+            self.assertIn(f"{callee}()", said_calls)
+        said = ("TCPM: struct tcpm_port in tcpm.o (pahole) has no data_role_swapped: send_discover_before_swap is "
+                "at 1064, the end of sink_dfp_not_before\ndriver: vmlinux (build ID 111111111111) has "
+                f"{', '.join(f + '()' for f in functions)}; {said_calls}\n")
+        self.assertEqual(self.tcpm_gate(), (0, said))
+        release_nm = "ffff8000809b0000 t sm5714_usbpd_cc_watch_work\n"
+        self.assertEqual(self.tcpm_gate(base_nm=release_nm),
+                         (0, said[:-1] + "; the release build's has none of them\n"))
+        for name, kwargs, message in (
+                ("revision 9's layout", {"layout": self.TCPM_PAHOLE_R9},
+                 "struct tcpm_port in TMP/build/drivers/usb/typec/tcpm/tcpm.o has data_role_swapped, or a member "
+                 "after sink_dfp_not_before: tcpm-request-dfp-as-sink-before-discovery.patch is revision 9's"),
+                ("a member renamed", {"layout": self.TCPM_PAHOLE_R9.replace("data_role_swapped", "role_swapped")},
+                 "has data_role_swapped, or a member after sink_dfp_not_before"),
+                ("no layout", {"layout": ""},
+                 "pahole gives no offsets of struct tcpm_port's sink_dfp_not_before and send_discover_before_swap"),
+                ("a function inlined away", {"nm": self.CC_NM.replace(f" t {functions[-1]}\n", " t other\n")},
+                 f"no {functions[-1]} in TMP/build/vmlinux"),
+                ("revision 9's watchdog", {"calls": {**self.CALLS, "sm5714_usbpd_cc_watch_work":
+                                                     self.CALLS_R9["sm5714_usbpd_cc_watch_work"]}},
+                 "sm5714_usbpd_cc_watch_work() in TMP/build/vmlinux does not call sm5714_usbpd_restart_cc(): the "
+                 "build's sm5714_usbpd.c is not revision 10's"),
+                ("revision 9's start_toggling()", {"calls": {**self.CALLS, "sm5714_usbpd_start_toggling":
+                                                             self.CALLS_R9["sm5714_usbpd_start_toggling"]}},
+                 "sm5714_usbpd_start_toggling() in TMP/build/vmlinux does not call usleep_range_state()"),
+                ("a watchdog that does not warn", {"calls": {**self.CALLS, "sm5714_usbpd_cc_watch_work": tuple(
+                    c for c in self.CALLS["sm5714_usbpd_cc_watch_work"] if c != "_dev_warn")}},
+                 "sm5714_usbpd_cc_watch_work() in TMP/build/vmlinux does not call _dev_warn()"),
+                ("set_cc() not found", {"calls": {k: v for k, v in self.CALLS.items() if k != "sm5714_usbpd_set_cc"}},
+                 "sm5714_usbpd_set_cc() in TMP/build/vmlinux does not call sm5714_usbpd_open_cc()"),
+                ("a release with one of them", {"base_nm": release_nm + f"1 t {functions[0]}\n"},
+                 f"self-test failed: the release vmlinux has {functions[0]}() too")):
+            with self.subTest(name):
+                code, out = self.tcpm_gate(**kwargs)
+                self.assertEqual(code, 1, out)
+                self.assertIn(message, out)
+
+    def test_the_readme_says_what_revision_10_is_and_that_none_of_it_has_run(self):
+        text = (KIT_SRC / "README.md").read_text()
+        readme = " ".join(text.split())
+        for said in ("**Revision 10 (2026-11-27): a sink is UFP after every Hard Reset, and a CC open no longer "
+                     "leaves the port dead. Built and checked on the host; nothing that it adds has run on a "
+                     "tablet.**",
+                     "**That the chip's CC logic stays off after the toggling's write alone is read from Samsung's "
+                     "code, not measured, and none of revision 10's driver code has run on a tablet.**",
+                     "(`mv ~/typec-roles ~/typec-roles-r9`)",
+                     "**Not on revision 9: a run with `swap_protocol_reset` at `N`.**",
+                     "On revision 9 leave out the first run's repeat with `swap_protocol_reset` at `N`",
+                     "`REVISION` the revision (10; revisions 1 to 7 had none)",
+                     "PREV_KIT=$HOME/ubuntu-gts9u/backups/typec-roles-ultra-kit-r9",
+                     "`a62145c2cbb49a5d5ccbd72a60a587cdcbb3deb35fd1914f2b8ce6be46ad552c`",
+                     "twenty-three files and two overlay blobs may differ"):
+            with self.subTest(said):
+                self.assertIn(said, readme)
+        for name in ("tcpm-use-retained-sink-data-role.patch", "tcpm-request-dfp-as-sink-before-discovery.patch"):
+            self.assertIn(f"`{name}`", readme)
+        for line in ("CC opened for TCPM's error recovery", "CC on again through Unattached.SNK",
+                     "CC finds no partner", "shows a partner TCPM was not told of"):
+            self.assertIn(f"`{line}`", readme)
+        for name in R10_SWITCHES:
+            self.assertIn(f"| `{name}` | `{SWITCHES[name]}` |", readme)
+        self.assertNotIn("PREV_KIT=$HOME/ubuntu-gts9u/backups/typec-roles-ultra-kit-r8", readme)
+        # A command run with sudo over ssh: -t, and its output through tee,
+        # never redirected on the build host (the password prompt would go
+        # into the file).  No command reads the TCPM log twice.
+        commands = [line.strip() for line in text.splitlines() if line.strip().startswith("ssh ")]
+        commands += re.findall(r"`(ssh [^`]*)`", text)
+        self.assertTrue([c for c in commands if "sudo" in c])
+        for command in commands:
+            with self.subTest(command):
+                # The README's placeholders (<user>, <tablet>) are no
+                # redirections.
+                quoted = re.sub(r"'[^']*'", "''", re.sub(r"<[a-z]+>", "X", command))
+                self.assertNotIn(">", quoted)
+                if "sudo" in command:
+                    self.assertTrue(command.startswith("ssh -t "), command)
+                    if "reboot" not in command:
+                        self.assertRegex(quoted, r"^ssh -t \S+ '' \| tee \S+$")
+        self.assertFalse([line for line in text.splitlines() if line.count("tcpm-8-0033/log") > 1])
+
+
+class Revision10UpgradeTest(FakeTablet):
+    """Revision 10 over a tablet that has revision 9, revision 8 or the
+    release, each with one install.sh and no rollback first, and each way
+    back: revision 9's and revision 8's own install.sh (from their kits'
+    commits), rollback.sh to the release, and from TWRP the release's or
+    revision 9's boot image with rollback.sh or revision 9's install.sh."""
+
+    def setUp(self):
+        super().setUp()
+        scripts = {}
+        for name, commit in (("r8", R8_COMMIT), ("r9", R9_COMMIT)):
+            scripts[name] = {s: repo_file_at(commit, f"tools/inplace/typec-roles-ultra/{s}")
+                             for s in ("install.sh", "rollback.sh", "verify.sh", "README.md")}
+            if None in scripts[name].values():
+                self.skipTest("no git history: revision 8's and 9's scripts come from their commits")
+        scripts["r10"] = {s: (KIT_SRC / s).read_text() for s in ("install.sh", "rollback.sh", "verify.sh", "README.md")}
+        self.kits, self.boots = {}, {}
+        for revision, build_id in (("r8", "8" * 40), ("r9", "9" * 40), ("r10", NEW_BUILD_ID)):
+            kit = self.tmp / f"kit-{revision}"
+            kit.mkdir()
+            self.boots[revision] = os.urandom(SIZE)
+            (kit / "boot.img").write_bytes(self.boots[revision])
+            (kit / f"modules-{RELEASE}.tar").write_bytes(modules_tar(revision))
+            (kit / "BUILD_ID").write_text(build_id + "\n")
+            (kit / "REVISION").write_text(revision[1:] + "\n")
+            for name in ("KEY_ID", "SIGNER", "SOURCE"):
+                (kit / name).write_bytes((self.kit / name).read_bytes())
+            for name, body in scripts[revision].items():
+                (kit / name).write_text(body)
+            self.kits[revision] = kit
+            self.kit = kit
+            self.seal()
+        self.backup = self.root / BACKUP
+
+    def install(self, revision, script="install.sh"):
+        self.kit = self.kits[revision]
+        result = self.run_script(script)
+        self.assertEqual(result.returncode, 0, f"{revision} {script}: " + result.stdout + result.stderr)
+        return result
+
+    def assert_on(self, revision):
+        """boot holds REVISION's image (or the release's), the module tree
+        is its, the release is still what the backup holds, vendor_boot is
+        the release's."""
+        self.assertEqual(self.part("vendor_boot").read_bytes(), self.base_vendor_boot)
+        if revision == "release":
+            self.assertEqual(self.part("boot").read_bytes(), self.base_boot)
+            self.assertEqual(self.tree(), {n: f"release {n}\n" for n in MODULES})
+            self.assertFalse(self.backup.exists())
+            return
+        self.assertEqual(self.part("boot").read_bytes(), self.boots[revision])
+        self.assertEqual(self.tree(), {n: f"{revision} {n}\n" for n in MODULES})
+        self.assertEqual((self.backup / "boot-release.img").read_bytes(), self.base_boot)
+        self.assertEqual({str(p.relative_to(self.backup / f"modules-{RELEASE}")): p.read_text()
+                          for p in (self.backup / f"modules-{RELEASE}").rglob("*") if p.is_file()},
+                         {n: f"release {n}\n" for n in MODULES})
+        self.assertEqual((self.backup / "installed-boot").read_text(), sha(self.boots[revision]) + "\n")
+        self.assertFalse((self.backup / "upgrading").exists())
+        self.assertEqual([p.name for p in (self.root / "usr/lib/modules").iterdir()], [RELEASE])
+
+    def boot_into(self, revision):
+        self.running({"r8": "8" * 40, "r9": "9" * 40, "r10": NEW_BUILD_ID, "release": BASE_BUILD_ID}[revision])
+
+    def test_the_earlier_revisions_pin_the_same_images(self):
+        for revision in ("r8", "r9"):
+            for name in ("base_boot", "base_vendor_boot", "base_build_id", "kit_r3_boot"):
+                with self.subTest(revision=revision, pin=name):
+                    self.assertEqual(re.search(rf"^{name}=([0-9a-f]+)$", (self.kits[revision] / "install.sh").read_text(),
+                                               re.M).group(1), pinned("install.sh", name))
+
+    def test_revision_10_over_the_release_and_back(self):
+        result = self.install("r10")
+        self.assertIn("boot saved to", result.stdout)
+        self.assert_on("r10")
+        self.boot_into("r10")
+        self.install("r10", "rollback.sh")
+        self.assert_on("release")
+
+    def test_revision_10_over_revision_9_and_back_to_9(self):
+        self.install("r9")
+        self.boot_into("r9")
+        result = self.install("r10")
+        self.assertIn(f"upgrade: boot holds {sha(self.boots['r9'])[:12]}; the release saved in", result.stdout)
+        self.assertNotIn("STOP", result.stdout)
+        self.assert_on("r10")
+        self.boot_into("r10")
+        # The way back to revision 9: its own install.sh, kept as
+        # ~/typec-roles-r9.
+        result = self.install("r9")
+        self.assertIn(f"upgrade: boot holds {sha(self.boots['r10'])[:12]}", result.stdout)
+        self.assert_on("r9")
+        self.boot_into("r9")
+        self.install("r10")
+        self.assert_on("r10")
+        # The same revision twice is refused, nothing changed.
+        self.kit = self.kits["r10"]
+        result = self.run_script("install.sh")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("this revision of the Type-C roles kit is already installed", result.stdout)
+        self.assert_on("r10")
+        # Revision 9's rollback.sh is revision 10's: either takes it back to
+        # the release.
+        self.install("r9", "rollback.sh")
+        self.assert_on("release")
+
+    def test_revision_10_over_revision_8_and_back_to_8(self):
+        self.install("r8")
+        self.boot_into("r8")
+        result = self.install("r10")
+        self.assertIn(f"upgrade: boot holds {sha(self.boots['r8'])[:12]}; the release saved in", result.stdout)
+        self.assert_on("r10")
+        self.boot_into("r10")
+        result = self.install("r8")
+        self.assertIn(f"upgrade: boot holds {sha(self.boots['r10'])[:12]}", result.stdout)
+        self.assert_on("r8")
+        self.boot_into("r8")
+        self.install("r10")
+        self.assert_on("r10")
+        self.install("r10", "rollback.sh")
+        self.assert_on("release")
+
+    def test_revision_10_over_revision_9_over_revision_8(self):
+        """The tablet's own history: revision 8, then 9, then 10, each over
+        the one before."""
+        for revision in ("r8", "r9", "r10"):
+            self.install(revision)
+            self.assert_on(revision)
+            self.boot_into(revision)
+        self.install("r10", "rollback.sh")
+        self.assert_on("release")
+        self.assertTrue(self.stopgap_enabled())
+
+    def test_the_ways_back_from_twrp(self):
+        """Revision 10 does not come up.  From TWRP the saved release image
+        goes back on boot, and rollback.sh on the next boot (release kernel,
+        revision 10's modules) finishes it; or revision 9's boot image goes
+        back, and revision 9's install.sh takes it as an upgrade."""
+        for way in ("release", "r9"):
+            with self.subTest(way):
+                FakeTablet.setUp(self)
+                Revision10UpgradeTest.setUp(self)
+                self.install("r9")
+                self.boot_into("r9")
+                self.install("r10")
+                # TWRP's dd.
+                if way == "release":
+                    self.part("boot").write_bytes((self.backup / "boot-release.img").read_bytes())
+                    self.boot_into("release")
+                    self.install("r10", "rollback.sh")
+                    self.assert_on("release")
+                else:
+                    self.part("boot").write_bytes((self.kits["r9"] / "boot.img").read_bytes())
+                    self.boot_into("r9")
+                    result = self.install("r9")
+                    self.assertIn(f"upgrade: boot holds {sha(self.boots['r9'])[:12]}", result.stdout)
+                    self.assert_on("r9")
+
+    def test_install_and_rollback_are_revision_9_s_but_for_comments(self):
+        """install.sh differs from revision 9's (and 8's) in its header
+        comment alone, rollback.sh not at all: what revision 9 and 8 were
+        rehearsed with is what revision 10 runs."""
+        for revision in ("r8", "r9"):
+            with self.subTest(revision):
+                old = (self.kits[revision] / "install.sh").read_text()
+                self.assertEqual(code_lines(old), code_lines((KIT_SRC / "install.sh").read_text()))
+                self.assertEqual((self.kits[revision] / "rollback.sh").read_text(),
+                                 (KIT_SRC / "rollback.sh").read_text())
+        self.assertIn('since revision 10 a sink that is UFP\n# after every Hard Reset',
+                      (KIT_SRC / "install.sh").read_text())
 
 def dts_node(text, head):
     """The DTS node that starts with the line HEAD (its indent included), up

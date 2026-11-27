@@ -6,10 +6,12 @@
 # for from userspace), with the USB power domains kept in retention across
 # suspend and with a NULL check in the dwc3-qcom glue, in boot, and its
 # module tree; since revision 8 also the deep-sleep groundwork (README,
-# "Revision 8"), and since revision 9 the GMU's lost answers and the swap
-# back to sink (README, "Revision 9").  The DTB is the release's (and up to
-# revision 7 the configuration too), so vendor_boot is checked but not
-# written, and the module list is the release's.
+# "Revision 8"), since revision 9 the GMU's lost answers and the swap back
+# to sink (README, "Revision 9"), and since revision 10 a sink that is UFP
+# after every Hard Reset and a CC open that is left through Unattached.SNK
+# (README, "Revision 10").  The DTB is the release's (and up to revision 7
+# the configuration too), so vendor_boot is checked but not written, and the
+# module list is the release's.
 #
 #   sudo sh ~/typec-roles/install.sh      then reboot
 #   sudo sh ~/typec-roles/rollback.sh     back to the release kernel, then reboot

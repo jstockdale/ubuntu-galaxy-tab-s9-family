@@ -40,6 +40,17 @@
 # power role swap).  Same configuration, DTB, overlays and build switches as
 # revision 8.
 #
+# Revision 10 (2026-11-27) is revision 9 with the two fixes that came after
+# it, in every build of this checkout: a sink is UFP after every Hard Reset,
+# as upstream has it (tcpm-use-retained-sink-data-role.patch without its
+# Hard Reset hunk, and tcpm-request-dfp-as-sink-before-discovery.patch
+# without data_role_swapped; the other five TCPM patches only have their
+# hunk offsets renumbered), and the sm5714_usbpd.c that turns CC on again
+# through Unattached.SNK after a CC open of its own, heals a port that finds
+# no partner after one, and has a rewritten attach watchdog, with two more
+# switches, twelve in all.  No patch was added or removed.  Same
+# configuration, DTB, overlays and build switches as revision 9.
+#
 #   bash tools/inplace/typec-roles-ultra/make-kit.sh BUILD_SCRATCH \
 #       KERNEL_OUT_DIR BASE_KERNEL_OUT_DIR BASE_BUNDLE_DIR KIT_DIR
 #
@@ -51,33 +62,35 @@
 # build's scratch; its kernel source tree is then the reference the new one
 # is compared with, file by file, its compiled clock controller the
 # reference for the power domain table, and its vmlinux the self-test of the
-# disassembly checks.  PREV_KIT, when set, is revision 8's kit
-# (~/ubuntu-gts9u/backups/typec-roles-ultra-kit-r8, whose boot.img is the
+# disassembly checks.  PREV_KIT, when set, is revision 9's kit
+# (~/ubuntu-gts9u/backups/typec-roles-ultra-kit-r9, whose boot.img is the
 # one on the tablet): its kernel and its modules.builtin.modinfo must have
-# none of what revision 9 adds.
+# none of what revision 10 adds, and its kernel what revision 10 takes out.
 #
 # Self-tests, each byte for byte:
 #   - boot: the release kernel plus its DTB, by the kits' recipe, is the
 #     release's boot.img, the image on the tablet;
 #   - the release vendor_boot carries that same DTB;
-#   - with PREV_KIT, revision 8's boot.img is the one the tablet has, and its
-#     kernel is revision 8's (its build ID, and every string of revisions 1
-#     to 8 in it).
+#   - with PREV_KIT, revision 9's boot.img is the one the tablet has, and its
+#     kernel is revision 9's (its build ID, every string of revisions 1 to 9
+#     in it, and the names that revision 10 takes out).
 # Then the changes are checked to be only the intended ones: the DTB, the
 # fingerprint layers and the module list are the release build's, the
 # configuration is the release's with config_changes and nothing else, the
 # source trees differ in the files this checkout's patches, stage scripts,
 # driver and early helper change and those are what they give (replayed on
-# the release tree's files in the build's order), the new image has the new
-# code and the old ones do not (the release's, and with PREV_KIT revision
-# 8's for what revision 9 adds) and was built after the last change to
-# those files, the compiled power domain table differs in four bytes, the
-# UFS PHY's calibration in the new vmlinux no longer asks which board it
-# runs on, the PIPE clock mux has its gate operations, the geni UART's sleep
-# callbacks force-suspend the port, the debug switches are there, the GMU's
-# HFI wait reads the response queue, the driver's ten switches are built in
-# with their types, and the new boot image differs only in its kernel.
-# Nothing is flashed.
+# the release tree's files in the build's order, with the Hard Reset hunk
+# that the release's tcpm-use-retained-sink-data-role.patch had taken out
+# first), the new image has the new code and the old ones do not (the
+# release's, and with PREV_KIT revision 9's for what revision 10 adds) and
+# was built after the last change to those files, the compiled power domain
+# table differs in four bytes, the UFS PHY's calibration in the new vmlinux
+# no longer asks which board it runs on, the PIPE clock mux has its gate
+# operations, the geni UART's sleep callbacks force-suspend the port, the
+# debug switches are there, the GMU's HFI wait reads the response queue,
+# TCPM's port has no data_role_swapped, the driver has revision 10's
+# functions and its twelve switches are built in with their types, and the
+# new boot image differs only in its kernel.  Nothing is flashed.
 set -euo pipefail
 export LC_ALL=C
 
@@ -98,10 +111,10 @@ mkbootimg=$tools/mkbootimg.py
 avbtool=$tools/avbtool.py
 size=100663296
 # This kit's revision: the Type-C changes (1 to 7), the deep-sleep
-# groundwork (8), and the GPU and dock fixes after it (9).  Written to the
-# kit for people and for verify.sh; install.sh knows a revision by its boot
-# image.
-revision=9
+# groundwork (8), the GPU and dock fixes after it (9), and the Hard Reset
+# role and the CC reopen (10).  Written to the kit for people and for
+# verify.sh; install.sh knows a revision by its boot image.
+revision=10
 dts=sm8550-samsung-gts9uwifi
 tcpm_dir=drivers/usb/typec/tcpm
 gcc=drivers/clk/qcom/gcc-sm8550
@@ -183,6 +196,28 @@ build_order=("${cx_patches[@]}" "${ufs_qcom_patches[@]}" gcc-sm8550-usb-gdscs-re
 patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$ufshcd.c" "$rpmhpd.c"
 	"$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c" "$qcom_stats.c"
 	"$va_macro.c" sound/soc/codecs/Kconfig "$dsi_phy.c" "$dsi_phy.h" "$geni.c" "$hfi.c")
+# Revision 10: tcpm-use-retained-sink-data-role.patch, which every build
+# applies before the five TCPM patches, the release's too, is not in the
+# replay: the release tree has it.  But the release's had one hunk more, the
+# one that kept a sink's host role across a Hard Reset, and 7232cff took it
+# out (a sink is UFP after every Hard Reset).  The replay takes that hunk out
+# of the release tree's tcpm.c first, as it takes the unpark patch out.  The
+# hunk as the release's patch had it, its last:
+retained_patch=tcpm-use-retained-sink-data-role.patch
+release_hard_reset_hunk() {
+	printf '%b\n' '--- a/drivers/usb/typec/tcpm/tcpm.c' '+++ b/drivers/usb/typec/tcpm/tcpm.c' \
+		'@@ -5949,7 +5961,9 @@ static void run_state_machine(struct tcpm_port *port)' \
+		' \t\tif (port->pd_capable)' \
+		' \t\t\ttcpm_set_charge(port, false);' \
+		' \t\ttcpm_set_roles(port, port->self_powered, TYPEC_STATE_USB, TYPEC_SINK,' \
+		'-\t\t\t       tcpm_data_role_for_sink(port));' \
+		'+\t\t\t       port->tcpc->adopt_retained_source_ufp &&' \
+		'+\t\t\t       port->data_role == TYPEC_HOST ?' \
+		'+\t\t\t       TYPEC_HOST : tcpm_data_role_for_sink(port));' \
+		' \t\t/*' \
+		' \t\t * VBUS may or may not toggle, depending on the adapter.' \
+		" \\t\\t * If it doesn't toggle, transition to SNK_HARD_RESET_SINK_ON"
+}
 # The UFS PHY driver: the release tree has the PCS reset in its SM-X910-only
 # form, which scripts/stage-ufs-resume-experiment.sh replaces with this
 # checkout's patch; the two diagnostics go on top.
@@ -203,11 +238,11 @@ base_image=5bb0cd52e5b868e25501765857f32924025883a87b7268ae972d3374a5b0177f
 base_dtb=613b3bb7729d55d1c60aaeda348a098163b79aed1efbf24cdcc582ff0d58ccc4
 base_config=a5648666cc6973ca2e78b3c47c8c660e03b0441defae69419b0618b194e1f1c7
 base_build_id=3447147dc203542e441eebfa4d62e60c57100f50
-# Revision 8 of this kit (2026-11-25), what the tablet runs before this one
+# Revision 9 of this kit (2026-11-26), what the tablet runs before this one
 # (PREV_KIT): its boot image and its kernel's build ID.
-prev_revision=8
-prev_boot=01c750171898950d67290351ad5309112189fcb1d91fdf2ab7e496b2c48dec45
-prev_build_id=946fcc21bf468d8480ee288cd772836a3f1af25d
+prev_revision=9
+prev_boot=a62145c2cbb49a5d5ccbd72a60a587cdcbb3deb35fd1914f2b8ce6be46ad552c
+prev_build_id=ba183276ef1888ac2813ba5429a107144ccef10d
 
 # What only the new kernel may contain: the patch's log line, the driver's
 # two parameters, and the deadline of the Try.SNK wait, a member of tcpm_port
@@ -262,12 +297,37 @@ swap_back_strings=(GET_SOURCE_CAP_TIMEOUT 'swap back to sink: %s' 'Swap back: st
 	'PR_SWAP: in-place swap dropped (%s)' "CC opened for TCPM's error recovery after a swap or Hard Reset"
 	'PD protocol layer released after a Hard Reset (PD_STATE3 0x%02x)'
 	'CC role bit left set by a swap before this boot (CC_CNTL7 0x%02x), cleared')
+# Then revision 10, in neither the release image nor revision 9's (PREV_KIT):
+# the driver's two new switches and its new log lines (cc_strings), the CC
+# turned on again through Unattached.SNK, the self-heal's warning with its
+# two reasons and its two outcomes, and the attach watchdog's new resync
+# line; and two members of the driver's structure (names in the image's
+# type information, as policy_open), the self-heal's arming and the
+# watchdog's count of suspect samples.  TCPM's fix adds no string: it takes
+# one out.
+cc_strings=(cc_reopen_via_snk cc_self_heal 'CC on again through Unattached.SNK after the driver opened it'
+	'CC finds no partner %s (CC status 0x%02x, status1 0x%02x, CC state 0x%02x): %s, try %u of %zu'
+	'since the driver opened it' 'though VBUS comes from one' 'CC logic re-initialised'
+	're-initialisation failed' 'CC status 0x%02x shows a partner TCPM was not told of; resyncing TCPM'
+	heal_armed watch_suspect)
+# What revision 10 takes out, in revision 9's image (PREV_KIT) and not in the
+# new one: data_role_swapped, the member of tcpm_port that kept a host role
+# from a DR_Swap apart at a Hard Reset (the image's type information has the
+# names of the members), and of the attach watchdog before its rewrite the
+# driver structure's two edge memories and the resync line (the release
+# image has these three too).
+gone_strings=(data_role_swapped irq_saw_attach watch_saw_attach
+	'CC status 0x%02x with no attach interrupt; resyncing TCPM')
 # The driver's switches as it declares them (NAME:TYPE, the type
-# modules.builtin.modinfo gives), revision 9's ten; the release driver has
-# the first two, revisions 1 to 8 the first four.
+# modules.builtin.modinfo gives), revision 10's twelve; the release driver
+# has the first two, revisions 1 to 8 the first four, revision 9 the first
+# ten.  Revision 10's two with the descriptions the driver gives them
+# (NAME:DESCRIPTION, as modules.builtin.modinfo has them after "parm=").
 switches=(otg_rp:uint connection_wakeup:bool sink_host_swap:bool try_snk_extra_wait_ms:uint
 	swap_back_to_sink:bool own_pr_swap_in_place:bool swap_protocol_reset:bool pr_swap_rd_delay_ms:uint
-	sink_tx_ok_rp:bool recovery_detach:bool)
+	sink_tx_ok_rp:bool recovery_detach:bool cc_reopen_via_snk:bool cc_self_heal:bool)
+cc_switch_descriptions=("cc_reopen_via_snk:leave a CC open of the driver's through Unattached.SNK before toggling (default on)"
+	'cc_self_heal:re-initialise the CC logic when the port finds no partner after a CC open (default on)')
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
@@ -293,7 +353,7 @@ for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$repo/kernel/drivers/sm5714_usbpd.c" "$repo/kernel/drivers/gts9u-performance.c" \
 	"${patches[@]/#/$repo/kernel/patches/}" "${cx_patches[@]/#/$repo/kernel/patches/}" \
 	"${build_order[@]/#/$repo/kernel/patches/}" "${ufs_patches[@]/#/$repo/kernel/patches/}" \
-	"$repo/kernel/patches/$unpark" "$repo/kernel/patches/$pcs_patch" \
+	"$repo/kernel/patches/$unpark" "$repo/kernel/patches/$pcs_patch" "$repo/kernel/patches/$retained_patch" \
 	"$repo/scripts/stage-ufs-resume-experiment.sh" "$repo/scripts/stage-performance-overlay.sh" \
 	"$repo/tools/inplace/typec-roles/sleep-test.sh" "$repo/tools/inplace/typec-roles/ufs-phy-power-check.sh"; do
 	[ -f "$f" ] || die "missing: $f"
@@ -396,6 +456,17 @@ grep -q 'Leave those bits to them' "$tree/$gmu.c" ||
 	die "the build tree does not carry ${gpu_patches[0]}"
 grep -q 'response that is already in the queue ends the wait too' "$tree/$hfi.c" ||
 	die "the build tree does not carry ${gpu_patches[1]}"
+# Revision 10: TCPM without data_role_swapped and with upstream's Hard Reset
+# states (no line of the release's hunk above: the one that kept the host
+# role, which revision 9's ${patches[0]} had too), and the driver with its
+# two new switches.
+! grep -q 'data_role_swapped' "$tree/$tcpm_dir/tcpm.c" ||
+	die "the build tree's tcpm.c has data_role_swapped: its ${patches[0]} is revision 9's"
+! grep -qF 'TYPEC_HOST : tcpm_data_role_for_sink(port)' "$tree/$tcpm_dir/tcpm.c" ||
+	die "the build tree's tcpm.c keeps a sink's host role across a Hard Reset: its $retained_patch or ${patches[0]} is revision 9's"
+grep -qx 'module_param(cc_reopen_via_snk, bool, 0644);' "$tree/$tcpm_dir/sm5714_usbpd.c" &&
+	grep -qx 'module_param(cc_self_heal, bool, 0644);' "$tree/$tcpm_dir/sm5714_usbpd.c" ||
+	die "the build tree's sm5714_usbpd.c has no cc_reopen_via_snk or no cc_self_heal"
 # The power state the source gives one power domain.  Counting the
 # PWRSTS_RET_ON lines of the file does not do: the four PCIe domains carry
 # it upstream.
@@ -498,6 +569,12 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 		! grep -q 'request_sink_as_source' "$base_tree/include/linux/usb/tcpm.h" "$base_tree/$tcpm_dir/tcpm.c" \
 			"$base_tree/$tcpm_dir/sm5714_usbpd.c" ||
 		die "the release tree carries part of revision 9's changes already"
+	# Nor revision 10's driver; and it has the Hard Reset hunk (taken out
+	# below).
+	! grep -q -e cc_reopen_via_snk -e cc_self_heal "$base_tree/$tcpm_dir/sm5714_usbpd.c" ||
+		die "the release tree carries part of revision 10's changes already"
+	grep -qF 'TYPEC_HOST : tcpm_data_role_for_sink(port)' "$base_tree/$tcpm_dir/tcpm.c" ||
+		die "the release tree's tcpm.c does not keep a sink's host role across a Hard Reset: it has no Hard Reset hunk of $retained_patch"
 	grep -q 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' "$base_tree/$qmp_pcie.c" ||
 		die "the release tree's $qmp_pcie.c does not carry $unpark"
 	# The UFS PHY driver as the build changes it: the release build gave the
@@ -520,12 +597,16 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 	cmp -s "$tmp/src/$qmp.c" "$tree/$qmp.c" ||
 		die "$qmp.c is not the release tree's with this checkout's stage script and diagnostics on it"
 	# Every patch, in the build's order, as patch(1) takes it there: the
-	# unpark patch out first.  Where the build's patch(1) puts a hunk in at
-	# an offset it keeps the file it started from as FILE.orig; the files it
-	# keeps so are recorded here, as they were right before that patch.
+	# unpark patch out first, and the Hard Reset hunk that the release's
+	# $retained_patch had (above).  Where the build's patch(1) puts a hunk in
+	# at an offset it keeps the file it started from as FILE.orig; the files
+	# it keeps so are recorded here, as they were right before that patch.
 	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 \
 		< "$repo/kernel/patches/$unpark" ||
 		die "$unpark does not come out of the release tree's $qmp_pcie.c whole"
+	release_hard_reset_hunk > "$tmp/hard-reset.hunk"
+	patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/src" -p1 < "$tmp/hard-reset.hunk" ||
+		die "the Hard Reset hunk of the release's $retained_patch does not come out of the release tree's tcpm.c whole"
 	for p in "${build_order[@]}"; do
 		case $p in
 		ufs-qcom-track-phy-power-state-gts9u.patch)
@@ -567,6 +648,30 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 		mv "$tmp/trees.rest" "$tmp/trees.diff"
 		backups="$backups ${f##*/}.orig"
 	done
+	# Since revision 10 one the other way round: the release build's patch(1)
+	# put the Hard Reset hunk of its $retained_patch in at an offset (revision
+	# 9's build did too, 9 lines up) and kept the file it started from as
+	# tcpm.c.orig; this build's patch has no such hunk and leaves none.  The
+	# file is compiled into nothing.  Passed over when it is that
+	# file: the release tree's tcpm.c with the hunk and then this checkout's
+	# $retained_patch (the rest of the release's) taken out again, each
+	# whole and with no fuzz; shown like any other file when it is not.
+	release_backup=
+	f=$tcpm_dir/tcpm.c
+	if [ -f "$base_tree/$f.orig" ] && [ ! -e "$tree/$f.orig" ]; then
+		mkdir -p "$tmp/rel/${f%/*}" "$tmp/rel/include/linux/usb"
+		cp "$base_tree/$f" "$tmp/rel/$f"
+		cp "$base_tree/include/linux/usb/tcpm.h" "$tmp/rel/include/linux/usb/tcpm.h"
+		if patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/rel" -p1 \
+			< "$tmp/hard-reset.hunk" > "$tmp/rel.log" 2>&1 &&
+			patch -s --reverse --force --fuzz=0 --no-backup-if-mismatch -d "$tmp/rel" -p1 \
+				< "$repo/kernel/patches/$retained_patch" >> "$tmp/rel.log" 2>&1 &&
+			cmp -s "$tmp/rel/$f" "$base_tree/$f.orig"; then
+			grep -vxF "Only in $base_tree/${f%/*}: ${f##*/}.orig" "$tmp/trees.diff" > "$tmp/trees.rest" || :
+			mv "$tmp/trees.rest" "$tmp/trees.diff"
+			release_backup=" ${f##*/}.orig"
+		fi
+	fi
 	# The new overlays' blobs, which the stage script compiled into the
 	# build tree (compared above), are in the new tree alone.
 	for o in "${new_overlays[@]}"; do
@@ -604,11 +709,15 @@ EOF
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $base_tree: twenty-three files differ and two overlay blobs are new, each by exactly this checkout's patches (replayed on the release tree's files in the build's order, $unpark taken out), stage scripts (the UFS PHY's PCS reset, with its two diagnostics; the early helper's header and blobs), driver and early helper"
+	source_check="compared with $base_tree: twenty-three files differ and two overlay blobs are new, each by exactly this checkout's patches (replayed on the release tree's files in the build's order, $unpark and the Hard Reset hunk of the release's $retained_patch taken out), stage scripts (the UFS PHY's PCS reset, with its two diagnostics; the early helper's header and blobs), driver and early helper"
 	echo 'sources: only the files of this checkout'"'"'s patches, stage scripts, driver and early helper differ from the release tree, by exactly those'
 	if [ -n "$backups" ]; then
 		source_check="$source_check; passed over, a copy of the file that patch(1) kept:$backups"
 		echo "sources: passed over$backups, the file as patch(1) kept it"
+	fi
+	if [ -n "$release_backup" ]; then
+		source_check="$source_check; passed over, in the release tree alone, the copy that its patch(1) kept of the file before its $retained_patch:$release_backup"
+		echo "sources: passed over the release tree's$release_backup, the file before its $retained_patch as patch(1) kept it"
 	fi
 else
 	echo 'sources: the patches, the PCS reset and its diagnostics, this checkout'"'"'s driver and early helper are in the build tree (BASE_SCRATCH not set: no tree comparison)'
@@ -619,11 +728,16 @@ fi
 # its first match fails the zcat feeding it, and the match with it.
 zcat "$out/Image.gz" > "$tmp/new.Image"
 zcat "$base/Image.gz" > "$tmp/base.Image"
-for s in "${new_strings[@]}" "${deep_strings[@]}" "${gpu_strings[@]}" "${swap_back_strings[@]}"; do
+for s in "${new_strings[@]}" "${deep_strings[@]}" "${gpu_strings[@]}" "${swap_back_strings[@]}" "${cc_strings[@]}"; do
 	grep -qaF -- "$s" "$tmp/new.Image" || die "the new kernel image does not contain '$s'"
 	! grep -qaF -- "$s" "$tmp/base.Image" || die "self-test failed: the release image contains '$s' too"
 done
-echo "image: $((${#new_strings[@]} + ${#deep_strings[@]} + ${#gpu_strings[@]} + ${#swap_back_strings[@]})) strings of the change are in the new kernel and not in the release one"
+# What revision 10 takes out is not in the new image (5a: it is in revision
+# 9's).
+for s in "${gone_strings[@]}"; do
+	! grep -qaF -- "$s" "$tmp/new.Image" || die "the new kernel image still contains '$s', which revision 10 takes out"
+done
+echo "image: $((${#new_strings[@]} + ${#deep_strings[@]} + ${#gpu_strings[@]} + ${#swap_back_strings[@]} + ${#cc_strings[@]})) strings of the change are in the new kernel and not in the release one, and none of the ${#gone_strings[@]} that revision 10 takes out"
 # The image is the build directory's, made from its vmlinux, and that from
 # objects compiled after the last change to their sources.
 for pair in "${objects[@]}"; do
@@ -721,12 +835,13 @@ new_id=$(build_id "$tmp/new.Image")
 [ ${#new_id} = 40 ] && [ "$new_id" != "$base_build_id" ] || die 'no new build ID in the new image'
 echo "build IDs: release ${base_build_id:0:12}, new ${new_id:0:12}"
 
-# 5a. Revision 8's kernel (PREV_KIT), the one the tablet runs: its boot.img
-# is the one revision 8 wrote (by its hash, and the kit matches its
+# 5a. Revision 9's kernel (PREV_KIT), the one the tablet runs: its boot.img
+# is the one revision 9 wrote (by its hash, and the kit matches its
 # SHA256SUMS), its kernel is its Image.gz with the release DTB after it
-# (revision 8 kept the DTB), that image has revision 8's build ID and every
-# string of revisions 1 to 8, and none of revision 9's; its module tree's
-# modules.builtin.modinfo (6c) has none of revision 9's switches.
+# (revision 9 kept the DTB), that image has revision 9's build ID, every
+# string of revisions 1 to 9 and every one that revision 10 takes out, and
+# none of revision 10's; its module tree's modules.builtin.modinfo (6c) has
+# none of revision 10's switches.
 prev_check="not compared (PREV_KIT not set)"
 if [ -n "${PREV_KIT:-}" ]; then
 	[ -f "$PREV_KIT/boot.img" ] && [ "$(sha "$PREV_KIT/boot.img")" = "$prev_boot" ] ||
@@ -743,16 +858,17 @@ if [ -n "${PREV_KIT:-}" ]; then
 	zcat "$tmp/prev.Image.gz" > "$tmp/prev.Image"
 	[ "$(build_id "$tmp/prev.Image")" = "$prev_build_id" ] ||
 		die "self-test failed: the build ID of revision $prev_revision's image is not ${prev_build_id:0:12}"
-	for s in "${new_strings[@]}" "${deep_strings[@]}"; do
+	for s in "${new_strings[@]}" "${deep_strings[@]}" "${gpu_strings[@]}" "${swap_back_strings[@]}" \
+		"${gone_strings[@]}"; do
 		grep -qaF -- "$s" "$tmp/prev.Image" ||
 			die "self-test failed: revision $prev_revision's image does not contain '$s'"
 	done
-	for s in "${gpu_strings[@]}" "${swap_back_strings[@]}"; do
+	for s in "${cc_strings[@]}"; do
 		! grep -qaF -- "$s" "$tmp/prev.Image" ||
-			die "revision $prev_revision's image contains '$s' already: it is not a string of revision 9 alone"
+			die "revision $prev_revision's image contains '$s' already: it is not a string of revision 10 alone"
 	done
 	[ "$new_id" != "$prev_build_id" ] || die "the new image is revision $prev_revision's"
-	prev_check="revision $prev_revision's boot.img (${prev_boot:0:12}) holds an image with build ID ${prev_build_id:0:12} and the release DTB, with all $((${#new_strings[@]} + ${#deep_strings[@]})) strings of revisions 1 to 8 and none of the $((${#gpu_strings[@]} + ${#swap_back_strings[@]})) of revision 9"
+	prev_check="revision $prev_revision's boot.img (${prev_boot:0:12}) holds an image with build ID ${prev_build_id:0:12} and the release DTB, with all $((${#new_strings[@]} + ${#deep_strings[@]} + ${#gpu_strings[@]} + ${#swap_back_strings[@]})) strings of revisions 1 to 9 and the ${#gone_strings[@]} that revision 10 takes out, and none of the ${#cc_strings[@]} of revision 10"
 	echo "revision $prev_revision: $prev_check"
 fi
 
@@ -896,6 +1012,56 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 fi
 echo "GMU HFI and swap back to sink: $fix_check"
 
+# 5e. Revision 10 in the same build.  TCPM's fix adds no code to look for:
+# it takes data_role_swapped out of struct tcpm_port, whose layout tcpm.o's
+# own debug information gives (pahole).  The member is not there, and the
+# two that ${patches[0]} declares around it follow each other with nothing
+# between them, send_discover_before_swap right at the end of
+# sink_dfp_not_before (revision 9 had data_role_swapped there; 5a finds
+# its name in revision 9's image).
+member_end() { # OBJECT STRUCT MEMBER: the member's offset plus its size, or nothing
+	{ pahole -C "$2" "$1" 2>/dev/null || :; } | awk -v m="$3" '
+		{ for (i = 1; i + 3 <= NF; i++) if ($i == m ";" && $(i + 1) == "/*" && $(i + 2) ~ /^[0-9]+$/ && $(i + 3) ~ /^[0-9]+$/) { print $(i + 2) + $(i + 3); exit } }'
+}
+dfp_end=$(member_end "$build/$tcpm_dir/tcpm.o" tcpm_port sink_dfp_not_before)
+next_at=$(member_offset "$build/$tcpm_dir/tcpm.o" tcpm_port send_discover_before_swap)
+case $dfp_end:$next_at in
+*[!0-9:]*|:*|*:) die "pahole gives no offsets of struct tcpm_port's sink_dfp_not_before and send_discover_before_swap in $build/$tcpm_dir/tcpm.o" ;;
+esac
+[ -z "$(member_offset "$build/$tcpm_dir/tcpm.o" tcpm_port data_role_swapped)" ] && [ "$next_at" = "$dfp_end" ] ||
+	die "struct tcpm_port in $build/$tcpm_dir/tcpm.o has data_role_swapped, or a member after sink_dfp_not_before: ${patches[0]} is revision 9's"
+tcpm_check="struct tcpm_port in tcpm.o (pahole) has no data_role_swapped: send_discover_before_swap is at $next_at, the end of sink_dfp_not_before"
+echo "TCPM: $tcpm_check"
+# The driver's new code, in the vmlinux of 5b: its three new functions that
+# the compiler kept (sm5714_usbpd_reopen_cc() is inlined into
+# start_toggling()), and who calls what, FUNCTION:CALLEE (a call or a tail
+# branch): the attach watchdog the self-heal's restart and its warning,
+# start_toggling() the reopen's 1 ms in Unattached.SNK and its line,
+# set_cc() the one CC open, init() the register init the self-heal shares.
+# Revision 9's driver has none of the three, and its functions make none of
+# these calls.
+cc_functions=(sm5714_usbpd_open_cc sm5714_usbpd_restart_cc sm5714_usbpd_init_regs)
+cc_calls=(sm5714_usbpd_cc_watch_work:sm5714_usbpd_restart_cc sm5714_usbpd_cc_watch_work:_dev_warn
+	sm5714_usbpd_start_toggling:usleep_range_state sm5714_usbpd_start_toggling:_dev_info
+	sm5714_usbpd_set_cc:sm5714_usbpd_open_cc sm5714_usbpd_init:sm5714_usbpd_init_regs)
+for f in "${cc_functions[@]}"; do
+	nm_has "$tmp/vmlinux.nm" "$f" || die "no $f in $build/vmlinux"
+done
+for c in "${cc_calls[@]}"; do
+	f=${c%%:*}
+	[ -s "$tmp/calls.$f" ] || branches_of "$build/vmlinux" "$f" > "$tmp/calls.$f"
+	grep -qx -- "${c#*:}" "$tmp/calls.$f" ||
+		die "$f() in $build/vmlinux does not call ${c#*:}(): the build's sm5714_usbpd.c is not revision 10's"
+done
+cc_check="vmlinux (build ID ${new_id:0:12}) has $(printf '%s(), ' "${cc_functions[@]}" | sed 's/, $//'); its attach watchdog calls sm5714_usbpd_restart_cc() and _dev_warn(), start_toggling() usleep_range_state() and _dev_info(), set_cc() sm5714_usbpd_open_cc() and init() sm5714_usbpd_init_regs()"
+if [ -n "${BASE_SCRATCH:-}" ]; then
+	for f in "${cc_functions[@]}"; do
+		! nm_has "$tmp/vmlinux.base.nm" "$f" || die "self-test failed: the release vmlinux has $f() too"
+	done
+	cc_check="$cc_check; the release build's has none of them"
+fi
+echo "driver: $cc_check"
+
 # 6. The module key and the modules.  The serial is what modinfo reports as
 # sig_key; the subject key ID is what the kernel logs and the registry files
 # it under.  Only the public certificate is read here.
@@ -951,10 +1117,12 @@ done
 switch_check="the seven parameters' names in the image and their descriptions in modules.builtin.modinfo, none in the release build's; the set and get handlers, the guard's genpd notifier, the CXPC log's PM notifier, the DSI PHY's system sleep callbacks and the raw CXPC file's show function in vmlinux (build ID ${new_id:0:12})"
 echo "debug switches: $switch_check"
 
-# 6c. The driver's ten switches, built in: each one's type in
-# modules.builtin.modinfo as switches gives it, and a description; the
-# release build's has the first two alone, and with PREV_KIT revision 8's
-# module tree the first four alone.  verify.sh reads them on the tablet.
+# 6c. The driver's twelve switches, built in: each one's type in
+# modules.builtin.modinfo as switches gives it, and a description, for
+# revision 10's two the one the driver gives it; the release build's has the
+# first two alone, and with PREV_KIT revision 9's module tree the first ten
+# alone, without revision 10's descriptions.  verify.sh reads them on the
+# tablet.
 builtin_switches() { # MODINFO-AS-LINES: the driver's switches, NAME:TYPE, sorted
 	sed -n 's/^sm5714_usbpd\.parmtype=\([a-z0-9_]*\):\([a-z]*\)$/\1:\2/p' "$1" | sort
 }
@@ -963,17 +1131,27 @@ for s in "${switches[@]}"; do
 		grep -q "^sm5714_usbpd.parm=${s%%:*}:." "$tmp/builtin.modinfo" ||
 		die "the module tree's modules.builtin.modinfo has no sm5714_usbpd switch ${s%%:*} of type ${s#*:}, or no description of it"
 done
+for d in "${cc_switch_descriptions[@]}"; do
+	grep -qxF "sm5714_usbpd.parm=$d" "$tmp/builtin.modinfo" ||
+		die "the module tree's modules.builtin.modinfo does not describe ${d%%:*} as the driver does: '${d#*:}'"
+	! grep -qxF "sm5714_usbpd.parm=$d" "$tmp/builtin.base.modinfo" ||
+		die "self-test failed: the release build's modules.builtin.modinfo describes ${d%%:*} too"
+done
 [ "$(builtin_switches "$tmp/builtin.modinfo")" = "$(printf '%s\n' "${switches[@]}" | sort)" ] ||
-	die "the driver has other switches than these ten: $(builtin_switches "$tmp/builtin.modinfo" | tr '\n' ' ')"
+	die "the driver has other switches than these twelve: $(builtin_switches "$tmp/builtin.modinfo" | tr '\n' ' ')"
 [ "$(builtin_switches "$tmp/builtin.base.modinfo")" = "$(printf '%s\n' "${switches[@]:0:2}" | sort)" ] ||
 	die "self-test failed: the release driver's switches are not ${switches[*]:0:2}: $(builtin_switches "$tmp/builtin.base.modinfo" | tr '\n' ' ')"
-driver_check="its ten switches in modules.builtin.modinfo with their types, the release build's with the first two alone"
+driver_check="its twelve switches in modules.builtin.modinfo with their types, and revision 10's two with their descriptions, the release build's with the first two alone"
 if [ -n "${PREV_KIT:-}" ]; then
 	tar -xOf "$PREV_KIT/modules-$release.tar" "usr/lib/modules/$release/modules.builtin.modinfo" |
 		tr '\0' '\n' > "$tmp/builtin.prev.modinfo"
-	[ "$(builtin_switches "$tmp/builtin.prev.modinfo")" = "$(printf '%s\n' "${switches[@]:0:4}" | sort)" ] ||
-		die "revision $prev_revision's driver does not have exactly the switches ${switches[*]:0:4}: $(builtin_switches "$tmp/builtin.prev.modinfo" | tr '\n' ' ')"
-	driver_check="$driver_check, revision $prev_revision's with the first four"
+	[ "$(builtin_switches "$tmp/builtin.prev.modinfo")" = "$(printf '%s\n' "${switches[@]:0:10}" | sort)" ] ||
+		die "revision $prev_revision's driver does not have exactly the switches ${switches[*]:0:10}: $(builtin_switches "$tmp/builtin.prev.modinfo" | tr '\n' ' ')"
+	for d in "${cc_switch_descriptions[@]}"; do
+		! grep -qxF "sm5714_usbpd.parm=$d" "$tmp/builtin.prev.modinfo" ||
+			die "revision $prev_revision's modules.builtin.modinfo describes ${d%%:*} already"
+	done
+	driver_check="$driver_check, revision $prev_revision's with the first ten"
 fi
 echo "driver: $driver_check"
 
@@ -1012,7 +1190,7 @@ printf '%s\n' "$revision" > "$kit/REVISION"
 	for o in "${overlays[@]}"; do
 		echo "kernel/dts/$o.dtso $(sha "$repo/kernel/dts/$o.dtso")"
 	done
-	for p in "${build_order[@]}" "$pcs_patch" "${ufs_patches[@]}"; do
+	for p in "${build_order[@]}" "$pcs_patch" "${ufs_patches[@]}" "$retained_patch"; do
 		echo "kernel/patches/$p $(sha "$repo/kernel/patches/$p")"
 	done
 	echo "left out: kernel/patches/$unpark (APPLY_SM8550_SLEEP_FIXES=1)"
@@ -1025,6 +1203,8 @@ printf '%s\n' "$revision" > "$kit/REVISION"
 	echo "PCIe PIPE clock and geni UARTs: $vmlinux_check"
 	echo "debug switches: $switch_check"
 	echo "GMU HFI and swap back to sink: $fix_check"
+	echo "TCPM: $tcpm_check"
+	echo "driver: $cc_check"
 	echo "driver switches: $driver_check"
 	echo "revision $prev_revision: $prev_check"
 } > "$kit/SOURCE"

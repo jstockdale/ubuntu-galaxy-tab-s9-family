@@ -4,9 +4,11 @@ This kit goes on top of release v1.2.5. It carries the kernel changes for
 powered USB-C docks described in
 [`docs/usb-c-dock-roles.md`](../../../docs/usb-c-dock-roles.md), so that they
 can be tested on a tablet before a release carries them, since
-revision 8 (below, "Revision 8") what the SM-X710 sleeps deeply with, and
+revision 8 (below, "Revision 8") what the SM-X710 sleeps deeply with,
 since revision 9 (below, "Revision 9") the fix for the GPU's one-second
-freezes and the swap back to sink for a dock that the tablet has to power.
+freezes and the swap back to sink for a dock that the tablet has to power,
+and since revision 10 (below, "Revision 10") the fixes for the Hard Reset
+and the dead port of 2026-11-26.
 It is a test vehicle, not an install or update path: a release kernel is
 built from committed code.
 
@@ -300,6 +302,125 @@ fingerprint layers, the module list and the build switches are revision
   the fix's own note, as information, not as a verdict. The plug-in
   recorder's `kernel` file also records the six new switches and `otg_rp`.
 
+**Revision 10 (2026-11-27): a sink is UFP after every Hard Reset, and a CC
+open no longer leaves the port dead. Built and checked on the host; nothing
+that it adds has run on a tablet.** It is revision 9 with the two fixes this
+checkout got after run 3 of the swap back on revision 9 (2026-11-26,
+[`docs/usb-c-dock-roles.md`](../../../docs/usb-c-dock-roles.md#run-3-a-hard-reset-after-a-deaf-swap-and-a-port-that-died)),
+in every build. The configuration, the DTB, the overlays, vendor_boot, the
+fingerprint layers, the module list and the build switches are revision
+9's, and no patch was added or removed:
+- **The data role after a Hard Reset**
+  (`tcpm-use-retained-sink-data-role.patch` without its Hard Reset hunk and
+  `tcpm-request-dfp-as-sink-before-discovery.patch` without
+  `data_role_swapped`, in `kernel/patches/`; the other five TCPM patches only
+  have their hunk offsets renumbered). In run 3 the tablet attached to the
+  Anker hub as power source and USB host, became the sink through the hub's
+  PR_Swap, and sent a Hard Reset when its Request got no answer. It stayed
+  host through the reset, the hub went back to Source/DFP, as the
+  specification has it, and the hub's first message was a data role
+  mismatch: error recovery. Now the sink goes back to the device role at
+  every Hard Reset, as upstream TCPM has it, and asks for the host role
+  again after the new contract (`Requesting DFP before discovery`); a dock
+  that kept UFP across the reset is taken back as host on its first message,
+  as before. The USB host controller goes away and comes back through every
+  Hard Reset of a sink that was host. This fix logs no line of its own.
+- **The dead port** (the driver `sm5714_usbpd.c`). The error recovery opened
+  CC (`CC opened for TCPM's error recovery after a swap or Hard Reset`,
+  revision 9's line), and when the port toggled again 100 ms later the
+  SM5714 reported nothing for 100 minutes, with the hub plugged in and
+  powered, until the driver was unbound and bound again. The driver now
+  turns CC on again after a CC open of its own through Unattached.SNK, as
+  the re-probe that brought the port back did (`CC on again through
+  Unattached.SNK after the driver opened it`). Behind that is a self-heal:
+  when the port has toggled for 5 s after such an open and the chip reports
+  nothing, or the chip reports nothing while VBUS comes from a partner, the
+  driver writes to the chip what a re-probe writes on an empty port, at most
+  three times, each time with one warning that has the chip's CC state in
+  it (`CC finds no partner since the driver opened it (CC status 0x00,
+  status1 0x10, CC state 0x01): CC logic re-initialised, try 1 of 3`, or
+  `... though VBUS comes from one ...`). And the attach watchdog compares the
+  chip with what TCPM was told, on two samples 0.5 s apart (`CC status 0x..
+  shows a partner TCPM was not told of; resyncing TCPM`; its line before,
+  `CC status 0x.. with no attach interrupt; resyncing TCPM`, is gone).
+  **That the chip's CC logic stays off after the toggling's write alone is
+  read from Samsung's code, not measured, and none of revision 10's driver
+  code has run on a tablet.** Two more switches, under
+  `/sys/module/sm5714_usbpd/parameters/`, each read whenever it is used:
+
+  | Parameter | Default | Meaning |
+  | --- | --- | --- |
+  | `cc_reopen_via_snk` | `Y` | Turn CC on again through Unattached.SNK after a CC open of the driver's; `N` is revision 9's sequence, run 3's |
+  | `cc_self_heal` | `Y` | Re-initialise the CC logic, at most three times, when the port finds no partner 5 s after a CC open of the driver's, or none with VBUS from one; `N` leaves such a port as it is (to read its registers), `Y` again acts at the next sample |
+
+  The driver has twelve switches now.
+- **`make-kit.sh`** requires revision 10's strings (`cc_strings`: the two
+  switches and the driver's new log lines) in the new image and finds none
+  of them in the release's or, with `PREV_KIT`, in revision 9's, whose
+  `boot.img` it checks against the one on the tablet; requires what revision
+  10 takes out (`gone_strings`: `data_role_swapped`, the old watchdog's two
+  members and its line) to be in revision 9's image and not in the new one;
+  reads `struct tcpm_port` in `tcpm.o` (no `data_role_swapped`, pahole) and
+  the driver's new functions in `vmlinux`; requires the twelve switches with
+  their types, and revision 10's two with their descriptions, in
+  `modules.builtin.modinfo` (revision 9's has the first ten); with
+  `BASE_SCRATCH` it takes the release's Hard Reset hunk out of the release
+  tree's `tcpm.c` before the replay; and it writes `REVISION` 10.
+- **`install.sh` and `rollback.sh` work as before** (only `install.sh`'s
+  header comment changed): revision 10 installs over revision 9, revision 8,
+  any earlier revision or the release with one command and one reboot, with
+  no rollback first, and `rollback.sh` returns to the release. Before
+  copying revision 10 to the tablet, move revision 9's kit aside, as
+  revision 8's was (`mv ~/typec-roles ~/typec-roles-r9`): its `install.sh`,
+  run over revision 10, is the one-command way back to revision 9. From the
+  build host, each command run with sudo with `-t` (so that the password
+  prompt shows) and its output through `tee`:
+
+  ```sh
+  ssh <user>@<tablet> 'mv ~/typec-roles ~/typec-roles-r9 && mkdir ~/typec-roles'
+  scp -r ~/ubuntu-gts9u/backups/typec-roles-ultra-kit-r10/* <user>@<tablet>:typec-roles/
+  ssh -t <user>@<tablet> 'sudo sh ~/typec-roles/install.sh' | tee ~/ubuntu-gts9u/backups/<tablet>-r10-install.log
+  ssh -t <user>@<tablet> 'sudo reboot'
+  ssh <user>@<tablet> 'sh ~/typec-roles/verify.sh' | tee ~/ubuntu-gts9u/backups/<tablet>-r10-verify.log
+  ```
+
+  The ways back, each one command and one reboot, none with a rollback
+  first:
+  - to revision 9: `ssh -t <user>@<tablet> 'sudo sh ~/typec-roles-r9/install.sh' | tee ~/ubuntu-gts9u/backups/<tablet>-r9-again.log`;
+  - to revision 8, with its kit still on the tablet as `~/typec-roles-r8`:
+    the same with `~/typec-roles-r8/install.sh`;
+  - to the release: `rollback.sh` (`ssh -t <user>@<tablet> 'sudo sh ~/typec-roles/rollback.sh' | tee ~/ubuntu-gts9u/backups/<tablet>-rollback.log`);
+  - if revision 10 does not come up: TWRP, then either the release's boot
+    image back as below ("If the tablet does not come back") and
+    `rollback.sh` on the next boot, or revision 9's (`dd
+    if=/mnt/ubuntu/home/<user>/typec-roles-r9/boot.img
+    of=/dev/block/by-name/boot bs=4M`, sha256
+    `a62145c2cbb49a5d5ccbd72a60a587cdcbb3deb35fd1914f2b8ce6be46ad552c`) and
+    revision 9's `install.sh` on the next boot, which takes it as an
+    upgrade. Either next boot has a kernel with revision 10's modules,
+    which it refuses: no Wi-Fi until that script has run (from the
+    tablet's own terminal, or over the USB cable to the build host).
+
+  **Not on revision 9: a run with `swap_protocol_reset` at `N`.** That is
+  what left the port dead there (run 3). On revision 10 the same run, the
+  repeat of the write-up's first one, is the test of both fixes (check 10
+  below).
+- **`verify.sh`** checks the driver's twelve switches (a missing one is a
+  FAIL, one off its default a note) and names the driver that runs when it
+  is not this kit's: `the running driver has revision 9's ten switches and
+  not revision 10's two` on revision 9's kernel, the four switches of
+  revisions 1 to 8, or the release's two. The Hard Reset fix is in TCPM,
+  which is built in: the build ID is what says that it runs, and
+  `verify.sh` says so on revision 10's kernel (and checks that
+  `modules.builtin` lists tcpm). It counts this boot's kernel log lines
+  `CC opened for TCPM's error recovery`, `CC on again through
+  Unattached.SNK`, `CC finds no partner` and `shows a partner TCPM was not
+  told of` as information, never as a verdict, and shows the self-heal's
+  and the watchdog's lines with their register values; the resync that the
+  probe asks for at every boot (`resynchronizing TCPM, CC status 0x..`) is
+  none of them. The plug-in recorder's `kernel` file also records the two
+  new switches.
+
 ## Build (host)
 
 The kernel inputs are the release's plus the change, so build from the
@@ -315,7 +436,7 @@ DEVICE=gts9uwifi UBUNTU_WORKDIR=$HOME/ubuntu-gts9u TMPDIR=$HOME/ubuntu-gts9u/tmp
   KERNEL_WORKTREE=$U/linux-src-gts9uwifi KERNEL_BUILD_DIR=$U/linux-gts9uwifi \
   KERNEL_OUT_DIR=$HOME/ubuntu-gts9u/out/kernel-gts9uwifi-typec \
   bash $U/source/scripts/build-mainline-kernel.sh
-BASE_SCRATCH=/path/to/scratch/build PREV_KIT=$HOME/ubuntu-gts9u/backups/typec-roles-ultra-kit-r8 \
+BASE_SCRATCH=/path/to/scratch/build PREV_KIT=$HOME/ubuntu-gts9u/backups/typec-roles-ultra-kit-r9 \
   bash tools/inplace/typec-roles-ultra/make-kit.sh $U \
   $HOME/ubuntu-gts9u/out/kernel-gts9uwifi-typec \
   $HOME/ubuntu-gts9u/out/kernel-gts9uwifi \
@@ -324,31 +445,40 @@ BASE_SCRATCH=/path/to/scratch/build PREV_KIT=$HOME/ubuntu-gts9u/backups/typec-ro
 ```
 
 The `APPLY_*` variables are revision 8's, the SM-X710 kit's set, and
-revision 9's too (`APPLY_SM8550_ROOT_PORT_D3` stays unset: the root port's
-D3hot is the sleep test's `root-port-d3`, off at every boot); revisions 1 to
-7 were built without them. Revision 9's fixes need no variable: the build
-applies them always. The build archives its module key in the registry
-(`scripts/kernel-key-registry.sh`); `make-kit.sh` refuses a build whose key is
-not there. Run `make-kit.sh` from the checkout that was built: it compares
-the build tree with that checkout's driver, early helper, patches and stage
-scripts, and refuses a build without one of revision 8's or 9's changes (the
-image has to hold every string of `new_strings`, `deep_strings`,
-`gpu_strings` and `swap_back_strings`, none of which the release image has).
+revisions 9 and 10's too (`APPLY_SM8550_ROOT_PORT_D3` stays unset: the root
+port's D3hot is the sleep test's `root-port-d3`, off at every boot);
+revisions 1 to 7 were built without them. Revision 9's and 10's fixes need
+no variable: the build applies them always. The build archives its module
+key in the registry (`scripts/kernel-key-registry.sh`); `make-kit.sh`
+refuses a build whose key is not there. Run `make-kit.sh` from the checkout
+that was built: it compares the build tree with that checkout's driver,
+early helper, patches and stage scripts, and refuses a build without one of
+revision 8's, 9's or 10's changes (the image has to hold every string of
+`new_strings`, `deep_strings`, `gpu_strings`, `swap_back_strings` and
+`cc_strings`, none of which the release image has, and none of
+`gone_strings`, which revision 10 takes out).
 With `BASE_SCRATCH` it also compares the whole kernel
 source tree with the release build's (the objects that the module builds
 leave in the tree aside): it replays every patch on the release tree's files
 in the build's order (`build_order`), with `unpark-pcie0-pipe-mux.patch`
-taken out, the two stage scripts on top, and twenty-three files and two
-overlay blobs may differ, by exactly that; and the compiled power domain
+and the Hard Reset hunk that the release's
+`tcpm-use-retained-sink-data-role.patch` had taken out, the two stage
+scripts on top, and twenty-three files and two
+overlay blobs may differ, by exactly that (the release tree's `tcpm.c.orig`,
+the copy its patch(1) kept when that hunk went in at an offset, and which
+this build leaves none of, is passed over once it is shown to be that
+file); and the compiled power domain
 table with the release build's: four bytes and nothing else (the two USB
 domains, `pcie_0_gdsc`'s power states and its genpd flag). It also checks,
 in `vmlinux`, the UFS PHY's calibration, the PIPE clock mux, the PCIe PHY's
 power-on, the geni UART's sleep callbacks, the debug switches, the GMU's HFI
-wait and the swap back's work. With `PREV_KIT` (revision 8's kit) it checks
-that kit's `boot.img` against the one revision 8 wrote and finds none of
-revision 9's strings and switches in its kernel and module tree.
+wait, the swap back's work and the driver's new functions, and in `tcpm.o`
+the port structure without `data_role_swapped`. With `PREV_KIT` (revision
+9's kit) it checks that kit's `boot.img` against the one revision 9 wrote,
+finds none of revision 10's strings and switches in its kernel and module
+tree, and finds what revision 10 takes out in its kernel.
 `SOURCE` in the kit records the checkout, the build's switches and which of
-the checks ran; `REVISION` the revision (9; revisions 1 to 7 had none).
+the checks ran; `REVISION` the revision (10; revisions 1 to 7 had none).
 
 ## Install, check, roll back (tablet)
 
@@ -552,4 +682,20 @@ they are worth one more run. Check 4 has not been run on any revision.
 9. Revision 9's swap back to sink: the six runs of "Trying it on a tablet"
    in the write-up, with the Anker hub, each with `sudo sh
    ~/typec-roles/verify.sh record`; its `kernel` file has the switches the
-   run had.
+   run had. On revision 9 leave out the first run's repeat with
+   `swap_protocol_reset` at `N`: it left the port dead there (run 3,
+   2026-11-26).
+10. Revision 10's two fixes: the write-up's first run with its repeat at
+    `swap_protocol_reset` `N`, with the Anker hub (the lines to expect are
+    in "Trying it on a tablet"), then `sh ~/typec-roles/verify.sh` and its
+    `CC, this boot's kernel log` line. No `Data role mismatch` and no error
+    recovery is the Hard Reset fix doing its work; if an error recovery
+    comes all the same, `CC on again through Unattached.SNK` and the hub
+    back within a second are the reopen's. A `CC finds no partner since the
+    driver opened it` warning is the self-heal at work, and its `CC state`
+    a reading nobody has had yet (`0x01` would be `CC_DISABLE`). If the port
+    is dead all the same, the re-probe that brought revision 9's back:
+
+    ```sh
+    ssh -t <user>@<tablet> 'sudo sh -c "echo 8-0033 > /sys/bus/i2c/drivers/sm5714-usbpd/unbind; sleep 2; echo 8-0033 > /sys/bus/i2c/drivers/sm5714-usbpd/bind"' | tee ~/ubuntu-gts9u/backups/<tablet>-r10-reprobe.log
+    ```

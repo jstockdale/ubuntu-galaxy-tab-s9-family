@@ -188,9 +188,11 @@ plug_test() { # dock|record|now|swap [COUNT]
 		echo "sink_host_swap: $(cat "$params/sink_host_swap" 2>/dev/null || echo absent)"
 		[ -z "$was" ] || echo "sink_host_swap before this run and after it: $was"
 		echo "try_snk_extra_wait_ms: $(cat "$params/try_snk_extra_wait_ms" 2>/dev/null || echo absent)"
-		# Revision 9's switches, which change what a dock's power role swap does.
+		# Revision 9's switches, which change what a dock's power role swap
+		# does, and revision 10's, which change how the port comes back from
+		# a CC open of the driver's.
 		for p in swap_back_to_sink own_pr_swap_in_place swap_protocol_reset pr_swap_rd_delay_ms \
-			sink_tx_ok_rp recovery_detach otg_rp; do
+			sink_tx_ok_rp recovery_detach cc_reopen_via_snk cc_self_heal otg_rp; do
 			echo "$p: $(cat "$params/$p" 2>/dev/null || echo absent)"
 		done
 		echo "TCPM log: $tcpm"
@@ -385,6 +387,10 @@ r8_bad() { if [ "$r8" = 1 ]; then bad "$*"; else note "$*"; fi; }
 r9=0
 [ "$r8" = 1 ] && [ "$(cat "$kit/REVISION" 2>/dev/null)" -ge 9 ] 2>/dev/null && r9=1
 r9_bad() { if [ "$r9" = 1 ]; then bad "$*"; else note "$*"; fi; }
+# And revision 10's (README, "Revision 10"), from REVISION 10 on.
+r10=0
+[ "$r9" = 1 ] && [ "$(cat "$kit/REVISION" 2>/dev/null)" -ge 10 ] 2>/dev/null && r10=1
+r10_bad() { if [ "$r10" = 1 ]; then bad "$*"; else note "$*"; fi; }
 findmnt -no OPTIONS / | tr ',' '\n' | grep -qx rw && ok 'root is rw' || bad 'root is not rw'
 
 k=$(journalctl -k -b --no-pager -q 2>/dev/null)
@@ -400,24 +406,35 @@ if [ -n "$k" ]; then
 		bad "no 'Loaded X.509 cert' line for the kit's key ${key:-unknown}"
 fi
 
-# The driver's ten switches (revision 9, kernel/drivers/sm5714_usbpd.c), each
-# with the value it has right after a boot: NAME:DEFAULT, a bool read as Y or
-# N.  One that is missing is a FAIL: the running kernel's driver is not this
-# kit's (revisions 1 to 8 have the first four, the release the first two).
-# One that is not at its default was changed since the boot, by hand or by a
-# swap run that was killed outright: a note.
+# The driver's twelve switches (revision 10, kernel/drivers/sm5714_usbpd.c),
+# each with the value it has right after a boot: NAME:DEFAULT, a bool read as
+# Y or N.  One that is missing is a FAIL: the running kernel's driver is not
+# this kit's (revision 9 has the first ten, revisions 1 to 8 the first four,
+# the release the first two).  One that is not at its default was changed
+# since the boot, by hand or by a run that was killed outright: a note.
+present=
 for p in otg_rp:0 connection_wakeup:N sink_host_swap:Y try_snk_extra_wait_ms:600 swap_back_to_sink:Y \
-	own_pr_swap_in_place:Y swap_protocol_reset:Y pr_swap_rd_delay_ms:0 sink_tx_ok_rp:Y recovery_detach:Y; do
+	own_pr_swap_in_place:Y swap_protocol_reset:Y pr_swap_rd_delay_ms:0 sink_tx_ok_rp:Y recovery_detach:Y \
+	cc_reopen_via_snk:Y cc_self_heal:Y; do
 	name=${p%%:*} default=${p#*:}
 	v=$(cat "$params/$name" 2>/dev/null)
 	if [ -z "$v" ]; then
 		bad "sm5714_usbpd.$name is missing, expected $default: the running kernel's driver is not this kit's"
+		present="$present-"
 	elif [ "$v" = "$default" ]; then
 		ok "sm5714_usbpd.$name = $v"
+		present="$present+"
 	else
 		note "sm5714_usbpd.$name = $v, changed from its default $default since the boot"
+		present="$present+"
 	fi
 done
+# Whose driver runs, when it is not this kit's: told by the switches it has.
+case $present in
+++++++++++--) note 'sm5714_usbpd: the running driver has revision 9'"'"'s ten switches and not revision 10'"'"'s two: this is revision 9'"'"'s kernel (or another without revision 10'"'"'s driver)' ;;
+++++--------) note 'sm5714_usbpd: the running driver has the four switches of revisions 1 to 8: this is one of their kernels' ;;
+++----------) note 'sm5714_usbpd: the running driver has the release'"'"'s two switches: this is the release kernel (or another without the kit'"'"'s driver)' ;;
+esac
 
 # The module tree is the kit's: every module is signed with its key.
 signer=$(cat "$kit/SIGNER" 2>/dev/null)
@@ -628,6 +645,39 @@ if [ -n "$k" ]; then
 	# The note's values: the mask found, the bits it left unmasked, the
 	# status, the mask read back.
 	printf '%s\n' "$k" | grep -F -- 'GMU interrupt mask' | head -n 1 | sed 's/^/  /'
+fi
+# Revision 10's TCPM fix (r10 and r10_bad, above): a sink is UFP after every
+# Hard Reset.  TCPM is built in (modules.builtin lists it) and the fix logs
+# nothing, so the build ID is what says that it runs; the driver's half is
+# known by its two new switches, above.  Then what the kernel log of this
+# boot says about the driver's CC opens, as information, never a verdict:
+# the error recovery's opens, the reopens through Unattached.SNK after them,
+# the self-heal's warnings (one when the port found no partner within 5 s of
+# a reopen, or reported none while VBUS came from one: a dead port, or one
+# unplugged right after the open) and the attach watchdog's resyncs (0 on a
+# healthy port).  The resync the probe asks for once at every boot
+# ("resynchronizing TCPM, CC status ...") is none of these.
+if grep -qx 'kernel/drivers/usb/typec/tcpm/tcpm.ko' "/usr/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null; then
+	if [ "$r10" = 1 ]; then
+		ok "TCPM: a sink is UFP after every Hard Reset in this kernel (TCPM is built in, and the build ID is the kit's)"
+	else
+		note "TCPM: the Hard Reset fix is not known to be in this kernel: TCPM is built in, and this is not revision 10's build"
+	fi
+else
+	r10_bad "TCPM: modules.builtin of $(uname -r) does not list tcpm as built in, so the build ID does not tell whether the Hard Reset fix runs"
+fi
+if [ -n "$k" ]; then
+	cc_count() { printf '%s\n' "$k" | grep -F -- "$1" | wc -l; }
+	note "CC, this boot's kernel log ($up): $(cc_count "CC opened for TCPM's error recovery")" \
+		"\"CC opened for TCPM's error recovery\", $(cc_count 'CC on again through Unattached.SNK')" \
+		"\"CC on again through Unattached.SNK\" (the reopen after one), $(cc_count 'CC finds no partner')" \
+		"\"CC finds no partner\" (the self-heal: no partner within 5 s of a reopen, or none with VBUS)," \
+		"$(cc_count 'shows a partner TCPM was not told of') \"shows a partner TCPM was not told of\"" \
+		"(the attach watchdog's resync, 0 on a healthy port)"
+	# The self-heal's warnings carry the chip's CC status and state, the
+	# resync's its CC status: the first six of them.
+	printf '%s\n' "$k" | grep -F -e 'CC finds no partner' -e 'shows a partner TCPM was not told of' |
+		head -n 6 | sed 's/^/  /'
 fi
 # What a confirming sleep needs besides the kernel: the sensors' sleep hook
 # of device 2.75 (or the sensors-hook kit), which stops iio-sensor-proxy.
