@@ -188,6 +188,11 @@ plug_test() { # dock|record|now|swap [COUNT]
 		echo "sink_host_swap: $(cat "$params/sink_host_swap" 2>/dev/null || echo absent)"
 		[ -z "$was" ] || echo "sink_host_swap before this run and after it: $was"
 		echo "try_snk_extra_wait_ms: $(cat "$params/try_snk_extra_wait_ms" 2>/dev/null || echo absent)"
+		# Revision 9's switches, which change what a dock's power role swap does.
+		for p in swap_back_to_sink own_pr_swap_in_place swap_protocol_reset pr_swap_rd_delay_ms \
+			sink_tx_ok_rp recovery_detach otg_rp; do
+			echo "$p: $(cat "$params/$p" 2>/dev/null || echo absent)"
+		done
 		echo "TCPM log: $tcpm"
 	} > "$dir/kernel"
 	[ "$(build_id)" = "$(cat "$kit/BUILD_ID" 2>/dev/null)" ] ||
@@ -376,6 +381,10 @@ tr '\0' '\n' < /proc/device-tree/compatible | grep -qx 'samsung,gts9uwifi' && ok
 r8=0
 [ -n "$want" ] && [ "$id" = "$want" ] && [ "$(cat "$kit/REVISION" 2>/dev/null)" -ge 8 ] 2>/dev/null && r8=1
 r8_bad() { if [ "$r8" = 1 ]; then bad "$*"; else note "$*"; fi; }
+# Revision 9's (README, "Revision 9") the same way, from REVISION 9 on.
+r9=0
+[ "$r8" = 1 ] && [ "$(cat "$kit/REVISION" 2>/dev/null)" -ge 9 ] 2>/dev/null && r9=1
+r9_bad() { if [ "$r9" = 1 ]; then bad "$*"; else note "$*"; fi; }
 findmnt -no OPTIONS / | tr ',' '\n' | grep -qx rw && ok 'root is rw' || bad 'root is not rw'
 
 k=$(journalctl -k -b --no-pager -q 2>/dev/null)
@@ -391,13 +400,24 @@ if [ -n "$k" ]; then
 		bad "no 'Loaded X.509 cert' line for the kit's key ${key:-unknown}"
 fi
 
-# The two switches of the change, at the driver's defaults.
-param_is() { # name value
-	v=$(cat "$params/$1" 2>/dev/null)
-	[ "$v" = "$2" ] && ok "sm5714_usbpd.$1 = $v" || bad "sm5714_usbpd.$1 is ${v:-missing}, expected $2"
-}
-param_is sink_host_swap Y
-param_is try_snk_extra_wait_ms 600
+# The driver's ten switches (revision 9, kernel/drivers/sm5714_usbpd.c), each
+# with the value it has right after a boot: NAME:DEFAULT, a bool read as Y or
+# N.  One that is missing is a FAIL: the running kernel's driver is not this
+# kit's (revisions 1 to 8 have the first four, the release the first two).
+# One that is not at its default was changed since the boot, by hand or by a
+# swap run that was killed outright: a note.
+for p in otg_rp:0 connection_wakeup:N sink_host_swap:Y try_snk_extra_wait_ms:600 swap_back_to_sink:Y \
+	own_pr_swap_in_place:Y swap_protocol_reset:Y pr_swap_rd_delay_ms:0 sink_tx_ok_rp:Y recovery_detach:Y; do
+	name=${p%%:*} default=${p#*:}
+	v=$(cat "$params/$name" 2>/dev/null)
+	if [ -z "$v" ]; then
+		bad "sm5714_usbpd.$name is missing, expected $default: the running kernel's driver is not this kit's"
+	elif [ "$v" = "$default" ]; then
+		ok "sm5714_usbpd.$name = $v"
+	else
+		note "sm5714_usbpd.$name = $v, changed from its default $default since the boot"
+	fi
+done
 
 # The module tree is the kit's: every module is signed with its key.
 signer=$(cat "$kit/SIGNER" 2>/dev/null)
@@ -579,6 +599,36 @@ case $(cat /sys/class/tty/ttyMSM0/power/wakeup 2>/dev/null) in
 disabled) ok 'console ttyMSM0: wakeup disabled (its UART powers down in system suspend)' ;;
 *) r8_bad 'console ttyMSM0: wakeup not disabled: uart_suspend_port() then leaves its UART running, and the force suspend powers it down all the same' ;;
 esac
+# Revision 9's GPU fixes (r9 and r9_bad, above): the GMU's hfi interrupt and
+# its HFI wait, in msm, which is built into this kernel (modules.builtin
+# lists it), so there is no module file to compare: the build ID is what
+# says the fixes are in the running kernel.  Then what the kernel log of
+# this boot says about the GMU, as information: with the fix the vote
+# timeouts, the OOB timeouts and the late answers they leave ("Unexpected
+# message id") should stay at 0, and "GMU interrupt mask" is the fix's own
+# note, at most once a boot, that it found the interrupt mask changed and
+# wrote it again.  Reads only, no root (the journal is readable by adm).
+if grep -qx 'kernel/drivers/gpu/drm/msm/msm.ko' "/usr/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null; then
+	if [ "$r9" = 1 ]; then
+		ok "GPU: the GMU HFI fixes are in this kernel (msm is built in, and the build ID is the kit's)"
+	else
+		note "GPU: the GMU HFI fixes are not known to be in this kernel: msm is built in, and this is not revision 9's build"
+	fi
+else
+	r9_bad "GPU: modules.builtin of $(uname -r) does not list msm as built in, so the build ID does not tell whether the GMU HFI fixes run"
+fi
+if [ -n "$k" ]; then
+	gmu_count() { printf '%s\n' "$k" | grep -F -- "$1" | wc -l; }
+	up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1)
+	case $up in ''|*[!0-9]*) up='uptime unknown' ;; *) up="up $((up / 3600)) h $((up % 3600 / 60)) min" ;; esac
+	note "GPU, this boot's kernel log ($up): $(gmu_count 'timed out waiting for response') \"timed out waiting for response\"," \
+		"$(gmu_count 'Timeout waiting for GMU OOB') \"Timeout waiting for GMU OOB\", $(gmu_count 'Unexpected message id')" \
+		"\"Unexpected message id\" (with the fix all three stay at 0); $(gmu_count 'GMU interrupt mask')" \
+		"\"GMU interrupt mask\" (the fix's note that it found the mask changed, at most once a boot)"
+	# The note's values: the mask found, the bits it left unmasked, the
+	# status, the mask read back.
+	printf '%s\n' "$k" | grep -F -- 'GMU interrupt mask' | head -n 1 | sed 's/^/  /'
+fi
 # What a confirming sleep needs besides the kernel: the sensors' sleep hook
 # of device 2.75 (or the sensors-hook kit), which stops iio-sensor-proxy.
 grep -q 'iio-sensor-proxy' /usr/lib/systemd/system-sleep/ubuntu-gts9u-sensors 2>/dev/null &&

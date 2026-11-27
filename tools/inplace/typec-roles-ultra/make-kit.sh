@@ -27,6 +27,19 @@
 # APPLY_SM8550_ROOT_PORT_D3).  The kit also carries the SM-X710 kit's
 # sleep-test.sh and ufs-phy-power-check.sh, which know both boards.
 #
+# Revision 9 (2026-11-26) is revision 8 with the two fixes that came after
+# it, in every build of this checkout: the GPU controller's (GMU's) hfi
+# interrupt no longer clears the bits that the HFI and OOB waits poll for,
+# and the HFI wait takes an answer that is in the queue
+# (msm-adreno-a6xx-hfi-irq-leave-polled-bits.patch on a6xx_gmu.c and
+# msm-adreno-a6xx-hfi-take-queued-response.patch on a6xx_hfi.c), and the
+# swap back to sink for a dock that the tablet has to power while the dock's
+# own supply is away (tcpm-swap-back-to-sink.patch on TCPM, after
+# tcpm-keep-queued-swap-pending.patch, and the sm5714_usbpd.c with six more
+# switches, ten in all, that turns it on and changes how the SM5714 runs a
+# power role swap).  Same configuration, DTB, overlays and build switches as
+# revision 8.
+#
 #   bash tools/inplace/typec-roles-ultra/make-kit.sh BUILD_SCRATCH \
 #       KERNEL_OUT_DIR BASE_KERNEL_OUT_DIR BASE_BUNDLE_DIR KIT_DIR
 #
@@ -38,24 +51,33 @@
 # build's scratch; its kernel source tree is then the reference the new one
 # is compared with, file by file, its compiled clock controller the
 # reference for the power domain table, and its vmlinux the self-test of the
-# disassembly checks.
+# disassembly checks.  PREV_KIT, when set, is revision 8's kit
+# (~/ubuntu-gts9u/backups/typec-roles-ultra-kit-r8, whose boot.img is the
+# one on the tablet): its kernel and its modules.builtin.modinfo must have
+# none of what revision 9 adds.
 #
 # Self-tests, each byte for byte:
 #   - boot: the release kernel plus its DTB, by the kits' recipe, is the
 #     release's boot.img, the image on the tablet;
-#   - the release vendor_boot carries that same DTB.
+#   - the release vendor_boot carries that same DTB;
+#   - with PREV_KIT, revision 8's boot.img is the one the tablet has, and its
+#     kernel is revision 8's (its build ID, and every string of revisions 1
+#     to 8 in it).
 # Then the changes are checked to be only the intended ones: the DTB, the
 # fingerprint layers and the module list are the release build's, the
 # configuration is the release's with config_changes and nothing else, the
 # source trees differ in the files this checkout's patches, stage scripts,
 # driver and early helper change and those are what they give (replayed on
 # the release tree's files in the build's order), the new image has the new
-# code and the old one does not and was built after the last change to
+# code and the old ones do not (the release's, and with PREV_KIT revision
+# 8's for what revision 9 adds) and was built after the last change to
 # those files, the compiled power domain table differs in four bytes, the
 # UFS PHY's calibration in the new vmlinux no longer asks which board it
 # runs on, the PIPE clock mux has its gate operations, the geni UART's sleep
-# callbacks force-suspend the port, the debug switches are there, and the
-# new boot image differs only in its kernel.  Nothing is flashed.
+# callbacks force-suspend the port, the debug switches are there, the GMU's
+# HFI wait reads the response queue, the driver's ten switches are built in
+# with their types, and the new boot image differs only in its kernel.
+# Nothing is flashed.
 set -euo pipefail
 export LC_ALL=C
 
@@ -75,10 +97,11 @@ registry=${KERNEL_KEY_REGISTRY:-$workdir/kernel-keys}
 mkbootimg=$tools/mkbootimg.py
 avbtool=$tools/avbtool.py
 size=100663296
-# This kit's revision: the Type-C changes (1 to 7) and the deep-sleep
-# groundwork (8).  Written to the kit for people; install.sh knows a
-# revision by its boot image.
-revision=8
+# This kit's revision: the Type-C changes (1 to 7), the deep-sleep
+# groundwork (8), and the GPU and dock fixes after it (9).  Written to the
+# kit for people and for verify.sh; install.sh knows a revision by its boot
+# image.
+revision=9
 dts=sm8550-samsung-gts9uwifi
 tcpm_dir=drivers/usb/typec/tcpm
 gcc=drivers/clk/qcom/gcc-sm8550
@@ -96,6 +119,8 @@ qcom_stats=drivers/soc/qcom/qcom_stats
 va_macro=sound/soc/codecs/lpass-va-macro
 dsi_phy=drivers/gpu/drm/msm/dsi/phy/dsi_phy
 geni=drivers/tty/serial/qcom_geni_serial
+# Revision 9's file besides $gmu.c and TCPM's: the GMU's HFI queues.
+hfi=drivers/gpu/drm/msm/adreno/a6xx_hfi
 # The early helper and the header scripts/stage-performance-overlay.sh
 # generates next to it from this checkout's overlays, which it compiles into
 # drivers/soc/qcom as well.
@@ -138,17 +163,26 @@ ufs_qcom_patches=(ufs-qcom-track-phy-power-state-gts9u.patch ufs-qcom-phy-power-
 xo_patches=(lpass-va-macro-pm-clock-framework.patch msm-dsi-phy-release-ahb-clock-in-system-sleep.patch
 	qcom-geni-serial-force-suspend-in-system-sleep.patch)
 xo_files=("$va_macro.c sound/soc/codecs/Kconfig" "$dsi_phy.c $dsi_phy.h" "$geni.c")
+# Revision 9: the GMU's hfi interrupt leaves the bits the HFI and OOB waits
+# poll for, and the HFI wait takes an answer that is in the queue (every
+# build, both boards, after the sleep fixes, whose stale RPMh vote fix is
+# a6xx_gmu.c's too); and the swap back to sink, on top of the five TCPM
+# patches above.
+gpu_patches=(msm-adreno-a6xx-hfi-irq-leave-polled-bits.patch msm-adreno-a6xx-hfi-take-queued-response.patch)
+gpu_files=("$gmu.c" "$hfi.c")
+swap_back_patches=(tcpm-swap-back-to-sink.patch)
 # Every patch above, in the order scripts/build-mainline-kernel.sh applies
 # it (the tree comparison replays them so), and the files they change.
 build_order=("${cx_patches[@]}" "${ufs_qcom_patches[@]}" gcc-sm8550-usb-gdscs-retention.patch
 	"${gdsc_patches[@]}" "${pcie_patches[0]}" "${debug_patches[@]}" "${pcie_patches[1]}"
 	dwc3-qcom-check-hcd-before-reading-port-speed.patch qcom-geni-serial-force-suspend-in-system-sleep.patch
 	lpass-va-macro-pm-clock-framework.patch msm-dsi-phy-release-ahb-clock-in-system-sleep.patch
-	"${fix_patches[@]}" tcpm-request-dfp-as-sink-before-discovery.patch tcpm-try-snk-extra-wait.patch
-	tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch tcpm-keep-queued-swap-pending.patch)
+	"${fix_patches[@]}" "${gpu_patches[@]}" tcpm-request-dfp-as-sink-before-discovery.patch
+	tcpm-try-snk-extra-wait.patch tcpm-no-dr-swap-during-vdm.patch tcpm-dr-set-checks-data-role.patch
+	tcpm-keep-queued-swap-pending.patch "${swap_back_patches[@]}")
 patched=("$tcpm_dir/tcpm.c" include/linux/usb/tcpm.h "$gcc.c" "$dwc3.c" "$ufshcd.c" "$rpmhpd.c"
 	"$phymux.c" "$qmp_pcie.c" "$gmu.c" "$ufs_qcom.c" "$ufs_qcom.h" "$pcie_qcom.c" "$qcom_stats.c"
-	"$va_macro.c" sound/soc/codecs/Kconfig "$dsi_phy.c" "$dsi_phy.h" "$geni.c")
+	"$va_macro.c" sound/soc/codecs/Kconfig "$dsi_phy.c" "$dsi_phy.h" "$geni.c" "$hfi.c")
 # The UFS PHY driver: the release tree has the PCS reset in its SM-X910-only
 # form, which scripts/stage-ufs-resume-experiment.sh replaces with this
 # checkout's patch; the two diagnostics go on top.
@@ -169,6 +203,11 @@ base_image=5bb0cd52e5b868e25501765857f32924025883a87b7268ae972d3374a5b0177f
 base_dtb=613b3bb7729d55d1c60aaeda348a098163b79aed1efbf24cdcc582ff0d58ccc4
 base_config=a5648666cc6973ca2e78b3c47c8c660e03b0441defae69419b0618b194e1f1c7
 base_build_id=3447147dc203542e441eebfa4d62e60c57100f50
+# Revision 8 of this kit (2026-11-25), what the tablet runs before this one
+# (PREV_KIT): its boot image and its kernel's build ID.
+prev_revision=8
+prev_boot=01c750171898950d67290351ad5309112189fcb1d91fdf2ab7e496b2c48dec45
+prev_build_id=946fcc21bf468d8480ee288cd772836a3f1af25d
 
 # What only the new kernel may contain: the patch's log line, the driver's
 # two parameters, and the deadline of the Try.SNK wait, a member of tcpm_port
@@ -207,6 +246,28 @@ deep_strings=('gts9u-performance: L15B held in HPM'
 	qcom_stats.debug_cxpc_violators "the AOP's CXPC monitor is on for this suspend"
 	'runtime PM put failed in fsgen disable' 'Unable to prepare iface clk'
 	'cxpc violators: raw %s +0x%03x: ' cxpc_violators_raw)
+# Then revision 9, in neither the release image nor revision 8's (PREV_KIT):
+# the GMU hfi interrupt fix's note (gpu_strings; the HFI wait's fix adds no
+# string, 5d reads its code), and the swap back to sink (swap_back_strings):
+# TCPM's new state, three of its log lines and the tcpc_dev member that turns
+# it on, then the driver's six new switches and the log lines of its
+# in-place swap, its Protocol Layer resets, the error recovery's detach and
+# the CC role bit.
+gpu_strings=('GMU interrupt mask 0x%x left 0x%x unmasked (status 0x%x), written again: 0x%x')
+swap_back_strings=(GET_SOURCE_CAP_TIMEOUT 'swap back to sink: %s' 'Swap back: stop: %s'
+	'partner has external power (vSafe5V PDO %#010x), requesting the sink role, PR_Swap %u of %u'
+	request_sink_as_source
+	swap_back_to_sink own_pr_swap_in_place swap_protocol_reset pr_swap_rd_delay_ms sink_tx_ok_rp recovery_detach
+	'Source-to-Sink PR_SWAP: own request accepted, applying it in place' '%s PR_SWAP: protocol layer reset'
+	'PR_SWAP: in-place swap dropped (%s)' "CC opened for TCPM's error recovery after a swap or Hard Reset"
+	'PD protocol layer released after a Hard Reset (PD_STATE3 0x%02x)'
+	'CC role bit left set by a swap before this boot (CC_CNTL7 0x%02x), cleared')
+# The driver's switches as it declares them (NAME:TYPE, the type
+# modules.builtin.modinfo gives), revision 9's ten; the release driver has
+# the first two, revisions 1 to 8 the first four.
+switches=(otg_rp:uint connection_wakeup:bool sink_host_swap:bool try_snk_extra_wait_ms:uint
+	swap_back_to_sink:bool own_pr_swap_in_place:bool swap_protocol_reset:bool pr_swap_rd_delay_ms:uint
+	sink_tx_ok_rp:bool recovery_detach:bool)
 # The objects of the changed sources.  Each has to be newer than what it was
 # compiled from and older than the vmlinux it was linked into.
 objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:include/linux/usb/tcpm.h"
@@ -215,7 +276,7 @@ objects=("$gcc.o:$gcc.c" "$tcpm_dir/tcpm.o:$tcpm_dir/tcpm.c" "$tcpm_dir/tcpm.o:i
 	"$ufshcd.o:$ufshcd.c" "$rpmhpd.o:$rpmhpd.c" "$phymux.o:$phymux.c" "$qmp_pcie.o:$qmp_pcie.c"
 	"$gmu.o:$gmu.c" "$ufs_qcom.o:$ufs_qcom.c" "$ufs_qcom.o:$ufs_qcom.h" "$pcie_qcom.o:$pcie_qcom.c"
 	"$qcom_stats.o:$qcom_stats.c" "$va_macro.o:$va_macro.c" "$dsi_phy.o:$dsi_phy.c" "$dsi_phy.o:$dsi_phy.h"
-	"$geni.o:$geni.c" "$helper.o:$helper.c" "$helper.o:$helper-overlay.h")
+	"$geni.o:$geni.c" "$helper.o:$helper.c" "$helper.o:$helper-overlay.h" "$hfi.o:$hfi.c")
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 die() { echo "$*" >&2; exit 1; }
@@ -227,7 +288,7 @@ for f in "$mkbootimg" "$avbtool" "$out/Image.gz" "$out/$dts.dtb" "$out/config" \
 	"$build/$gcc.o" "$build/$tcpm_dir/tcpm.o" "$build/$tcpm_dir/sm5714_usbpd.o" "$build/$dwc3.o" \
 	"$build/$ufshcd.o" "$build/$rpmhpd.o" "$build/$phymux.o" "$build/$qmp_pcie.o" "$build/$gmu.o" \
 	"$build/$ufs_qcom.o" "$build/$pcie_qcom.o" "$build/$qcom_stats.o" "$build/$va_macro.o" \
-	"$build/$dsi_phy.o" "$build/$geni.o" "$build/$helper.o" "$tree/$helper.c" "$tree/$helper-overlay.h" \
+	"$build/$dsi_phy.o" "$build/$geni.o" "$build/$helper.o" "$build/$hfi.o" "$tree/$helper.c" "$tree/$helper-overlay.h" \
 	"$tree/$qmp.c" "$build/$qmp.o" "$tree/$tcpm_dir/sm5714_usbpd.c" "$build/arch/arm64/boot/Image.gz" \
 	"$repo/kernel/drivers/sm5714_usbpd.c" "$repo/kernel/drivers/gts9u-performance.c" \
 	"${patches[@]/#/$repo/kernel/patches/}" "${cx_patches[@]/#/$repo/kernel/patches/}" \
@@ -323,6 +384,18 @@ grep -q 'request_dfp_as_sink' "$tree/include/linux/usb/tcpm.h" &&
 	grep -q 'Partner swapped first, queued DR_SWAP_SEND dropped' "$tree/$tcpm_dir/tcpm.c" &&
 	grep -q 'Partner swapped first, queued PR_SWAP_SEND dropped' "$tree/$tcpm_dir/tcpm.c" ||
 	die 'the build tree does not carry the five TCPM patches'
+# Revision 9: the swap back to sink (the build's marker in tcpm.h, and its
+# work in tcpm.c), the driver that turns it on, and the two GMU HFI fixes,
+# each by the marker the build applies it by.
+grep -q 'request_sink_as_source' "$tree/include/linux/usb/tcpm.h" &&
+	grep -q 'tcpm_swap_back_work' "$tree/$tcpm_dir/tcpm.c" ||
+	die "the build tree does not carry ${swap_back_patches[0]}"
+grep -q 'sm->tcpc.request_sink_as_source = swap_back_to_sink;' "$tree/$tcpm_dir/sm5714_usbpd.c" ||
+	die "the build tree's sm5714_usbpd.c does not turn the swap back to sink on"
+grep -q 'Leave those bits to them' "$tree/$gmu.c" ||
+	die "the build tree does not carry ${gpu_patches[0]}"
+grep -q 'response that is already in the queue ends the wait too' "$tree/$hfi.c" ||
+	die "the build tree does not carry ${gpu_patches[1]}"
 # The power state the source gives one power domain.  Counting the
 # PWRSTS_RET_ON lines of the file does not do: the four PCIe domains carry
 # it upstream.
@@ -419,6 +492,12 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 		! grep -qF 'return pm_runtime_force_suspend(dev);' "$base_tree/$geni.c" &&
 		! grep -q 'L15B' "$base_tree/$helper.c" ||
 		die "the release tree carries part of revision 8's changes already"
+	# Nor any of revision 9's.
+	! grep -q 'Leave those bits to them' "$base_tree/$gmu.c" &&
+		! grep -q 'response that is already in the queue ends the wait too' "$base_tree/$hfi.c" &&
+		! grep -q 'request_sink_as_source' "$base_tree/include/linux/usb/tcpm.h" "$base_tree/$tcpm_dir/tcpm.c" \
+			"$base_tree/$tcpm_dir/sm5714_usbpd.c" ||
+		die "the release tree carries part of revision 9's changes already"
 	grep -q 'clk_set_rate(qmp->pipe_clks\[0\].clk, ULONG_MAX)' "$base_tree/$qmp_pcie.c" ||
 		die "the release tree's $qmp_pcie.c does not carry $unpark"
 	# The UFS PHY driver as the build changes it: the release build gave the
@@ -513,6 +592,7 @@ sound/soc/codecs/Kconfig
 $dsi_phy.c
 $dsi_phy.h
 $geni.c
+$hfi.c
 $helper.c
 $helper-overlay.h
 $tcpm_dir/sm5714_usbpd.c
@@ -524,7 +604,7 @@ EOF
 		cat "$tmp/trees.diff" >&2
 		exit 1
 	}
-	source_check="compared with $base_tree: twenty-two files differ and two overlay blobs are new, each by exactly this checkout's patches (replayed on the release tree's files in the build's order, $unpark taken out), stage scripts (the UFS PHY's PCS reset, with its two diagnostics; the early helper's header and blobs), driver and early helper"
+	source_check="compared with $base_tree: twenty-three files differ and two overlay blobs are new, each by exactly this checkout's patches (replayed on the release tree's files in the build's order, $unpark taken out), stage scripts (the UFS PHY's PCS reset, with its two diagnostics; the early helper's header and blobs), driver and early helper"
 	echo 'sources: only the files of this checkout'"'"'s patches, stage scripts, driver and early helper differ from the release tree, by exactly those'
 	if [ -n "$backups" ]; then
 		source_check="$source_check; passed over, a copy of the file that patch(1) kept:$backups"
@@ -539,11 +619,11 @@ fi
 # its first match fails the zcat feeding it, and the match with it.
 zcat "$out/Image.gz" > "$tmp/new.Image"
 zcat "$base/Image.gz" > "$tmp/base.Image"
-for s in "${new_strings[@]}" "${deep_strings[@]}"; do
+for s in "${new_strings[@]}" "${deep_strings[@]}" "${gpu_strings[@]}" "${swap_back_strings[@]}"; do
 	grep -qaF -- "$s" "$tmp/new.Image" || die "the new kernel image does not contain '$s'"
 	! grep -qaF -- "$s" "$tmp/base.Image" || die "self-test failed: the release image contains '$s' too"
 done
-echo "image: $((${#new_strings[@]} + ${#deep_strings[@]})) strings of the change are in the new kernel and not in the release one"
+echo "image: $((${#new_strings[@]} + ${#deep_strings[@]} + ${#gpu_strings[@]} + ${#swap_back_strings[@]})) strings of the change are in the new kernel and not in the release one"
 # The image is the build directory's, made from its vmlinux, and that from
 # objects compiled after the last change to their sources.
 for pair in "${objects[@]}"; do
@@ -641,6 +721,41 @@ new_id=$(build_id "$tmp/new.Image")
 [ ${#new_id} = 40 ] && [ "$new_id" != "$base_build_id" ] || die 'no new build ID in the new image'
 echo "build IDs: release ${base_build_id:0:12}, new ${new_id:0:12}"
 
+# 5a. Revision 8's kernel (PREV_KIT), the one the tablet runs: its boot.img
+# is the one revision 8 wrote (by its hash, and the kit matches its
+# SHA256SUMS), its kernel is its Image.gz with the release DTB after it
+# (revision 8 kept the DTB), that image has revision 8's build ID and every
+# string of revisions 1 to 8, and none of revision 9's; its module tree's
+# modules.builtin.modinfo (6c) has none of revision 9's switches.
+prev_check="not compared (PREV_KIT not set)"
+if [ -n "${PREV_KIT:-}" ]; then
+	[ -f "$PREV_KIT/boot.img" ] && [ "$(sha "$PREV_KIT/boot.img")" = "$prev_boot" ] ||
+		die "$PREV_KIT/boot.img is not revision $prev_revision's (${prev_boot:0:12})"
+	[ "$(cat "$PREV_KIT/REVISION" 2>/dev/null)" = "$prev_revision" ] || die "$PREV_KIT is not revision $prev_revision's kit"
+	(cd "$PREV_KIT" && sha256sum -c --quiet SHA256SUMS) || die "$PREV_KIT does not match its SHA256SUMS"
+	[ -f "$PREV_KIT/modules-$release.tar" ] || die "no modules-$release.tar in $PREV_KIT"
+	unpack "$PREV_KIT/boot.img" "$tmp/pb"
+	prev_size=$(stat -c %s "$tmp/pb/kernel")
+	dtb_size=$(stat -c %s "$base/$dts.dtb")
+	[ "$prev_size" -gt "$dtb_size" ] && cmp -s <(tail -c "$dtb_size" "$tmp/pb/kernel") "$base/$dts.dtb" ||
+		die "self-test failed: revision $prev_revision's boot kernel does not end with the release DTB"
+	head -c $((prev_size - dtb_size)) "$tmp/pb/kernel" > "$tmp/prev.Image.gz"
+	zcat "$tmp/prev.Image.gz" > "$tmp/prev.Image"
+	[ "$(build_id "$tmp/prev.Image")" = "$prev_build_id" ] ||
+		die "self-test failed: the build ID of revision $prev_revision's image is not ${prev_build_id:0:12}"
+	for s in "${new_strings[@]}" "${deep_strings[@]}"; do
+		grep -qaF -- "$s" "$tmp/prev.Image" ||
+			die "self-test failed: revision $prev_revision's image does not contain '$s'"
+	done
+	for s in "${gpu_strings[@]}" "${swap_back_strings[@]}"; do
+		! grep -qaF -- "$s" "$tmp/prev.Image" ||
+			die "revision $prev_revision's image contains '$s' already: it is not a string of revision 9 alone"
+	done
+	[ "$new_id" != "$prev_build_id" ] || die "the new image is revision $prev_revision's"
+	prev_check="revision $prev_revision's boot.img (${prev_boot:0:12}) holds an image with build ID ${prev_build_id:0:12} and the release DTB, with all $((${#new_strings[@]} + ${#deep_strings[@]})) strings of revisions 1 to 8 and none of the $((${#gpu_strings[@]} + ${#swap_back_strings[@]})) of revision 9"
+	echo "revision $prev_revision: $prev_check"
+fi
+
 # 5b. The UFS PHY's board gate, which the calibration may no longer have.
 # The release's asked of_machine_is_compatible("samsung,gts9uwifi"), an
 # inline that calls of_machine_compatible_match(), before the PCS reset; it
@@ -729,6 +844,58 @@ if [ -n "${BASE_SCRATCH:-}" ]; then
 fi
 echo "PCIe PIPE clock and geni UARTs: $vmlinux_check"
 
+# 5d. Revision 9 in the same vmlinux.  The swap back's work, which TCPM
+# queues by its address, is one of its functions; so are the GMU's hfi
+# interrupt handler and its HFI wait (gpu-watch probes both by name).  The
+# wait's fix adds no string: the wait now reads the response queue's header,
+# a 64-bit load from its gmu argument at queues[HFI_RESPONSE_QUEUE].header
+# (HFI_RESPONSE_QUEUE is 1), at the offset a6xx_hfi.o's own debug
+# information gives (pahole), and before the fix it read no such thing.
+# With BASE_SCRATCH the release build's vmlinux has to show the opposite of
+# both, and its a6xx_hfi.o (the same source as revision 8's) other code.
+struct_size() { # OBJECT STRUCT: its size, or nothing
+	{ pahole -C "$2" "$1" 2>/dev/null || :; } | sed -n 's|^.*/\* size: \([0-9]*\),.*$|\1|p' | head -n 1
+}
+array_offset() { # OBJECT STRUCT MEMBER: the offset of the array member MEMBER[N] in the struct, or nothing
+	{ pahole -C "$2" "$1" 2>/dev/null || :; } | awk -v m="$3" '
+		{ for (i = 1; i + 2 <= NF; i++) if (index($i, m "[") == 1 && $i ~ /^[A-Za-z0-9_]+\[[0-9]+\];$/ && $(i + 1) == "/*") { print $(i + 2); exit } }'
+}
+loads_of() { # VMLINUX FUNCTION: the offsets of FUNCTION's 64-bit loads with an immediate, in decimal
+	llvm-objdump -d --no-show-raw-insn --disassemble-symbols="$2" "$1" |
+		sed -n 's/^.*[[:space:]]ldr[[:space:]]x[0-9]*, \[x[0-9]*, #\(0x[0-9a-f]*\)\]$/\1/p' |
+		while read -r at; do echo $((at)); done | sort -un
+}
+for f in tcpm_swap_back_work a6xx_hfi_irq a6xx_hfi_wait_for_msg_interrupt; do
+	nm_has "$tmp/vmlinux.nm" "$f" || die "no $f in $build/vmlinux"
+done
+queues_at=$(array_offset "$build/$hfi.o" a6xx_gmu queues)
+header_in=$(member_offset "$build/$hfi.o" a6xx_hfi_queue header)
+queue_size=$(struct_size "$build/$hfi.o" a6xx_hfi_queue)
+case $queues_at:$header_in:$queue_size in
+*[!0-9:]*|:*|*::*|*:) die "pahole gives no offsets of struct a6xx_gmu's queues and struct a6xx_hfi_queue's header, or no size of the latter, in $build/$hfi.o" ;;
+esac
+response_header=$((queues_at + queue_size + header_in))
+loads_of "$build/vmlinux" a6xx_hfi_wait_for_msg_interrupt > "$tmp/hfi.loads"
+grep -qx "$response_header" "$tmp/hfi.loads" ||
+	die "a6xx_hfi_wait_for_msg_interrupt() in $build/vmlinux does not read the response queue's header (gmu + $response_header): ${gpu_patches[1]} is not in it"
+fix_check="vmlinux (build ID ${new_id:0:12}) has tcpm_swap_back_work(), a6xx_hfi_irq() and a6xx_hfi_wait_for_msg_interrupt(), and the wait reads the response queue's header (gmu + $response_header, pahole)"
+if [ -n "${BASE_SCRATCH:-}" ]; then
+	! nm_has "$tmp/vmlinux.base.nm" tcpm_swap_back_work ||
+		die 'self-test failed: the release vmlinux has tcpm_swap_back_work() too'
+	nm_has "$tmp/vmlinux.base.nm" a6xx_hfi_wait_for_msg_interrupt ||
+		die 'self-test failed: the release vmlinux has no a6xx_hfi_wait_for_msg_interrupt()'
+	loads_of "$BASE_SCRATCH/linux-gts9uwifi/vmlinux" a6xx_hfi_wait_for_msg_interrupt > "$tmp/hfi.base.loads"
+	[ -s "$tmp/hfi.base.loads" ] && ! grep -qx "$response_header" "$tmp/hfi.base.loads" ||
+		die "self-test failed: the release build's a6xx_hfi_wait_for_msg_interrupt() reads no field through a pointer, or reads gmu + $response_header already"
+	[ -f "$BASE_SCRATCH/linux-gts9uwifi/$hfi.o" ] || die "no $hfi.o in $BASE_SCRATCH"
+	llvm-objcopy -O binary --only-section=.text "$BASE_SCRATCH/linux-gts9uwifi/$hfi.o" "$tmp/hfi.base.text"
+	llvm-objcopy -O binary --only-section=.text "$build/$hfi.o" "$tmp/hfi.new.text"
+	[ -s "$tmp/hfi.new.text" ] && ! cmp -s "$tmp/hfi.base.text" "$tmp/hfi.new.text" ||
+		die "the compiled $hfi.o is the release build's"
+	fix_check="$fix_check; the release build's has no swap back, its wait reads no such field, and its $hfi.o has other code"
+fi
+echo "GMU HFI and swap back to sink: $fix_check"
+
 # 6. The module key and the modules.  The serial is what modinfo reports as
 # sig_key; the subject key ID is what the kernel logs and the registry files
 # it under.  Only the public certificate is read here.
@@ -784,6 +951,32 @@ done
 switch_check="the seven parameters' names in the image and their descriptions in modules.builtin.modinfo, none in the release build's; the set and get handlers, the guard's genpd notifier, the CXPC log's PM notifier, the DSI PHY's system sleep callbacks and the raw CXPC file's show function in vmlinux (build ID ${new_id:0:12})"
 echo "debug switches: $switch_check"
 
+# 6c. The driver's ten switches, built in: each one's type in
+# modules.builtin.modinfo as switches gives it, and a description; the
+# release build's has the first two alone, and with PREV_KIT revision 8's
+# module tree the first four alone.  verify.sh reads them on the tablet.
+builtin_switches() { # MODINFO-AS-LINES: the driver's switches, NAME:TYPE, sorted
+	sed -n 's/^sm5714_usbpd\.parmtype=\([a-z0-9_]*\):\([a-z]*\)$/\1:\2/p' "$1" | sort
+}
+for s in "${switches[@]}"; do
+	grep -qx "sm5714_usbpd.parmtype=$s" "$tmp/builtin.modinfo" &&
+		grep -q "^sm5714_usbpd.parm=${s%%:*}:." "$tmp/builtin.modinfo" ||
+		die "the module tree's modules.builtin.modinfo has no sm5714_usbpd switch ${s%%:*} of type ${s#*:}, or no description of it"
+done
+[ "$(builtin_switches "$tmp/builtin.modinfo")" = "$(printf '%s\n' "${switches[@]}" | sort)" ] ||
+	die "the driver has other switches than these ten: $(builtin_switches "$tmp/builtin.modinfo" | tr '\n' ' ')"
+[ "$(builtin_switches "$tmp/builtin.base.modinfo")" = "$(printf '%s\n' "${switches[@]:0:2}" | sort)" ] ||
+	die "self-test failed: the release driver's switches are not ${switches[*]:0:2}: $(builtin_switches "$tmp/builtin.base.modinfo" | tr '\n' ' ')"
+driver_check="its ten switches in modules.builtin.modinfo with their types, the release build's with the first two alone"
+if [ -n "${PREV_KIT:-}" ]; then
+	tar -xOf "$PREV_KIT/modules-$release.tar" "usr/lib/modules/$release/modules.builtin.modinfo" |
+		tr '\0' '\n' > "$tmp/builtin.prev.modinfo"
+	[ "$(builtin_switches "$tmp/builtin.prev.modinfo")" = "$(printf '%s\n' "${switches[@]:0:4}" | sort)" ] ||
+		die "revision $prev_revision's driver does not have exactly the switches ${switches[*]:0:4}: $(builtin_switches "$tmp/builtin.prev.modinfo" | tr '\n' ' ')"
+	driver_check="$driver_check, revision $prev_revision's with the first four"
+fi
+echo "driver: $driver_check"
+
 # 7. The kit's boot image, and what changed in it.
 mkdir -p "$kit"
 pack_boot "$out/Image.gz" "$out/$dts.dtb" "$kit/boot.img"
@@ -831,6 +1024,9 @@ printf '%s\n' "$revision" > "$kit/REVISION"
 	echo "UFS PHY board gate: $gate_check"
 	echo "PCIe PIPE clock and geni UARTs: $vmlinux_check"
 	echo "debug switches: $switch_check"
+	echo "GMU HFI and swap back to sink: $fix_check"
+	echo "driver switches: $driver_check"
+	echo "revision $prev_revision: $prev_check"
 } > "$kit/SOURCE"
 install -m 0644 "$here/install.sh" "$here/rollback.sh" "$here/verify.sh" "$here/README.md" "$kit/"
 # The sleep test and the UFS PHY check are the SM-X710 kit's, which know

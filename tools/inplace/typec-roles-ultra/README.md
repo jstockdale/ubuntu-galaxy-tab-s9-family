@@ -3,10 +3,12 @@
 This kit goes on top of release v1.2.5. It carries the kernel changes for
 powered USB-C docks described in
 [`docs/usb-c-dock-roles.md`](../../../docs/usb-c-dock-roles.md), so that they
-can be tested on a tablet before a release carries them, and since
-revision 8 (below, "Revision 8") what the SM-X710 sleeps deeply with. It is
-a test vehicle, not an install or update path: a release kernel is built
-from committed code.
+can be tested on a tablet before a release carries them, since
+revision 8 (below, "Revision 8") what the SM-X710 sleeps deeply with, and
+since revision 9 (below, "Revision 9") the fix for the GPU's one-second
+freezes and the swap back to sink for a dock that the tablet has to power.
+It is a test vehicle, not an install or update path: a release kernel is
+built from committed code.
 
 **Why.** A powered dock should leave the tablet as power sink and USB host,
 also when the tablet boots with the dock attached. On the SM-X910 two docks
@@ -213,6 +215,91 @@ that does not come up needs TWRP and revision 7's `boot.img`
 `f81161f20d148a8e649bc240cddcb82b8898a1af0558f2346643ece0b15190fc`), then
 revision 7's `install.sh` as an upgrade.
 
+**Revision 9 (2026-11-26): the GPU's one-second freezes and the swap back to
+sink. Built and checked on the host; nothing that it adds has run on a
+tablet.** It is revision 8 with the two fixes this checkout got after it, in
+every build. The configuration, the DTB, the overlays, vendor_boot, the
+fingerprint layers, the module list and the build switches are revision
+8's:
+- **The GPU controller's lost answers**
+  (`msm-adreno-a6xx-hfi-irq-leave-polled-bits.patch` and
+  `msm-adreno-a6xx-hfi-take-queued-response.patch`, in `kernel/patches/`,
+  both boards;
+  [`docs/gpu-recovery.md`](../../../docs/gpu-recovery.md#gmu-vote-timeouts-the-answer-bit-that-goes-missing-2026-11-26)).
+  About once an hour of use the desktop froze for a second, with `Message
+  HFI_H2F_MSG_GX_BW_PERF_VOTE id N timed out waiting for response` and then
+  `Unexpected message id N on the response queue` in the kernel log: the GPU
+  controller (GMU) had answered in time, and the driver's own interrupt
+  handler had cleared the bit that announces the answer. The handler now
+  leaves that bit, and the OOB acknowledge bits, to the code that waits for
+  them, and the wait also ends when the answer is in the queue. **Both were
+  written from nine timeouts captured on this tablet with the gpu-watch kit
+  on 2026-11-26, under revision 8's kernel, and neither has run on a
+  tablet.** If the handler finds the interrupt mask changed, it writes it
+  again and says so once a boot: `GMU interrupt mask 0x... left 0x...
+  unmasked (status 0x...), written again: 0x...`.
+- **The swap back to sink** (`tcpm-swap-back-to-sink.patch`, in
+  `kernel/patches/`, on top of the five TCPM patches, and the driver
+  `sm5714_usbpd.c` with six more switches;
+  [`docs/usb-c-dock-roles.md`](../../../docs/usb-c-dock-roles.md#the-power-role-later-asking-a-dock-with-its-own-supply-again)).
+  When a charge-through dock's own supply goes away for a moment, the tablet
+  becomes the dock's power source, as it should. On 2026-11-26 the Anker hub
+  then said nothing, also after its charger was back, and the tablet powered
+  it from its battery until it was re-plugged. Now, as power source to a PD
+  partner, the tablet asks it from time to time for its source capabilities
+  and asks for the sink role when they say that it has its own supply; under
+  a PD 3 contract it presents Rp 3.0 A where TCPM signals SinkTxOK, so that
+  the hub may ask for the swap itself; and the driver applies the tablet's
+  own power role swap in place, resets the SM5714's PD Protocol Layer at the
+  end of an in-place swap and releases it after a Hard Reset, and makes
+  TCPM's error recovery after either a real detach. **None of revision 9's
+  dock code has run on a tablet.** What it was written from ran on revision
+  8: the hub's own power role swap (at 14:52, with `otg_rp` at 2), which
+  completed and left PD deaf until a detach, and a swap of the tablet's
+  own, which the hub accepted and the tablet could not finish.
+  The switches, under `/sys/module/sm5714_usbpd/parameters/`, each read from
+  the next attach unless it says "each swap" or "each recovery":
+
+  | Parameter | Default | Meaning |
+  | --- | --- | --- |
+  | `swap_back_to_sink` | `Y` | As power source, ask a PD partner with its own supply for the sink role |
+  | `own_pr_swap_in_place` | `Y` | Apply the tablet's own accepted swap to sink in place; `N` is the error recovery of before |
+  | `sink_tx_ok_rp` | `Y` | As PD 3 source, Rp 3.0 A where TCPM asks for SinkTxOK; `N` is `otg_rp` for every Rp request |
+  | `swap_protocol_reset` | `Y` | Reset the PD Protocol Layer at the end of an in-place swap (each swap) |
+  | `recovery_detach` | `Y` | Open CC for TCPM's error recovery after an in-place swap or a Hard Reset (each recovery) |
+  | `pr_swap_rd_delay_ms` | `0` | Wait before Rd in an in-place swap to sink (each swap), at most 500 |
+
+  With `otg_rp` (`0`) and `connection_wakeup` (`N`), which the release
+  already had, and `sink_host_swap` and `try_snk_extra_wait_ms` above, the
+  driver has ten. The write-up's "Trying it on a tablet" has six runs with
+  the lines to expect.
+- **`make-kit.sh`** replays the three patches in the build's order (with the
+  release tree, twenty-three files may differ now), requires their strings
+  and the driver's in the new image and finds none of them in the release's
+  or, with `PREV_KIT`, in revision 8's (whose `boot.img` it checks against
+  the one on the tablet), requires the driver's ten switches with their
+  types in `modules.builtin.modinfo`, reads the GMU's HFI wait and the swap
+  back's work in `vmlinux`, and writes `REVISION` 9.
+- **`install.sh` and `rollback.sh` work as before** (only `install.sh`'s
+  header comment changed): revision 9 installs over revision 8, any earlier
+  revision or the release with one command and one reboot, and
+  `rollback.sh` returns to the release. Before copying revision 9 to a
+  tablet that runs revision 8, move revision 8's kit aside
+  (`mv ~/typec-roles ~/typec-roles-r8`) instead of copying over it: its
+  `install.sh`, run over revision 9, is the one-command way back to
+  revision 8.
+- **`verify.sh`** checks the driver's ten switches: a missing one is a FAIL
+  (the running driver is not this kit's), one that is not at its default
+  is a note, changed since the boot (up to revision 8 a changed
+  `sink_host_swap` or `try_snk_extra_wait_ms` was a FAIL). The GPU fixes are
+  in msm, which is built in: the build ID is what says that they run, and
+  `verify.sh` says so on the kit's kernel (and checks that
+  `modules.builtin` lists msm). It counts this boot's kernel log lines
+  `timed out waiting for response`, `Timeout waiting for GMU OOB` and
+  `Unexpected message id`, which should stay at 0, and `GMU interrupt mask`,
+  the fix's own note, as information, not as a verdict. The plug-in
+  recorder's `kernel` file also records the six new switches and `otg_rp`.
+
 ## Build (host)
 
 The kernel inputs are the release's plus the change, so build from the
@@ -228,7 +315,7 @@ DEVICE=gts9uwifi UBUNTU_WORKDIR=$HOME/ubuntu-gts9u TMPDIR=$HOME/ubuntu-gts9u/tmp
   KERNEL_WORKTREE=$U/linux-src-gts9uwifi KERNEL_BUILD_DIR=$U/linux-gts9uwifi \
   KERNEL_OUT_DIR=$HOME/ubuntu-gts9u/out/kernel-gts9uwifi-typec \
   bash $U/source/scripts/build-mainline-kernel.sh
-BASE_SCRATCH=/path/to/scratch/build \
+BASE_SCRATCH=/path/to/scratch/build PREV_KIT=$HOME/ubuntu-gts9u/backups/typec-roles-ultra-kit-r8 \
   bash tools/inplace/typec-roles-ultra/make-kit.sh $U \
   $HOME/ubuntu-gts9u/out/kernel-gts9uwifi-typec \
   $HOME/ubuntu-gts9u/out/kernel-gts9uwifi \
@@ -236,27 +323,32 @@ BASE_SCRATCH=/path/to/scratch/build \
   $HOME/ubuntu-gts9u/backups/typec-roles-ultra-kit
 ```
 
-The `APPLY_*` variables are revision 8's, the SM-X710 kit's set
-(`APPLY_SM8550_ROOT_PORT_D3` stays unset: the root port's D3hot is the
-sleep test's `root-port-d3`, off at every boot); revisions 1 to 7 were built
-without them. The build archives its module key in the registry
+The `APPLY_*` variables are revision 8's, the SM-X710 kit's set, and
+revision 9's too (`APPLY_SM8550_ROOT_PORT_D3` stays unset: the root port's
+D3hot is the sleep test's `root-port-d3`, off at every boot); revisions 1 to
+7 were built without them. Revision 9's fixes need no variable: the build
+applies them always. The build archives its module key in the registry
 (`scripts/kernel-key-registry.sh`); `make-kit.sh` refuses a build whose key is
 not there. Run `make-kit.sh` from the checkout that was built: it compares
 the build tree with that checkout's driver, early helper, patches and stage
-scripts, and refuses a build without one of revision 8's changes (the image
-has to hold every string of `new_strings` and `deep_strings`, none of which
-the release image has). With `BASE_SCRATCH` it also compares the whole kernel
+scripts, and refuses a build without one of revision 8's or 9's changes (the
+image has to hold every string of `new_strings`, `deep_strings`,
+`gpu_strings` and `swap_back_strings`, none of which the release image has).
+With `BASE_SCRATCH` it also compares the whole kernel
 source tree with the release build's (the objects that the module builds
 leave in the tree aside): it replays every patch on the release tree's files
 in the build's order (`build_order`), with `unpark-pcie0-pipe-mux.patch`
-taken out, the two stage scripts on top, and twenty-two files and two
+taken out, the two stage scripts on top, and twenty-three files and two
 overlay blobs may differ, by exactly that; and the compiled power domain
 table with the release build's: four bytes and nothing else (the two USB
 domains, `pcie_0_gdsc`'s power states and its genpd flag). It also checks,
 in `vmlinux`, the UFS PHY's calibration, the PIPE clock mux, the PCIe PHY's
-power-on, the geni UART's sleep callbacks and the debug switches.
+power-on, the geni UART's sleep callbacks, the debug switches, the GMU's HFI
+wait and the swap back's work. With `PREV_KIT` (revision 8's kit) it checks
+that kit's `boot.img` against the one revision 8 wrote and finds none of
+revision 9's strings and switches in its kernel and module tree.
 `SOURCE` in the kit records the checkout, the build's switches and which of
-the checks ran; `REVISION` the revision (8; revisions 1 to 7 had none).
+the checks ran; `REVISION` the revision (9; revisions 1 to 7 had none).
 
 ## Install, check, roll back (tablet)
 
@@ -452,3 +544,12 @@ they are worth one more run. Check 4 has not been run on any revision.
    costs.
 7. Bluetooth, Wi-Fi, audio, the fingerprint reader and the cameras: the
    kernel was rebuilt, and nothing else in it changed.
+8. Revision 9's GPU fix, after a day of ordinary use: `sh
+   ~/typec-roles/verify.sh` and its `GPU, this boot's kernel log` line. No
+   `timed out waiting for response` is the fix doing its work (revision 8
+   logged about one an hour of use); a `GMU interrupt mask` line gives the
+   register values the fix found.
+9. Revision 9's swap back to sink: the six runs of "Trying it on a tablet"
+   in the write-up, with the Anker hub, each with `sudo sh
+   ~/typec-roles/verify.sh record`; its `kernel` file has the switches the
+   run had.
