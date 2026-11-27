@@ -923,6 +923,17 @@ apply_unless 'Data role swap ended with the role unchanged' \
 # seen on a tablet.
 apply_unless 'Swap is still queued, left pending' \
 	drivers/usb/typec/tcpm/tcpm.c tcpm-keep-queued-swap-pending.patch
+# A charge-through dock whose own supply went away for a moment is powered by
+# the tablet, and the Anker hub then said nothing, also when its charger was
+# re-plugged: the tablet powered it from its battery until someone re-plugged
+# the hub.  As source to a PD partner, the tablet now asks for its source
+# capabilities from time to time and for the sink role when they say
+# Unconstrained Power, a few swaps per session at most (one partner, across
+# the reconnects of a failed swap), none after one that failed.  Inert unless
+# a controller sets tcpc->request_sink_as_source.  Applies on top of the
+# patches above (its hunks follow theirs in tcpm.c and in tcpm.h).
+apply_unless 'request_sink_as_source' \
+	include/linux/usb/tcpm.h tcpm-swap-back-to-sink.patch
 # A dock's DisplayPort alternate mode is discovered while the tablet is still
 # UFP; typec_displayport then refuses to bind (-EPROTO) and the mode sat
 # driverless until a physical re-plug.  Impatient adapters hard-reset around

@@ -1,0 +1,1175 @@
+Subject: [PATCH] usb: typec: tcpm: ask a powered partner for the sink role
+
+A charge-through dock whose own supply goes away for a moment falls back
+to an unpowered sink.  A port that prefers the sink role finds no Rp in
+Try.SNK and becomes the dock's power source.  One hub (291a:8383) then
+said nothing at all for 26 minutes, also when its charger was pulled and
+plugged in again: no PD message and no CC change, while the port powered
+it and its USB devices from a tablet battery, until the hub was
+re-plugged.  The same hub accepts a PR_Swap from the port once its supply
+is back.
+
+Let the TCPC opt in to asking.  With tcpc->request_sink_as_source set, a
+port that is Source to a PD partner under an explicit contract, and that
+prefers the sink role, sends Get_Source_Cap (new states GET_SOURCE_CAP
+and GET_SOURCE_CAP_TIMEOUT, in the AMS GET_SOURCE_CAPABILITIES) and
+requests a PR_Swap when the vSafe5V PDO of the answer has Unconstrained
+Power.  That answer is the only one that ever leads to a PR_Swap.  The
+swap is TCPM's own PR_Swap, requested as tcpm_pr_set() does with nobody
+waiting; its success and failure paths are unchanged.
+
+The first question goes out 5 s after the first SRC_READY with an
+explicit contract.  A partner without external power is asked again
+after 30 s, then 60, 120, 240 and 480 s, then every 10 minutes, since its
+supply can come back at any time.  Reject or Not_Supported to
+Get_Source_Cap, or no answer to it, is asked again every 10 minutes: a
+charge-through dock may well be a plain sink while its supply is away.
+Wait to either message is asked again one step further down the ladder,
+and so are Reject and no answer to the PR_Swap, bounded by the requests
+per session below.  Reject to the PR_Swap from a partner whose PDO does
+not claim dual-role power, Not_Supported to it, and capabilities that do
+not start with a fixed supply stop the questions for the session.  The
+Dual-Role Power bit alone does not decide: the hub above passes its
+charger's flags on, announced no dual-role power with one of its
+chargers, and accepted the PR_Swap all the same.
+
+The questions belong to a session: one partner while it stays attached,
+or comes back within a minute of a port reset, as the partner of a
+failed swap does.  The port cannot tell partners apart across a reset,
+so another partner plugged in within that minute continues the session.
+A question or a PR_Swap that is on the wire when a port reset, a Soft
+Reset or a Hard Reset comes, or that was sent less than 2 s before a
+port reset and not answered, stops the session: a partner that leaves
+the bus on either gets it once per session, and the reset counts as a
+failed swap if the partner then stays away for longer than the minute.
+One that was queued and never sent is asked again later.
+
+An accepted swap is settled at the next ready state, also when an error
+recovery comes in between: SNK_READY with a contract is the swap done,
+SRC_READY means the partner took it and could not supply power.  That,
+and a sink role lost within a minute of the swap with the port source
+again in the same session (a supply that collapses under the port's
+load; an unplug is not one), is a failed swap and stops the session.  An
+accepted swap still unsettled when its partner has been gone for longer
+than the minute counts as failed as well.  Per session at most eight
+requests and three accepted swaps are made; a sink role from a swap that
+lasted 10 minutes gives both back, so that a supply that drops now and
+then is followed each time.  After two failed swaps nothing is asked in
+any session until a sink stint of 30 minutes has ended.  A partner used
+without its supply on purpose, or one that leaves the bus on a question,
+therefore sees at most one reconnect per session (in practice per
+plug-in), two in all while it keeps taking longer than a minute to come
+back, none from then on until such a sink stint, and never a loop.
+
+Others' choices stand.  A write of "source" to power_role stops the
+session and drops a request that has not gone out yet; a write of "sink"
+takes over one that is queued or due.  A PR_Swap that the partner asks
+for and that makes the port source stops the session as well, and a
+queued question is dropped when the partner's PR_Swap is accepted, since
+it would go out in the other power role.  A write of preferred_role that
+makes the port prefer the sink role again resumes the questions.
+
+The work starts nothing while the VDM state machine runs, discovery is
+due, an AMS is open or a state change is queued, and GET_SOURCE_CAP sends
+nothing unless the AMS is still the question's: a write or a partner
+message that comes in during the tSinkTx wait goes first, and the
+question is asked again a second later.  While the port stays busy that
+is every second for a minute, then one step down the ladder.  The work
+is deferrable and runs on a freezable workqueue: it never wakes an idle
+CPU and does nothing while the system sleeps.  Each request, each answer
+to it, the first "no external power" and the first "not a source now"
+answer to Get_Source_Cap in a session, and each reason to stop is one
+dev_info() line, formatted once for both the kernel log and the TCPM
+log; the other answers go to the TCPM log only.
+
+Upstream sets the AMS GET_SOURCE_CAPABILITIES when the partner asks for
+the port's own source capabilities, and takes Source_Capabilities in it
+as Source, but the port never asked for the partner's as Source.  That
+handling is completed for the new state: the answer in GET_SOURCE_CAP
+goes back to SRC_READY with the AMS still set, so that tcpm_ams_finish()
+gives the sink SinkTxOK back, and Reject, Wait or Not_Supported that come
+in GET_SOURCE_CAP no longer end in a Soft Reset.  Answers that come after
+the 60 ms timeout take upstream's path unchanged: a late Reject, Wait or
+Not_Supported a Soft Reset, late Source_Capabilities a Not_Supported (a
+Reject below PD 3.0).  Both new states are source states for a CC or
+VBUS change.
+
+Ports whose TCPC does not set the flag are not affected.  Written,
+compiled and run in a host harness of the bookkeeping; not run on
+hardware.
+---
+ drivers/usb/typec/tcpm/tcpm.c |  868 +++++++++++++++++++++++++++++++++++++++++
+ include/linux/usb/tcpm.h      |   12 +
+ 2 files changed, 877 insertions(+), 3 deletions(-)
+
+--- a/drivers/usb/typec/tcpm/tcpm.c
++++ b/drivers/usb/typec/tcpm/tcpm.c
+@@ -32,6 +32,7 @@
+ #include <linux/usb/role.h>
+ #include <linux/usb/tcpm.h>
+ #include <linux/usb/typec_altmode.h>
++#include <linux/workqueue.h>
+ 
+ #include <uapi/linux/sched/types.h>
+ 
+@@ -145,6 +146,8 @@
+ 						\
+ 	S(GET_SINK_CAP),			\
+ 	S(GET_SINK_CAP_TIMEOUT),		\
++	S(GET_SOURCE_CAP),			\
++	S(GET_SOURCE_CAP_TIMEOUT),		\
+ 						\
+ 	S(ERROR_RECOVERY),			\
+ 	S(PORT_RESET),				\
+@@ -280,6 +283,27 @@ enum frs_typec_current {
+ #define SINK_DFP_SWAP_TRIES	3
+ #define SINK_DFP_SWAP_WAIT_MS	100
+ 
++/*
++ * tcpc->request_sink_as_source, the swap back to sink (see
++ * tcpm_swap_back_work()): when the first question goes out, the ladder of
++ * waits after an answer that is not "yes", the retry while the port is busy
++ * and how long it lasts, how long after a question a reset counts against
++ * it, and the bounds.
++ */
++#define SWAP_BACK_FIRST_MS		5000U
++#define SWAP_BACK_POLL_MIN_MS		30000U
++#define SWAP_BACK_POLL_MAX_MS		600000U
++#define SWAP_BACK_RETRY_MS		1000U
++#define SWAP_BACK_BUSY_MAX_MS		60000U
++#define SWAP_BACK_CUT_MS		2000U
++#define SWAP_BACK_MAX_REQUESTS		8U
++#define SWAP_BACK_MAX_ACCEPTED		3U
++#define SWAP_BACK_MAX_STRIKES		2U
++#define SWAP_BACK_SESSION_GAP_MS	60000U
++#define SWAP_BACK_SINK_SHORT_MS		60000U
++#define SWAP_BACK_SINK_REFUND_MS	(10U * 60 * 1000)
++#define SWAP_BACK_SINK_STABLE_MS	(30U * 60 * 1000)
++
+ struct pd_mode_data {
+ 	int svid_index;		/* current SVID index		*/
+ 	int nsvids;
+@@ -431,6 +455,76 @@ enum aug_req_type {
+ 	PD_SPR_AVS,
+ };
+ 
++/*
++ * struct swap_back_data - tcpc->request_sink_as_source, the swap back to sink
++ * @work: the next question or request; deferrable, on a freezable workqueue
++ *
++ * One session per partner: it goes on while the partner stays attached and
++ * across a reconnect, and ends when the port has been without a partner for
++ * SWAP_BACK_SESSION_GAP_MS (see tcpm_swap_back_ready()).
++ * @reset_at: last port reset (boot time, so that a system sleep counts)
++ * @requests: PR_Swap requests made in this session
++ * @accepted: of these, the ones the partner accepted
++ * @stopped: no more questions in this session
++ * @told_no_power: "no external power" is in the kernel log for this session
++ * @told_refused: "not a source now" is in the kernel log for this session
++ *
++ * Until a sink stint of SWAP_BACK_SINK_STABLE_MS has ended:
++ * @strikes: failed swaps
++ *
++ * Until the next ready state, across a port reset:
++ * @pending: a PR_Swap of the swap back's was accepted, outcome not known yet
++ * @pending_reset: the port was reset while @pending
++ * @unsettled: a question or request was cut short by a port reset
++ * @lost_early: the sink role of a swap ended within SWAP_BACK_SINK_SHORT_MS
++ *
++ * Per attach (cleared by tcpm_swap_back_reset()):
++ * @armed: scheduled since the first SRC_READY with an explicit contract
++ * @seen_ready: a ready state has been reached since the reset
++ * @probing: a Get_Source_Cap of the swap back's is queued or under way
++ * @probe_sent: it went out, and neither an answer nor the timeout came yet
++ * @pr_due: the partner's capabilities said yes; request the swap next
++ * @pr_queued: the swap back's PR_Swap waits in upcoming_state
++ * @pr_sent: the PR_Swap in PR_SWAP_SEND is the swap back's, not answered yet
++ * @sent_pr: what went out last was a PR_Swap (else a Get_Source_Cap)
++ * @partner_drp: the partner's vSafe5V PDO claims dual-role power
++ * @interval_ms: the next wait on the ladder after an answer that is not "yes"
++ * @due: jiffies at which @work is meant to run
++ * @busy_since: the port has been busy since (boot time; 0 when not)
++ * @sent_at: when the last question or request went out, until answered
++ * @sink_at: start of the current sink stint (boot time; 0 when source)
++ * @sink_by_swap: that sink stint came from a swap of the swap back's
++ */
++struct swap_back_data {
++	struct delayed_work work;
++	ktime_t reset_at;
++	unsigned int requests;
++	unsigned int accepted;
++	bool stopped;
++	bool told_no_power;
++	bool told_refused;
++	unsigned int strikes;
++	bool pending;
++	bool pending_reset;
++	bool unsettled;
++	bool lost_early;
++	bool armed;
++	bool seen_ready;
++	bool probing;
++	bool probe_sent;
++	bool pr_due;
++	bool pr_queued;
++	bool pr_sent;
++	bool sent_pr;
++	bool partner_drp;
++	unsigned int interval_ms;
++	unsigned long due;
++	ktime_t busy_since;
++	ktime_t sent_at;
++	ktime_t sink_at;
++	bool sink_by_swap;
++};
++
+ struct tcpm_port {
+ 	struct device *dev;
+ 
+@@ -625,6 +719,9 @@ struct tcpm_port {
+ 	/* Deadline in jiffies of tcpc->try_snk_extra_wait_ms, set in SNK_TRY */
+ 	unsigned long try_snk_wait_until;
+ 
++	/* tcpc->request_sink_as_source */
++	struct swap_back_data swap_back;
++
+ 	/* port belongs to a self powered device */
+ 	bool self_powered;
+ 
+@@ -1847,6 +1944,677 @@ static int tcpm_request_dfp_as_sink(stru
+ }
+ 
+ /*
++ * Opt-in (tcpc->request_sink_as_source): the swap back to sink.
++ *
++ * A charge-through dock whose own supply goes away falls back to an
++ * unpowered sink; a port that prefers the sink role finds no source in
++ * Try.SNK and powers the dock.  When the dock's supply comes back, nothing on
++ * the link need say so, and the dock can stay on the port's power until it
++ * is re-plugged.
++ *
++ * So, as Source to a PD partner under an explicit contract, while the port
++ * prefers the sink role, the port asks the partner for its source
++ * capabilities (Get_Source_Cap, in GET_SOURCE_CAP) and requests a PR_Swap to
++ * Sink when their vSafe5V PDO says Unconstrained Power.  Nothing else ever
++ * leads to a PR_Swap.  The swap is TCPM's own PR_Swap; its failure paths are
++ * unchanged.
++ *
++ * The answers:
++ * - Unconstrained Power: PR_Swap.  Accepted, the port is to be sink at the
++ *   next ready state, in place or after the reconnect of an error recovery;
++ *   when the port is source there instead, the partner took the swap but
++ *   could not deliver, and the session stops.  Reject from a partner that
++ *   does not claim dual-role power, or Not_Supported: stop.  Any other
++ *   Reject, Wait or no answer: asked again later.
++ * - No Unconstrained Power: asked again after 30 s, then 60, 120, 240 and
++ *   480 s, then every 10 minutes; the partner's supply can come back at any
++ *   time.
++ * - Reject or Not_Supported (a sink now, as a charge-through dock may be while
++ *   its supply is away), or no answer: asked again every 10 minutes.
++ * The Dual-Role Power bit alone does not decide: a charge-through hub can
++ * pass on its charger's flags without it and still accept a PR_Swap.
++ *
++ * A session is one partner, across the reconnects that a failed swap causes
++ * itself: it ends once the port has been without a partner for
++ * SWAP_BACK_SESSION_GAP_MS.  A question or a request that was on the wire
++ * when a reset came stops the session: a partner that leaves the bus on
++ * either gets it once per session.  Per session, at most
++ * SWAP_BACK_MAX_REQUESTS requests and SWAP_BACK_MAX_ACCEPTED accepted swaps;
++ * a swap whose sink role lasted SWAP_BACK_SINK_REFUND_MS gives both back.  A
++ * swap that fails, or whose sink role is lost within SWAP_BACK_SINK_SHORT_MS
++ * with the port source again in the same session, is a strike and stops the
++ * session; so is a swap or a question that a reset cut short when the
++ * partner then stays away longer than the session's gap.  At
++ * SWAP_BACK_MAX_STRIKES nothing is asked in any session until a sink stint
++ * of SWAP_BACK_SINK_STABLE_MS has ended.
++ *
++ * Others' choices stand: a write of "source" to power_role, or a PR_Swap the
++ * partner asks for that makes the port source, stops the session.
++ *
++ * The work starts nothing while the VDM state machine runs, discovery is
++ * due, an AMS is open or a state change is queued, and GET_SOURCE_CAP sends
++ * nothing unless the AMS is still the question's.  The work runs on a
++ * freezable workqueue from a deferrable timer: it never wakes an idle CPU,
++ * and it does nothing while the system sleeps.
++ */
++
++/* One line in the TCPM log and the same one in the kernel log, formatted once */
++__printf(2, 3)
++static void tcpm_swap_back_info(struct tcpm_port *port, const char *fmt, ...)
++{
++	char buf[128];
++	va_list args;
++
++	va_start(args, fmt);
++	vsnprintf(buf, sizeof(buf), fmt, args);
++	va_end(args);
++	tcpm_log(port, "Swap back: %s", buf);
++	dev_info(port->dev, "swap back to sink: %s\n", buf);
++}
++
++/* Stop for the rest of the session; true when it had not stopped before */
++static bool tcpm_swap_back_halt(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	if (!port->tcpc->request_sink_as_source)
++		return false;
++	sb->pr_due = false;
++	cancel_delayed_work(&sb->work);
++	if (sb->stopped)
++		return false;
++	sb->stopped = true;
++	return true;
++}
++
++/* Stop for the rest of the session, saying why, once */
++__printf(2, 3)
++static void tcpm_swap_back_stop(struct tcpm_port *port, const char *fmt, ...)
++{
++	char buf[128];
++	va_list args;
++
++	if (!tcpm_swap_back_halt(port))
++		return;
++	va_start(args, fmt);
++	vsnprintf(buf, sizeof(buf), fmt, args);
++	va_end(args);
++	tcpm_log(port, "Swap back: stop: %s", buf);
++	dev_info(port->dev,
++		 "swap back to sink: %s; not asking again until the partner has been away for a minute\n",
++		 buf);
++}
++
++static bool tcpm_swap_back_wanted(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	return port->tcpc->request_sink_as_source && port->registered &&
++	       port->attached && port->pwr_role == TYPEC_SOURCE &&
++	       port->port_type == TYPEC_PORT_DRP &&
++	       port->try_role == TYPEC_SINK &&
++	       port->pd_capable && port->explicit_contract &&
++	       sb->armed && !sb->stopped &&
++	       sb->strikes < SWAP_BACK_MAX_STRIKES;
++}
++
++static void tcpm_swap_back_schedule(struct tcpm_port *port, unsigned int ms)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	sb->due = jiffies + msecs_to_jiffies(ms);
++	if (port->registered)
++		mod_delayed_work(system_freezable_power_efficient_wq, &sb->work,
++				 msecs_to_jiffies(ms));
++}
++
++/* Queue the work again at its due time if it should run and is not queued */
++static void tcpm_swap_back_kick(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	if (!tcpm_swap_back_wanted(port) || delayed_work_pending(&sb->work))
++		return;
++	mod_delayed_work(system_freezable_power_efficient_wq, &sb->work,
++			 time_after(sb->due, jiffies) ? sb->due - jiffies : 0);
++}
++
++/*
++ * After an answer that is not "yes": schedule the next question one step
++ * further down the ladder.  Returns the wait in seconds, for the log.
++ */
++static unsigned int tcpm_swap_back_backoff(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	unsigned int ms = sb->interval_ms;
++
++	sb->interval_ms = min(2 * ms, SWAP_BACK_POLL_MAX_MS);
++	tcpm_swap_back_schedule(port, ms);
++	return ms / 1000;
++}
++
++/*
++ * The port is busy, or a question was not sent: again in a second, for
++ * SWAP_BACK_BUSY_MAX_MS; after that, one step down the ladder.
++ */
++static void tcpm_swap_back_retry(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	ktime_t now = ktime_get_boottime();
++	unsigned int s;
++
++	if (!sb->busy_since)
++		sb->busy_since = now;
++	if (ktime_ms_delta(now, sb->busy_since) < SWAP_BACK_BUSY_MAX_MS) {
++		tcpm_swap_back_schedule(port, SWAP_BACK_RETRY_MS);
++		return;
++	}
++	sb->busy_since = 0;
++	s = tcpm_swap_back_backoff(port);
++	tcpm_log(port, "Swap back: port busy for a minute, asking again in %u s", s);
++}
++
++/* A question or a request goes on the wire now */
++static void tcpm_swap_back_sent(struct tcpm_port *port, bool pr_swap)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	sb->sent_at = ktime_get_boottime();
++	sb->sent_pr = pr_swap;
++	sb->busy_since = 0;
++}
++
++/* Ask for the partner's source capabilities (GET_SOURCE_CAP) */
++static void tcpm_swap_back_probe(struct tcpm_port *port)
++{
++	port->upcoming_state = GET_SOURCE_CAP;
++	if (tcpm_ams_start(port, GET_SOURCE_CAPABILITIES) == -EAGAIN) {
++		port->upcoming_state = INVALID_STATE;
++		tcpm_swap_back_retry(port);
++		return;
++	}
++	port->swap_back.probing = true;
++}
++
++/* Request the sink role, as tcpm_pr_set() does, with nobody waiting */
++static void tcpm_swap_back_request(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	sb->pr_due = false;
++	if (sb->requests >= SWAP_BACK_MAX_REQUESTS) {
++		tcpm_swap_back_stop(port, "%u PR_Swap requests made",
++				    sb->requests);
++		return;
++	}
++	if (sb->accepted >= SWAP_BACK_MAX_ACCEPTED) {
++		tcpm_swap_back_stop(port, "%u swaps accepted", sb->accepted);
++		return;
++	}
++
++	port->upcoming_state = PR_SWAP_SEND;
++	if (tcpm_ams_start(port, POWER_ROLE_SWAP) == -EAGAIN) {
++		port->upcoming_state = INVALID_STATE;
++		sb->pr_due = true;
++		tcpm_swap_back_retry(port);
++		return;
++	}
++	sb->requests++;
++	sb->pr_queued = true;
++	tcpm_swap_back_info(port,
++			    "partner has external power (vSafe5V PDO %#010x), requesting the sink role, PR_Swap %u of %u",
++			    port->source_caps[0], sb->requests,
++			    SWAP_BACK_MAX_REQUESTS);
++}
++
++static void tcpm_swap_back_work(struct work_struct *work)
++{
++	struct tcpm_port *port = container_of(to_delayed_work(work),
++					      struct tcpm_port, swap_back.work);
++	struct swap_back_data *sb = &port->swap_back;
++
++	mutex_lock(&port->lock);
++	if (!tcpm_swap_back_wanted(port))
++		goto unlock;
++
++	/* A run that waited for the lock while the schedule changed */
++	if (time_before(jiffies, sb->due)) {
++		mod_delayed_work(system_freezable_power_efficient_wq, &sb->work,
++				 sb->due - jiffies);
++		goto unlock;
++	}
++
++	/* Away from SRC_READY: tcpm_swap_back_ready() schedules again there */
++	if (port->state != SRC_READY)
++		goto unlock;
++
++	if (port->vdm_sm_running || port->send_discover ||
++	    port->send_discover_prime || port->ams != NONE_AMS ||
++	    port->upcoming_state != INVALID_STATE ||
++	    port->delayed_state != INVALID_STATE) {
++		tcpm_swap_back_retry(port);
++		goto unlock;
++	}
++
++	if (sb->pr_due)
++		tcpm_swap_back_request(port);
++	else
++		tcpm_swap_back_probe(port);
++
++unlock:
++	mutex_unlock(&port->lock);
++}
++
++/*
++ * A sink stint ends: at a port reset, or with the port source again without
++ * one (a swap the partner or the user asked for).  One that lasted
++ * SWAP_BACK_SINK_STABLE_MS clears the strikes and the session's counts, and
++ * at a reset the stop as well; one that came from a swap of the swap back's
++ * gives the budget back after SWAP_BACK_SINK_REFUND_MS, and is judged at the
++ * next ready state when it lasted less than SWAP_BACK_SINK_SHORT_MS.
++ */
++static void tcpm_swap_back_sink_ended(struct tcpm_port *port, ktime_t now,
++				      bool by_reset)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	s64 ms = ktime_ms_delta(now, sb->sink_at);
++
++	if (ms >= SWAP_BACK_SINK_STABLE_MS) {
++		sb->strikes = 0;
++		sb->requests = 0;
++		sb->accepted = 0;
++		if (by_reset) {
++			sb->stopped = false;
++			sb->told_no_power = false;
++			sb->told_refused = false;
++		}
++	} else if (sb->sink_by_swap && ms >= SWAP_BACK_SINK_REFUND_MS) {
++		sb->requests = 0;
++		sb->accepted = 0;
++	} else if (sb->sink_by_swap && ms < SWAP_BACK_SINK_SHORT_MS) {
++		sb->lost_early = true;
++	}
++	sb->sink_at = 0;
++	sb->sink_by_swap = false;
++}
++
++/*
++ * Where SRC_READY and SNK_READY settle: a session starts at the first ready
++ * state after a gap, the outcome of an accepted swap and of a question is
++ * read, and the questions stay scheduled while the port is source.
++ */
++static void tcpm_swap_back_ready(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	ktime_t now;
++	unsigned int s;
++
++	if (!port->tcpc->request_sink_as_source)
++		return;
++
++	now = ktime_get_boottime();
++	if (!sb->seen_ready) {
++		sb->seen_ready = true;
++		/*
++		 * Without a partner for longer than a reconnect: a new one.  A
++		 * swap still pending, or a question or request that a reset
++		 * cut short, was the old partner's and counts as failed, but
++		 * stops nothing for the new one.  A sink role lost early was an
++		 * unplug.
++		 */
++		if (ktime_ms_delta(now, sb->reset_at) > SWAP_BACK_SESSION_GAP_MS) {
++			if (sb->pending || sb->unsettled) {
++				sb->strikes++;
++				tcpm_log(port,
++					 "Swap back: the last %s ended in a reset, failed swap %u of %u",
++					 sb->pending ? "swap" : "question",
++					 sb->strikes, SWAP_BACK_MAX_STRIKES);
++			}
++			sb->pending = false;
++			sb->lost_early = false;
++			sb->requests = 0;
++			sb->accepted = 0;
++			sb->stopped = false;
++			sb->told_no_power = false;
++			sb->told_refused = false;
++		}
++		/* The same partner again: the reset stopped the session already */
++		sb->unsettled = false;
++	}
++
++	if (port->pwr_role == TYPEC_SINK) {
++		/* Nothing of the swap back's is due while the port is sink */
++		sb->probing = false;
++		sb->probe_sent = false;
++		sb->pr_due = false;
++		sb->pr_queued = false;
++		sb->pr_sent = false;
++		sb->sent_at = 0;
++		if (!port->explicit_contract)
++			return;
++		sb->lost_early = false;
++		if (!sb->sink_at)
++			sb->sink_at = now;
++		if (sb->pending) {
++			sb->pending = false;
++			sb->sink_by_swap = true;
++			tcpm_swap_back_info(port, "power sink at %u mV %u mA%s",
++					    port->supply_voltage,
++					    port->current_limit,
++					    sb->pending_reset ?
++					    ", after a reconnect" : "");
++		}
++		return;
++	}
++
++	if (sb->sink_at)
++		tcpm_swap_back_sink_ended(port, now, false);
++	if (sb->lost_early) {
++		sb->lost_early = false;
++		sb->strikes++;
++		tcpm_swap_back_stop(port,
++				    "sink role lost within a minute of the swap, failed swap %u of %u",
++				    sb->strikes, SWAP_BACK_MAX_STRIKES);
++	}
++	if (sb->pending) {
++		/* Taken, but the partner did not become the source */
++		sb->pending = false;
++		sb->strikes++;
++		tcpm_swap_back_stop(port,
++				    "swap accepted but the partner did not supply power, failed swap %u of %u",
++				    sb->strikes, SWAP_BACK_MAX_STRIKES);
++	}
++	if (sb->probe_sent || sb->pr_sent) {
++		/* On the wire, and a Soft or Hard Reset came instead of an answer */
++		tcpm_swap_back_stop(port, "%s cut short",
++				    sb->pr_sent ? "PR_Swap" : "Get_Source_Cap");
++		sb->probe_sent = false;
++		sb->pr_sent = false;
++		sb->probing = false;
++		sb->pr_queued = false;
++		sb->sent_at = 0;
++	} else if (sb->probing) {
++		/* Never sent: a write or a message of the partner's came first */
++		sb->probing = false;
++		if (tcpm_swap_back_wanted(port))
++			tcpm_swap_back_retry(port);
++	} else if (sb->pr_queued) {
++		/* Never sent either: ask again later */
++		sb->pr_queued = false;
++		if (tcpm_swap_back_wanted(port)) {
++			s = tcpm_swap_back_backoff(port);
++			tcpm_swap_back_info(port,
++					    "PR_Swap request not sent, asking again in %u s",
++					    s);
++		}
++	}
++
++	if (!port->pd_capable || !port->explicit_contract)
++		return;
++
++	if (!sb->armed) {
++		sb->armed = true;
++		sb->interval_ms = SWAP_BACK_POLL_MIN_MS;
++		if (sb->strikes >= SWAP_BACK_MAX_STRIKES) {
++			tcpm_swap_back_stop(port,
++					    "paused after %u failed swaps until the port has been a power sink for %u minutes",
++					    sb->strikes,
++					    SWAP_BACK_SINK_STABLE_MS / 60000);
++			return;
++		}
++		sb->due = jiffies + msecs_to_jiffies(SWAP_BACK_FIRST_MS);
++		if (tcpm_swap_back_wanted(port))
++			tcpm_swap_back_schedule(port, SWAP_BACK_FIRST_MS);
++		return;
++	}
++
++	if (sb->pr_due && tcpm_swap_back_wanted(port))
++		tcpm_swap_back_schedule(port, 0);
++	else
++		tcpm_swap_back_kick(port);
++}
++
++/*
++ * At every port reset.  The sink stint that it ends is judged
++ * (tcpm_swap_back_sink_ended()); an accepted swap that is still pending
++ * stays so, for the next ready state.  A question or a request that was on
++ * the wire, or sent less than SWAP_BACK_CUT_MS before and not answered, may
++ * be what made the partner leave: it stops the session, and it is a failed
++ * swap if the partner then stays away longer than the session's gap.
++ */
++static void tcpm_swap_back_reset(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	ktime_t now = ktime_get_boottime();
++
++	cancel_delayed_work(&sb->work);
++
++	if (sb->sink_at)
++		tcpm_swap_back_sink_ended(port, now, true);
++	if (sb->pending)
++		sb->pending_reset = true;
++	if (sb->probe_sent || sb->pr_sent ||
++	    (sb->sent_at &&
++	     ktime_ms_delta(now, sb->sent_at) < SWAP_BACK_CUT_MS)) {
++		tcpm_swap_back_stop(port, "%s cut short by a port reset",
++				    sb->pr_sent || (!sb->probe_sent && sb->sent_pr) ?
++				    "PR_Swap" : "Get_Source_Cap");
++		sb->unsettled = true;
++	}
++	/* A request that was about to go out is not for the next partner */
++	if ((sb->pr_queued && port->upcoming_state == PR_SWAP_SEND) ||
++	    (sb->probing && port->upcoming_state == GET_SOURCE_CAP))
++		port->upcoming_state = INVALID_STATE;
++
++	sb->reset_at = now;
++	sb->armed = false;
++	sb->seen_ready = false;
++	sb->probing = false;
++	sb->probe_sent = false;
++	sb->pr_due = false;
++	sb->pr_queued = false;
++	sb->pr_sent = false;
++	sb->partner_drp = false;
++	sb->interval_ms = SWAP_BACK_POLL_MIN_MS;
++	sb->busy_since = 0;
++	sb->sent_at = 0;
++	sb->sink_at = 0;
++	sb->sink_by_swap = false;
++}
++
++/* The partner's Source_Capabilities, in answer to GET_SOURCE_CAP */
++static void tcpm_swap_back_source_caps(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	unsigned int s;
++	u32 pdo;
++
++	sb->probing = false;
++	sb->probe_sent = false;
++	sb->sent_at = 0;
++	if (!tcpm_swap_back_wanted(port))
++		return;
++	if (!port->nr_source_caps ||
++	    pdo_type(port->source_caps[0]) != PDO_TYPE_FIXED) {
++		tcpm_swap_back_stop(port,
++				    "the partner's source capabilities do not start with a fixed supply");
++		return;
++	}
++
++	pdo = port->source_caps[0];
++	sb->partner_drp = pdo & PDO_FIXED_DUAL_ROLE;
++	if (pdo & PDO_FIXED_EXTPOWER) {
++		/* tcpm_swap_back_ready() starts the request from SRC_READY */
++		tcpm_log(port, "Swap back: partner has external power, dual-role power %s",
++			 str_yes_no(sb->partner_drp));
++		sb->pr_due = true;
++		return;
++	}
++
++	s = tcpm_swap_back_backoff(port);
++	if (sb->told_no_power) {
++		tcpm_log(port, "Swap back: no external power, asking again in %u s", s);
++		return;
++	}
++	sb->told_no_power = true;
++	tcpm_swap_back_info(port,
++			    "partner has no external power now, asking again in %u s, then less often down to every %u s",
++			    s, SWAP_BACK_POLL_MAX_MS / 1000);
++}
++
++/*
++ * Not a source now: Reject or Not_Supported to Get_Source_Cap, or no answer.
++ * A charge-through dock may well answer so while its supply is away, so ask
++ * again, at the slow end of the ladder; this never leads to a PR_Swap by
++ * itself.
++ */
++static void tcpm_swap_back_no_source(struct tcpm_port *port,
++				     const char *answer)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	unsigned int s;
++
++	sb->probing = false;
++	sb->probe_sent = false;
++	if (!tcpm_swap_back_wanted(port))
++		return;
++	sb->interval_ms = SWAP_BACK_POLL_MAX_MS;
++	s = tcpm_swap_back_backoff(port);
++	if (sb->told_refused) {
++		tcpm_log(port, "Swap back: Get_Source_Cap answered %s, asking again in %u s",
++			 answer, s);
++		return;
++	}
++	sb->told_refused = true;
++	tcpm_swap_back_info(port,
++			    "Get_Source_Cap answered %s, not a source now, asking again every %u s",
++			    answer, s);
++}
++
++/* Reject, Wait or Not_Supported in answer to GET_SOURCE_CAP */
++static void tcpm_swap_back_probe_refused(struct tcpm_port *port,
++					 enum pd_ctrl_msg_type type)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	unsigned int s;
++
++	sb->sent_at = 0;
++	if (type != PD_CTRL_WAIT) {
++		tcpm_swap_back_no_source(port, type == PD_CTRL_REJECT ?
++					 "Reject" : "Not_Supported");
++		return;
++	}
++	sb->probing = false;
++	sb->probe_sent = false;
++	if (!tcpm_swap_back_wanted(port))
++		return;
++	s = tcpm_swap_back_backoff(port);
++	tcpm_log(port, "Swap back: Get_Source_Cap answered Wait, asking again in %u s", s);
++}
++
++/*
++ * GET_SOURCE_CAP: no answer (0), or the transmit failed (< 0).  A message
++ * the TCPC discarded for an incoming one did not go out: the next ready
++ * state retries it.  Any other failure may have reached the partner and
++ * counts as sent, without an answer.
++ */
++static void tcpm_swap_back_probe_failed(struct tcpm_port *port, int ret)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	if (ret == -EAGAIN) {
++		sb->sent_at = 0;
++		return;
++	}
++	if (ret)
++		tcpm_log(port, "Swap back: Get_Source_Cap not sent whole (%d)", ret);
++	tcpm_swap_back_no_source(port, "nothing");
++}
++
++/* PR_SWAP_SEND: tell whose request goes out */
++static void tcpm_swap_back_pr_send(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	sb->pr_sent = sb->pr_queued;
++	sb->pr_queued = false;
++	if (sb->pr_sent)
++		tcpm_swap_back_sent(port, true);
++}
++
++/*
++ * PR_SWAP_ACCEPT: the partner asked for a power role swap and gets it.  A
++ * request of the swap back's that was queued is dropped there (the partner's
++ * swap gives the role it asked for), a question that was queued goes too (it
++ * would go out in the other power role), and a partner that asks for the sink
++ * role itself, making the port source, is not asked to take it back.
++ */
++static void tcpm_swap_back_partner_swap(struct tcpm_port *port)
++{
++	struct swap_back_data *sb = &port->swap_back;
++
++	sb->pr_queued = false;
++	sb->pr_due = false;
++	if (sb->probing && port->upcoming_state == GET_SOURCE_CAP) {
++		port->upcoming_state = INVALID_STATE;
++		sb->probing = false;
++	}
++	if (port->pwr_role == TYPEC_SINK)
++		tcpm_swap_back_stop(port, "the partner asked for the sink role");
++}
++
++/*
++ * The partner's answer to a PR_Swap of the swap back's: Accept, Reject,
++ * Wait, Not_Supported, or 0 for none.
++ */
++static void tcpm_swap_back_pr_answer(struct tcpm_port *port,
++				     enum pd_ctrl_msg_type type)
++{
++	struct swap_back_data *sb = &port->swap_back;
++	const char *answer;
++	unsigned int s;
++
++	if (!sb->pr_sent)
++		return;
++	sb->pr_sent = false;
++	if (type)
++		sb->sent_at = 0;
++
++	switch (type) {
++	case PD_CTRL_ACCEPT:
++		sb->accepted++;
++		sb->pending = true;
++		sb->pending_reset = false;
++		tcpm_swap_back_info(port, "PR_Swap accepted, swap %u of %u",
++				    sb->accepted, SWAP_BACK_MAX_ACCEPTED);
++		return;
++	case PD_CTRL_NOT_SUPP:
++		tcpm_swap_back_stop(port, "PR_Swap answered Not_Supported");
++		return;
++	case PD_CTRL_REJECT:
++		if (!sb->partner_drp) {
++			tcpm_swap_back_stop(port,
++					    "PR_Swap answered Reject by a partner that does not claim dual-role power");
++			return;
++		}
++		answer = "Reject";
++		break;
++	case PD_CTRL_WAIT:
++		answer = "Wait";
++		break;
++	default:
++		answer = "nothing";
++		break;
++	}
++
++	if (!tcpm_swap_back_wanted(port))
++		return;
++	s = tcpm_swap_back_backoff(port);
++	tcpm_swap_back_info(port, "PR_Swap answered %s, asking again in %u s",
++			    answer, s);
++}
++
++/*
+  * VDM/VDO handling functions
+  */
+ static void tcpm_queue_vdm(struct tcpm_port *port, const u32 header,
+@@ -3493,15 +4261,26 @@ static void tcpm_pd_data_request(struct
+ 		}
+ 
+ 		if (port->pwr_role == TYPEC_SOURCE) {
+-			if (port->ams == GET_SOURCE_CAPABILITIES)
++			if (port->ams == GET_SOURCE_CAPABILITIES &&
++			    port->state == GET_SOURCE_CAP) {
++				/*
++				 * The answer to the port's own request
++				 * (tcpc->request_sink_as_source).  SRC_READY
++				 * with the AMS still set finishes it and gives
++				 * the sink SinkTxOK back.
++				 */
++				tcpm_swap_back_source_caps(port);
++				tcpm_set_state(port, SRC_READY, 0);
++			} else if (port->ams == GET_SOURCE_CAPABILITIES) {
+ 				tcpm_pd_handle_state(port, SRC_READY, NONE_AMS, 0);
+-			/* Unexpected Source Capabilities */
+-			else
++			} else {
++				/* Unexpected Source Capabilities */
+ 				tcpm_pd_handle_msg(port,
+ 						   port->negotiated_rev < PD_REV30 ?
+ 						   PD_MSG_CTRL_REJECT :
+ 						   PD_MSG_CTRL_NOT_SUPP,
+ 						   NONE_AMS);
++			}
+ 		} else if (port->state == SNK_WAIT_CAPABILITIES ||
+ 			   port->state == SNK_WAIT_CAPABILITIES_TIMEOUT) {
+ 		/*
+@@ -3773,6 +4552,7 @@ static void tcpm_pd_ctrl_request(struct
+ 			tcpm_set_state(port, DR_SWAP_CANCEL, 0);
+ 			break;
+ 		case PR_SWAP_SEND:
++			tcpm_swap_back_pr_answer(port, type);
+ 			port->swap_status = (type == PD_CTRL_WAIT ?
+ 					     -EAGAIN : -EOPNOTSUPP);
+ 			tcpm_set_state(port, PR_SWAP_CANCEL, 0);
+@@ -3789,6 +4569,10 @@ static void tcpm_pd_ctrl_request(struct
+ 			port->sink_cap_done = true;
+ 			tcpm_set_state(port, ready_state(port), 0);
+ 			break;
++		case GET_SOURCE_CAP:
++			tcpm_swap_back_probe_refused(port, type);
++			tcpm_set_state(port, ready_state(port), 0);
++			break;
+ 		/*
+ 		 * Some port partners do not support GET_STATUS, avoid soft reset the link to
+ 		 * prevent redundant power re-negotiation
+@@ -3863,6 +4647,7 @@ static void tcpm_pd_ctrl_request(struct
+ 			tcpm_set_state(port, DR_SWAP_CHANGE_DR, 0);
+ 			break;
+ 		case PR_SWAP_SEND:
++			tcpm_swap_back_pr_answer(port, PD_CTRL_ACCEPT);
+ 			tcpm_set_state(port, PR_SWAP_START, 0);
+ 			break;
+ 		case VCONN_SWAP_SEND:
+@@ -5053,6 +5838,7 @@ static void tcpm_reset_port(struct tcpm_
+ 	/* A request that was about to go out is not for the next partner */
+ 	if (port->tcpc->request_dfp_as_sink)
+ 		port->upcoming_state = INVALID_STATE;
++	tcpm_swap_back_reset(port);
+ 	port->pps_data.supported = false;
+ 	tcpm_set_partner_usb_comm_capable(port, false);
+ 
+@@ -5608,6 +6394,9 @@ static void run_state_machine(struct tcp
+ 			break;
+ 		}
+ 
++		/* tcpc->request_sink_as_source: see tcpm_swap_back_work() */
++		tcpm_swap_back_ready(port);
++
+ 		/*
+ 		 * 6.4.4.3.1 Discover Identity
+ 		 * "The Discover Identity Command Shall only be sent to SOP when there is an
+@@ -6000,6 +6789,9 @@ static void run_state_machine(struct tcp
+ 			break;
+ 		}
+ 
++		/* tcpc->request_sink_as_source: see tcpm_swap_back_work() */
++		tcpm_swap_back_ready(port);
++
+ 		/*
+ 		 * 6.4.4.3.1 Discover Identity
+ 		 * "The Discover Identity Command Shall only be sent to SOP when there is an
+@@ -6324,6 +7116,8 @@ static void run_state_machine(struct tcp
+ 
+ 	/* PR_Swap states */
+ 	case PR_SWAP_ACCEPT:
++		/* tcpc->request_sink_as_source: see tcpm_swap_back_partner_swap() */
++		tcpm_swap_back_partner_swap(port);
+ 		/*
+ 		 * A power role swap of the port's own that was still queued
+ 		 * when the partner's came in asked for the role this one gives
+@@ -6337,11 +7131,14 @@ static void run_state_machine(struct tcp
+ 		tcpm_set_state(port, PR_SWAP_START, 0);
+ 		break;
+ 	case PR_SWAP_SEND:
++		/* Whose request this is, for tcpm_swap_back_pr_answer() */
++		tcpm_swap_back_pr_send(port);
+ 		tcpm_pd_send_control(port, PD_CTRL_PR_SWAP, TCPC_TX_SOP);
+ 		tcpm_set_state_cond(port, PR_SWAP_SEND_TIMEOUT,
+ 				    PD_T_SENDER_RESPONSE);
+ 		break;
+ 	case PR_SWAP_SEND_TIMEOUT:
++		tcpm_swap_back_pr_answer(port, 0);
+ 		tcpm_swap_complete(port, -ETIMEDOUT);
+ 		tcpm_set_state(port, ready_state(port), 0);
+ 		break;
+@@ -6552,6 +7349,34 @@ static void run_state_machine(struct tcp
+ 		port->sink_cap_done = true;
+ 		tcpm_set_state(port, ready_state(port), 0);
+ 		break;
++	/* tcpc->request_sink_as_source, as source only: see tcpm_swap_back_work() */
++	case GET_SOURCE_CAP:
++		/*
++		 * Only the swap back's own question, in its own AMS: a write or
++		 * a message of the partner's that got in first may have taken
++		 * the AMS over.  Then nothing is sent, and the ready state tries
++		 * again later.
++		 */
++		if (port->pwr_role != TYPEC_SOURCE || !port->swap_back.probing ||
++		    port->ams != GET_SOURCE_CAPABILITIES) {
++			tcpm_set_state(port, ready_state(port), 0);
++			break;
++		}
++		tcpm_swap_back_sent(port, false);
++		ret = tcpm_pd_send_control(port, PD_CTRL_GET_SOURCE_CAP, TCPC_TX_SOP);
++		if (ret) {
++			tcpm_swap_back_probe_failed(port, ret);
++			tcpm_set_state(port, ready_state(port), 0);
++		} else {
++			port->swap_back.probe_sent = true;
++			tcpm_set_state_cond(port, GET_SOURCE_CAP_TIMEOUT,
++					    PD_T_SENDER_RESPONSE);
++		}
++		break;
++	case GET_SOURCE_CAP_TIMEOUT:
++		tcpm_swap_back_probe_failed(port, 0);
++		tcpm_set_state(port, ready_state(port), 0);
++		break;
+ 	case ERROR_RECOVERY:
+ 		tcpm_swap_complete(port, -EPROTO);
+ 		tcpm_aug_supply_req_complete(port, -EPROTO);
+@@ -6691,6 +7516,8 @@ static void _tcpm_cc_change(struct tcpm_
+ 	case SRC_STARTUP:
+ 	case SRC_SEND_CAPABILITIES:
+ 	case SRC_READY:
++	case GET_SOURCE_CAP:
++	case GET_SOURCE_CAP_TIMEOUT:
+ 		if (tcpm_port_is_disconnected(port) ||
+ 		    !tcpm_port_is_source(port)) {
+ 			if (port->port_type == TYPEC_PORT_SRC)
+@@ -7035,6 +7862,8 @@ static void _tcpm_pd_vbus_off(struct tcp
+ 	case SRC_TRANSITION_SUPPLY:
+ 	case SRC_READY:
+ 	case SRC_WAIT_NEW_CAPABILITIES:
++	case GET_SOURCE_CAP:
++	case GET_SOURCE_CAP_TIMEOUT:
+ 		/*
+ 		 * Force to unattached state to re-initiate connection.
+ 		 * DRP port should move to Unattached.SNK instead of Unattached.SRC if
+@@ -7097,6 +7926,8 @@ static void _tcpm_pd_vbus_vsafe0v(struct
+ 	case SRC_TRANSITION_SUPPLY:
+ 	case SRC_READY:
+ 	case SRC_WAIT_NEW_CAPABILITIES:
++	case GET_SOURCE_CAP:
++	case GET_SOURCE_CAP_TIMEOUT:
+ 		if (port->auto_vbus_discharge_enabled) {
+ 			if (port->port_type == TYPEC_PORT_SRC)
+ 				tcpm_set_state(port, SRC_UNATTACHED, 0);
+@@ -7480,6 +8311,26 @@ static int tcpm_pr_set(struct typec_port
+ 		ret = -EINVAL;
+ 		goto port_unlock;
+ 	}
++
++	/*
++	 * tcpc->request_sink_as_source does not undo a choice made here.  A
++	 * request for the source role stops it for the session, also when the
++	 * write fails below or changes nothing, and drops a request of its own
++	 * that has not gone out yet.  A request for the sink role takes over
++	 * one that is queued or due.
++	 */
++	if (port->tcpc->request_sink_as_source && port->attached) {
++		if (role == TYPEC_SOURCE) {
++			if (port->swap_back.pr_queued &&
++			    port->upcoming_state == PR_SWAP_SEND)
++				port->upcoming_state = INVALID_STATE;
++			tcpm_swap_back_stop(port,
++					    "the source role was asked for through power_role");
++		}
++		port->swap_back.pr_queued = false;
++		port->swap_back.pr_due = false;
++	}
++
+ 	if (port->state != SRC_READY && port->state != SNK_READY) {
+ 		ret = -EAGAIN;
+ 		goto port_unlock;
+@@ -7575,6 +8426,9 @@ static int tcpm_try_role(struct typec_po
+ 		port->try_role = role;
+ 	port->try_src_count = 0;
+ 	port->try_snk_count = 0;
++	/* tcpc->request_sink_as_source asks again from here, if it should */
++	if (!ret)
++		tcpm_swap_back_kick(port);
+ 	mutex_unlock(&port->lock);
+ 
+ 	return ret;
+@@ -8846,6 +9700,7 @@ struct tcpm_port *tcpm_register_port(str
+ 	kthread_init_work(&port->event_work, tcpm_pd_event_handler);
+ 	kthread_init_work(&port->enable_frs, tcpm_enable_frs_work);
+ 	kthread_init_work(&port->send_discover_work, tcpm_send_discover_work);
++	INIT_DEFERRABLE_WORK(&port->swap_back.work, tcpm_swap_back_work);
+ 	hrtimer_setup(&port->state_machine_timer, state_machine_timer_handler, CLOCK_MONOTONIC,
+ 		      HRTIMER_MODE_REL);
+ 	hrtimer_setup(&port->vdm_state_machine_timer, vdm_state_machine_timer_handler,
+@@ -8945,7 +9800,14 @@ void tcpm_unregister_port(struct tcpm_po
+ 	int i;
+ 
+ 	port->registered = false;
++	/*
++	 * The swap back's work queues state machine work: stop it while the
++	 * worker is still there, and once more after the worker's last run,
++	 * which finds registered false and queues nothing.
++	 */
++	cancel_delayed_work_sync(&port->swap_back.work);
+ 	kthread_destroy_worker(port->wq);
++	cancel_delayed_work_sync(&port->swap_back.work);
+ 
+ 	hrtimer_cancel(&port->send_discover_timer);
+ 	hrtimer_cancel(&port->enable_frs_timer);
+--- a/include/linux/usb/tcpm.h
++++ b/include/linux/usb/tcpm.h
+@@ -146,6 +146,17 @@ enum tcpm_transmit_type {
+  *		that of a partner which tries the sink role first itself, sends
+  *		the port back to waiting for the rest of it. 0 keeps the
+  *		standard timing.
++ * @request_sink_as_source:
++ *		Optional; as Source to a PD partner under an explicit contract,
++ *		while the port prefers the sink role, ask the partner for its
++ *		source capabilities from time to time and request a PR_Swap to
++ *		Sink when they say that it has external power (Unconstrained
++ *		Power in the vSafe5V PDO). For a charge-through dock that the
++ *		port has to power while the dock's own supply is away, and that
++ *		does not ask for the source role itself once the supply is back.
++ *		The questions back off to one every 10 minutes, and the swaps
++ *		are bounded per session (one partner, across the reconnects of
++ *		a failed swap); one that fails stops them.
+  */
+ struct tcpc_dev {
+ 	struct fwnode_handle *fwnode;
+@@ -166,6 +177,7 @@ struct tcpc_dev {
+ 
+ 	bool request_dfp_as_sink;
+ 	unsigned int try_snk_extra_wait_ms;
++	bool request_sink_as_source;
+ 
+ 	int (*init)(struct tcpc_dev *dev);
+ 	int (*get_vbus)(struct tcpc_dev *dev);
