@@ -226,7 +226,7 @@ hardware.
  struct tcpm_port {
  	struct device *dev;
  
-@@ -625,6 +719,9 @@ struct tcpm_port {
+@@ -623,6 +717,9 @@ struct tcpm_port {
  	/* Deadline in jiffies of tcpc->try_snk_extra_wait_ms, set in SNK_TRY */
  	unsigned long try_snk_wait_until;
  
@@ -236,7 +236,7 @@ hardware.
  	/* port belongs to a self powered device */
  	bool self_powered;
  
-@@ -1847,6 +1944,677 @@ static int tcpm_request_dfp_as_sink(stru
+@@ -1845,6 +1942,677 @@ static int tcpm_request_dfp_as_sink(stru
  }
  
  /*
@@ -914,7 +914,7 @@ hardware.
   * VDM/VDO handling functions
   */
  static void tcpm_queue_vdm(struct tcpm_port *port, const u32 header,
-@@ -3493,15 +4261,26 @@ static void tcpm_pd_data_request(struct
+@@ -3491,15 +4259,26 @@ static void tcpm_pd_data_request(struct
  		}
  
  		if (port->pwr_role == TYPEC_SOURCE) {
@@ -944,7 +944,7 @@ hardware.
  		} else if (port->state == SNK_WAIT_CAPABILITIES ||
  			   port->state == SNK_WAIT_CAPABILITIES_TIMEOUT) {
  		/*
-@@ -3773,6 +4552,7 @@ static void tcpm_pd_ctrl_request(struct
+@@ -3771,6 +4550,7 @@ static void tcpm_pd_ctrl_request(struct
  			tcpm_set_state(port, DR_SWAP_CANCEL, 0);
  			break;
  		case PR_SWAP_SEND:
@@ -952,7 +952,7 @@ hardware.
  			port->swap_status = (type == PD_CTRL_WAIT ?
  					     -EAGAIN : -EOPNOTSUPP);
  			tcpm_set_state(port, PR_SWAP_CANCEL, 0);
-@@ -3789,6 +4569,10 @@ static void tcpm_pd_ctrl_request(struct
+@@ -3787,6 +4567,10 @@ static void tcpm_pd_ctrl_request(struct
  			port->sink_cap_done = true;
  			tcpm_set_state(port, ready_state(port), 0);
  			break;
@@ -963,7 +963,7 @@ hardware.
  		/*
  		 * Some port partners do not support GET_STATUS, avoid soft reset the link to
  		 * prevent redundant power re-negotiation
-@@ -3863,6 +4647,7 @@ static void tcpm_pd_ctrl_request(struct
+@@ -3861,6 +4645,7 @@ static void tcpm_pd_ctrl_request(struct
  			tcpm_set_state(port, DR_SWAP_CHANGE_DR, 0);
  			break;
  		case PR_SWAP_SEND:
@@ -971,7 +971,7 @@ hardware.
  			tcpm_set_state(port, PR_SWAP_START, 0);
  			break;
  		case VCONN_SWAP_SEND:
-@@ -5053,6 +5838,7 @@ static void tcpm_reset_port(struct tcpm_
+@@ -5050,6 +5835,7 @@ static void tcpm_reset_port(struct tcpm_
  	/* A request that was about to go out is not for the next partner */
  	if (port->tcpc->request_dfp_as_sink)
  		port->upcoming_state = INVALID_STATE;
@@ -979,7 +979,7 @@ hardware.
  	port->pps_data.supported = false;
  	tcpm_set_partner_usb_comm_capable(port, false);
  
-@@ -5608,6 +6394,9 @@ static void run_state_machine(struct tcp
+@@ -5605,6 +6391,9 @@ static void run_state_machine(struct tcp
  			break;
  		}
  
@@ -989,7 +989,7 @@ hardware.
  		/*
  		 * 6.4.4.3.1 Discover Identity
  		 * "The Discover Identity Command Shall only be sent to SOP when there is an
-@@ -6000,6 +6789,9 @@ static void run_state_machine(struct tcp
+@@ -5997,6 +6786,9 @@ static void run_state_machine(struct tcp
  			break;
  		}
  
@@ -999,7 +999,7 @@ hardware.
  		/*
  		 * 6.4.4.3.1 Discover Identity
  		 * "The Discover Identity Command Shall only be sent to SOP when there is an
-@@ -6324,6 +7116,8 @@ static void run_state_machine(struct tcp
+@@ -6307,6 +7099,8 @@ static void run_state_machine(struct tcp
  
  	/* PR_Swap states */
  	case PR_SWAP_ACCEPT:
@@ -1008,7 +1008,7 @@ hardware.
  		/*
  		 * A power role swap of the port's own that was still queued
  		 * when the partner's came in asked for the role this one gives
-@@ -6337,11 +7131,14 @@ static void run_state_machine(struct tcp
+@@ -6320,11 +7114,14 @@ static void run_state_machine(struct tcp
  		tcpm_set_state(port, PR_SWAP_START, 0);
  		break;
  	case PR_SWAP_SEND:
@@ -1023,7 +1023,7 @@ hardware.
  		tcpm_swap_complete(port, -ETIMEDOUT);
  		tcpm_set_state(port, ready_state(port), 0);
  		break;
-@@ -6552,6 +7349,34 @@ static void run_state_machine(struct tcp
+@@ -6535,6 +7332,34 @@ static void run_state_machine(struct tcp
  		port->sink_cap_done = true;
  		tcpm_set_state(port, ready_state(port), 0);
  		break;
@@ -1058,7 +1058,7 @@ hardware.
  	case ERROR_RECOVERY:
  		tcpm_swap_complete(port, -EPROTO);
  		tcpm_aug_supply_req_complete(port, -EPROTO);
-@@ -6691,6 +7516,8 @@ static void _tcpm_cc_change(struct tcpm_
+@@ -6674,6 +7499,8 @@ static void _tcpm_cc_change(struct tcpm_
  	case SRC_STARTUP:
  	case SRC_SEND_CAPABILITIES:
  	case SRC_READY:
@@ -1067,7 +1067,7 @@ hardware.
  		if (tcpm_port_is_disconnected(port) ||
  		    !tcpm_port_is_source(port)) {
  			if (port->port_type == TYPEC_PORT_SRC)
-@@ -7035,6 +7862,8 @@ static void _tcpm_pd_vbus_off(struct tcp
+@@ -7018,6 +7845,8 @@ static void _tcpm_pd_vbus_off(struct tcp
  	case SRC_TRANSITION_SUPPLY:
  	case SRC_READY:
  	case SRC_WAIT_NEW_CAPABILITIES:
@@ -1076,7 +1076,7 @@ hardware.
  		/*
  		 * Force to unattached state to re-initiate connection.
  		 * DRP port should move to Unattached.SNK instead of Unattached.SRC if
-@@ -7097,6 +7926,8 @@ static void _tcpm_pd_vbus_vsafe0v(struct
+@@ -7080,6 +7909,8 @@ static void _tcpm_pd_vbus_vsafe0v(struct
  	case SRC_TRANSITION_SUPPLY:
  	case SRC_READY:
  	case SRC_WAIT_NEW_CAPABILITIES:
@@ -1085,7 +1085,7 @@ hardware.
  		if (port->auto_vbus_discharge_enabled) {
  			if (port->port_type == TYPEC_PORT_SRC)
  				tcpm_set_state(port, SRC_UNATTACHED, 0);
-@@ -7480,6 +8311,26 @@ static int tcpm_pr_set(struct typec_port
+@@ -7463,6 +8294,26 @@ static int tcpm_pr_set(struct typec_port
  		ret = -EINVAL;
  		goto port_unlock;
  	}
@@ -1112,7 +1112,7 @@ hardware.
  	if (port->state != SRC_READY && port->state != SNK_READY) {
  		ret = -EAGAIN;
  		goto port_unlock;
-@@ -7575,6 +8426,9 @@ static int tcpm_try_role(struct typec_po
+@@ -7558,6 +8409,9 @@ static int tcpm_try_role(struct typec_po
  		port->try_role = role;
  	port->try_src_count = 0;
  	port->try_snk_count = 0;
@@ -1122,7 +1122,7 @@ hardware.
  	mutex_unlock(&port->lock);
  
  	return ret;
-@@ -8846,6 +9700,7 @@ struct tcpm_port *tcpm_register_port(str
+@@ -8829,6 +9683,7 @@ struct tcpm_port *tcpm_register_port(str
  	kthread_init_work(&port->event_work, tcpm_pd_event_handler);
  	kthread_init_work(&port->enable_frs, tcpm_enable_frs_work);
  	kthread_init_work(&port->send_discover_work, tcpm_send_discover_work);
@@ -1130,7 +1130,7 @@ hardware.
  	hrtimer_setup(&port->state_machine_timer, state_machine_timer_handler, CLOCK_MONOTONIC,
  		      HRTIMER_MODE_REL);
  	hrtimer_setup(&port->vdm_state_machine_timer, vdm_state_machine_timer_handler,
-@@ -8945,7 +9800,14 @@ void tcpm_unregister_port(struct tcpm_po
+@@ -8928,7 +9783,14 @@ void tcpm_unregister_port(struct tcpm_po
  	int i;
  
  	port->registered = false;

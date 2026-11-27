@@ -38,7 +38,7 @@ never sees an event, and the debounce states give up as they did.
 diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
 --- a/drivers/usb/typec/tcpm/tcpm.c
 +++ b/drivers/usb/typec/tcpm/tcpm.c
-@@ -622,6 +622,8 @@ struct tcpm_port {
+@@ -620,6 +620,8 @@ struct tcpm_port {
  
  	/* Deadline in jiffies to exit src_try_wait state */
  	unsigned long max_wait;
@@ -47,7 +47,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  
  	/* port belongs to a self powered device */
  	bool self_powered;
-@@ -5290,6 +5292,21 @@ static void tcpm_set_initial_negotiated_
+@@ -5287,6 +5289,21 @@ static void tcpm_set_initial_negotiated_
  	port->negotiated_rev_prime = port->negotiated_rev;
  }
  
@@ -69,7 +69,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  static void run_state_machine(struct tcpm_port *port)
  {
  	int ret;
-@@ -5354,13 +5371,24 @@ static void run_state_machine(struct tcp
+@@ -5351,13 +5368,24 @@ static void run_state_machine(struct tcp
  		 *   Until then, ignore any state changes.
  		 */
  		tcpm_set_cc(port, TYPEC_CC_RD);
@@ -95,7 +95,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  			port->max_wait = 0;
  		}
  		break;
-@@ -6665,6 +6693,16 @@ static void _tcpm_cc_change(struct tcpm_
+@@ -6648,6 +6676,16 @@ static void _tcpm_cc_change(struct tcpm_
  	case SNK_TRY:
  		/* Do nothing, waiting for timeout */
  		break;
@@ -112,7 +112,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  
  	case SNK_DISCOVERY:
  		/* CC line is unstable, wait for debounce */
-@@ -6686,7 +6724,11 @@ static void _tcpm_cc_change(struct tcpm_
+@@ -6669,7 +6707,11 @@ static void _tcpm_cc_change(struct tcpm_
  	case SNK_TRY_WAIT_DEBOUNCE:
  		if (!tcpm_port_is_sink(port)) {
  			port->max_wait = 0;
@@ -125,7 +125,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		}
  		break;
  	case SRC_TRY_WAIT:
-@@ -6705,10 +6747,13 @@ static void _tcpm_cc_change(struct tcpm_
+@@ -6688,10 +6730,13 @@ static void _tcpm_cc_change(struct tcpm_
  			tcpm_set_state(port, SNK_TRYWAIT_DEBOUNCE, 0);
  		break;
  	case SNK_TRY_WAIT_DEBOUNCE_CHECK_VBUS:
@@ -142,7 +142,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		break;
  	case SNK_TRYWAIT:
  		/* Do nothing, waiting for tCCDebounce */
-@@ -6785,6 +6830,7 @@ static void _tcpm_pd_vbus_on(struct tcpm
+@@ -6768,6 +6813,7 @@ static void _tcpm_pd_vbus_on(struct tcpm
  		break;
  
  	case SNK_TRY:
@@ -150,7 +150,7 @@ diff --git a/drivers/usb/typec/tcpm/tcpm.c b/drivers/usb/typec/tcpm/tcpm.c
  		/* Do nothing, waiting for timeout */
  		break;
  	case SRC_TRYWAIT:
-@@ -6852,6 +6898,7 @@ static void _tcpm_pd_vbus_off(struct tcp
+@@ -6835,6 +6881,7 @@ static void _tcpm_pd_vbus_off(struct tcp
  	case HARD_RESET_SEND:
  		break;
  	case SNK_TRY:
