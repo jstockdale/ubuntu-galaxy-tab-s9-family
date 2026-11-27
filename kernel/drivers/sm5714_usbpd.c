@@ -69,12 +69,37 @@
 #define SM5714_REG_TX_HEADER		0x60
 #define SM5714_REG_TX_PAYLOAD		0x62
 #define SM5714_REG_TX_REQ		0x7e
+/* Samsung reads the CC state machine here; low nibble 0x1 is CC_DISABLE */
+#define SM5714_REG_PD_STATE0		0xd5
 #define SM5714_REG_PD_STATE3		0xd8
 /* Samsung: "Reset Wait Policy Engine", the Protocol Layer after a Hard Reset */
 #define  SM5714_PD_STATE3_RESET_WAIT	GENMASK(2, 1)
 
 /* How often the attach watchdog samples CC while the port is idle. */
 #define SM5714_CC_WATCH_MS		4000
+/* A sample that disagrees with TCPM is taken again this much later. */
+#define SM5714_CC_CONFIRM_MS		500
+/*
+ * How long the chip is left in Unattached.SNK (CC_CNTL3 0x82) after a CC open
+ * before the toggling mode is written.  The re-probe that brought the
+ * SM-X910's dead port back had 0.5 ms between the two writes (TCPM log,
+ * 2026-11-26); this is no less, and nobody has measured what the chip needs.
+ */
+#define SM5714_CC_REOPEN_US		1000
+
+/*
+ * The watchdog's resyncs of one attachment that TCPM did not take: the wait
+ * after the first, second, third and every later one.  Back to the first
+ * when the chip shows nothing, reports an attach or detach, or TCPM attaches.
+ */
+static const unsigned int sm5714_resync_wait_ms[] = { 0, 30000, 120000, 600000 };
+
+/*
+ * The CC self-heal: how long the port toggles without a partner before the
+ * first re-initialisation of the CC logic, and the waits before the second
+ * and the third.  There is no fourth until a partner has been seen.
+ */
+static const unsigned int sm5714_heal_wait_ms[] = { 5000, 25000, 90000 };
 
 /*
  * Rp advertised to a device we are powering, as the SM5714's CC_CNTL1 bits
@@ -279,6 +304,43 @@ module_param(recovery_detach, bool, 0644);
 MODULE_PARM_DESC(recovery_detach,
 		 "open CC for TCPM's error recovery after an in-place PR_Swap or a Hard Reset (default on)");
 
+/*
+ * Leave a CC open of the driver's own (CC_CNTL3 0x88, Samsung's "CC off")
+ * through Unattached.SNK, CC_CNTL1 0x45 and CC_CNTL3 0x82, before the
+ * toggling mode (0x40, 0x80) is written.
+ *
+ * 0x80 alone did not bring the CC logic back.  On the SM-X910 (2026-11-26,
+ * kit r9) the recovery detach above wrote 0x88 with the Anker hub attached
+ * and start_toggling() wrote 0x40/0x80 100 ms later: for 100 minutes the chip
+ * reported nothing (CC_STATUS 0), raised no interrupt, and the hub, which
+ * powers VBUS only for an Rd it sees, stayed dark, also across re-plugs.  A
+ * re-probe brought it back: there PORT_RESET's set_cc(RD) found nothing
+ * attached and wrote 0x45/0x82, and the same 0x40/0x80 followed; the hub was
+ * reported 112 ms later.  A boot that resets a retained dock goes 0x88,
+ * 0x45/0x82, 0x40/0x80 as well.  Samsung's driver turns CC back on with
+ * 0x82, never with 0x80, and writes 0x82 whenever its CC state machine reads
+ * CC_DISABLE.  Clear this for the r9 sequence, for comparison; read each
+ * time.
+ */
+static bool cc_reopen_via_snk = true;
+module_param(cc_reopen_via_snk, bool, 0644);
+MODULE_PARM_DESC(cc_reopen_via_snk,
+		 "leave a CC open of the driver's through Unattached.SNK before toggling (default on)");
+
+/*
+ * Re-initialise the CC logic, as a re-probe does, when TCPM toggles and the
+ * chip has reported nothing for 5 s after the driver opened CC, or reports
+ * nothing on two samples while a partner powers VBUS.  At most three times,
+ * 5 s, 30 s and 2 min into the toggling, until a partner is seen; each time
+ * one warning with the chip's CC state.  See sm5714_usbpd_cc_watch_work().
+ * Clear this to keep a dead port as it is (to read its registers); setting
+ * it again lets the next sample act.
+ */
+static bool cc_self_heal = true;
+module_param(cc_self_heal, bool, 0644);
+MODULE_PARM_DESC(cc_self_heal,
+		 "re-initialise the CC logic when the port finds no partner after a CC open (default on)");
+
 /* Implemented by the companion charger/fuel-gauge driver on this board. */
 int sm5714_battery_set_pd_contract(unsigned int mv, unsigned int ma);
 int sm5714_battery_set_otg(bool active);
@@ -315,10 +377,27 @@ struct sm5714_usbpd {
 	bool sink_tx_ok;
 	/* An in-place swap or a Hard Reset since the chip last saw a detach */
 	bool recovery_detach_armed;
+	/* CC_CNTL3 bit 3 (CC off) was written by the driver, not cleared since */
+	bool cc_open;
+	/*
+	 * What TCPM knows, for the watchdog: it has been toggling since its
+	 * last start_toggling() and called nothing else, and a get_cc() since
+	 * then reported a partner.  VBUS from a partner at the last get_vbus().
+	 */
+	bool toggling;
+	bool partner_seen;
+	bool vbus_ext;
+	/* Watchdog: suspect samples in a row, resyncs since the last change */
+	unsigned int watch_suspect;
+	unsigned int vbus_suspect;
+	unsigned int resyncs;
+	unsigned long resync_after;
+	/* Self-heal: armed by a CC open, tries since a partner was last seen */
+	bool heal_armed;
+	unsigned int heal_tries;
+	unsigned long heal_after;
 	bool retained_sink_dfp;
 	bool retained_dock_reset;
-	bool irq_saw_attach;
-	bool watch_saw_attach;
 	bool irq_wake_enabled;
 	bool suspended;
 	bool policy_open;
@@ -426,6 +505,156 @@ static void sm5714_usbpd_forget_swap(struct sm5714_usbpd *sm,
 		dev_info(sm->dev, "PR_SWAP: in-place swap dropped (%s)\n", why);
 }
 
+/* A partner as get_cc() reports one: a source, a sink, an audio accessory */
+static bool sm5714_usbpd_cc_attached(unsigned int cc)
+{
+	switch (cc & SM5714_CC_ATTACH_MASK) {
+	case SM5714_CC_ATTACH_SOURCE:
+	case SM5714_CC_ATTACH_SINK:
+	case SM5714_CC_ATTACH_AUDIO:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * Open both CC pins (CC_CNTL3 0x88, Samsung's "CC off") for set_cc(OPEN) and
+ * for the recovery detach, and arm the self-heal for the toggling that
+ * follows.  The role bit is cleared after the CC logic is off, not before:
+ * with the chip attached in the swapped role, clearing it first would be an
+ * in-place swap back of its own (Samsung clears it only after a detach).
+ * start_toggling() turns CC on again through sm5714_usbpd_reopen_cc().
+ * Called with sm->lock.
+ */
+static int sm5714_usbpd_open_cc(struct sm5714_usbpd *sm)
+{
+	int ret;
+
+	sm5714_usbpd_clear_swap(sm);
+	sm->recovery_detach_armed = false;
+	ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x88);
+	if (ret)
+		return ret;
+	sm->cc_open = true;
+	sm->heal_armed = true;
+	sm->heal_tries = 0;
+	return sm5714_usbpd_clear_cc_role(sm);
+}
+
+/*
+ * After a CC open of the driver's, go through Unattached.SNK (CC_CNTL1 0x45,
+ * CC_CNTL3 0x82) before the caller writes the toggling mode: what PORT_RESET's
+ * set_cc(RD) writes on an empty port, the sequence of a boot that resets a
+ * retained dock and of the re-probe that brought the SM-X910's dead port
+ * back (see cc_reopen_via_snk), with the chip left there for
+ * SM5714_CC_REOPEN_US.  The caller writes CC_CNTL3 next and clears cc_open.
+ * Called with sm->lock.
+ */
+static int sm5714_usbpd_reopen_cc(struct sm5714_usbpd *sm)
+{
+	int ret;
+
+	if (!sm->cc_open || !READ_ONCE(cc_reopen_via_snk))
+		return 0;
+
+	ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1, 0x45);
+	if (!ret)
+		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x82);
+	if (ret)
+		return ret;
+	usleep_range(SM5714_CC_REOPEN_US, 2 * SM5714_CC_REOPEN_US);
+	dev_info(sm->dev, "CC on again through Unattached.SNK after the driver opened it\n");
+	return 0;
+}
+
+/* Interrupt masks: 1 masks.  See sm5714_usbpd_init_regs(). */
+static const u8 sm5714_usbpd_masks[5] = {
+	0xe6, /* VBUS valid, attach and detach */
+	0xcf, /* advertised current and VBUS 0 V */
+	0xff,
+	0x08, /* all PD transport events; bit 3 is unused */
+	0xff,
+};
+
+/*
+ * The register part of tcpc->init(), also run by the self-heal.  Called with
+ * sm->lock.
+ */
+static int sm5714_usbpd_init_regs(struct sm5714_usbpd *sm)
+{
+	unsigned int state3;
+	u8 pending[5];
+	int ret;
+
+	/* Match the non-water-detection part of Samsung's register init. */
+	ret = regmap_write(sm->regmap, SM5714_REG_CORR_CNTL5, 0x00);
+	if (ret)
+		return ret;
+	ret = regmap_write(sm->regmap, SM5714_REG_CORR_CNTL4, 0x00);
+	if (ret)
+		return ret;
+	ret = regmap_read(sm->regmap, SM5714_REG_PD_STATE3, &state3);
+	if (ret)
+		return ret;
+	/*
+	 * The controller and a powered partner can both retain PD state across
+	 * an AP reboot.  Flush any partial message and protocol event left in
+	 * the RX window before resetting the protocol layer.  Without this, a
+	 * retained-dock CC reset can deliver Source_Capabilities but then expose
+	 * a stale hard reset before TCPM has transmitted its Request.
+	 *
+	 * This is the same RX-buffer flush used by Samsung's
+	 * sm5714_protocol_layer_reset().
+	 */
+	ret = regmap_write(sm->regmap, SM5714_REG_RX_BUF_ST, 0x10);
+	if (ret)
+		return ret;
+	if (state3 & 0x06) {
+		ret = regmap_write(sm->regmap, SM5714_REG_PD_CNTL4, 0x01);
+		if (ret)
+			return ret;
+	}
+
+	/* Reading the interrupt block clears stale edge latches. */
+	ret = regmap_bulk_read(sm->regmap, SM5714_REG_INT1,
+			       pending, sizeof(pending));
+	if (ret)
+		return ret;
+	return regmap_bulk_write(sm->regmap, SM5714_REG_MASK1,
+				 sm5714_usbpd_masks, sizeof(sm5714_usbpd_masks));
+}
+
+/*
+ * The self-heal: what an unbind and bind of the driver does to the chip on
+ * an empty port, without touching TCPM, which goes on toggling: the register
+ * init, PORT_RESET's set_cc(RD) (0x45/0x82), start_toggling() (0x40/0x80).
+ * Called with sm->lock, only while TCPM toggles and no partner is reported.
+ */
+static int sm5714_usbpd_restart_cc(struct sm5714_usbpd *sm)
+{
+	int ret;
+
+	ret = sm5714_usbpd_init_regs(sm);
+	if (ret)
+		return ret;
+	sm5714_usbpd_clear_swap(sm);
+	ret = sm5714_usbpd_clear_cc_role(sm);
+	if (!ret)
+		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1, 0x45);
+	if (!ret)
+		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x82);
+	if (ret)
+		return ret;
+	usleep_range(SM5714_CC_REOPEN_US, 2 * SM5714_CC_REOPEN_US);
+	ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1, 0x40);
+	if (!ret)
+		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x80);
+	if (!ret)
+		sm->cc_open = false;
+	return ret;
+}
+
 static void sm5714_usbpd_cc_resync_work(struct work_struct *work)
 {
 	struct sm5714_usbpd *sm =
@@ -444,30 +673,52 @@ static void sm5714_usbpd_cc_resync_work(struct work_struct *work)
 }
 
 /*
- * Recover an attachment the chip detected but never announced.
+ * The attach watchdog: what the chip reports, compared with what TCPM was
+ * told, while TCPM toggles.
  *
  * Measured on this board: after a detach, the SM5714 can update CC_STATUS for
  * the next accessory and raise no ATTACH interrupt at all.  The interrupt
  * count stays frozen, INT1..INT5 read back empty, the masks are correct, and
  * TCPM sits unattached forever while the connector plainly has something in
  * it.  Re-probing the driver clears it instantly, which is what pointed here.
+ * When TCPM toggles and no get_cc() since its start_toggling() has reported a
+ * partner, while CC_STATUS shows one on two samples 0.5 s apart, TCPM was not
+ * told: it is told now (tcpm_cc_change()).  No edge has to have been seen
+ * for that, a detach shorter than a sample period included; a healthy port
+ * reports a partner within milliseconds, so two samples never disagree.
+ *
+ * And the chip can stop detecting altogether.  On the SM-X910 (2026-11-26)
+ * CC_STATUS read 0 for 100 minutes with the Anker hub plugged in and
+ * powered, after the recovery detach and a toggling restart; see
+ * cc_reopen_via_snk.  With cc_self_heal the port is re-initialised as a
+ * re-probe does it (sm5714_usbpd_restart_cc()): when TCPM has toggled for 5 s
+ * after a CC open of the driver's with nothing reported, or when the chip
+ * reports nothing on two samples while VBUS comes from a partner.  At most
+ * three times until a partner is seen.
  *
  * The recovery has to be narrow.  An earlier attempt to re-arm the resync
  * unconditionally made TCPM oscillate between host and unattached, because
- * poking it while genuinely idle feeds back through start_toggling().  So this
- * only speaks up when the hardware says something is attached *and* the
- * interrupt path never reported it: in a healthy attach/detach cycle it stays
- * silent and costs one i2c read.
- *
- * The work is deferrable, so an idle, unplugged tablet is never woken for it.
+ * poking it while genuinely idle feeds back through start_toggling().  So
+ * nothing here runs while TCPM is anywhere but toggling with no partner seen
+ * (not in Try.SNK, a debounce, PORT_RESET or an attached state).  A resync
+ * only makes TCPM read the CC state; for an attachment TCPM looked at and did
+ * not take it is repeated at the next sample, after 30 s, after 2 min, then
+ * every 10 min at the most.  Nothing here is armed by start_toggling().  On
+ * an idle, empty port it costs one i2c read per period, and the work is
+ * deferrable, so an idle tablet is never woken for it.
  */
 static void sm5714_usbpd_cc_watch_work(struct work_struct *work)
 {
 	struct sm5714_usbpd *sm =
 		container_of(to_delayed_work(work), struct sm5714_usbpd,
 			     cc_watch_work);
-	unsigned int cc;
-	bool attached;
+	unsigned long delay = msecs_to_jiffies(SM5714_CC_WATCH_MS);
+	unsigned int status1 = 0, state0 = 0, cc = 0;
+	const char *why = NULL;
+	unsigned int tries = 0;
+	bool resync = false;
+	bool heal = false;
+	unsigned int wait;
 
 	if (READ_ONCE(sm->suspended))
 		return;
@@ -475,24 +726,103 @@ static void sm5714_usbpd_cc_watch_work(struct work_struct *work)
 	if (IS_ERR_OR_NULL(sm->port))
 		goto again;
 
+	mutex_lock(&sm->lock);
+	if (!sm->toggling || sm->partner_seen) {
+		/* TCPM deals with a partner or with the port itself */
+		sm->watch_suspect = 0;
+		sm->vbus_suspect = 0;
+		goto unlock;
+	}
 	if (regmap_read(sm->regmap, SM5714_REG_CC_STATUS, &cc))
-		goto again;
+		goto unlock;
 
-	attached = cc & SM5714_CC_ATTACH_MASK;
+	if (sm5714_usbpd_cc_attached(cc)) {
+		/* A partner TCPM has not been told of; the chip detects again */
+		sm->vbus_suspect = 0;
+		sm->heal_armed = false;
+		if (time_before(jiffies, sm->resync_after)) {
+			sm->watch_suspect = 0;
+			goto unlock;
+		}
+		if (!sm->watch_suspect++) {
+			delay = msecs_to_jiffies(SM5714_CC_CONFIRM_MS);
+			goto unlock;
+		}
+		sm->watch_suspect = 0;
+		wait = sm5714_resync_wait_ms[min_t(unsigned int, sm->resyncs,
+						    ARRAY_SIZE(sm5714_resync_wait_ms) - 1)];
+		sm->resyncs++;
+		sm->resync_after = jiffies + msecs_to_jiffies(wait);
+		resync = true;
+		goto unlock;
+	}
 
-	if (attached && !sm->irq_saw_attach && !sm->watch_saw_attach) {
+	/* Nothing attached: the next attachment starts afresh */
+	sm->watch_suspect = 0;
+	sm->resyncs = 0;
+	sm->resync_after = jiffies;
+	if (cc & SM5714_CC_ATTACH_MASK) {
+		/* A debug accessory: the chip detects, get_cc() reports none */
+		sm->heal_armed = false;
+		sm->vbus_suspect = 0;
+		goto unlock;
+	}
+	if (READ_ONCE(sm->vbus_ext) &&
+	    !regmap_read(sm->regmap, SM5714_REG_STATUS1, &status1)) {
+		WRITE_ONCE(sm->vbus_ext, status1 & SM5714_INT1_VBUS_POK);
+		if (status1 & SM5714_INT1_VBUS_POK)
+			sm->vbus_suspect++;
+		else
+			sm->vbus_suspect = 0;
+	} else {
+		sm->vbus_suspect = 0;
+	}
+
+	if (sm->heal_armed)
+		why = "since the driver opened it";
+	else if (sm->vbus_suspect >= 2)
+		why = "though VBUS comes from one";
+	if (!why || !READ_ONCE(cc_self_heal) ||
+	    sm->heal_tries >= ARRAY_SIZE(sm5714_heal_wait_ms) ||
+	    time_before(jiffies, sm->heal_after))
+		goto unlock;
+
+	/* Read for the log only: Samsung's CC state, 0x1 is CC_DISABLE */
+	if (regmap_read(sm->regmap, SM5714_REG_PD_STATE0, &state0))
+		state0 = 0xff;
+	if (!status1 && regmap_read(sm->regmap, SM5714_REG_STATUS1, &status1))
+		status1 = 0xff;
+	heal = !sm5714_usbpd_restart_cc(sm);
+	tries = ++sm->heal_tries;
+	sm->vbus_suspect = 0;
+	if (sm->heal_tries < ARRAY_SIZE(sm5714_heal_wait_ms))
+		sm->heal_after = jiffies +
+			msecs_to_jiffies(sm5714_heal_wait_ms[sm->heal_tries]);
+	else
+		sm->heal_armed = false;
+	delay = msecs_to_jiffies(1000);
+
+unlock:
+	mutex_unlock(&sm->lock);
+
+	if (resync)
 		dev_info(sm->dev,
-			 "CC status 0x%02x with no attach interrupt; resyncing TCPM\n",
+			 "CC status 0x%02x shows a partner TCPM was not told of; resyncing TCPM\n",
 			 cc);
+	if (tries)
+		dev_warn(sm->dev,
+			 "CC finds no partner %s (CC status 0x%02x, status1 0x%02x, CC state 0x%02x): %s, try %u of %zu\n",
+			 why, cc, status1, state0,
+			 heal ? "CC logic re-initialised" : "re-initialisation failed",
+			 tries, ARRAY_SIZE(sm5714_heal_wait_ms));
+	if (resync || heal) {
 		tcpm_cc_change(sm->port);
 		tcpm_vbus_change(sm->port);
 	}
-	sm->watch_saw_attach = attached;
 
 again:
 	if (!READ_ONCE(sm->suspended))
-		queue_delayed_work(system_dfl_wq, &sm->cc_watch_work,
-				   msecs_to_jiffies(SM5714_CC_WATCH_MS));
+		queue_delayed_work(system_dfl_wq, &sm->cc_watch_work, delay);
 }
 
 static void sm5714_usbpd_otg_det_work(struct work_struct *work)
@@ -507,56 +837,10 @@ static void sm5714_usbpd_otg_det_work(struct work_struct *work)
 static int sm5714_usbpd_init(struct tcpc_dev *tcpc)
 {
 	struct sm5714_usbpd *sm = tcpc_to_sm5714(tcpc);
-	unsigned int state3;
-	u8 pending[5];
-	static const u8 masks[5] = {
-		0xe6, /* VBUS valid, attach and detach */
-		0xcf, /* advertised current and VBUS 0 V */
-		0xff,
-		0x08, /* all PD transport events; bit 3 is unused */
-		0xff,
-	};
 	int ret;
 
 	mutex_lock(&sm->lock);
-
-	/* Match the non-water-detection part of Samsung's register init. */
-	ret = regmap_write(sm->regmap, SM5714_REG_CORR_CNTL5, 0x00);
-	if (ret)
-		goto out;
-	ret = regmap_write(sm->regmap, SM5714_REG_CORR_CNTL4, 0x00);
-	if (ret)
-		goto out;
-	ret = regmap_read(sm->regmap, SM5714_REG_PD_STATE3, &state3);
-	if (ret)
-		goto out;
-	/*
-	 * The controller and a powered partner can both retain PD state across
-	 * an AP reboot.  Flush any partial message and protocol event left in
-	 * the RX window before resetting the protocol layer.  Without this, a
-	 * retained-dock CC reset can deliver Source_Capabilities but then expose
-	 * a stale hard reset before TCPM has transmitted its Request.
-	 *
-	 * This is the same RX-buffer flush used by Samsung's
-	 * sm5714_protocol_layer_reset().
-	 */
-	ret = regmap_write(sm->regmap, SM5714_REG_RX_BUF_ST, 0x10);
-	if (ret)
-		goto out;
-	if (state3 & 0x06) {
-		ret = regmap_write(sm->regmap, SM5714_REG_PD_CNTL4, 0x01);
-		if (ret)
-			goto out;
-	}
-
-	/* Reading the interrupt block clears stale edge latches. */
-	ret = regmap_bulk_read(sm->regmap, SM5714_REG_INT1,
-			       pending, sizeof(pending));
-	if (ret)
-		goto out;
-	ret = regmap_bulk_write(sm->regmap, SM5714_REG_MASK1,
-				masks, sizeof(masks));
-out:
+	ret = sm5714_usbpd_init_regs(sm);
 	mutex_unlock(&sm->lock);
 	return ret;
 }
@@ -570,6 +854,9 @@ static int sm5714_usbpd_get_vbus(struct tcpc_dev *tcpc)
 	ret = regmap_read(sm->regmap, SM5714_REG_STATUS1, &status);
 	if (ret)
 		return ret;
+
+	/* For the watchdog: VBUS from a partner, the one thing it reads it for */
+	WRITE_ONCE(sm->vbus_ext, status & SM5714_INT1_VBUS_POK);
 
 	/*
 	 * STATUS1.VBUS_POK reports an external source but stays low while the
@@ -648,6 +935,22 @@ static void sm5714_usbpd_latch_policy(struct sm5714_usbpd *sm, bool attached)
 		sm->policy_open = false;
 }
 
+/*
+ * get_cc() is what TCPM knows of CC: a partner it reports ends the
+ * watchdog's suspicion and the self-heal's tries (the chip detects).
+ */
+static void sm5714_usbpd_note_cc(struct sm5714_usbpd *sm, unsigned int cc)
+{
+	if (!sm5714_usbpd_cc_attached(cc))
+		return;
+
+	mutex_lock(&sm->lock);
+	sm->partner_seen = true;
+	sm->heal_armed = false;
+	sm->heal_tries = 0;
+	mutex_unlock(&sm->lock);
+}
+
 static int sm5714_usbpd_get_cc(struct tcpc_dev *tcpc,
 			       enum typec_cc_status *cc1,
 			       enum typec_cc_status *cc2)
@@ -662,6 +965,7 @@ static int sm5714_usbpd_get_cc(struct tcpc_dev *tcpc,
 	ret = regmap_read(sm->regmap, SM5714_REG_CC_STATUS, &cc);
 	if (ret)
 		return ret;
+	sm5714_usbpd_note_cc(sm, cc);
 
 	switch (cc & SM5714_CC_ATTACH_MASK) {
 	case SM5714_CC_ATTACH_SOURCE:
@@ -713,13 +1017,11 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 		msleep(delay);
 
 	mutex_lock(&sm->lock);
+	/* TCPM is no longer just toggling (see start_toggling()) */
+	sm->toggling = false;
 	switch (cc) {
 	case TYPEC_CC_OPEN:
-		sm5714_usbpd_clear_swap(sm);
-		sm->recovery_detach_armed = false;
-		sm5714_usbpd_set_cc_hold(sm, 0);
-		sm5714_usbpd_clear_cc_role(sm);
-		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x88);
+		ret = sm5714_usbpd_open_cc(sm);
 		break;
 	case TYPEC_CC_RD:
 		ret = regmap_read(sm->regmap, SM5714_REG_CC_STATUS,
@@ -733,15 +1035,12 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 			 * attachment, except in TCPM's error recovery
 			 * (PORT_RESET) after an in-place swap or a Hard Reset,
 			 * where the partner has to see a detach: open CC as
-			 * set_cc(OPEN) does (Samsung's "force to detach").
-			 * start_toggling() closes it again.
+			 * set_cc(OPEN) does (Samsung's "CC off").
+			 * start_toggling() turns it on again.
 			 */
 			if (!sm->recovery_detach_armed || !recovery_detach)
 				break;
-			sm5714_usbpd_clear_swap(sm);
-			sm->recovery_detach_armed = false;
-			sm5714_usbpd_clear_cc_role(sm);
-			ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x88);
+			ret = sm5714_usbpd_open_cc(sm);
 			if (!ret)
 				dev_info(sm->dev,
 					 "CC opened for TCPM's error recovery after a swap or Hard Reset\n");
@@ -779,6 +1078,8 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 		if (!ret)
 			ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3,
 					   0x82);
+		if (!ret)
+			sm->cc_open = false;
 		break;
 	case TYPEC_CC_RP_DEF:
 	case TYPEC_CC_RP_1_5:
@@ -835,6 +1136,8 @@ static int sm5714_usbpd_set_cc(struct tcpc_dev *tcpc,
 		if (!ret)
 			ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3,
 					   0x81);
+		if (!ret)
+			sm->cc_open = false;
 		break;
 	default:
 		ret = -EOPNOTSUPP;
@@ -876,10 +1179,14 @@ static int sm5714_usbpd_start_toggling(struct tcpc_dev *tcpc,
 	 * not merely an optimisation: software toggling would keep issuing I2C
 	 * transfers after the QUP controller has suspended.
 	 */
-	if (port_type == TYPEC_PORT_SRC)
-		return sm5714_usbpd_set_cc(tcpc, cc);
-	if (port_type == TYPEC_PORT_SNK)
-		return sm5714_usbpd_set_cc(tcpc, TYPEC_CC_RD);
+	if (port_type == TYPEC_PORT_SRC) {
+		ret = sm5714_usbpd_set_cc(tcpc, cc);
+		goto toggled;
+	}
+	if (port_type == TYPEC_PORT_SNK) {
+		ret = sm5714_usbpd_set_cc(tcpc, TYPEC_CC_RD);
+		goto toggled;
+	}
 
 	/*
 	 * Use the same default Rp while the autonomous DRP engine toggles.
@@ -891,18 +1198,43 @@ static int sm5714_usbpd_start_toggling(struct tcpc_dev *tcpc,
 	sm5714_usbpd_clear_swap(sm);
 	sm5714_usbpd_set_cc_hold(sm, 0);
 	sm5714_usbpd_clear_cc_role(sm);
-	ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1, val);
+	/* A CC open of the driver's is left through Unattached.SNK first */
+	ret = sm5714_usbpd_reopen_cc(sm);
+	if (!ret)
+		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL1, val);
 	/*
-	 * set_cc(OPEN) disables both CC comparators with CC_CNTL3=0x88.
-	 * Merely selecting NORMAL_DRP in CC_CNTL1 does not clear that latch,
-	 * leaving TCPM permanently unattached.  Samsung's downstream
-	 * sm5714_check_cc_state() restores CC operation with 0x80.
+	 * set_cc(OPEN) and the recovery detach disable both CC comparators
+	 * with CC_CNTL3=0x88.  Merely selecting NORMAL_DRP in CC_CNTL1 does not
+	 * clear that latch, leaving TCPM permanently unattached.  0x80 is
+	 * Samsung's CC_OP_EN (sm5714_check_cc_state()); after a CC open it
+	 * follows the 0x82 above, as in Samsung's driver.
 	 */
 	if (!ret)
 		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x80);
+	if (!ret)
+		sm->cc_open = false;
 	mutex_unlock(&sm->lock);
 
-	return ret;
+toggled:
+	if (ret)
+		return ret;
+
+	/*
+	 * TCPM toggles from here, and holds its port lock until this returns,
+	 * so no get_cc() of the new toggling can come before this.  The
+	 * watchdog compares from here; the self-heal after a CC open counts
+	 * from here.
+	 */
+	mutex_lock(&sm->lock);
+	sm->toggling = true;
+	sm->partner_seen = false;
+	sm->watch_suspect = 0;
+	sm->vbus_suspect = 0;
+	if (sm->heal_armed && sm->heal_tries < ARRAY_SIZE(sm5714_heal_wait_ms))
+		sm->heal_after = jiffies +
+			msecs_to_jiffies(sm5714_heal_wait_ms[sm->heal_tries]);
+	mutex_unlock(&sm->lock);
+	return 0;
 }
 
 static int sm5714_usbpd_set_polarity(struct tcpc_dev *tcpc,
@@ -1041,6 +1373,17 @@ static int sm5714_usbpd_set_roles(struct tcpc_dev *tcpc, bool attached,
 	struct sm5714_usbpd *sm = tcpc_to_sm5714(tcpc);
 	unsigned int val;
 	int ret;
+
+	/*
+	 * TCPM sets the roles at every attach, swap and reset: it is not just
+	 * toggling.  An attach (snk/src/acc attach, data role swap) gives the
+	 * watchdog's resyncs back.
+	 */
+	mutex_lock(&sm->lock);
+	sm->toggling = false;
+	if (attached)
+		sm->resyncs = 0;
+	mutex_unlock(&sm->lock);
 
 	ret = regmap_read(sm->regmap, SM5714_REG_PD_CNTL2, &val);
 	if (ret)
@@ -1256,18 +1599,14 @@ static irqreturn_t sm5714_usbpd_irq(int irq, void *data)
 		sm->recovery_detach_armed = true;
 		tcpm_pd_hard_reset(sm->port);
 	}
+	/* An attach or a detach the chip reported gives the resyncs back */
+	if (intr[0] & (SM5714_INT1_ATTACH | SM5714_INT1_DETACH))
+		sm->resyncs = 0;
 	/* A detach the chip saw itself starts the next attach afresh */
 	if (intr[0] & SM5714_INT1_DETACH)
 		sm->recovery_detach_armed = false;
 
 	mutex_unlock(&sm->lock);
-
-	/* Remember whether the interrupt path is doing its job, so the watchdog
-	 * stays quiet whenever it is. */
-	if (intr[0] & SM5714_INT1_ATTACH)
-		sm->irq_saw_attach = true;
-	if (intr[0] & SM5714_INT1_DETACH)
-		sm->irq_saw_attach = false;
 
 	if (intr[0] & (SM5714_INT1_ATTACH | SM5714_INT1_DETACH) ||
 	    intr[1] & SM5714_INT2_SRC_ADV)
@@ -1368,6 +1707,8 @@ static int sm5714_usbpd_probe(struct i2c_client *client)
 		ret = regmap_write(sm->regmap, SM5714_REG_CC_CNTL3, 0x88);
 		if (ret)
 			goto put_fwnode;
+		/* PORT_RESET's set_cc(RD) turns CC on again (0x45/0x82) */
+		sm->cc_open = true;
 		msleep(50);
 		sm->retained_sink_dfp = false;
 		sm->retained_dock_reset = true;
@@ -1472,6 +1813,11 @@ static int sm5714_usbpd_resume(struct device *dev)
 {
 	struct sm5714_usbpd *sm = dev_get_drvdata(dev);
 
+	/* Samples from before the sleep are not samples in a row */
+	mutex_lock(&sm->lock);
+	sm->watch_suspect = 0;
+	sm->vbus_suspect = 0;
+	mutex_unlock(&sm->lock);
 	WRITE_ONCE(sm->suspended, false);
 	queue_delayed_work(system_dfl_wq, &sm->cc_watch_work,
 			   msecs_to_jiffies(SM5714_CC_WATCH_MS));
