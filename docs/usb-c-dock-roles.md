@@ -245,6 +245,342 @@ whose Rp went away again, the first revision's among them, it was still
 off.  The Anker hub attached as a source from the start in its two plug-ins
 with this revision, so they did not come through Try.SNK at all.
 
+## The power role, later: asking a dock with its own supply again
+
+**Written and compiled; the swap back has not run on hardware** (2026-11-26).
+The partner's in-place PR_Swap ran once on the SM-X910, with the r8 kernel,
+when the hub asked for the source role itself (14:52, below); the swap
+itself completed and PD then went deaf.  The driver fixes for that, and the
+tablet's own in-place PR_Swap, have not run.  The SinkTxOK signal below
+(`sink_tx_ok_rp`) is on by default, the user's decision of 2026-11-26 after
+that test, which used `otg_rp` at 2 (Rp 3.0 A all the time);
+`sink_tx_ok_rp` itself has not run either.
+
+When the Anker hub's own supply goes away for a moment it falls back to an
+unpowered sink; Try.SNK finds no source, and the tablet becomes the hub's
+power source, as it should.  On 2026-11-26 the tablet then powered the hub
+and its devices from its battery for 26 minutes, until the hub was
+re-plugged.  The hub said nothing in all that time: no PD message and no CC
+change, also when its charger was pulled and plugged in again.
+
+### Why the hub said nothing: SinkTxOK
+
+A PD 3 sink may start a message sequence only while its source presents
+Rp 3.0 A ("SinkTxOK"); during the source's own sequences the source shows
+"SinkTxNG".  TCPM asks for exactly that (`cc:=5` and `cc:=4` in the TCPM
+log), but `sm5714_usbpd` wrote `otg_rp` (default: Rp default) for every Rp
+request while a sink was attached.  The hub never saw SinkTxOK, so it never
+asked for anything.  At 14:52 the user set `otg_rp` to 2 (Rp 3.0 A all the
+time) and pulled and re-plugged the hub's charger: 8.1 s after the tablet's
+`SRC_READY`, as the charger went back in, the hub sent a PR_Swap itself
+(`PD RX, header: 0xe8a`), the first in any capture.  That settles it.
+
+`sink_tx_ok_rp` (below, on by default) gives TCPM's requests their
+meaning under a PD 3 contract: Rp 3.0 A where TCPM asks for SinkTxOK, the
+`otg_rp` level for SinkTxNG and for everything before the contract.  TCPM
+asks for Rp 3.0 A only as SinkTxOK, after a PD 3 contract: the 900 mA
+source PDO gives Rp default otherwise, a PD 2 contract gives SinkTxNG, and a
+device without PD never gets a contract, so a USB stick, a passive OTG
+adapter or a PD 2 sink never sees 3.0 A.  A PD 3 sink under the 5 V 900 mA
+contract has to keep to it; one that draws by the Rp instead runs into the
+OTG current limit (`otg_ma`, 1.5 A by default) and is dropped.  Samsung's
+driver presents Rp 3.0 A to PD 3 sinks as well, through the chip's Rp auto
+control.  This is the fix that lets a powered hub take the source role
+back the moment its supply returns; the questions below are the fallback
+for a partner that does not ask.  With it on, every PD 3 sink may also
+start its own message sequences (a PR_Swap, a DR_Swap, a VDM), as it may
+with any PD 3 source; `N` gives back the behaviour before, `otg_rp` for
+every Rp request.
+
+With both on, as by default, a two-second pull of the hub's charger can go
+either way: the hub's own PR_Swap comes first, or the tablet's question 5 s
+after its `SRC_READY` does.  Both end in the same in-place swap in the
+driver, armed by the hub's PR_Swap or by its Accept of the tablet's.  Which
+one comes first on this hub is not known until it runs.  They do not get in
+each other's way: a PR_Swap of the hub's in the 16 ms before the question
+goes out is taken and the question dropped; while the question is on the
+wire the tablet shows SinkTxNG, and a hub that sends anyway gets a Soft
+Reset, after which the questions stop for the session and the hub can ask
+again.
+
+### Why PD went deaf after the hub's swap
+
+In the 14:52 capture the in-place swap worked on the wire: Accept, the
+kernel lines `Source-to-Sink PR_SWAP: CC state frozen` and `CC hold
+applied`, the tablet's PS_RDY with its GoodCRC (`PD TX complete, status:
+0`), the hub's PS_RDY, `CC hold released`, VBUS from the hub.  Then nothing
+more was received: the hub's Source_Capabilities never arrived, the hub
+sent a Hard Reset, every message of the tablet's failed (`status: 2`), TCPM
+went to error recovery, and three attaches without a single message
+followed, until the hub opened its own CC 11 s after its Hard Reset.  Only
+then did PD work again (9 V, 1.66 A, as host).  The USB 2 side of the hub
+went with the VBUS gap of the swap; its USB 3 side with the Hard Reset.
+
+The SM5714 runs the PD Protocol Layer in hardware (GoodCRC, retries,
+MessageIDs).  Samsung's driver resets it at the end of every power role
+swap and tells it when a Hard Reset has been dealt with; `sm5714_usbpd` did
+neither.  After the Hard Reset the Protocol Layer waits for the second
+("Reset Wait Policy Engine") and passes no message until the chip sees a
+detach, which TCPM's error recovery never made: it keeps Rd up on this port,
+and the driver kept the attachment.  Why nothing was received right after
+the swap is less certain: the hub's PS_RDY carried MessageID 0, and a new
+source's first Source_Capabilities carry 0 as well, which a Protocol Layer
+that was not reset takes for a repeat.  The driver now does both, and makes
+TCPM's error recovery a real detach (switches below):
+
+- the Protocol Layer is reset when the PS_RDY that ends an in-place swap
+  has been received (Source-to-Sink) or sent (Sink-to-Source):
+  `Source-to-Sink PR_SWAP: protocol layer reset`;
+- when TCPM turns PD reception back on after a Hard Reset and the chip says
+  it is waiting: `PD protocol layer released after a Hard Reset (PD_STATE3
+  0x..)`;
+- TCPM's error recovery after an in-place swap or a Hard Reset opens CC, so
+  that the partner sees a detach and the port comes back in one reconnect:
+  `CC opened for TCPM's error recovery after a swap or Hard Reset`.
+
+A short USB 2 drop at a swap is expected: a PR_Swap takes VBUS to 0 V, and a
+self-powered USB 2 device has to let go of the bus without VBUS.  It comes
+back about a second after the hub's VBUS; the USB 3 side may stay.
+
+### Asking: the swap back
+
+`tcpm-swap-back-to-sink.patch` lets the controller ask.  With
+`tcpc_dev.request_sink_as_source` set, a tablet that is power source to a PD
+partner under an explicit contract, and whose preferred role is sink, sends
+Get_Source_Cap (new states `GET_SOURCE_CAP` and `GET_SOURCE_CAP_TIMEOUT`)
+and asks for the sink role with a PR_Swap when the partner's 5 V PDO has the
+Unconstrained Power bit (`E` in the log's `[RUDE]`).  That answer is the
+only one that ever leads to a PR_Swap.
+
+- The first question goes out 5 s after the first `SRC_READY` of an
+  attach.
+- No external power: asked again after 30 s, then 60, 120, 240 and 480 s,
+  then every 600 s for as long as the tablet is the source.
+- Reject or Not_Supported to Get_Source_Cap, or no answer: the hub may well
+  be a plain sink while its supply is away, so it is asked again every
+  600 s.  Wait: one step further down the ladder.
+- External power: PR_Swap at once.  Accepted, the tablet is to be sink at
+  the next ready state, in place or after a reconnect.  Reject, Wait or no
+  answer: asked again on the same ladder.  Reject from a partner whose PDO
+  does not claim dual-role power, or Not_Supported: no more questions.
+- While the port is busy (discovery, a VDM, another message sequence) the
+  question waits a second at a time, for at most a minute, then one step
+  down the ladder.
+
+The Dual-Role Power bit alone does not decide: with the charger it had on
+2026-11-26 (20 V 2.25 A) the hub announced `[UDE]`, no dual-role power, and
+accepted a PR_Swap all the same; with the one at boot it announced `[RUDE]`.
+
+**One partner, one session.**  The questions belong to a session: one
+partner while it stays attached, or comes back within 60 s of a port reset
+(the reconnect of a failed swap).  The tablet cannot tell partners apart
+across a reset, so a different one plugged in within that minute continues
+the session.  "No more questions" means: not while this partner stays
+attached, or comes back within a minute.
+
+**Bounds.**  Per session at most 8 PR_Swap requests and 3 accepted swaps.
+
+- A question or a PR_Swap that was on the wire when a reset came (or sent
+  less than 2 s before a port reset, unanswered) stops the session: a hub
+  that leaves the bus when asked is asked once per session.  If it then
+  stays away for more than a minute, that counts as a failed swap.
+- A swap that the partner accepts but cannot complete (its supply is really
+  gone while its capabilities still say Unconstrained Power) runs TCPM's
+  failure path, one reconnect, and the tablet is source again: a failed
+  swap, and the session stops.  So is a sink role lost within a minute of
+  the swap with the tablet source again in the same session (a supply that
+  collapses under the load).  An unplug soon after a good swap is not one.
+- After 2 failed swaps nothing is asked of any partner until the tablet has
+  been a power sink for 30 minutes in one stint (counted when the stint
+  ends).  A hub used without its charger on purpose therefore sees at most
+  one reconnect per session, two in all, and never a loop.
+- **A supply that drops now and then** is followed every time: a swap whose
+  sink role lasted 10 minutes gives the 8 requests and 3 swaps back.
+
+**Others' choices stand.**  A write of `source` to the port's `power_role`
+stops the session; a write of `sink` takes over a request that is queued
+or due.  **A PR_Swap that the partner asks for** and that makes the tablet
+the source stops the session too: the partner chose, and the tablet does
+not ask it to take the role back.  A write of `sink` to `preferred_role`
+after another value resumes the questions.  Nothing is sent while a VDM
+exchange is under way or discovery is due; the work is deferrable and
+freezable, so it never wakes an idle tablet and does nothing in a system
+sleep.
+
+**The tablet's own PR_Swap in place.**  The hand test on 2026-11-26 (tablet
+source to the hub with its charger back, `echo sink` to `power_role`) ended
+in error recovery: `set_cc(RD)` forced the sink mode, the chip dropped its
+attachment, and the PS_RDY went nowhere.  The driver applies a Source-to-Sink
+PR_Swap in place (CC state frozen, CC hold, `CC_CNTL7` bit 0 toggled, hold
+released at the partner's PS_RDY) for a PR_Swap the partner asks for, and
+now also when the partner accepts the tablet's own (`Source-to-Sink PR_SWAP:
+own request accepted, applying it in place`), as Samsung's driver does for
+both.  The swap stays armed only while TCPM goes ahead with it: any other
+message from TCPM, or a Hard Reset, drops it (`PR_SWAP: in-place swap
+dropped (...)`).  The `CC_CNTL7` bit is cleared wherever the driver forgets a
+swap or forces a mode, and once at boot (`CC role bit left set by a swap
+before this boot (CC_CNTL7 0x..), cleared`), as Samsung clears it at every
+detach.  A Sink-to-Source swap that the tablet asks for is left as it was.
+
+### Switches
+
+Read like the others from the next attach, except where the table says
+"each time":
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `/sys/module/sm5714_usbpd/parameters/swap_back_to_sink` | `Y` | As power source, ask a PD partner with its own supply for the sink role.  `N`: TCPM's standard behaviour |
+| `/sys/module/sm5714_usbpd/parameters/own_pr_swap_in_place` | `Y` | Apply the tablet's own accepted PR_Swap to sink in place.  `N`: the old behaviour, error recovery |
+| `/sys/module/sm5714_usbpd/parameters/sink_tx_ok_rp` | `Y` | As PD 3 source, Rp 3.0 A where TCPM asks for SinkTxOK, so that the partner may ask for the source role itself.  `N`: `otg_rp` for every Rp request, the behaviour before |
+| `/sys/module/sm5714_usbpd/parameters/swap_protocol_reset` | `Y` | Reset the PD Protocol Layer at the end of an in-place PR_Swap (each time).  `N`: the r8 behaviour, for comparison |
+| `/sys/module/sm5714_usbpd/parameters/recovery_detach` | `Y` | Open CC for TCPM's error recovery after an in-place swap or a Hard Reset (each time).  `N`: keep the attachment, as before |
+| `/sys/module/sm5714_usbpd/parameters/pr_swap_rd_delay_ms` | `0` | Wait before Rd in an in-place swap to sink (each time); at most 500, keep it at 450 or less |
+
+`pr_swap_rd_delay_ms` is for one failure only: the tablet's PS_RDY goes out
+with `status: 0` but the partner's never comes.  Samsung changes the pull
+about 375 ms after the Accept and this driver about 65 ms after it; the
+PS_RDY follows 200 ms later, about 265 ms plus the wait after the Accept,
+and a partner gives up on it after tPSSourceOff, at least 750 ms after the
+Accept.  310 matches Samsung's pull change; 450 is the most that leaves a
+margin.
+
+Delivering it needs a new kernel image: TCPM and `sm5714_usbpd` are built
+in (`CONFIG_TYPEC_TCPM=y`, `CONFIG_TYPEC_SM5714=y`), there is no module to
+swap, and nothing in the device tree changes.
+
+### Trying it on a tablet
+
+All on the SM-X910 or the SM-X710 with a kernel from this tree, the TCPM log
+emptied before each step as in "Checking it on a tablet" below, and the
+kernel log read with
+
+```sh
+journalctl -k -b -o short-monotonic |
+    grep -E 'swap back|PR_SWAP|protocol layer|CC opened|CC role bit|OTG boost|USB-PD contract|usb [12]-1'
+```
+
+`P` below is `/sys/module/sm5714_usbpd/parameters`.  `-o short-monotonic`
+gives the kernel's own time stamps, the ones the TCPM log uses.
+
+1. **The hub asks itself** (the 14:52 test, with the fixes), with the
+   defaults: `sink_tx_ok_rp` on, `otg_rp` at 0.  With the hub charging the
+   tablet, pull the hub's charger (the tablet becomes its source), wait
+   10 s, plug it back.  About 5 s after `SRC_READY` the tablet's question
+   goes out while the charger is still out (step 3's `partner has no
+   external power now` or one of its other answer lines).  Expected in the
+   TCPM log, in order: the attach as source up to `SRC_READY` and `cc:=5`;
+   the question and its answer; after the charger is back, `PD RX, header:`
+   ending in `8a` (the hub's PR_Swap), `SRC_READY -> PR_SWAP_ACCEPT`, the
+   Accept (`PD TX, header:` ending in `a3`) with `status: 0`,
+   `PR_SWAP_START`, `PR_SWAP_SRC_SNK_TRANSITION_OFF`,
+   `vbus:=0`, `VBUS off`, `PR_SWAP_SRC_SNK_SOURCE_OFF`, `cc:=2`,
+   `PR_SWAP_SRC_SNK_SOURCE_OFF_CC_DEBOUNCED`, the tablet's PS_RDY (header
+   ending in `a6`) with `status: 0`, `CC1: 2 -> 5` (or CC2), the hub's
+   PS_RDY (`PD RX`, header ending in `86`), `PR_SWAP_SRC_SNK_SINK_ON`,
+   `SNK_STARTUP`, `SNK_DISCOVERY`, `VBUS on`, `SNK_WAIT_CAPABILITIES`, `CC1:
+   5 -> 4`, and then, where r8 had nothing, the hub's capabilities (`PD RX,
+   header:` ending in `81`: the hub keeps the device role, the tablet stays
+   USB host) and its PDOs, `Requesting PDO 1: 9000 mV, 1660 mA`, the hub's
+   Accept and PS_RDY, `SNK_READY`.  No `Received hard reset`, no
+   `HARD_RESET`, no `ERROR_RECOVERY`.  In the kernel log: `Source-to-Sink
+   PR_SWAP: CC state frozen`, `disabled USB OTG boost`, `CC hold applied`,
+   `CC hold released`, `Source-to-Sink PR_SWAP: protocol layer reset`, `USB-PD contract: 5000 mV, 3000 mA`, `USB-PD
+   contract: 9000 mV, 1660 mA`; `usb 1-1: USB disconnect` at the VBUS gap
+   and the hub's USB 2 devices back about a second later.  What else can
+   show, and what it means:
+   - `Received hard reset` about 150 ms after `CC1: 5 -> 4`, as on r8: the
+     reset did not keep the swap clean.  Then expect `PD protocol layer
+     released after a Hard Reset (PD_STATE3 0x..)` at the next
+     `SNK_WAIT_CAPABILITIES` and the capabilities after it: one Hard Reset,
+     no reconnect.
+   - `ERROR_RECOVERY`, `PORT_RESET`, and `CC opened for TCPM's error recovery
+     after a swap or Hard Reset`, then `disconnected` within a few tens of
+     ms: the net under both; one fresh attach, with PD.
+   - Repeat once with `echo N | sudo tee $P/swap_protocol_reset`: the r8
+     deafness up to the hub's Hard Reset is expected again, and then the
+     second line above and charging without a reconnect.  That run tests
+     the Hard Reset fix on purpose.  Set it back to `Y`.
+2. **The tablet's own PR_Swap**, with `swap_back_to_sink` and
+   `sink_tx_ok_rp` at `N` (`echo N | sudo tee $P/swap_back_to_sink
+   $P/sink_tx_ok_rp`, so that neither the question nor the hub gets there
+   first): the hub without its charger, plug it in (the tablet becomes its
+   source), plug the hub's charger in, then `echo sink | sudo tee
+   /sys/class/typec/port0/power_role`.  Expected: `PR_SWAP_SEND`,
+   the hub's Accept, and from `PR_SWAP_START` on step 1's lines; in the
+   kernel log `Source-to-Sink PR_SWAP: own request accepted, applying it in
+   place` first, and the hub's Accept is `PD RX, header:` ending in `83`.
+   With `own_pr_swap_in_place` at `N` it should end as the hand test did.
+   If our PS_RDY has `status: 0` but no PS_RDY comes from the hub and TCPM
+   goes to `ERROR_RECOVERY` 450 ms later, repeat with `echo 310 | sudo tee
+   $P/pr_swap_rd_delay_ms`.  Afterwards `echo Y` to both switches again,
+   and `echo 0` to `pr_swap_rd_delay_ms` if it was set.
+3. **The swap back after a short loss of the hub's supply**, with
+   `sink_tx_ok_rp` at `N` (`echo N | sudo tee $P/sink_tx_ok_rp`; with it
+   on, the hub may ask first, see the last line below): with the hub
+   charging the tablet, pull the hub's charger for about two seconds and
+   put it back.  The tablet becomes the source, and about 5 s after its
+   `SRC_READY` the TCPM log shows `AMS GET_SOURCE_CAPABILITIES start`,
+   `AMS_START -> GET_SOURCE_CAP`, `PD TX, header:` ending in `a7`
+   (Get_Source_Cap) and the answer.  Each kernel log line it can give,
+   prefixed `swap back to sink:`:
+   - `partner has external power (vSafe5V PDO 0x2e0190c8), requesting the
+     sink role, PR_Swap 1 of 8` (the PDO as sent; 0x2e0190c8 is the 5 V 2 A
+     `[RUDE]` one): the hub's supply is back.  Then `PR_Swap accepted, swap
+     1 of 3`, step 1's swap and `power sink at 9000 mV 1660 mA`, or
+     `power sink at 9000 mV 1660 mA, after a reconnect` if the in-place swap
+     did not hold and TCPM's failure path got there.
+   - `partner has no external power now, asking again in 30 s, then less
+     often down to every 600 s`: no `E` yet; asked again at 30, 60, 120, 240,
+     480 s, then every 600 s (TCPM log: `Swap back: no external power,
+     asking again in N s`).
+   - `Get_Source_Cap answered Reject, not a source now, asking again every
+     600 s`, or `Not_Supported` instead of `Reject`: the hub refuses while
+     unpowered; it is asked again every 10 minutes.
+   - `Get_Source_Cap answered nothing, not a source now, asking again every
+     600 s`: no answer within 60 ms; asked again every 10 minutes.  The
+     later answers of both kinds go to the TCPM log only (`Swap back:
+     Get_Source_Cap answered ..., asking again in 600 s`), as does Wait.
+   - `PR_Swap answered Wait, asking again in N s` (or `Reject`, `nothing`):
+     asked again on the ladder, at most 8 requests.
+   - `PR_Swap request not sent, asking again in N s`: a message of the hub's
+     or a write got in first; asked again on the ladder.
+   - `sink role lost within a minute of the swap, failed swap 1 of 2; not
+     asking again until the partner has been away for a minute`: the swap
+     held, but the hub's supply gave out and the tablet is its source again.
+   - `Get_Source_Cap cut short by a port reset; not asking again until the
+     partner has been away for a minute` (or `PR_Swap ...`): the hub left
+     the bus when it was asked; not asked again in this session.  Without
+     `by a port reset`, a Soft or Hard Reset came instead of the answer.
+   - Any other `...; not asking again until the partner has been away for a
+     minute` names its reason: `PR_Swap answered Not_Supported`, `PR_Swap
+     answered Reject by a partner that does not claim dual-role power`,
+     `the partner's source capabilities do not start with a fixed supply`,
+     `8 PR_Swap requests made`, `3 swaps accepted`, `the partner asked for
+     the sink role`, `the source role was asked for through power_role`.
+   - No line at all when the hub asked first (with `sink_tx_ok_rp` on, as
+     by default): then the hub's PR_Swap took the place of the question.
+   Afterwards `echo Y | sudo tee $P/sink_tx_ok_rp`.
+4. **A partner whose PDOs keep the `E` without a supply**: the hub without
+   its charger, plugged in.  Expect exactly one reconnect about 5 s after
+   plugging in and then `swap accepted but the partner did not supply power,
+   failed swap 1 of 2; not asking again until the partner has been away for
+   a minute`; no further reconnect while it stays.  Unplugged for more than a
+   minute and plugged in again: once more, `failed swap 2 of 2`; the third
+   time `paused after 2 failed swaps until the port has been a power sink
+   for 30 minutes`.
+5. **A choice of the user's**: as source to the hub with its charger, `echo
+   source | sudo tee /sys/class/typec/port0/power_role`: `the source role was
+   asked for through power_role; not asking again until the partner has been
+   away for a minute`, and no swap afterwards.
+6. **Nothing changes** for a USB stick, a keyboard (no `swap back` line, no
+   PD traffic), a plain PD charger (the tablet is sink from the start) and,
+   with `swap_back_to_sink` at `N`, for the hub.  A PD 3 phone as sink
+   shows `cc:=5` after its contract (Rp 3.0 A, SinkTxOK) and keeps charging
+   from the tablet without `VBUS off`; a PD 2 one shows `cc:=4` there.
+
+What to save from each run: the TCPM log (it empties when read) and
+`journalctl -k -b -o short-monotonic`.
+
 ## A boot with the dock attached: the USB host that died
 
 With the first revision, the SM-X910 booted with the Satechi attached came up
